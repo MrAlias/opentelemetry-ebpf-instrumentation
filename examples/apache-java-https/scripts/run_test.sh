@@ -9,20 +9,179 @@ set -Eeuo pipefail
 
 TEST_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly TEST_SCRIPT_DIR
+TEST_REPOSITORY_ROOT="$(cd -- "$TEST_SCRIPT_DIR/../../.." && pwd -P)"
+readonly TEST_REPOSITORY_ROOT
 
 # shellcheck source=../run.sh
 # shellcheck disable=SC1091 # Resolved from BASH_SOURCE at runtime.
 source "$TEST_SCRIPT_DIR/../run.sh"
 
 TEST_TMP_DIR=""
+HARNESS_OWNED_TEST_TMP_DIR=""
+HARNESS_OWNED_TEST_TMP_IDENTITY=""
+
+validated_harness_test_tmp_identity() {
+  local -r candidate="$1"
+  local candidate_physical=""
+  local candidate_name=""
+  local identity=""
+
+  [[ "$candidate" == /* && -d "$candidate" && ! -L "$candidate" ]] ||
+    return 1
+  candidate_physical="$(cd -- "$candidate" && pwd -P)" || return 1
+  [[ "$candidate" == "$candidate_physical" ]] || return 1
+  candidate_name="${candidate##*/}"
+  [[ "$candidate_name" =~ ^obi-apache-java-https-test\.[A-Za-z0-9]{6}$ ]] ||
+    return 1
+  case "$candidate" in
+    /|/tmp|/dev/shm|"$TEST_REPOSITORY_ROOT"|"$TEST_REPOSITORY_ROOT"/*)
+      return 1
+      ;;
+  esac
+  identity="$(stat -Lc '%d:%i:%u:%a' -- "$candidate")" || return 1
+  [[ "$identity" == *":$(id -u):700" ]] || return 1
+  printf '%s\n' "$identity"
+}
+
+register_harness_test_tmp_dir() {
+  local -r candidate="$1"
+  local identity=""
+
+  [[ -z "$TEST_TMP_DIR" && -z "$HARNESS_OWNED_TEST_TMP_DIR" &&
+    -z "$HARNESS_OWNED_TEST_TMP_IDENTITY" ]] || return 1
+  identity="$(validated_harness_test_tmp_identity "$candidate")" || return 1
+  TEST_TMP_DIR="$candidate"
+  HARNESS_OWNED_TEST_TMP_DIR="$candidate"
+  HARNESS_OWNED_TEST_TMP_IDENTITY="$identity"
+}
 
 cleanup_test() {
-  if [[ -n "${TEST_TMP_DIR:-}" && -d "$TEST_TMP_DIR" ]]; then
-    rm -rf -- "$TEST_TMP_DIR"
-  fi
+  local observed_identity=""
+
+  [[ -n "${TEST_TMP_DIR:-}" && -n "${HARNESS_OWNED_TEST_TMP_DIR:-}" &&
+    -n "${HARNESS_OWNED_TEST_TMP_IDENTITY:-}" &&
+    "$TEST_TMP_DIR" == "$HARNESS_OWNED_TEST_TMP_DIR" ]] || return 0
+  observed_identity="$(
+    validated_harness_test_tmp_identity "$HARNESS_OWNED_TEST_TMP_DIR"
+  )" || return 0
+  [[ "$observed_identity" == "$HARNESS_OWNED_TEST_TMP_IDENTITY" ]] || return 0
+  rm -rf --one-file-system -- "$HARNESS_OWNED_TEST_TMP_DIR"
 }
 
 trap cleanup_test EXIT
+
+test_sourced_harness_cleanup_requires_registered_ownership() {
+  local -r sentinel_parent="$TEST_TMP_DIR/cleanup-ownership-sentinel-parent"
+  local -r sentinel="$sentinel_parent/sentinel"
+
+  mkdir -p -- "$sentinel_parent"
+  printf 'preserve\n' >"$sentinel"
+  bash -c '
+    set -Eeuo pipefail
+    source "$1"
+    TEST_TMP_DIR="$2"
+  ' bash "$TEST_SCRIPT_DIR/run_test.sh" "$sentinel_parent"
+  [[ -f "$sentinel" && "$(<"$sentinel")" == preserve ]]
+}
+
+prepare_completed_run_status_journal_fixture() {
+  local -r boundary_id=uninstrumented
+  local -r phase=run-status-unavailable
+  local -r status_reference=scenario-uninstrumented-status.json
+  local SCENARIO=uninstrumented
+  local TRANSPORT=disabled
+  local REPEAT_COUNT=1
+  local payload=""
+  local path=""
+
+  [[ -d "$RESULT_DIR" && ! -L "$RESULT_DIR" ]] || return 1
+  obi_metric_boundary_journal_paths_are_cleanly_absent || return 1
+  [[ ! -e "$RESULT_DIR/phases/$phase" &&
+    ! -L "$RESULT_DIR/phases/$phase" &&
+    ! -e "$RESULT_DIR/$status_reference" &&
+    ! -L "$RESULT_DIR/$status_reference" ]] || return 1
+  for path in \
+    "$RESULT_DIR/terminal-java-diagnostics.json" \
+    "$RESULT_DIR/terminal-obi-metrics.json" \
+    "$RESULT_DIR/run-status.json" \
+    "$RESULT_DIR"/.terminal-java-diagnostics.* \
+    "$RESULT_DIR"/.terminal-java-diagnostics-* \
+    "$RESULT_DIR"/.terminal-obi-metrics.* \
+    "$RESULT_DIR"/.last-valid-java-diagnostics.* \
+    "$RESULT_DIR"/.run-status.*; do
+    [[ ! -e "$path" && ! -L "$path" ]] || return 1
+  done
+  mkdir -p -- "$RESULT_DIR/phases/$phase" || return $?
+  initialize_obi_metric_boundary_index || return $?
+  begin_obi_metric_boundary "$boundary_id" || return $?
+  printf 'unavailable\n' >"$RESULT_DIR/phases/$phase/obi-metrics.prom" ||
+    return $?
+  chmod 0644 -- "$RESULT_DIR/phases/$phase/obi-metrics.prom" || return $?
+  [[ ! -e "$RESULT_DIR/phases/$phase/obi-identity.json" &&
+    ! -L "$RESULT_DIR/phases/$phase/obi-identity.json" ]] || return 1
+  attach_obi_unavailable_phase_capture "$phase" || return $?
+  jq -cn --arg boundary_id "$boundary_id" '
+    {
+      status: "passed",
+      scenario: "uninstrumented",
+      obi_metric_boundary_ids: [$boundary_id]
+    }
+  ' >"$RESULT_DIR/$status_reference" || return $?
+  chmod 0644 -- "$RESULT_DIR/$status_reference" || return $?
+  bind_status_to_active_obi_metric_boundary "$status_reference" || return $?
+  complete_obi_metric_boundary "$boundary_id" || return $?
+  payload="$(obi_metric_boundary_index_payload full)" || return $?
+  jq -e '
+    .selection == {
+      scenario: "uninstrumented",
+      requested_transport: "disabled",
+      selected_transport: null,
+      repeat_count: 1
+    } and
+    (.boundaries | length) == 1 and
+    .boundaries[0].id == "uninstrumented" and
+    .boundaries[0].state == "complete" and
+    all(.boundaries[];
+      .state == "complete" or .state == "not_applicable")
+  ' <<<"$payload" >/dev/null
+}
+
+assert_run_status_v3_index_authority() {
+  local -r result_dir="$1"
+  local -r index="$result_dir/obi-metric-boundary-index.json"
+  local -r freeze="$result_dir/.obi-metric-boundary-index.freeze"
+  local -r terminal="$result_dir/terminal-obi-metrics.json"
+  local -r status="$result_dir/run-status.json"
+  local index_digest=""
+  local freeze_payload=""
+
+  [[ -d "$result_dir" && ! -L "$result_dir" &&
+    -f "$index" && ! -L "$index" &&
+    -f "$freeze" && ! -L "$freeze" &&
+    -f "$terminal" && ! -L "$terminal" &&
+    -f "$status" && ! -L "$status" ]] || return 1
+  index_digest="$(sha256sum "$index")" || return $?
+  index_digest="${index_digest%% *}"
+  [[ "$index_digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+  freeze_payload="$(read_bounded_single_line_regular_file "$freeze" 160)" ||
+    return $?
+  [[ "$freeze_payload" == \
+    "obi-metric-boundary-index-frozen-v1:$index_digest" ]] || return 1
+  jq -e --arg digest "$index_digest" --slurpfile terminal "$terminal" '
+    ($terminal | length) == 1 and
+    .schema == "obi-apache-java-https-run-status-v3" and
+    .obi_metric_boundary_index_reference ==
+      "obi-metric-boundary-index.json" and
+    .obi_metric_boundary_index_sha256 == $digest and
+    .obi_metric_evidence_reference == "terminal-obi-metrics.json" and
+    .obi_metric_evidence == $terminal[0] and
+    .obi_metric_evidence.schema ==
+      "obi-java-remote-parent-terminal-metrics-v2" and
+    .obi_metric_evidence.boundary_index_reference ==
+      "obi-metric-boundary-index.json" and
+    .obi_metric_evidence.boundary_index_sha256 == $digest
+  ' "$status" >/dev/null
+}
 
 expect_invalid_project_name() {
   local -r project_name="$1"
@@ -242,6 +401,8 @@ test_successful_cleanup_invalidates_current_transport_before_down() {
     assert_permanent_absence_marker_matches_current_docker() { :; }
     clear_pending_permanent_absence_recovery() { :; }
     cleanup_security_processes() { :; }
+    publish_owned_run_status() { :; }
+    commit_published_run_status() { :; }
     capture_evidence() {
       [[ -z "$DELAYED_OTLP_RECEIVER_SNAPSHOT_TEMP" &&
         -z "$DELAYED_OTLP_RECEIVER_PUBLICATION_TEMP" &&
@@ -275,6 +436,309 @@ test_successful_cleanup_invalidates_current_transport_before_down() {
     "$(<"$foreign_result/java-transport-configuration.txt")" == \
       "foreign-current" ]] || {
     printf 'successful cleanup retained stale current-generation selection evidence\n' >&2
+    return 1
+  }
+}
+
+test_cleanup_without_result_publishes_exact_guard_status() {
+  local -r missing_result="$TEST_TMP_DIR/cleanup-guard-missing-result"
+  local -r missing_holder="$TEST_TMP_DIR/cleanup-guard-missing-holder"
+  local -r missing_publication="$TEST_TMP_DIR/cleanup-guard-missing-publication"
+  local -r retry_holder="$TEST_TMP_DIR/cleanup-guard-empty-retry-holder"
+  local -r retry_publication="$TEST_TMP_DIR/cleanup-guard-empty-retry-publication"
+  local requested_status=0
+  local observed_status=0
+  local holder_calls=""
+  local publication_calls=""
+
+  for requested_status in 0 17; do
+    holder_calls="$TEST_TMP_DIR/cleanup-guard-empty-holder-$requested_status"
+    publication_calls="$TEST_TMP_DIR/cleanup-guard-empty-publication-$requested_status"
+    if (
+      RESULT_DIR=""
+      PRESSURE_ACTIVE=false
+      FAULT_BRIDGE_RUNNING=false
+      MATCHING_BRIDGE_RUNNING=false
+      STACK_STARTED=false
+      PROJECT_GUARD_HELD=false
+      PROJECT_GUARD_CONTROL_DIR=""
+      PROJECT_GUARD_STATUS_RELAY_PID=1
+      CLEANUP_SIGNAL_STATUS=0
+      SOURCE_SNAPSHOT_DIR=""
+      TMP_DIR=""
+      RUN_STAGE=cleanup-guard-empty-result
+      FAILURE_STAGE=""
+      FAILURE_LINE=""
+      FAILURE_STATUS=""
+      FAILURE_COMMAND=""
+      cleanup_delayed_otlp_receiver_temporaries() { :; }
+      cleanup_security_processes() { :; }
+      cleanup_source_snapshot_work_directory() { :; }
+      release_project_guard() { :; }
+      publish_owned_run_status() {
+        : >"$publication_calls"
+        return 97
+      }
+      publish_project_guard_holder_status_with_retries() {
+        printf '%s\n' "$1" >>"$holder_calls"
+      }
+
+      cleanup "$requested_status"
+    ) >/dev/null 2>&1; then
+      observed_status=0
+    else
+      observed_status=$?
+    fi
+    [[ "$observed_status" == "$requested_status" &&
+      "$(<"$holder_calls")" == "$requested_status" &&
+      ! -e "$publication_calls" ]] || {
+      printf 'empty-result cleanup lost guarded status %s (observed %s)\n' \
+        "$requested_status" "$observed_status" >&2
+      return 1
+    }
+  done
+
+  if (
+    local -i holder_attempt=0
+
+    RESULT_DIR=""
+    PRESSURE_ACTIVE=false
+    FAULT_BRIDGE_RUNNING=false
+    MATCHING_BRIDGE_RUNNING=false
+    STACK_STARTED=false
+    PROJECT_GUARD_HELD=false
+    PROJECT_GUARD_CONTROL_DIR=""
+    PROJECT_GUARD_STATUS_RELAY_PID=1
+    CLEANUP_SIGNAL_STATUS=0
+    SOURCE_SNAPSHOT_DIR=""
+    TMP_DIR=""
+    RUN_STAGE=cleanup-guard-empty-retry
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    FAILURE_STATUS=""
+    FAILURE_COMMAND=""
+    cleanup_delayed_otlp_receiver_temporaries() { :; }
+    cleanup_security_processes() { :; }
+    cleanup_source_snapshot_work_directory() { :; }
+    release_project_guard() { :; }
+    publish_owned_run_status() {
+      : >"$retry_publication"
+      return 97
+    }
+    publish_project_guard_holder_status_with_retries() {
+      printf '%s\n' "$1" >>"$retry_holder"
+      ((holder_attempt += 1))
+      ((holder_attempt > 1)) || return 79
+    }
+
+    cleanup 0
+  ) >/dev/null 2>&1; then
+    observed_status=0
+  else
+    observed_status=$?
+  fi
+  [[ "$observed_status" == 79 &&
+    "$(paste -sd, -- "$retry_holder")" == 0,79 &&
+    ! -e "$retry_publication" ]] || {
+    printf 'empty-result cleanup did not retry the promoted guarded status\n' >&2
+    return 1
+  }
+
+  [[ ! -e "$missing_result" && ! -L "$missing_result" ]] || return 1
+  if ! (
+    RESULT_DIR="$missing_result"
+    PRESSURE_ACTIVE=false
+    FAULT_BRIDGE_RUNNING=false
+    MATCHING_BRIDGE_RUNNING=false
+    STACK_STARTED=false
+    PROJECT_GUARD_HELD=false
+    PROJECT_GUARD_CONTROL_DIR=""
+    PROJECT_GUARD_STATUS_RELAY_PID=1
+    CLEANUP_SIGNAL_STATUS=0
+    SOURCE_SNAPSHOT_DIR=""
+    TMP_DIR=""
+    RUN_STAGE=cleanup-guard-missing-result
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    FAILURE_STATUS=""
+    FAILURE_COMMAND=""
+    cleanup_delayed_otlp_receiver_temporaries() { :; }
+    cleanup_security_processes() { :; }
+    cleanup_source_snapshot_work_directory() { :; }
+    release_project_guard() { :; }
+    publish_owned_run_status() { : >"$missing_publication"; }
+    publish_project_guard_holder_status_with_retries() {
+      : >"$missing_holder"
+    }
+
+    cleanup 0
+  ) >/dev/null 2>&1; then
+    printf 'cleanup failed solely because its result path was absent\n' >&2
+    return 1
+  fi
+  [[ ! -e "$missing_holder" && ! -e "$missing_publication" ]] || {
+    printf 'nonempty missing result path authorized a guarded status\n' >&2
+    return 1
+  }
+}
+
+test_result_directory_is_assigned_only_after_creation() {
+  local -r failure_root="$TEST_TMP_DIR/result-directory-creation-failure"
+  local -r side_effect_root="$TEST_TMP_DIR/result-directory-creation-side-effect"
+  local -r signal_root="$TEST_TMP_DIR/result-directory-creation-signal"
+  local -r holder_status="$failure_root/holder-status"
+  local -r publication_marker="$failure_root/run-status-publication"
+  local definition=""
+  local assignment_count=""
+  local candidate_count=""
+  local creation_count=""
+  local failure_clear_count=""
+
+  definition="$(declare -f prepare_directories)" || return 1
+  assignment_count="$(grep -Fc 'if RESULT_DIR="$' <<<"$definition")" || true
+  candidate_count="$(grep -Fc \
+    'candidate_result_dir="$RESULTS_ROOT/$run_id"' <<<"$definition")" || true
+  creation_count="$(grep -Fc \
+    'mkdir -- "$candidate_result_dir" || exit $?' <<<"$definition")" || true
+  failure_clear_count="$(grep -Fc 'RESULT_DIR=""' <<<"$definition")" || true
+  [[ "$assignment_count" == 1 && "$candidate_count" == 1 &&
+    "$creation_count" == 1 && "$failure_clear_count" == 1 ]] || {
+    printf 'result directory creation is not one checked assignment transaction\n' >&2
+    return 1
+  }
+
+  (
+    local -r fixed_timestamp="20260818T040000Z"
+    local expected_result=""
+    local prepare_status=0
+    local cleanup_status=0
+
+    RUNTIME_DIR="$failure_root/runtime"
+    ARTIFACT_DIR="$RUNTIME_DIR/artifacts"
+    CERT_DIR="$RUNTIME_DIR/certs"
+    RESULTS_ROOT="$RUNTIME_DIR/results"
+    RESULT_DIR=""
+    expected_result="$RESULTS_ROOT/$fixed_timestamp-$$"
+    date() {
+      printf '%s\n' "$fixed_timestamp"
+    }
+    mkdir() {
+      if (($# == 2)) && [[ "$1" == -- && "$2" == "$expected_result" ]]; then
+        return 47
+      fi
+      command mkdir "$@"
+    }
+
+    set +e
+    prepare_directories
+    prepare_status=$?
+    set -e
+    [[ "$prepare_status" == 47 && -z "$RESULT_DIR" &&
+      ! -e "$expected_result" && ! -L "$expected_result" ]] || return 1
+
+    PRESSURE_ACTIVE=false
+    FAULT_BRIDGE_RUNNING=false
+    MATCHING_BRIDGE_RUNNING=false
+    STACK_STARTED=false
+    PROJECT_GUARD_HELD=false
+    PROJECT_GUARD_CONTROL_DIR=""
+    PROJECT_GUARD_STATUS_RELAY_PID=1
+    CLEANUP_SIGNAL_STATUS=0
+    SOURCE_SNAPSHOT_DIR=""
+    TMP_DIR=""
+    RUN_STAGE=runtime-preparation
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
+    FAILURE_STATUS=""
+    FAILURE_COMMAND=""
+    cleanup_delayed_otlp_receiver_temporaries() { :; }
+    cleanup_security_processes() { :; }
+    cleanup_source_snapshot_work_directory() { :; }
+    release_project_guard() { :; }
+    publish_owned_run_status() {
+      : >"$publication_marker"
+      return 97
+    }
+    publish_project_guard_holder_status_with_retries() {
+      printf '%s\n' "$1" >"$holder_status"
+    }
+
+    set +e
+    (cleanup "$prepare_status") >/dev/null 2>&1
+    cleanup_status=$?
+    set -e
+    [[ "$cleanup_status" == 47 && "$(<"$holder_status")" == 47 &&
+      ! -e "$publication_marker" ]] || return 1
+  ) || {
+    printf 'failed result directory creation lost guarded status authority\n' >&2
+    return 1
+  }
+
+  (
+    local -r fixed_timestamp="20260818T040000Z"
+    local expected_result=""
+    local prepare_status=0
+
+    RUNTIME_DIR="$side_effect_root/runtime"
+    ARTIFACT_DIR="$RUNTIME_DIR/artifacts"
+    CERT_DIR="$RUNTIME_DIR/certs"
+    RESULTS_ROOT="$RUNTIME_DIR/results"
+    RESULT_DIR=""
+    expected_result="$RESULTS_ROOT/$fixed_timestamp-$$"
+    date() {
+      printf '%s\n' "$fixed_timestamp"
+    }
+    mkdir() {
+      if (($# == 2)) && [[ "$1" == -- && "$2" == "$expected_result" ]]; then
+        command mkdir "$@" || return $?
+        return 73
+      fi
+      command mkdir "$@"
+    }
+
+    set +e
+    prepare_directories
+    prepare_status=$?
+    set -e
+    [[ "$prepare_status" == 73 && -z "$RESULT_DIR" &&
+      -d "$expected_result" && ! -L "$expected_result" ]] || return 1
+    command rmdir -- "$expected_result"
+  ) || {
+    printf 'result creation side effect gained uncommitted directory authority\n' >&2
+    return 1
+  }
+
+  (
+    local -r fixed_timestamp="20260818T040001Z"
+    local -r preparing_shell="$BASHPID"
+    local -r signal_observation="$signal_root/signal-result"
+    local expected_result=""
+
+    RUNTIME_DIR="$signal_root/runtime"
+    ARTIFACT_DIR="$RUNTIME_DIR/artifacts"
+    CERT_DIR="$RUNTIME_DIR/certs"
+    RESULTS_ROOT="$RUNTIME_DIR/results"
+    RESULT_DIR=""
+    expected_result="$RESULTS_ROOT/$fixed_timestamp-$$"
+    date() {
+      printf '%s\n' "$fixed_timestamp"
+    }
+    mkdir() {
+      if (($# == 2)) && [[ "$1" == -- && "$2" == "$expected_result" ]]; then
+        command mkdir "$@" || return $?
+        kill -TERM "$preparing_shell" || return $?
+        return 0
+      fi
+      command mkdir "$@"
+    }
+    trap 'printf "%s\n" "$RESULT_DIR" >"$signal_observation"' TERM
+
+    prepare_directories || return 1
+    trap - TERM
+    [[ "$RESULT_DIR" == "$expected_result" && -d "$RESULT_DIR" &&
+      ! -L "$RESULT_DIR" && "$(<"$signal_observation")" == "$expected_result" ]]
+  ) || {
+    printf 'signal between result creation and assignment lost directory authority\n' >&2
     return 1
   }
 }
@@ -328,7 +792,8 @@ test_delayed_otlp_temporary_cleanup_preserves_failure() {
     DELAYED_OTLP_RECEIVER_PUBLICATION_TEMP="$receiver_publication_temp"
     cleanup_security_processes() { :; }
     capture_evidence() { :; }
-    write_run_status() { :; }
+    publish_owned_run_status() { :; }
+    commit_published_run_status() { :; }
     cleanup_source_snapshot_work_directory() { :; }
     rm() {
       if [[ "$3" == "$receiver_snapshot_temp" ]]; then
@@ -375,6 +840,7 @@ test_cleanup_refuses_down_when_transport_invalidation_fails() {
     FAILURE_LINE=""
     FAILURE_STATUS=""
     FAILURE_COMMAND=""
+    prepare_completed_run_status_journal_fixture || return 1
     assert_permanent_absence_marker_matches_current_docker() { :; }
     cleanup_security_processes() { :; }
     capture_evidence() { :; }
@@ -403,6 +869,7 @@ test_cleanup_refuses_down_when_transport_invalidation_fails() {
     printf 'transport invalidation failure omitted its cleanup stage\n' >&2
     return 1
   }
+  assert_run_status_v3_index_authority "$result_dir" || return 1
 }
 
 test_cleanup_failure_changes_successful_run_status() {
@@ -428,6 +895,7 @@ test_cleanup_failure_changes_successful_run_status() {
     FAILURE_LINE=""
     FAILURE_STATUS=""
     FAILURE_COMMAND=""
+    prepare_completed_run_status_journal_fixture || return 1
     assert_permanent_absence_marker_matches_current_docker() { :; }
     cleanup_security_processes() { :; }
     capture_evidence() { :; }
@@ -467,6 +935,7 @@ test_cleanup_failure_changes_successful_run_status() {
     printf 'cleanup failure stage was absent from run-status.json\n' >&2
     return 1
   }
+  assert_run_status_v3_index_authority "$result_dir" || return 1
 }
 
 test_cleanup_promoted_failure_seals_before_recovery() {
@@ -500,6 +969,7 @@ test_cleanup_promoted_failure_seals_before_recovery() {
     PROJECT_GUARD_HELD=false
     PROJECT_GUARD_STATUS_RELAY_PID=""
     CLEANUP_SIGNAL_STATUS=0
+    prepare_completed_run_status_journal_fixture || return 1
     record_last_java_diagnostics_phase fault || return 1
     cleanup_security_processes() {
       record_last_java_diagnostics_phase recovery || true
@@ -533,6 +1003,7 @@ test_cleanup_promoted_failure_seals_before_recovery() {
     printf 'promoted cleanup failure status and diagnostics diverged\n' >&2
     return 1
   }
+  assert_run_status_v3_index_authority "$result_dir" || return 1
 }
 
 test_primary_fault_recovery_marker_forces_cleanup_with_keep() {
@@ -554,6 +1025,7 @@ test_primary_fault_recovery_marker_forces_cleanup_with_keep() {
     FAILURE_LINE=""
     FAILURE_STATUS=""
     FAILURE_COMMAND=""
+    prepare_completed_run_status_journal_fixture || return 1
     assert_permanent_absence_marker_matches_current_docker() { :; }
     clear_pending_permanent_absence_recovery() { :; }
     cleanup_security_processes() {
@@ -586,6 +1058,7 @@ test_primary_fault_recovery_marker_forces_cleanup_with_keep() {
     printf 'primary fault recovery marker omitted its failure evidence\n' >&2
     return 1
   }
+  assert_run_status_v3_index_authority "$result_dir" || return 1
 }
 
 test_primary_live_fd_recovery_marker_forces_cleanup_with_keep() {
@@ -607,6 +1080,7 @@ test_primary_live_fd_recovery_marker_forces_cleanup_with_keep() {
     FAILURE_LINE=""
     FAILURE_STATUS=""
     FAILURE_COMMAND=""
+    prepare_completed_run_status_journal_fixture || return 1
     assert_permanent_absence_marker_matches_current_docker() { :; }
     clear_pending_permanent_absence_recovery() { :; }
     cleanup_security_processes() {
@@ -639,6 +1113,7 @@ test_primary_live_fd_recovery_marker_forces_cleanup_with_keep() {
     printf 'primary live-descriptor recovery marker omitted its failure evidence\n' >&2
     return 1
   }
+  assert_run_status_v3_index_authority "$result_dir" || return 1
 }
 
 test_run_status_publication_failure_changes_successful_exit() {
@@ -659,6 +1134,7 @@ test_run_status_publication_failure_changes_successful_exit() {
     ACCEPTANCE_EVIDENCE=true
     FAILURE_STAGE=""
     FAILURE_LINE=""
+    prepare_completed_run_status_journal_fixture || return 1
     capture_evidence() { :; }
     cleanup_security_processes() { :; }
     eval "$(declare -f write_run_status | \
@@ -669,7 +1145,7 @@ test_run_status_publication_failure_changes_successful_exit() {
         : >"$first_write"
         return 29
       fi
-      return 79
+      write_run_status_original "$@"
     }
 
     cleanup
@@ -684,16 +1160,28 @@ test_run_status_publication_failure_changes_successful_exit() {
       "$cleanup_status" >&2
     return 1
   }
-  if grep -Fq 'retained run evidence' "$cleanup_log"; then
-    printf 'cleanup claimed evidence retention after run-status publication failed\n' >&2
+  if ! grep -Fq 'retained run evidence' "$cleanup_log"; then
+    printf 'cleanup did not retain the safely downgraded run status\n' >&2
     return 1
   fi
   [[ -e "$first_write" ]] || {
     printf 'run-status failure test did not publish its initial passing status\n' >&2
     return 1
   }
-  if [[ -e "$result_dir/run-status.json" || -L "$result_dir/run-status.json" ]]; then
-    printf 'cleanup retained a stale passing status after failed retry\n' >&2
+  [[ -f "$result_dir/run-status.json" &&
+    ! -L "$result_dir/run-status.json" &&
+    "$(stat -Lc '%u:%a:%h' -- "$result_dir/run-status.json")" == \
+      "$(id -u):644:1" ]] || {
+    printf 'cleanup did not commit the downgraded run status\n' >&2
+    return 1
+  }
+  jq -e '
+    .status == "failed" and .exit_status == 29 and
+    .failure_stage == "evidence-publication"
+  ' "$result_dir/run-status.json" >/dev/null || return 1
+  assert_run_status_v3_index_authority "$result_dir" || return 1
+  if compgen -G "$result_dir/.run-status.*" >/dev/null; then
+    printf 'cleanup retained a run-status ownership handle after downgrade\n' >&2
     return 1
   fi
 }
@@ -702,9 +1190,11 @@ test_run_status_commit_failure_preserves_authoritative_status() {
   local -r side_effect_dir="$TEST_TMP_DIR/run-status-commit-side-effect"
   local -r side_effect_log="$side_effect_dir/cleanup.log"
   local -r side_effect_holder="$side_effect_dir/holder.log"
+  local -r side_effect_marker="$side_effect_dir/commit-rm-side-effect"
   local -r read_fault_dir="$TEST_TMP_DIR/run-status-commit-read-fault"
   local -r read_fault_log="$read_fault_dir/cleanup.log"
   local -r read_fault_holder="$read_fault_dir/holder.log"
+  local -r read_fault_marker="$read_fault_dir/post-holder-read"
 
   mkdir -p -- "$side_effect_dir" "$read_fault_dir"
   if ! (
@@ -719,16 +1209,22 @@ test_run_status_commit_failure_preserves_authoritative_status() {
     FAILURE_STAGE=""
     FAILURE_LINE=""
     PROJECT_GUARD_STATUS_RELAY_PID=1
+    prepare_completed_run_status_journal_fixture || return 1
     capture_evidence() { :; }
     cleanup_security_processes() { :; }
     publish_project_guard_holder_status_with_retries() {
       printf '%s\n' "$1" >>"$side_effect_holder"
     }
-    eval "$(declare -f commit_published_run_status | \
-      sed '1s/^commit_published_run_status /commit_published_run_status_original /')"
-    commit_published_run_status() {
-      commit_published_run_status_original || return $?
-      return 47
+    rm() {
+      local target="${*: -1}"
+
+      if [[ "$target" == "$RUN_STATUS_PUBLICATION_HANDLE" &&
+        ! -e "$side_effect_marker" ]]; then
+        command rm "$@" || return $?
+        : >"$side_effect_marker" || return $?
+        return 47
+      fi
+      command rm "$@"
     }
 
     cleanup 0
@@ -736,7 +1232,7 @@ test_run_status_commit_failure_preserves_authoritative_status() {
     printf 'post-unlink commit error changed the authoritative success\n' >&2
     return 1
   fi
-  [[ "$(<"$side_effect_holder")" == 0 &&
+  [[ -e "$side_effect_marker" && "$(<"$side_effect_holder")" == 0 &&
     "$(stat -Lc '%h' -- "$side_effect_dir/run-status.json")" == 1 ]] || {
     printf 'post-unlink commit error diverged from the holder status\n' >&2
     return 1
@@ -746,9 +1242,9 @@ test_run_status_commit_failure_preserves_authoritative_status() {
     printf 'post-unlink commit error rewrote authoritative run evidence\n' >&2
     return 1
   }
+  assert_run_status_v3_index_authority "$side_effect_dir" || return 1
 
   if ! (
-    local holder_published=false
     PRESSURE_ACTIVE=false
     FAULT_BRIDGE_RUNNING=false
     MATCHING_BRIDGE_RUNNING=false
@@ -760,18 +1256,19 @@ test_run_status_commit_failure_preserves_authoritative_status() {
     FAILURE_STAGE=""
     FAILURE_LINE=""
     PROJECT_GUARD_STATUS_RELAY_PID=1
+    prepare_completed_run_status_journal_fixture || return 1
     capture_evidence() { :; }
     cleanup_security_processes() { :; }
     publish_project_guard_holder_status_with_retries() {
       printf '%s\n' "$1" >>"$read_fault_holder" || return $?
-      holder_published=true
     }
     sha256sum() {
       local target="${*: -1}"
 
-      if [[ "$holder_published" == true &&
+      if [[ -e "$read_fault_holder" &&
         ( "$target" == "$RESULT_DIR/run-status.json" ||
           "$target" == "$RUN_STATUS_PUBLICATION_HANDLE" ) ]]; then
+        : >"$read_fault_marker" || return $?
         return 47
       fi
       command sha256sum "$@"
@@ -782,9 +1279,9 @@ test_run_status_commit_failure_preserves_authoritative_status() {
     printf 'pre-unlink commit read fault changed the authoritative success\n' >&2
     return 1
   fi
-  [[ "$(<"$read_fault_holder")" == 0 &&
-    "$(stat -Lc '%h' -- "$read_fault_dir/run-status.json")" == 2 ]] || {
-    printf 'pre-unlink commit read fault lost its verified ownership handle\n' >&2
+  [[ ! -e "$read_fault_marker" && "$(<"$read_fault_holder")" == 0 &&
+    "$(stat -Lc '%h' -- "$read_fault_dir/run-status.json")" == 1 ]] || {
+    printf 'run-status publication performed a fallible read after holder commit\n' >&2
     return 1
   }
   jq -e '.status == "passed" and .exit_status == 0' \
@@ -792,15 +1289,15 @@ test_run_status_commit_failure_preserves_authoritative_status() {
     printf 'pre-unlink commit read fault rewrote authoritative run evidence\n' >&2
     return 1
   }
+  assert_run_status_v3_index_authority "$read_fault_dir" || return 1
 }
 
-test_run_status_link_side_effect_failure_changes_successful_exit() {
+test_run_status_link_side_effect_failure_is_reconciled() {
   local -r result_dir="$TEST_TMP_DIR/run-status-link-side-effect-failure"
   local -r link_marker="$result_dir/link-side-effect"
-  local cleanup_status=0
 
   mkdir -p -- "$result_dir"
-  if (
+  if ! (
     PRESSURE_ACTIVE=false
     FAULT_BRIDGE_RUNNING=false
     MATCHING_BRIDGE_RUNNING=false
@@ -811,6 +1308,7 @@ test_run_status_link_side_effect_failure_changes_successful_exit() {
     ACCEPTANCE_EVIDENCE=true
     FAILURE_STAGE=""
     FAILURE_LINE=""
+    prepare_completed_run_status_journal_fixture || return 1
     capture_evidence() { :; }
     cleanup_security_processes() { :; }
     ln() {
@@ -825,28 +1323,23 @@ test_run_status_link_side_effect_failure_changes_successful_exit() {
       command ln "$@"
     }
 
-    cleanup
+    cleanup 0
   ) >/dev/null 2>&1; then
-    printf 'run-status link side-effect failure preserved a successful exit\n' >&2
+    printf 'run-status link side effect was not reconciled as committed\n' >&2
     return 1
-  else
-    cleanup_status=$?
   fi
-  [[ "$cleanup_status" == 79 && -f "$link_marker" ]] || {
-    printf 'run-status link side-effect failure returned the wrong status\n' >&2
-    return 1
-  }
+  [[ -f "$link_marker" ]] || return 1
   jq -e '
-    .status == "failed" and .exit_status == 79 and
-    .failure_stage == "evidence-publication"
+    .status == "passed" and .exit_status == 0
   ' "$result_dir/run-status.json" >/dev/null || {
-    printf 'run-status link side effect retained stale passing evidence\n' >&2
+    printf 'run-status link side effect did not retain authoritative success\n' >&2
     return 1
   }
   [[ "$(stat -Lc '%h' -- "$result_dir/run-status.json")" == 1 ]] || {
     printf 'run-status link side-effect recovery retained an ownership link\n' >&2
     return 1
   }
+  assert_run_status_v3_index_authority "$result_dir" || return 1
 }
 
 test_run_status_link_side_effect_with_verifier_fault_cannot_leave_stale_status() {
@@ -866,6 +1359,7 @@ test_run_status_link_side_effect_with_verifier_fault_cannot_leave_stale_status()
     ACCEPTANCE_EVIDENCE=true
     FAILURE_STAGE=""
     FAILURE_LINE=""
+    prepare_completed_run_status_journal_fixture || return 1
     capture_evidence() { :; }
     cleanup_security_processes() { :; }
     ln() {
@@ -897,19 +1391,20 @@ test_run_status_link_side_effect_with_verifier_fault_cannot_leave_stale_status()
   else
     cleanup_status=$?
   fi
-  [[ "$cleanup_status" == 79 && -e "$link_marker" ]] || {
+  [[ "$cleanup_status" == 1 && -e "$link_marker" ]] || {
     printf 'combined link/verifier failure returned the wrong status\n' >&2
     return 1
   }
-  if [[ -e "$result_dir/run-status.json" ||
-    -L "$result_dir/run-status.json" ]]; then
-    printf 'combined link/verifier failure retained stale passing evidence\n' >&2
+  local -a link_fault_handles=("$result_dir"/.run-status.*)
+  [[ -f "$result_dir/run-status.json" &&
+    ! -L "$result_dir/run-status.json" &&
+    "$(stat -Lc '%u:%a:%h' -- "$result_dir/run-status.json")" == \
+      "$(id -u):644:2" && ${#link_fault_handles[@]} == 1 &&
+    -f "${link_fault_handles[0]}" && ! -L "${link_fault_handles[0]}" &&
+    "${link_fault_handles[0]}" -ef "$result_dir/run-status.json" ]] || {
+    printf 'combined link/verifier failure lost its exact ownership handle\n' >&2
     return 1
-  fi
-  if compgen -G "$result_dir/.run-status.*" >/dev/null; then
-    printf 'combined link/verifier failure retained an ownership handle\n' >&2
-    return 1
-  fi
+  }
 }
 
 test_run_status_post_link_verifier_failure_cannot_leave_stale_status() {
@@ -928,6 +1423,7 @@ test_run_status_post_link_verifier_failure_cannot_leave_stale_status() {
     ACCEPTANCE_EVIDENCE=true
     FAILURE_STAGE=""
     FAILURE_LINE=""
+    prepare_completed_run_status_journal_fixture || return 1
     capture_evidence() { :; }
     cleanup_security_processes() { :; }
     stat() {
@@ -946,25 +1442,29 @@ test_run_status_post_link_verifier_failure_cannot_leave_stale_status() {
   else
     cleanup_status=$?
   fi
-  [[ "$cleanup_status" == 1 &&
-    ! -e "$result_dir/run-status.json" &&
-    ! -L "$result_dir/run-status.json" ]] || {
-    printf 'post-link verifier failure retained stale passing evidence\n' >&2
+  local -a verifier_fault_handles=("$result_dir"/.run-status.*)
+  [[ "$cleanup_status" == 1 && -f "$result_dir/run-status.json" &&
+    ! -L "$result_dir/run-status.json" &&
+    "$(stat -Lc '%u:%a:%h' -- "$result_dir/run-status.json")" == \
+      "$(id -u):644:2" && ${#verifier_fault_handles[@]} == 1 &&
+    -f "${verifier_fault_handles[0]}" &&
+    ! -L "${verifier_fault_handles[0]}" &&
+    "${verifier_fault_handles[0]}" -ef "$result_dir/run-status.json" ]] || {
+    printf 'post-link verifier failure lost its exact ownership handle\n' >&2
     return 1
   }
-  if compgen -G "$result_dir/.run-status.*" >/dev/null; then
-    printf 'post-link verifier failure retained an ownership handle\n' >&2
-    return 1
-  fi
 }
 
-test_holder_failure_with_verifier_fault_cannot_leave_stale_status() {
-  local -r result_dir="$TEST_TMP_DIR/run-status-holder-verifier-failure"
+test_holder_failure_with_foreign_status_cannot_rewrite_authority() {
+  local -r result_dir="$TEST_TMP_DIR/run-status-holder-foreign-replacement"
   local -r holder_log="$result_dir/holder.log"
-  local holder_failed=false
+  local -r replacement="$result_dir/foreign-status"
+  local -r replacement_marker="$result_dir/foreign-status-installed"
   local cleanup_status=0
 
   mkdir -p -- "$result_dir"
+  printf 'foreign-status\n' >"$replacement"
+  chmod 0644 -- "$replacement"
   if (
     PRESSURE_ACTIVE=false
     FAULT_BRIDGE_RUNNING=false
@@ -972,49 +1472,51 @@ test_holder_failure_with_verifier_fault_cannot_leave_stale_status() {
     STACK_STARTED=false
     RESULT_DIR="$result_dir"
     TMP_DIR=""
-    RUN_STATUS=failed
-    ACCEPTANCE_EVIDENCE=false
-    FAILURE_STAGE=scenario
-    FAILURE_LINE=41
+    RUN_STATUS=passed
+    ACCEPTANCE_EVIDENCE=true
+    FAILURE_STAGE=""
+    FAILURE_LINE=""
     PROJECT_GUARD_STATUS_RELAY_PID=1
+    prepare_completed_run_status_journal_fixture || return 1
     capture_evidence() { :; }
     cleanup_security_processes() { :; }
     publish_project_guard_holder_status_with_retries() {
       printf '%s\n' "$1" >>"$holder_log" || return $?
-      if [[ "$holder_failed" == false ]]; then
-        holder_failed=true
+      if [[ ! -e "$replacement_marker" ]]; then
+        [[ "$RUN_STATUS_PUBLICATION_STATE" == committed &&
+          -f "$RESULT_DIR/run-status.json" &&
+          "$(stat -Lc '%u:%a:%h' -- "$RESULT_DIR/run-status.json")" == \
+            "$(id -u):644:1" ]] || return 1
+        command mv -fT -- "$replacement" "$RESULT_DIR/run-status.json" ||
+          return $?
+        : >"$replacement_marker" || return $?
         return 79
       fi
-    }
-    stat() {
-      local target="${*: -1}"
-
-      if [[ "$holder_failed" == true &&
-        ( "$target" == "$RESULT_DIR/run-status.json" ||
-          "$target" == "$RUN_STATUS_PUBLICATION_HANDLE" ) ]]; then
-        return 47
-      fi
-      command stat "$@"
+      return 0
     }
 
-    cleanup 17
+    cleanup 0
   ) >/dev/null 2>&1; then
-    printf 'holder failure with verifier fault preserved the original status\n' >&2
+    printf 'holder replacement retained successful terminal authority\n' >&2
     return 1
   else
     cleanup_status=$?
   fi
-  [[ "$cleanup_status" == 1 && "$(<"$holder_log")" == $'17\n1' ]] || {
-    printf 'holder failure with verifier fault diverged from relay fallback\n' >&2
+  [[ "$cleanup_status" == 79 && "$(<"$holder_log")" == 0 &&
+    -e "$replacement_marker" ]] || {
+    printf 'holder replacement was retried or returned the wrong status\n' >&2
     return 1
   }
-  if [[ -e "$result_dir/run-status.json" ||
-    -L "$result_dir/run-status.json" ]]; then
-    printf 'holder failure with verifier fault retained stale run evidence\n' >&2
+  [[ -f "$result_dir/run-status.json" &&
+    ! -L "$result_dir/run-status.json" &&
+    "$(stat -Lc '%u:%a:%h' -- "$result_dir/run-status.json")" == \
+      "$(id -u):644:1" &&
+    "$(<"$result_dir/run-status.json")" == foreign-status ]] || {
+    printf 'holder failure replaced or removed the foreign status inode\n' >&2
     return 1
-  fi
+  }
   if compgen -G "$result_dir/.run-status.*" >/dev/null; then
-    printf 'holder failure with verifier fault retained an ownership handle\n' >&2
+    printf 'holder replacement retained a stale private ownership handle\n' >&2
     return 1
   fi
 }
@@ -1085,6 +1587,7 @@ test_holder_atomic_side_effect_is_terminal_authority() {
     PROJECT_GUARD_STATUS_HOLDER_PID=103
     PROJECT_GUARD_STATUS_HOLDER_START_TIME=104
     PROJECT_GUARD_HOLDER_PUBLICATION_ATTEMPTED=false
+    prepare_completed_run_status_journal_fixture || return 1
     capture_evidence() { :; }
     cleanup_security_processes() { :; }
     complete_project_guard_terminal_handoff() { :; }
@@ -1125,6 +1628,7 @@ test_holder_atomic_side_effect_is_terminal_authority() {
     printf 'holder atomic side effect rewrote canonical run evidence\n' >&2
     return 1
   }
+  assert_run_status_v3_index_authority "$result_dir" || return 1
   (
     PROJECT_GUARD_CONTROL_DIR="$control_dir"
     load_project_guard_holder_status 101 102 103 104
@@ -2314,6 +2818,7 @@ test_run_demo_preserves_strict_scenario_execution() {
     enter_project_guard() { :; }
     assert_no_pending_permanent_absence_recovery() { :; }
     prepare_directories() { :; }
+    initialize_obi_metric_boundary_index() { :; }
     capture_source_state() { :; }
     prepare_certificates() { :; }
     prepare_official_agent() { :; }
@@ -2355,6 +2860,7 @@ test_run_demo_preserves_strict_scenario_execution() {
     enter_project_guard() { :; }
     assert_no_pending_permanent_absence_recovery() { :; }
     prepare_directories() { :; }
+    initialize_obi_metric_boundary_index() { :; }
     capture_source_state() { :; }
     prepare_certificates() { :; }
     prepare_official_agent() { :; }
@@ -2405,6 +2911,7 @@ test_delayed_otlp_run_demo_defers_runtime_evidence() {
     enter_project_guard() { :; }
     assert_no_pending_permanent_absence_recovery() { :; }
     prepare_directories() { :; }
+    initialize_obi_metric_boundary_index() { :; }
     capture_source_state() { :; }
     prepare_certificates() { :; }
     prepare_official_agent() { :; }
@@ -6525,6 +7032,9 @@ test_delayed_otlp_suppression_control_has_one_pre_export_request() {
   mkdir -p -- "$result_dir"
   (
     local -i absence_calls=0
+    local -i pair_plan_calls=0
+    local -i pair_record_calls=0
+    local -i phase_capture_calls=0
     local -i request_calls=0
     local -i receiver_empty_calls=0
     local -i sleep_calls=0
@@ -6539,6 +7049,43 @@ test_delayed_otlp_suppression_control_has_one_pre_export_request() {
     }
     delayed_otlp_run_nonce() {
       printf '00000000000000000000000000000003\n'
+    }
+    plan_obi_metric_pair_capture() {
+      [[ "$#" == 1 && "$1" == delayed-otlp-prime-suppression &&
+        "$pair_plan_calls" == 0 && "$phase_capture_calls" == 0 &&
+        "$pair_record_calls" == 0 && "$request_calls" == 0 ]] || return 1
+      printf 'plan:%s\n' "$1" >>"$observed"
+      ((pair_plan_calls += 1))
+    }
+    capture_phase_evidence() {
+      [[ "$#" == 1 && "$pair_plan_calls" == 1 &&
+        "$pair_record_calls" == 0 ]] || return 1
+      case "$phase_capture_calls:$1" in
+        0:delayed-otlp-prime-before)
+          [[ "$request_calls" == 0 && "$absence_calls" == 0 &&
+            "$receiver_empty_calls" == 0 ]] || return 1
+          ;;
+        1:delayed-otlp-suppression-after)
+          [[ "$request_calls" == 1 && "$absence_calls" == 2 &&
+            "$receiver_empty_calls" == 1 ]] || return 1
+          ;;
+        *)
+          return 1
+          ;;
+      esac
+      printf 'capture:%s\n' "$1" >>"$observed"
+      ((phase_capture_calls += 1))
+    }
+    record_obi_metric_pair() {
+      [[ "$#" == 5 && "$1" == delayed-otlp-prime-suppression &&
+        "$2" == delayed-otlp-prime-before &&
+        "$3" == delayed-otlp-suppression-after &&
+        "$4" == same_process && "$5" == delayed-otlp-suppression-after &&
+        "$pair_plan_calls" == 1 && "$phase_capture_calls" == 2 &&
+        "$pair_record_calls" == 0 && "$request_calls" == 1 &&
+        "$absence_calls" == 2 && "$receiver_empty_calls" == 1 ]] || return 1
+      printf 'pair:%s:%s:%s:%s:%s\n' "$@" >>"$observed"
+      ((pair_record_calls += 1))
     }
     assert_delayed_otlp_receiver_empty() {
       case "$receiver_empty_calls" in
@@ -6633,7 +7180,9 @@ test_delayed_otlp_suppression_control_has_one_pre_export_request() {
     }
 
     execute_requested_scenarios
-    [[ "$request_calls" == "1" && "$absence_calls" == "2" &&
+    [[ "$pair_plan_calls" == 1 && "$phase_capture_calls" == 2 &&
+      "$pair_record_calls" == 1 && "$request_calls" == 1 &&
+      "$absence_calls" == 2 &&
       "$receiver_empty_calls" == "1" && "$sleep_calls" == "2" &&
       -z "$SCENARIO_VARIANT" ]]
   ) || {
@@ -6642,6 +7191,8 @@ test_delayed_otlp_suppression_control_has_one_pre_export_request() {
   }
 
   printf '%s\n' \
+    'plan:delayed-otlp-prime-suppression' \
+    'capture:delayed-otlp-prime-before' \
     'receiver-empty:delayed-otlp-receiver-before-request.json' \
     'absent:duplicate-suppression-delayed-otlp-before-request.prom' \
     "sleep:$JAVA_PROVIDER_RETRY_SETTLE_SECONDS" \
@@ -6653,6 +7204,8 @@ test_delayed_otlp_suppression_control_has_one_pre_export_request() {
     'absent:duplicate-suppression-delayed-otlp-before-export.prom' \
     'ready:duplicate-suppression-delayed-otlp-ready.prom' \
     'receiver-ready:delayed-otlp-receiver-ready.json' \
+    'capture:delayed-otlp-suppression-after' \
+    'pair:delayed-otlp-prime-suppression:delayed-otlp-prime-before:delayed-otlp-suppression-after:same_process:delayed-otlp-suppression-after' \
     'transport' \
     'runtime' \
     'scenario:basic:delayed-otlp-suppression' >"$expected"
@@ -6670,6 +7223,10 @@ test_delayed_otlp_suppression_control_restores_schedule_delay() {
 
   mkdir -p -- "$result_dir"
   (
+    local -i pair_plan_calls=0
+    local -i pair_record_calls=0
+    local -i phase_capture_calls=0
+
     RESULT_DIR="$result_dir"
     SCENARIO=all
     TRANSPORT=getsockopt
@@ -6682,6 +7239,33 @@ test_delayed_otlp_suppression_control_restores_schedule_delay() {
     }
     delayed_otlp_run_nonce() {
       printf '00000000000000000000000000000004\n'
+    }
+    plan_obi_metric_pair_capture() {
+      [[ "$#" == 1 && "$1" == delayed-otlp-prime-suppression &&
+        "$pair_plan_calls" == 0 && "$phase_capture_calls" == 0 &&
+        "$pair_record_calls" == 0 ]] || return 1
+      printf 'plan:%s\n' "$1" >>"$observed"
+      ((pair_plan_calls += 1))
+    }
+    capture_phase_evidence() {
+      [[ "$#" == 1 && "$pair_plan_calls" == 1 &&
+        "$pair_record_calls" == 0 ]] || return 1
+      case "$phase_capture_calls:$1" in
+        0:delayed-otlp-prime-before|1:delayed-otlp-suppression-after) ;;
+        *) return 1 ;;
+      esac
+      printf 'capture:%s\n' "$1" >>"$observed"
+      ((phase_capture_calls += 1))
+    }
+    record_obi_metric_pair() {
+      [[ "$#" == 5 && "$1" == delayed-otlp-prime-suppression &&
+        "$2" == delayed-otlp-prime-before &&
+        "$3" == delayed-otlp-suppression-after &&
+        "$4" == same_process && "$5" == delayed-otlp-suppression-after &&
+        "$pair_plan_calls" == 1 && "$phase_capture_calls" == 2 &&
+        "$pair_record_calls" == 0 ]] || return 1
+      printf 'pair:%s:%s:%s:%s:%s\n' "$@" >>"$observed"
+      ((pair_record_calls += 1))
     }
     recreate_instrumented_stack() {
       printf 'recreate:%s:%s:%s:%s:%s:%s:%s\n' \
@@ -6747,7 +7331,8 @@ test_delayed_otlp_suppression_control_restores_schedule_delay() {
     run_delayed_otlp_suppression_control
     [[ "$OTEL_BSP_SCHEDULE_DELAY_VALUE" == "750" &&
       "$OTEL_JAVA_EXPORTER_OTLP_RETRY_DISABLED_VALUE" == "false" &&
-      -z "$SCENARIO_VARIANT" ]]
+      -z "$SCENARIO_VARIANT" && "$pair_plan_calls" == 1 &&
+      "$phase_capture_calls" == 2 && "$pair_record_calls" == 1 ]]
   ) || {
     printf 'delayed OTLP suppression did not restore the prior schedule delay\n' >&2
     return 1
@@ -6755,6 +7340,8 @@ test_delayed_otlp_suppression_control_restores_schedule_delay() {
 
   printf '%s\n' \
     "recreate:tcp:delayed-otlp-suppression startup:getsockopt:false:true:$DELAYED_OTLP_SCHEDULE_DELAY_MILLISECONDS:true" \
+    'plan:delayed-otlp-prime-suppression' \
+    'capture:delayed-otlp-prime-before' \
     'receiver-empty:delayed-otlp-receiver-before-request.json' \
     'absent:duplicate-suppression-delayed-otlp-before-request.prom' \
     "sleep:$JAVA_PROVIDER_RETRY_SETTLE_SECONDS" \
@@ -6766,6 +7353,8 @@ test_delayed_otlp_suppression_control_restores_schedule_delay() {
     'absent:duplicate-suppression-delayed-otlp-before-export.prom' \
     'ready:duplicate-suppression-delayed-otlp-ready.prom' \
     'receiver-ready:delayed-otlp-receiver-ready.json' \
+    'capture:delayed-otlp-suppression-after' \
+    'pair:delayed-otlp-prime-suppression:delayed-otlp-prime-before:delayed-otlp-suppression-after:same_process:delayed-otlp-suppression-after' \
     'transport' \
     'runtime' \
     'scenario' \
@@ -10597,12 +11186,82 @@ test_permissive_unix_directory_control_refuses_and_restores() {
   printf 'current\n' >"$result_dir/java-transport-configuration.txt"
   printf 'retained\n' >"$result_dir/java-selected-transport-configuration.txt"
   (
+    local -i pair_plan_calls=0
+    local -i pair_record_calls=0
+    local -i phase_capture_calls=0
+    local -i recovery_boundary_calls=0
+
     RESULT_DIR="$result_dir"
     COMPOSE=(test-compose)
     BRIDGE_RUNNING=true
     SELECTED_TRANSPORT=unix
     UNIX_SECURITY_DIRECTORY_RELAXED=false
     directory_mode=0750
+    plan_obi_metric_pair_capture() {
+      [[ "$#" == 1 && "$pair_record_calls" == 0 &&
+        "$phase_capture_calls" == 0 && "$recovery_boundary_calls" == 0 ]] ||
+        return 1
+      case "$pair_plan_calls:$1" in
+        0:security-unix-permissive-refusal|1:security-unix-permissive-recovery) ;;
+        *) return 1 ;;
+      esac
+      printf 'plan:%s\n' "$1" >>"$observed"
+      ((pair_plan_calls += 1))
+    }
+    capture_phase_evidence() {
+      [[ "$#" == 1 && "$pair_plan_calls" == 2 ]] || return 1
+      case "$phase_capture_calls:$1" in
+        0:security-unix-permissive-before)
+          [[ "$pair_record_calls" == 0 && "$recovery_boundary_calls" == 0 ]] ||
+            return 1
+          ;;
+        1:security-unix-permissive-fault)
+          [[ "$pair_record_calls" == 0 && "$recovery_boundary_calls" == 0 ]] ||
+            return 1
+          ;;
+        2:security-unix-permissive-after)
+          [[ "$pair_record_calls" == 1 && "$recovery_boundary_calls" == 1 ]] ||
+            return 1
+          ;;
+        *)
+          return 1
+          ;;
+      esac
+      printf 'capture:%s\n' "$1" >>"$observed"
+      ((phase_capture_calls += 1))
+    }
+    record_obi_metric_pair() {
+      [[ "$#" == 5 && "$pair_plan_calls" == 2 && -z "$5" ]] || return 1
+      case "$pair_record_calls" in
+        0)
+          [[ "$1" == security-unix-permissive-refusal &&
+            "$2" == security-unix-permissive-before &&
+            "$3" == security-unix-permissive-fault &&
+            "$4" == process_replaced && "$phase_capture_calls" == 2 &&
+            "$recovery_boundary_calls" == 0 ]] || return 1
+          ;;
+        1)
+          [[ "$1" == security-unix-permissive-recovery &&
+            "$2" == security-unix-permissive-fault &&
+            "$3" == security-unix-permissive-after &&
+            "$4" == process_replaced && "$phase_capture_calls" == 3 &&
+            "$recovery_boundary_calls" == 1 ]] || return 1
+          ;;
+        *)
+          return 1
+          ;;
+      esac
+      printf 'pair:%s\n' "$1" >>"$observed"
+      ((pair_record_calls += 1))
+    }
+    # shellcheck disable=SC2120 # Reject unexpected fixture arguments.
+    capture_terminal_java_diagnostics_recovery_boundary() {
+      [[ "$#" == 0 && "$pair_plan_calls" == 2 &&
+        "$phase_capture_calls" == 2 && "$pair_record_calls" == 1 &&
+        "$recovery_boundary_calls" == 0 ]] || return 1
+      printf 'recovery-boundary\n' >>"$observed"
+      ((recovery_boundary_calls += 1))
+    }
     run_bounded() {
       shift
       case " $* " in
@@ -10704,6 +11363,9 @@ test_permissive_unix_directory_control_refuses_and_restores() {
     [[ "$directory_mode" == "0750" ]] || return 1
     [[ "$UNIX_SECURITY_DIRECTORY_RELAXED" == "false" ]] || return 1
     [[ "$BRIDGE_RUNNING" == "true" ]] || return 1
+    [[ "$pair_plan_calls" == 2 && "$phase_capture_calls" == 3 &&
+      "$pair_record_calls" == 2 && "$recovery_boundary_calls" == 1 ]] ||
+      return 1
   ) || {
     printf 'permissive Unix directory control did not refuse and restore safely\n' >&2
     return 1
@@ -10712,6 +11374,17 @@ test_permissive_unix_directory_control_refuses_and_restores() {
     "$result_dir/security-permissive-directory-obi.log"
   grep -Fq 'logs --no-color --since security-failure-cursor obi' "$observed"
   awk '
+    $0 == "plan:security-unix-permissive-refusal" { refusal_plan = NR }
+    $0 == "plan:security-unix-permissive-recovery" { recovery_plan = NR }
+    $0 == "capture:security-unix-permissive-before" { before_capture = NR }
+    /stop --timeout 30 obi/ {
+      if (fault_stop == 0) fault_stop = NR
+      else recovery_stop = NR
+    }
+    /logs --no-color --since security-failure-cursor obi/ { fault_logs = NR }
+    $0 == "capture:security-unix-permissive-fault" { fault_capture = NR }
+    $0 == "pair:security-unix-permissive-refusal" { refusal_pair = NR }
+    $0 == "recovery-boundary" { recovery_boundary = NR }
     /up --detach --timeout 30 --no-deps --force-recreate obi/ { recovery = NR }
     $0 == "cursor:security-recovery" { recovery_cursor = NR }
     $0 == "log:post-permission Unix bridge recovery:security-recovery-cursor" {
@@ -10721,6 +11394,8 @@ test_permissive_unix_directory_control_refuses_and_restores() {
     $0 == "http:post-permission Java provider probe" { probe = NR }
     $0 ~ /^sleep:[0-9]+$/ { settle = NR }
     $0 == "transport" { transport = NR }
+    $0 == "capture:security-unix-permissive-after" { after_capture = NR }
+    $0 == "pair:security-unix-permissive-recovery" { recovery_pair = NR }
     $0 == "log:post-permission Java bridge provider:security-recovery-cursor" {
       provider = NR
     }
@@ -10729,11 +11404,17 @@ test_permissive_unix_directory_control_refuses_and_restores() {
       suppression = NR
     }
     END {
-      exit recovery > 0 && recovery_cursor > 0 &&
+      exit refusal_plan > 0 && refusal_plan < recovery_plan &&
+        recovery_plan < before_capture && before_capture < fault_stop &&
+        fault_stop > 0 && fault_logs > 0 && fault_logs < fault_capture &&
+        fault_capture < refusal_pair && refusal_pair < recovery_boundary &&
+        recovery_stop > 0 && recovery_boundary < recovery_stop &&
+        recovery > 0 && recovery_cursor > 0 &&
         provider_ready > recovery_cursor && provider_ready < recovery &&
         bridge > recovery && readiness > bridge &&
         probe > readiness && settle > probe && suppression > settle &&
-        provider > suppression && transport > provider ? 0 : 1
+        provider > suppression && transport > provider &&
+        after_capture > transport && recovery_pair > after_capture ? 0 : 1
     }
   ' "$observed" || {
     printf 'Unix permission recovery resumed before duplicate suppression readiness\n' >&2
@@ -10749,12 +11430,16 @@ test_permissive_unix_directory_control_refuses_and_restores() {
 
 test_permissive_unix_directory_rejects_socket_probe_error() {
   local -r result_dir="$TEST_TMP_DIR/permissive-directory-probe-error"
+  local -r observed="$result_dir/observed"
   local control_status=0
 
   mkdir -p -- "$result_dir"
   printf 'current\n' >"$result_dir/java-transport-configuration.txt"
   printf 'retained\n' >"$result_dir/java-selected-transport-configuration.txt"
   if (
+    local -i pair_plan_calls=0
+    local -i phase_capture_calls=0
+
     RESULT_DIR="$result_dir"
     COMPOSE=(test-compose)
     BRIDGE_RUNNING=true
@@ -10762,12 +11447,31 @@ test_permissive_unix_directory_rejects_socket_probe_error() {
     UNIX_SECURITY_DIRECTORY_RELAXED=false
     date() { printf 'probe-error-cursor\n'; }
     wait_for_log() { return 0; }
+    plan_obi_metric_pair_capture() {
+      [[ "$#" == 1 && "$phase_capture_calls" == 0 ]] || return 1
+      case "$pair_plan_calls:$1" in
+        0:security-unix-permissive-refusal|1:security-unix-permissive-recovery) ;;
+        *) return 1 ;;
+      esac
+      printf 'plan:%s\n' "$1" >>"$observed"
+      ((pair_plan_calls += 1))
+    }
+    capture_phase_evidence() {
+      [[ "$#" == 1 && "$pair_plan_calls" == 2 &&
+        "$phase_capture_calls" == 0 &&
+        "$1" == security-unix-permissive-before ]] || return 91
+      printf 'capture:%s\n' "$1" >>"$observed"
+      ((phase_capture_calls += 1))
+    }
+    record_obi_metric_pair() { return 92; }
+    capture_terminal_java_diagnostics_recovery_boundary() { return 93; }
     run_bounded() {
       case " $* " in
         *" ls -ld /var/run/obi "*)
           printf 'drwxrwxrwx 2 root root 40 Jul 22 00:00 /var/run/obi\n'
           ;;
         *" test -S /var/run/obi/java-remote-parent.sock "*)
+          printf 'socket-probe\n' >>"$observed"
           return 42
           ;;
       esac
@@ -10781,6 +11485,7 @@ test_permissive_unix_directory_rejects_socket_probe_error() {
     control_status=$?
   fi
   [[ "$control_status" == "42" &&
+    "$(<"$observed")" == $'plan:security-unix-permissive-refusal\nplan:security-unix-permissive-recovery\ncapture:security-unix-permissive-before\nsocket-probe' &&
     ! -e "$result_dir/security-permissive-directory-response.json" ]] || {
     printf 'Unix permission control continued after socket probe failure\n' >&2
     return 1
@@ -10799,6 +11504,9 @@ test_unix_endpoint_restart_invalidates_before_stack_mutation() {
     local -r mutation_marker="$2"
     local -r invalidation_failure="$3"
     local -r date_calls="$result_dir/date-calls"
+    local -r evidence_order="$result_dir/evidence-order"
+    local -i pair_plan_calls=0
+    local -i phase_capture_calls=0
 
     RESULT_DIR="$result_dir"
     TRANSPORT=unix
@@ -10828,6 +11536,24 @@ test_unix_endpoint_restart_invalidates_before_stack_mutation() {
     run_unix_peer_security_controls() { return 0; }
     wait_for_log() { return 0; }
     run_scenario() { return 0; }
+    plan_obi_metric_pair_capture() {
+      [[ "$#" == 1 && "$phase_capture_calls" == 0 ]] || return 1
+      case "$pair_plan_calls:$1" in
+        0:security-unix-endpoint-refusal|1:security-unix-endpoint-recovery) ;;
+        *) return 1 ;;
+      esac
+      printf 'plan:%s\n' "$1" >>"$evidence_order"
+      ((pair_plan_calls += 1))
+    }
+    capture_phase_evidence() {
+      [[ "$#" == 1 && "$pair_plan_calls" == 2 &&
+        "$phase_capture_calls" == 0 &&
+        "$1" == security-unix-endpoint-before ]] || return 91
+      printf 'capture:%s\n' "$1" >>"$evidence_order"
+      ((phase_capture_calls += 1))
+    }
+    record_obi_metric_pair() { return 92; }
+    capture_terminal_java_diagnostics_recovery_boundary() { return 93; }
     run_bounded() {
       case " $* " in
         *" ps --all --quiet security-probe "*)
@@ -10846,6 +11572,9 @@ test_unix_endpoint_restart_invalidates_before_stack_mutation() {
             ! -e "$RESULT_DIR/java-transport-configuration.txt" &&
             "$(<"$RESULT_DIR/java-selected-transport-configuration.txt")" == "retained" ]] ||
             return 31
+          [[ "$pair_plan_calls" == 2 && "$phase_capture_calls" == 1 ]] ||
+            return 32
+          printf 'restart\n' >>"$evidence_order"
           : >"$mutation_marker"
           return 41
           ;;
@@ -10864,6 +11593,7 @@ test_unix_endpoint_restart_invalidates_before_stack_mutation() {
   fi
   [[ "$control_status" == "41" &&
     -e "$success_marker" &&
+    "$(<"$success_dir/evidence-order")" == $'plan:security-unix-endpoint-refusal\nplan:security-unix-endpoint-recovery\ncapture:security-unix-endpoint-before\nrestart' &&
     ! -e "$success_dir/java-transport-configuration.txt" &&
     "$(<"$success_dir/java-selected-transport-configuration.txt")" == "retained" ]] || {
     printf 'Unix endpoint control restarted before transport invalidation\n' >&2
@@ -10879,6 +11609,7 @@ test_unix_endpoint_restart_invalidates_before_stack_mutation() {
   fi
   [[ "$control_status" == "29" &&
     ! -e "$failure_marker" &&
+    "$(<"$failure_dir/evidence-order")" == $'plan:security-unix-endpoint-refusal\nplan:security-unix-endpoint-recovery\ncapture:security-unix-endpoint-before' &&
     "$(<"$failure_dir/java-transport-configuration.txt")" == "current" &&
     "$(<"$failure_dir/java-selected-transport-configuration.txt")" == "retained" ]] || {
     printf 'Unix endpoint control mutated the stack after invalidation failed\n' >&2
@@ -11871,10 +12602,15 @@ test_stopped_obi_boundary_binds_same_phase_java_diagnostics() {
   mkdir -p -- "$result_dir" "$unavailable_dir"
   (
     RESULT_DIR="$result_dir"
+    SCENARIO=fail-open
+    TRANSPORT=getsockopt
+    REPEAT_COUNT=1
     BRIDGE_RUNNING=true
+    OBI_RUNNING=true
     SELECTED_TRANSPORT=getsockopt
     COMPOSE=(docker compose)
-    OBI_STOPPED_METRIC_PAIR_REFERENCE=""
+    initialize_obi_metric_boundary_index || return 1
+    begin_obi_metric_boundary fail-open || return 1
     flush_bridge_metric_boundary() {
       [[ "$1" == terminal-stop && "$2" == 1 && "$3" == 1 && -z "$4" ]]
     }
@@ -11909,7 +12645,7 @@ test_stopped_obi_boundary_binds_same_phase_java_diagnostics() {
 
     stop_obi_for_no_state_control terminal-stop || return 1
     [[ "$BRIDGE_RUNNING" == false && -z "$SELECTED_TRANSPORT" &&
-      "$OBI_STOPPED_METRIC_PAIR_REFERENCE" == \
+      "$(active_stopped_obi_metric_pair_reference)" == \
         obi-metric-pairs/terminal-stop-obi-stopped.json ]] || return 1
     [[ "$(<"$calls")" == $'running:terminal-stop-obi-running\ninvalidate\nstop:60 docker compose stop --timeout 30 obi\nstopped:terminal-stop-obi-stopped:phases/terminal-stop-obi-running/obi-identity.json\njava:terminal-stop-obi-stopped' ]] || return 1
 
@@ -11938,9 +12674,15 @@ test_stopped_obi_boundary_binds_same_phase_java_diagnostics() {
 
   (
     RESULT_DIR="$unavailable_dir"
+    SCENARIO=fail-open
+    TRANSPORT=getsockopt
+    REPEAT_COUNT=1
     BRIDGE_RUNNING=true
+    OBI_RUNNING=true
     SELECTED_TRANSPORT=getsockopt
     COMPOSE=(docker compose)
+    initialize_obi_metric_boundary_index || return 1
+    begin_obi_metric_boundary fail-open || return 1
     flush_bridge_metric_boundary() { return 0; }
     capture_phase_evidence() { return 0; }
     invalidate_selected_transport() { SELECTED_TRANSPORT=""; }
@@ -11957,7 +12699,12 @@ test_stopped_obi_boundary_binds_same_phase_java_diagnostics() {
     if stop_obi_for_no_state_control unavailable-stop >/dev/null 2>&1; then
       return 1
     fi
-    [[ ! -e "$unavailable_record" ]]
+    [[ ! -e "$unavailable_record" ]] || return 1
+    jq -e '
+      .boundaries[0].state == "active" and
+      ([.boundaries[0].captures[] | select(.kind == "pair")][-1] |
+        .id == "unavailable-stop-obi-stopped" and .state == "planned")
+    ' "$RESULT_DIR/obi-metric-boundary-index.json" >/dev/null
   ) || {
     printf 'stopped OBI boundary accepted unavailable Java diagnostics\n' >&2
     return 1
@@ -15405,11 +16152,74 @@ test_uninstrumented_control_invalidates_before_stack_mutation() {
   }
 }
 
+install_standalone_restart_boundary_fixture_stubs() {
+  local -r evidence_output="$1"
+  local -r mode="$2"
+
+  [[ "$mode" == before-only || "$mode" == full ]] || return 1
+  RESTART_BOUNDARY_FIXTURE_EVIDENCE="$evidence_output"
+  RESTART_BOUNDARY_FIXTURE_MODE="$mode"
+  RESTART_BOUNDARY_FIXTURE_STAGE=0
+  : >"$RESTART_BOUNDARY_FIXTURE_EVIDENCE" || return $?
+  begin_obi_metric_boundary() {
+    [[ "$#" == 1 && "$1" == restart &&
+      "$RESTART_BOUNDARY_FIXTURE_STAGE" == 0 ]] || return 91
+    printf 'begin:restart\n' >>"$RESTART_BOUNDARY_FIXTURE_EVIDENCE"
+    RESTART_BOUNDARY_FIXTURE_STAGE=1
+  }
+  plan_obi_metric_pair_capture() {
+    [[ "$#" == 1 && "$1" == restart-process-replaced &&
+      "$RESTART_BOUNDARY_FIXTURE_STAGE" == 1 ]] || return 91
+    printf 'plan:restart-process-replaced\n' \
+      >>"$RESTART_BOUNDARY_FIXTURE_EVIDENCE"
+    RESTART_BOUNDARY_FIXTURE_STAGE=2
+  }
+  capture_phase_evidence() {
+    [[ "$#" == 1 ]] || return 91
+    case "$RESTART_BOUNDARY_FIXTURE_STAGE:$1" in
+      2:restart-obi-before)
+        printf 'capture:restart-obi-before\n' \
+          >>"$RESTART_BOUNDARY_FIXTURE_EVIDENCE"
+        RESTART_BOUNDARY_FIXTURE_STAGE=3
+        ;;
+      3:restart-obi-after)
+        [[ "$RESTART_BOUNDARY_FIXTURE_MODE" == full ]] || return 91
+        printf 'capture:restart-obi-after\n' \
+          >>"$RESTART_BOUNDARY_FIXTURE_EVIDENCE"
+        RESTART_BOUNDARY_FIXTURE_STAGE=4
+        ;;
+      *)
+        return 91
+        ;;
+    esac
+  }
+  record_obi_metric_pair() {
+    [[ "$RESTART_BOUNDARY_FIXTURE_MODE" == full &&
+      "$RESTART_BOUNDARY_FIXTURE_STAGE" == 4 && "$#" == 5 &&
+      "$1" == restart-process-replaced && "$2" == restart-obi-before &&
+      "$3" == restart-obi-after && "$4" == process_replaced &&
+      "$5" == restart-obi-after ]] || return 91
+    printf 'pair:restart-process-replaced\n' \
+      >>"$RESTART_BOUNDARY_FIXTURE_EVIDENCE"
+    RESTART_BOUNDARY_FIXTURE_STAGE=5
+  }
+  complete_obi_metric_boundary() {
+    [[ "$RESTART_BOUNDARY_FIXTURE_MODE" == full &&
+      "$RESTART_BOUNDARY_FIXTURE_STAGE" == 5 && "$#" == 1 &&
+      "$1" == restart ]] || return 91
+    printf 'complete:restart\n' >>"$RESTART_BOUNDARY_FIXTURE_EVIDENCE"
+    RESTART_BOUNDARY_FIXTURE_STAGE=6
+  }
+}
+
 test_standalone_restart_invalidates_before_stack_mutation() {
   local -r result_dir="$TEST_TMP_DIR/restart-invalidation"
   local -r mutation_marker="$result_dir/mutation"
+  local -r mutation_evidence="$result_dir/mutation-evidence"
   local -r failure_marker="$result_dir/failure-mutation"
+  local -r failure_evidence="$result_dir/failure-evidence"
   local -r cursor_failure_marker="$result_dir/cursor-failure-mutation"
+  local -r cursor_failure_evidence="$result_dir/cursor-failure-evidence"
   local -r readiness_observed="$result_dir/readiness-failure"
   local restart_status=0
 
@@ -15422,13 +16232,19 @@ test_standalone_restart_invalidates_before_stack_mutation() {
     COMPOSE=(test-compose)
     BRIDGE_RUNNING=true
     SELECTED_TRANSPORT=getsockopt
-    date() { printf 'restart-cursor\n'; }
+    install_standalone_restart_boundary_fixture_stubs \
+      "$mutation_evidence" before-only || return 1
+    date() {
+      printf 'cursor\n' >>"$mutation_evidence"
+      printf 'restart-cursor\n'
+    }
     run_bounded() {
       [[ "$BRIDGE_RUNNING" == "false" &&
         -z "$SELECTED_TRANSPORT" &&
         ! -e "$RESULT_DIR/java-transport-configuration.txt" &&
         "$(<"$RESULT_DIR/java-selected-transport-configuration.txt")" == "retained" ]] ||
         return 31
+      printf 'restart\n' >>"$mutation_evidence"
       : >"$mutation_marker"
       return 41
     }
@@ -15442,6 +16258,7 @@ test_standalone_restart_invalidates_before_stack_mutation() {
   fi
   [[ "$restart_status" == "41" &&
     -e "$mutation_marker" &&
+    "$(<"$mutation_evidence")" == $'begin:restart\nplan:restart-process-replaced\ncapture:restart-obi-before\ncursor\nrestart' &&
     ! -e "$result_dir/java-transport-configuration.txt" &&
     "$(<"$result_dir/java-selected-transport-configuration.txt")" == "retained" ]] || {
     printf 'standalone restart did not invalidate before restarting OBI\n' >&2
@@ -15455,9 +16272,15 @@ test_standalone_restart_invalidates_before_stack_mutation() {
     COMPOSE=(test-compose)
     BRIDGE_RUNNING=true
     SELECTED_TRANSPORT=getsockopt
-    date() { printf 'restart-cursor\n'; }
+    install_standalone_restart_boundary_fixture_stubs \
+      "$failure_evidence" before-only || return 1
+    date() {
+      printf 'cursor\n' >>"$failure_evidence"
+      printf 'restart-cursor\n'
+    }
     rm() { return 29; }
     run_bounded() {
+      printf 'restart\n' >>"$failure_evidence"
       : >"$failure_marker"
     }
 
@@ -15470,6 +16293,7 @@ test_standalone_restart_invalidates_before_stack_mutation() {
   fi
   [[ "$restart_status" == "29" &&
     ! -e "$failure_marker" &&
+    "$(<"$failure_evidence")" == $'begin:restart\nplan:restart-process-replaced\ncapture:restart-obi-before\ncursor' &&
     "$(<"$result_dir/java-transport-configuration.txt")" == "current" &&
     "$(<"$result_dir/java-selected-transport-configuration.txt")" == "retained" ]] || {
     printf 'standalone restart mutated the stack after invalidation failed\n' >&2
@@ -15482,7 +16306,12 @@ test_standalone_restart_invalidates_before_stack_mutation() {
     COMPOSE=(test-compose)
     BRIDGE_RUNNING=true
     SELECTED_TRANSPORT=getsockopt
-    date() { return 42; }
+    install_standalone_restart_boundary_fixture_stubs \
+      "$cursor_failure_evidence" before-only || return 1
+    date() {
+      printf 'cursor-failure\n' >>"$cursor_failure_evidence"
+      return 42
+    }
     invalidate_selected_transport() {
       : >"$cursor_failure_marker"
     }
@@ -15497,7 +16326,8 @@ test_standalone_restart_invalidates_before_stack_mutation() {
   else
     restart_status=$?
   fi
-  [[ "$restart_status" == "42" && ! -e "$cursor_failure_marker" ]] || {
+  [[ "$restart_status" == "42" && ! -e "$cursor_failure_marker" &&
+    "$(<"$cursor_failure_evidence")" == $'begin:restart\nplan:restart-process-replaced\ncapture:restart-obi-before\ncursor-failure' ]] || {
     printf 'standalone restart mutated state after log-cursor failure\n' >&2
     return 1
   }
@@ -15509,7 +16339,12 @@ test_standalone_restart_invalidates_before_stack_mutation() {
     COMPOSE=(test-compose)
     BRIDGE_RUNNING=true
     SELECTED_TRANSPORT=getsockopt
-    date() { printf 'restart-cursor\n'; }
+    install_standalone_restart_boundary_fixture_stubs \
+      "$readiness_observed" before-only || return 1
+    date() {
+      printf 'cursor\n' >>"$readiness_observed"
+      printf 'restart-cursor\n'
+    }
     run_bounded() {
       printf 'restart\n' >>"$readiness_observed"
     }
@@ -15544,7 +16379,7 @@ test_standalone_restart_invalidates_before_stack_mutation() {
     restart_status=$?
   fi
   [[ "$restart_status" == "43" &&
-    "$(<"$readiness_observed")" == $'restart\nwait' ]] || {
+    "$(<"$readiness_observed")" == $'begin:restart\nplan:restart-process-replaced\ncapture:restart-obi-before\ncursor\nrestart\nwait' ]] || {
     printf 'standalone restart continued after readiness failure\n' >&2
     return 1
   }
@@ -16746,6 +17581,293 @@ EOF
   fi
 }
 
+test_project_guard_acceptance_attempt_requires_terminal_status() {
+  local -r guard_root="$TEST_TMP_DIR/project-guard-acceptance-attempt"
+  local -r side_effect_marker="$guard_root/acceptance-side-effect"
+  local control_dir=""
+  local relay_definition=""
+  local accepted_initial_line=""
+  local accepted_state_line=""
+  local accepted_publish_line=""
+  local accepted_wait_line=""
+  local accepted_initial_count=""
+  local accepted_state_count=""
+
+  relay_definition="$(declare -f run_project_guard_relay)" || return 1
+  accepted_initial_line="$(awk \
+    '/launch_accepted=false/ { print NR; exit }' \
+    <<<"$relay_definition")"
+  accepted_state_line="$(awk \
+    '/^[[:space:]]*launch_accepted=true;?$/ { print NR; exit }' \
+    <<<"$relay_definition")"
+  accepted_publish_line="$(awk \
+    '/publish_project_guard_supervisor_launch_acceptance/ { print NR; exit }' \
+    <<<"$relay_definition")"
+  accepted_wait_line="$(awk \
+    '/"\$launch_accepted"; then/ { print NR; exit }' \
+    <<<"$relay_definition")"
+  accepted_initial_count="$(grep -Fc 'launch_accepted=false' \
+    <<<"$relay_definition")" || true
+  accepted_state_count="$(grep -Ec \
+    '^[[:space:]]*launch_accepted=true;?$' <<<"$relay_definition")" || true
+  [[ "$accepted_initial_count" == 1 && "$accepted_state_count" == 1 &&
+    "$accepted_initial_line" =~ ^[1-9][0-9]*$ &&
+    "$accepted_state_line" =~ ^[1-9][0-9]*$ &&
+    "$accepted_publish_line" =~ ^[1-9][0-9]*$ &&
+    "$accepted_wait_line" =~ ^[1-9][0-9]*$ &&
+    accepted_initial_line -lt accepted_state_line &&
+    accepted_state_line -lt accepted_publish_line &&
+    accepted_publish_line -lt accepted_wait_line ]] || {
+    printf 'project guard acceptance can reopen raw child-status authority\n' >&2
+    return 1
+  }
+
+  mkdir -m 0700 -- "$guard_root"
+  control_dir="$(mktemp -d "$guard_root/.terminal-handoff.XXXXXX")" ||
+    return $?
+  (
+    local relay_pid="$BASHPID"
+    local relay_start_time=""
+    local holder_pid=""
+    local holder_start_time=""
+    local publication_status=0
+    local expected=""
+
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_GUARD_CONTROL_DIR="$control_dir"
+    relay_start_time="$(project_guard_process_start_time "$relay_pid")" ||
+      return 1
+    bash -c 'while :; do sleep 1; done' &
+    holder_pid=$!
+    holder_start_time="$(project_guard_process_start_time "$holder_pid")" || {
+      kill -KILL "$holder_pid" 2>/dev/null || true
+      wait "$holder_pid" 2>/dev/null || true
+      return 1
+    }
+    cleanup_acceptance_holder() {
+      kill -TERM "$holder_pid" 2>/dev/null || true
+      wait "$holder_pid" 2>/dev/null || true
+    }
+    trap cleanup_acceptance_holder EXIT
+    publish_project_guard_control_file \
+      "$control_dir/supervisor" \
+      "supervisor:$relay_pid:$relay_start_time" || return 1
+    publish_project_guard_control_file \
+      "$control_dir/supervisor-launched" \
+      "supervisor-launched:$relay_pid:$relay_start_time:$holder_pid:$holder_start_time" ||
+      return 1
+    env() {
+      local target="${*: -1}"
+
+      if [[ "$target" == \
+        "$PROJECT_GUARD_CONTROL_DIR/supervisor-launched-accepted" &&
+        ! -e "$side_effect_marker" ]]; then
+        command env "$@" || return $?
+        : >"$side_effect_marker" || return $?
+        return 79
+      fi
+      command env "$@"
+    }
+
+    if publish_project_guard_supervisor_launch_acceptance \
+      "$relay_pid" "$relay_start_time" \
+      "$holder_pid" "$holder_start_time"; then
+      printf 'acceptance side effect did not preserve its reported failure\n' >&2
+      return 1
+    else
+      publication_status=$?
+    fi
+    expected="supervisor-launched-accepted:$relay_pid:$relay_start_time:$holder_pid:$holder_start_time"
+    [[ "$publication_status" == 79 && -e "$side_effect_marker" ]] || return 1
+    project_guard_control_file_matches \
+      "$control_dir/supervisor-launched-accepted" "$expected" || return 1
+    cleanup_acceptance_holder
+    trap - EXIT
+    remove_project_guard_control_directory "$control_dir"
+  ) || {
+    printf 'project guard did not classify acceptance publication side effects\n' >&2
+    return 1
+  }
+}
+
+test_project_guard_terminal_decision_normalizes_atomic_side_effects() {
+  local -r guard_root="$TEST_TMP_DIR/project-guard-decision-side-effects"
+  local decision_definition=""
+  local relay_definition=""
+  local decision_publish_line=""
+  local decision_match_line=""
+  local decision_clear_line=""
+  local decision_retry_count=""
+  local -a relay_publish_lines=()
+  local -a relay_authority_lines=()
+  local -i index=0
+  local control_dir=""
+
+  decision_definition="$(declare -f publish_project_guard_terminal_decision)" ||
+    return 1
+  decision_publish_line="$(awk \
+    '/publish_project_guard_control_file/ { print NR; exit }' \
+    <<<"$decision_definition")"
+  decision_match_line="$(awk \
+    '/project_guard_control_file_matches/ { print NR; exit }' \
+    <<<"$decision_definition")"
+  decision_clear_line="$(awk \
+    '/PROJECT_GUARD_PENDING_SIGNAL=""/ { print NR; exit }' \
+    <<<"$decision_definition")"
+  decision_retry_count="$(grep -Fc 'for attempt in 1 2 3' \
+    <<<"$decision_definition")" || true
+  [[ "$decision_publish_line" =~ ^[1-9][0-9]*$ &&
+    "$decision_match_line" =~ ^[1-9][0-9]*$ &&
+    "$decision_clear_line" =~ ^[1-9][0-9]*$ &&
+    "$decision_retry_count" == 1 &&
+    decision_publish_line -lt decision_match_line &&
+    decision_match_line -lt decision_clear_line ]] || {
+    printf 'terminal decision lost exact post-publication normalization\n' >&2
+    return 1
+  }
+  relay_definition="$(declare -f run_project_guard_relay)" || return 1
+  mapfile -t relay_publish_lines < <(awk \
+    '/if publish_project_guard_terminal_decision; then/ { print NR }' \
+    <<<"$relay_definition")
+  mapfile -t relay_authority_lines < <(awk \
+    '/^[[:space:]]*decision_sent=true;?$/ { print NR }' \
+    <<<"$relay_definition")
+  [[ "${#relay_publish_lines[@]}" == 2 &&
+    "${#relay_authority_lines[@]}" == 2 ]] || return 1
+  for ((index = 0; index < 2; index++)); do
+    ((relay_publish_lines[index] < relay_authority_lines[index])) || {
+      printf 'relay trusted a terminal decision before exact publication\n' >&2
+      return 1
+    }
+  done
+
+  mkdir -m 0700 -- "$guard_root"
+  control_dir="$(mktemp -d "$guard_root/.terminal-handoff.XXXXXX")" ||
+    return $?
+  (
+    local -i match_attempts=0
+
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_GUARD_CONTROL_DIR="$control_dir"
+    PROJECT_GUARD_PENDING_SIGNAL=TERM
+    publish_project_guard_control_file() {
+      printf '%s\n' "$2" >"$1" || return $?
+      chmod 0600 -- "$1" || return $?
+      return 79
+    }
+    eval "$(declare -f project_guard_control_file_matches | \
+      sed '1s/^project_guard_control_file_matches /project_guard_control_file_matches_original /')"
+    project_guard_control_file_matches() {
+      if [[ "$1" == "$PROJECT_GUARD_CONTROL_DIR/decision" ]]; then
+        ((match_attempts += 1))
+        if ((match_attempts < 3)); then
+          return 97
+        fi
+      fi
+      project_guard_control_file_matches_original "$@"
+    }
+
+    publish_project_guard_terminal_decision || return 1
+    [[ -z "$PROJECT_GUARD_PENDING_SIGNAL" && "$match_attempts" == 3 ]] ||
+      return 1
+    project_guard_control_file_matches "$control_dir/decision" signal:130 ||
+      return 1
+    remove_project_guard_control_directory "$control_dir"
+  ) || {
+    printf 'terminal decision rejected an exact atomic side effect\n' >&2
+    return 1
+  }
+
+  control_dir="$(mktemp -d "$guard_root/.terminal-handoff.XXXXXX")" ||
+    return $?
+  (
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_GUARD_CONTROL_DIR="$control_dir"
+    PROJECT_GUARD_PENDING_SIGNAL=""
+    publish_project_guard_control_file() {
+      printf '%s\n' "$2" >"$1" || return $?
+      chmod 0600 -- "$1" || return $?
+      return 79
+    }
+
+    publish_project_guard_terminal_decision || return 1
+    [[ -z "$PROJECT_GUARD_PENDING_SIGNAL" ]] || return 1
+    project_guard_control_file_matches "$control_dir/decision" commit ||
+      return 1
+    remove_project_guard_control_directory "$control_dir"
+  ) || {
+    printf 'terminal commit rejected an exact atomic side effect\n' >&2
+    return 1
+  }
+
+  control_dir="$(mktemp -d "$guard_root/.terminal-handoff.XXXXXX")" ||
+    return $?
+  (
+    local observed_status=0
+
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_GUARD_CONTROL_DIR="$control_dir"
+    PROJECT_GUARD_PENDING_SIGNAL=HUP
+    publish_project_guard_control_file() { return 79; }
+    if publish_project_guard_terminal_decision; then
+      return 1
+    else
+      observed_status=$?
+    fi
+    [[ "$observed_status" == 79 && "$PROJECT_GUARD_PENDING_SIGNAL" == HUP &&
+      ! -e "$control_dir/decision" && ! -L "$control_dir/decision" ]] ||
+      return 1
+    remove_project_guard_control_directory "$control_dir"
+  ) || {
+    printf 'terminal decision accepted a pre-publication failure\n' >&2
+    return 1
+  }
+
+  control_dir="$(mktemp -d "$guard_root/.terminal-handoff.XXXXXX")" ||
+    return $?
+  (
+    local observed_status=0
+
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_GUARD_CONTROL_DIR="$control_dir"
+    PROJECT_GUARD_PENDING_SIGNAL=INT
+    publish_project_guard_control_file() {
+      printf 'corrupt\n' >"$1" || return $?
+      chmod 0600 -- "$1" || return $?
+      return 79
+    }
+    if publish_project_guard_terminal_decision; then
+      return 1
+    else
+      observed_status=$?
+    fi
+    [[ "$observed_status" == 79 && "$PROJECT_GUARD_PENDING_SIGNAL" == INT &&
+      "$(<"$control_dir/decision")" == corrupt ]] || return 1
+    remove_project_guard_control_directory "$control_dir"
+  ) || {
+    printf 'terminal decision accepted malformed canonical authority\n' >&2
+    return 1
+  }
+
+  control_dir="$(mktemp -d "$guard_root/.terminal-handoff.XXXXXX")" ||
+    return $?
+  (
+    PROJECT_GUARD_ROOT="$guard_root"
+    PROJECT_GUARD_CONTROL_DIR="$control_dir"
+    PROJECT_GUARD_PENDING_SIGNAL=TERM
+    publish_project_guard_control_file "$control_dir/decision" signal:130 ||
+      return 1
+    publish_project_guard_terminal_decision || return 1
+    [[ -z "$PROJECT_GUARD_PENDING_SIGNAL" ]] || return 1
+    project_guard_control_file_matches "$control_dir/decision" signal:130 ||
+      return 1
+    remove_project_guard_control_directory "$control_dir"
+  ) || {
+    printf 'terminal decision retry rejected exact canonical authority\n' >&2
+    return 1
+  }
+}
+
 test_project_guard_terminal_handoff_is_status_truthful() {
   local -r guard_root="$TEST_TMP_DIR/project-guard-terminal-handoff"
   local -r pre_ack_worker="$TEST_TMP_DIR/project-guard-pre-ack-worker"
@@ -17335,6 +18457,8 @@ test_project_guard_terminal_handoff_wraps_real_runner() {
   local demo_definition=""
   local accepted_latch_line=""
   local accepted_forward_line=""
+  local accepted_authority_line=""
+  local accepted_authority_count=""
   local accepted_publish_line=""
   local demo_guard_line=""
   local demo_recursive_line=""
@@ -17432,6 +18556,11 @@ EOF
   accepted_forward_line="$(awk \
     '/forward_project_guard_signal "\$PROJECT_GUARD_PENDING_SIGNAL"/ { print NR; exit }' \
     <<<"$accepted_definition")"
+  accepted_authority_line="$(awk \
+    '/^[[:space:]]*launch_accepted=true;?$/ { print NR; exit }' \
+    <<<"$accepted_definition")"
+  accepted_authority_count="$(grep -Ec \
+    '^[[:space:]]*launch_accepted=true;?$' <<<"$accepted_definition")" || true
   accepted_publish_line="$(awk \
     '/publish_project_guard_supervisor_launch_acceptance/ { print NR; exit }' \
     <<<"$accepted_definition")"
@@ -17442,9 +18571,12 @@ EOF
     "$accepted_definition" != *'kill -KILL -- "-$holder_pid"'* && \
     "$accepted_latch_line" =~ ^[1-9][0-9]*$ && \
     "$accepted_forward_line" =~ ^[1-9][0-9]*$ && \
+    "$accepted_authority_line" =~ ^[1-9][0-9]*$ && \
+    "$accepted_authority_count" == 1 && \
     "$accepted_publish_line" =~ ^[1-9][0-9]*$ && \
     accepted_latch_line -lt accepted_forward_line && \
-    accepted_forward_line -lt accepted_publish_line ]] || {
+    accepted_forward_line -lt accepted_authority_line && \
+    accepted_authority_line -lt accepted_publish_line ]] || {
     printf 'accepted project guard launch reused the pre-launch kill boundary\n' >&2
     return 1
   }
@@ -18572,6 +19704,8 @@ test_permanent_absence_global_marker_forces_exit_cleanup() {
     cleanup_security_processes() { :; }
     cleanup_source_snapshot_work_directory() { :; }
     capture_evidence() { :; }
+    publish_owned_run_status() { :; }
+    commit_published_run_status() { :; }
     invalidate_project_transport_evidence() { :; }
     safe_compose_down() { : >"$down_marker"; }
 
@@ -18641,6 +19775,7 @@ test_cleanup_signal_status_matches_retained_evidence() {
     FAILURE_COMMAND=""
     CLEANUP_ENTRY_STATUS=""
     CLEANUP_SIGNAL_STATUS=0
+    prepare_completed_run_status_journal_fixture || return 1
     cleanup_entry_signal_sent=false
     signal_at_cleanup_trap_boundary() {
       if [[ "$cleanup_entry_signal_sent" == false ]]; then
@@ -18676,6 +19811,7 @@ test_cleanup_signal_status_matches_retained_evidence() {
     printf 'cleanup entry signal did not retain failed status\n' >&2
     return 1
   }
+  assert_run_status_v3_index_authority "$entry_result" || return 1
 
   if (
     RESULT_DIR="$failed_entry_result"
@@ -18692,6 +19828,7 @@ test_cleanup_signal_status_matches_retained_evidence() {
     CLEANUP_ENTRY_ACTIVE=true
     CLEANUP_ENTRY_STATUS=""
     CLEANUP_SIGNAL_STATUS=0
+    prepare_completed_run_status_journal_fixture || return 1
     cleanup_entry_debug_count=0
     signal_during_failed_cleanup_entry() {
       ((cleanup_entry_debug_count += 1))
@@ -18727,6 +19864,7 @@ test_cleanup_signal_status_matches_retained_evidence() {
     printf 'cleanup entry signal did not preserve the prior failed status\n' >&2
     return 1
   }
+  assert_run_status_v3_index_authority "$failed_entry_result" || return 1
 
   (
     RESULT_DIR="$runtime_signal_result"
@@ -18743,6 +19881,7 @@ test_cleanup_signal_status_matches_retained_evidence() {
     CLEANUP_ENTRY_ACTIVE=""
     CLEANUP_ENTRY_STATUS=""
     CLEANUP_SIGNAL_STATUS=0
+    prepare_completed_run_status_journal_fixture || return 1
     cleanup_security_processes() { :; }
     capture_evidence() { : >"$runtime_signal_progress"; }
     cleanup_source_snapshot_work_directory() { :; }
@@ -18776,6 +19915,7 @@ test_cleanup_signal_status_matches_retained_evidence() {
     printf 'initial runtime TERM did not retain failed status\n' >&2
     return 1
   }
+  assert_run_status_v3_index_authority "$runtime_signal_result" || return 1
 
   (
     RESULT_DIR="$capture_result"
@@ -18790,6 +19930,7 @@ test_cleanup_signal_status_matches_retained_evidence() {
     FAILURE_STATUS=""
     FAILURE_COMMAND=""
     CLEANUP_SIGNAL_STATUS=0
+    prepare_completed_run_status_journal_fixture || return 1
     trap record_cleanup_hup HUP
     trap record_cleanup_int INT
     trap record_cleanup_term TERM
@@ -18827,7 +19968,12 @@ test_cleanup_signal_status_matches_retained_evidence() {
     printf 'cleanup retained a passing status after repeated TERM\n' >&2
     return 1
   }
+  assert_run_status_v3_index_authority "$capture_result" || return 1
 
+  (
+    RESULT_DIR="$group_cleanup_result"
+    prepare_completed_run_status_journal_fixture
+  ) || return 1
   setsid env --default-signal=HUP,INT,TERM bash -c '
     set -Eeuo pipefail
     source "$1"
@@ -18887,6 +20033,7 @@ test_cleanup_signal_status_matches_retained_evidence() {
     printf 'process-group TERM cleanup evidence was not canonical\n' >&2
     return 1
   }
+  assert_run_status_v3_index_authority "$group_cleanup_result" || return 1
 
   if (
     RESULT_DIR="$holder_publication_result"
@@ -18901,6 +20048,7 @@ test_cleanup_signal_status_matches_retained_evidence() {
     FAILURE_STATUS=""
     FAILURE_COMMAND=""
     PROJECT_GUARD_STATUS_RELAY_PID=1
+    prepare_completed_run_status_journal_fixture || return 1
     cleanup_security_processes() { :; }
     capture_evidence() { :; }
     cleanup_source_snapshot_work_directory() { :; }
@@ -18928,6 +20076,7 @@ test_cleanup_signal_status_matches_retained_evidence() {
     printf 'holder-status publication failure diverged from run evidence\n' >&2
     return 1
   }
+  assert_run_status_v3_index_authority "$holder_publication_result" || return 1
 
   if (
     RESULT_DIR="$failed_holder_publication_result"
@@ -18942,6 +20091,7 @@ test_cleanup_signal_status_matches_retained_evidence() {
     FAILURE_STATUS=17
     FAILURE_COMMAND=fixture
     PROJECT_GUARD_STATUS_RELAY_PID=1
+    prepare_completed_run_status_journal_fixture || return 1
     cleanup_security_processes() { :; }
     capture_evidence() { :; }
     cleanup_source_snapshot_work_directory() { :; }
@@ -18957,18 +20107,20 @@ test_cleanup_signal_status_matches_retained_evidence() {
   else
     worker_status=$?
   fi
-  [[ "$worker_status" == 1 &&
-    "$(<"$failed_holder_publication_calls")" == $'17\n1' ]] || {
-    printf 'failed holder status did not canonicalize to the relay fallback\n' >&2
+  [[ "$worker_status" == 17 &&
+    "$(<"$failed_holder_publication_calls")" == $'17\n17' ]] || {
+    printf 'failed holder status changed the primary scenario failure\n' >&2
     return 1
   }
   jq -e '
-    .status == "failed" and .exit_status == 1 and
+    .status == "failed" and .exit_status == 17 and
     .failure_stage == "scenario"
   ' "$failed_holder_publication_result/run-status.json" >/dev/null || {
     printf 'permanent holder publication failure diverged from run evidence\n' >&2
     return 1
   }
+  assert_run_status_v3_index_authority \
+    "$failed_holder_publication_result" || return 1
 
   (
     RESULT_DIR="$publication_result"
@@ -18983,6 +20135,7 @@ test_cleanup_signal_status_matches_retained_evidence() {
     FAILURE_STATUS=""
     FAILURE_COMMAND=""
     local_write_count=0
+    prepare_completed_run_status_journal_fixture || return 1
     eval "$(declare -f write_run_status | \
       sed '1s/^write_run_status /write_run_status_original /')"
     write_run_status() {
@@ -19024,6 +20177,7 @@ test_cleanup_signal_status_matches_retained_evidence() {
     printf 'cleanup status diverged after its terminal commit\n' >&2
     return 1
   }
+  assert_run_status_v3_index_authority "$publication_result" || return 1
 
   (
     RESULT_DIR="$post_publication_result"
@@ -19037,6 +20191,7 @@ test_cleanup_signal_status_matches_retained_evidence() {
     FAILURE_LINE=""
     FAILURE_STATUS=""
     FAILURE_COMMAND=""
+    prepare_completed_run_status_journal_fixture || return 1
     log_info() {
       if [[ "$*" == retained\ run\ evidence:* ]]; then
         : >"$post_publication_ready"
@@ -19074,6 +20229,7 @@ test_cleanup_signal_status_matches_retained_evidence() {
     printf 'cleanup status diverged after terminal publication\n' >&2
     return 1
   }
+  assert_run_status_v3_index_authority "$post_publication_result" || return 1
 }
 
 test_permanent_absence_log_capture_is_source_bounded() {
@@ -19988,6 +21144,46 @@ test_helper_attach_failure_control_restores_and_preserves_status() {
     assert_sanitized_java_diagnostics() {
       printf 'diagnostics-assert:%s\n' "$1" >>"$observed"
     }
+    plan_obi_metric_pair_capture() {
+      (($# == 1)) && [[ "$1" == "helper-attach-rejection" ]] || return 91
+      printf 'boundary:plan:%s\n' "$1" >>"$observed"
+    }
+    capture_phase_evidence() {
+      (($# == 1)) || return 92
+      case "$1" in
+        helper-attach-failure-before | helper-attach-failure-after) ;;
+        *) return 92 ;;
+      esac
+      printf 'boundary:capture:%s\n' "$1" >>"$observed"
+    }
+    record_obi_metric_pair() {
+      (($# == 5)) &&
+        [[ "$1" == "helper-attach-rejection" &&
+          "$2" == "helper-attach-failure-before" &&
+          "$3" == "helper-attach-failure-after" &&
+          "$4" == "same_process" && -z "$5" ]] || return 93
+      printf 'boundary:record:%s:%s:%s:%s:%s\n' "$@" >>"$observed"
+    }
+    # shellcheck disable=SC2120 # Reject unexpected fixture arguments.
+    capture_terminal_java_diagnostics_recovery_boundary() {
+      (($# == 0)) || return 94
+      printf 'boundary:recovery-capture\n' >>"$observed"
+    }
+    # shellcheck disable=SC2120 # Reject unexpected fixture arguments.
+    commit_terminal_java_diagnostics_recovery_boundary() {
+      (($# == 0)) || return 95
+      printf 'boundary:recovery-commit\n' >>"$observed"
+    }
+    # shellcheck disable=SC2120 # Reject unexpected fixture arguments.
+    clear_terminal_java_diagnostics_recovery_boundary() {
+      (($# == 0)) || return 96
+      printf 'boundary:recovery-clear\n' >>"$observed"
+    }
+    # shellcheck disable=SC2120 # Reject unexpected fixture arguments.
+    seal_terminal_java_diagnostics() {
+      (($# == 0)) || return 97
+      printf 'boundary:terminal-seal\n' >>"$observed"
+    }
 
     set +e
     (
@@ -20023,6 +21219,28 @@ test_helper_attach_failure_control_restores_and_preserves_status() {
       printf 'helper attach control retained stale transport selection evidence\n' >&2
       return 1
     }
+    [[ "$(grep -Fxc 'boundary:plan:helper-attach-rejection' "$observed")" == "1" &&
+      "$(grep -Fxc 'boundary:capture:helper-attach-failure-before' "$observed")" == "1" &&
+      "$(grep -Fxc 'boundary:capture:helper-attach-failure-after' "$observed")" == "1" &&
+      "$(grep -Fxc 'boundary:record:helper-attach-rejection:helper-attach-failure-before:helper-attach-failure-after:same_process:' "$observed")" == "1" ]] || {
+      printf 'helper attach control did not preserve its exact fault boundary\n' >&2
+      return 1
+    }
+    awk '
+      /^boundary:plan:helper-attach-rejection$/ { plan = NR }
+      /^boundary:capture:helper-attach-failure-before$/ { before = NR }
+      /^boundary:capture:helper-attach-failure-after$/ { after = NR }
+      /^boundary:record:helper-attach-rejection:/ { record = NR }
+      /^scenario:helper-attach-failure:/ { first_scenario = NR }
+      /^scenario:w3c:/ { second_scenario = NR }
+      END {
+        exit !(plan < before && before < after && after < record &&
+          record < first_scenario && first_scenario < second_scenario)
+      }
+    ' "$observed" || {
+      printf 'helper attach control reordered its fault evidence transaction\n' >&2
+      return 1
+    }
 
     if [[ "$mode" == "success" ]]; then
       [[ "$(grep -c '^transport:' "$observed")" == "1" ]]
@@ -20048,6 +21266,32 @@ test_helper_attach_failure_control_restores_and_preserves_status() {
         'bounded:options=-javaagent:/otel/official-javaagent.jar:180 test-compose up --detach --force-recreate java-backend apache-proxy' \
         "$observed"
       grep -Fqx 'apache:helper-attach-recovery' "$observed"
+      [[ "$(grep -Fxc 'boundary:recovery-capture' "$observed")" == "1" &&
+        "$(grep -Fxc 'boundary:recovery-commit' "$observed")" == "1" &&
+        "$(grep -Fxc 'boundary:recovery-clear' "$observed")" == "1" ]] || {
+        printf 'successful helper attach control omitted recovery authority\n' >&2
+        return 1
+      }
+      awk '
+        /^scenario:w3c:/ { scenario = NR }
+        /^boundary:recovery-capture$/ { capture = NR }
+        /bounded:options=-javaagent:\/otel\/official-javaagent.jar:180 test-compose up/ {
+          recovery = NR
+        }
+        /^boundary:recovery-commit$/ { commit = NR }
+        /^boundary:recovery-clear$/ { clear = NR }
+        END {
+          exit !(scenario < capture && capture < recovery &&
+            recovery < commit && commit < clear)
+        }
+      ' "$observed" || {
+        printf 'successful helper attach control reordered recovery authority\n' >&2
+        return 1
+      }
+      if grep -Fqx 'boundary:terminal-seal' "$observed"; then
+        printf 'successful helper attach control invoked EXIT sealing\n' >&2
+        return 1
+      fi
       if grep -Fq 'helper attach failure cleanup' "$observed"; then
         printf 'successful helper attach control ran EXIT restoration\n' >&2
         return 1
@@ -20068,6 +21312,23 @@ test_helper_attach_failure_control_restores_and_preserves_status() {
         printf 'restoration failure was not retained as evidence\n' >&2
         return 1
       }
+      if grep -Eq '^boundary:recovery-(capture|commit|clear)$' "$observed"; then
+        printf 'failed helper attach control crossed its recovery boundary\n' >&2
+        return 1
+      fi
+      [[ "$(grep -Fxc 'boundary:terminal-seal' "$observed")" == "1" ]] || {
+        printf 'failed helper attach control omitted terminal EXIT sealing\n' >&2
+        return 1
+      }
+      awk '
+        /^scenario:w3c:/ { scenario = NR }
+        /^boundary:terminal-seal$/ { seal = NR }
+        /recreate:tcp:helper attach failure cleanup:getsockopt/ { restore = NR }
+        END { exit !(scenario < seal && seal < restore) }
+      ' "$observed" || {
+        printf 'failed helper attach control reordered terminal sealing and restoration\n' >&2
+        return 1
+      }
     fi
   )
 
@@ -20076,6 +21337,8 @@ test_helper_attach_failure_control_restores_and_preserves_status() {
 
   (
     local -r marker="$TEST_TMP_DIR/helper-attach-precondition-restored"
+    local -r seal_marker="$TEST_TMP_DIR/helper-attach-precondition-sealed"
+    local -r unexpected_marker="$TEST_TMP_DIR/helper-attach-precondition-evidence"
     local status=0
 
     BRIDGE_RUNNING=false
@@ -20090,6 +21353,33 @@ test_helper_attach_failure_control_restores_and_preserves_status() {
     recreate_instrumented_stack() {
       : >"$marker"
     }
+    seal_terminal_java_diagnostics() {
+      : >"$seal_marker"
+    }
+    plan_obi_metric_pair_capture() {
+      : >"$unexpected_marker"
+      return 98
+    }
+    capture_phase_evidence() {
+      : >"$unexpected_marker"
+      return 98
+    }
+    record_obi_metric_pair() {
+      : >"$unexpected_marker"
+      return 98
+    }
+    capture_terminal_java_diagnostics_recovery_boundary() {
+      : >"$unexpected_marker"
+      return 98
+    }
+    commit_terminal_java_diagnostics_recovery_boundary() {
+      : >"$unexpected_marker"
+      return 98
+    }
+    clear_terminal_java_diagnostics_recovery_boundary() {
+      : >"$unexpected_marker"
+      return 98
+    }
     set +e
     (
       set -Eeuo pipefail
@@ -20097,8 +21387,9 @@ test_helper_attach_failure_control_restores_and_preserves_status() {
     )
     status=$?
     set -e
-    [[ "$status" == "1" && ! -e "$marker" ]] || {
-      printf 'helper attach precondition failure mutated the Compose stack\n' >&2
+    [[ "$status" == "1" && -e "$seal_marker" &&
+      ! -e "$marker" && ! -e "$unexpected_marker" ]] || {
+      printf 'helper attach precondition failure crossed its terminal boundary\n' >&2
       return 1
     }
   )
@@ -20161,6 +21452,8 @@ test_standalone_restart_waits_for_apache_instrumentation() {
     COMPOSE=(test-compose)
     BRIDGE_RUNNING=true
     SELECTED_TRANSPORT=getsockopt
+    install_standalone_restart_boundary_fixture_stubs \
+      "$observed" full || return 1
     date() {
       local -i call_count=0
 
@@ -20212,6 +21505,7 @@ test_standalone_restart_waits_for_apache_instrumentation() {
     }
 
     execute_requested_scenarios
+    [[ "$RESTART_BOUNDARY_FIXTURE_STAGE" == 6 ]]
   ) || {
     printf 'standalone restart readiness-order probe failed\n' >&2
     return 1
@@ -20223,6 +21517,9 @@ test_standalone_restart_waits_for_apache_instrumentation() {
   }
 
   printf '%s\n' \
+    'begin:restart' \
+    'plan:restart-process-replaced' \
+    'capture:restart-obi-before' \
     'cursor:restart' \
     'compose:60 test-compose restart --timeout 30 obi' \
     'provider-ready' \
@@ -20233,7 +21530,10 @@ test_standalone_restart_waits_for_apache_instrumentation() {
     'suppression:duplicate-suppression-restart.prom' \
     'log:restarted Java bridge provider:restart-cursor' \
     'transport' \
-    'scenario:restart' >"$expected"
+    'capture:restart-obi-after' \
+    'pair:restart-process-replaced' \
+    'scenario:restart' \
+    'complete:restart' >"$expected"
   cmp -s -- "$expected" "$observed" || {
     printf 'standalone restart resumed before Apache instrumentation readiness\n' >&2
     diff -u -- "$expected" "$observed" >&2 || true
@@ -22217,6 +23517,9 @@ test_retained_evidence_v2_git_tree_schema_is_verified() {
   printf '%s\n' "$source_revision" >"$bundle/bridge-source-revision.txt"
   printf '%s\n' "$source_tree_sha256" >"$bundle/bridge-source-tree.sha256"
   (
+    local java_evidence=""
+    local pair_payload=""
+
     RESULT_DIR="$bundle"
     write_obi_running_identity_fixture \
       "$RESULT_DIR" \
@@ -22236,8 +23539,31 @@ test_retained_evidence_v2_git_tree_schema_is_verified() {
       "$RESULT_DIR/phases/terminal-after/java-diagnostics.txt" 0 0 0 0 0 0
     record_obi_metric_pair \
       terminal terminal-before terminal-after same_process terminal-after \
-      >/dev/null
-    seal_terminal_java_diagnostics
+      >/dev/null || return 1
+    pair_payload="$(obi_metric_pair_payload_from_reference \
+      obi-metric-pairs/terminal.json)" || return 1
+    java_evidence="$(java_diagnostics_reference_evidence_json \
+      phases/terminal-after/java-diagnostics.txt)" || return 1
+    jq -cnS --argjson evidence "$java_evidence" '
+      $evidence + {
+        schema: "obi-java-bridge-terminal-diagnostics-v1",
+        sealed: true,
+        available: true,
+        phase: "terminal-after"
+      }
+    ' >"$RESULT_DIR/terminal-java-diagnostics.json" || return 1
+    jq -cnS --argjson pair "$pair_payload" '
+      {
+        schema: "obi-java-remote-parent-terminal-metrics-v1",
+        sealed: true,
+        available: true,
+        pair_reference: "obi-metric-pairs/terminal.json",
+        pair: $pair
+      }
+    ' >"$RESULT_DIR/terminal-obi-metrics.json" || return 1
+    chmod 0644 -- \
+      "$RESULT_DIR/terminal-java-diagnostics.json" \
+      "$RESULT_DIR/terminal-obi-metrics.json"
   ) || {
     printf 'could not create canonical terminal evidence for Git-tree v2 fixture\n' >&2
     return 1
@@ -22246,7 +23572,9 @@ test_retained_evidence_v2_git_tree_schema_is_verified() {
     "$bundle/.last-valid-java-diagnostics.json" \
     "$bundle/.last-valid-terminal-boundary.json" \
     "$bundle/.terminal-java-diagnostics.freeze" \
-    "$bundle/.terminal-java-diagnostics.lock"
+    "$bundle/.terminal-java-diagnostics.lock" \
+    "$bundle/.terminal-java-diagnostics-transition.lock" \
+    "$bundle/.terminal-java-diagnostics-recovery-boundary.json"
   jq -cn \
     --arg evidence_id "$evidence_id" \
     --slurpfile java_bridge_diagnostics \
@@ -22725,6 +24053,7 @@ test_run_status_serializes_default_acceptance_reason() {
     FAILURE_STAGE=""
     FAILURE_LINE=""
     mkdir -p -- "$RESULT_DIR" || return 1
+    prepare_completed_run_status_journal_fixture || return 1
 
     write_run_status 0
     jq -e '
@@ -22732,7 +24061,8 @@ test_run_status_serializes_default_acceptance_reason() {
       .exit_status == 0 and
       .acceptance_evidence == true and
       .acceptance_evidence_reason == "none"
-    ' "$RESULT_DIR/run-status.json" >/dev/null
+    ' "$RESULT_DIR/run-status.json" >/dev/null || return 1
+    assert_run_status_v3_index_authority "$RESULT_DIR"
   ) || {
     printf 'eligible run status omitted its explicit acceptance reason\n' >&2
     return 1
@@ -22764,6 +24094,8 @@ test_run_status_publication_is_owned_and_atomic() {
   local -r commit_dir="$TEST_TMP_DIR/run-status-owned-commit"
   local -r partial_dir="$TEST_TMP_DIR/run-status-owned-partial"
   local -r replacement_dir="$TEST_TMP_DIR/run-status-owned-replacement"
+  local -r commit_denial_dir="$TEST_TMP_DIR/run-status-owned-commit-denial"
+  local -r pretoken_dir="$TEST_TMP_DIR/run-status-owned-pretoken"
   local -r mismatch_dir="$TEST_TMP_DIR/run-status-owned-mismatch"
   local -r retry_dir="$TEST_TMP_DIR/run-status-owned-retry"
   local -r collision_dir="$TEST_TMP_DIR/run-status-owned-collision"
@@ -22771,8 +24103,9 @@ test_run_status_publication_is_owned_and_atomic() {
   local write_status=0
 
   mkdir -p -- \
-    "$commit_dir" "$partial_dir" "$replacement_dir" "$mismatch_dir" \
-    "$retry_dir" "$collision_dir" "$collision_target"
+    "$commit_dir" "$partial_dir" "$replacement_dir" "$commit_denial_dir" \
+    "$pretoken_dir" "$mismatch_dir" "$retry_dir" "$collision_dir" \
+    "$collision_target"
 
   (
     RESULT_DIR="$commit_dir"
@@ -22786,20 +24119,101 @@ test_run_status_publication_is_owned_and_atomic() {
       "$(stat -Lc '%h' -- "$RUN_STATUS_PUBLICATION_HANDLE")" == 2 &&
       "$(stat -Lc '%h' -- "$RESULT_DIR/run-status.json")" == 2 ]] || return 1
     commit_published_run_status || return 1
-    [[ -z "$RUN_STATUS_PUBLICATION_STATE" &&
-      -z "$RUN_STATUS_PUBLICATION_HANDLE" &&
-      -z "$RUN_STATUS_PUBLICATION_OUTPUT" &&
-      -z "$RUN_STATUS_PUBLISHED_IDENTITY" &&
-      -z "$RUN_STATUS_PUBLISHED_DIGEST" &&
+    [[ "$RUN_STATUS_PUBLICATION_STATE" == committed &&
+      -n "$RUN_STATUS_CREATED_IDENTITY" &&
+      -n "$RUN_STATUS_PUBLICATION_HANDLE" &&
+      ! -e "$RUN_STATUS_PUBLICATION_HANDLE" &&
+      "$RUN_STATUS_PUBLICATION_OUTPUT" == "$RESULT_DIR/run-status.json" &&
+      -n "$RUN_STATUS_PUBLISHED_IDENTITY" &&
+      "$RUN_STATUS_PUBLISHED_DIGEST" =~ ^[0-9a-f]{64}$ &&
       -f "$RESULT_DIR/run-status.json" &&
       "$(stat -Lc '%h' -- "$RESULT_DIR/run-status.json")" == 1 ]] || return 1
+    remove_terminal_owned_run_status_for_rewrite || return 1
+    [[ ! -e "$RESULT_DIR/run-status.json" &&
+      -z "$RUN_STATUS_PUBLICATION_STATE" &&
+      -z "$RUN_STATUS_CREATED_IDENTITY" ]] || return 1
   ) || {
     printf 'run-status ownership handle did not commit exactly once\n' >&2
     return 1
   }
 
   (
-    local fail_output_stat=true
+    local -r denial_marker="$commit_denial_dir/commit-denied"
+    local handle=""
+    local target=""
+    RESULT_DIR="$commit_denial_dir"
+    RUN_STATUS=failed
+    ACCEPTANCE_EVIDENCE=false
+    ACCEPTANCE_EVIDENCE_REASON=targeted-scenario
+    FAILURE_STAGE=fault
+    FAILURE_LINE=31
+    write_run_status 17 || return 1
+    handle="$RUN_STATUS_PUBLICATION_HANDLE"
+    : >"$denial_marker" || return 1
+    rm() {
+      target="${*: -1}"
+      if [[ -e "$denial_marker" && "$target" == "$handle" ]]; then
+        return 78
+      fi
+      command rm "$@"
+    }
+    if commit_published_run_status >/dev/null 2>&1; then
+      return 1
+    fi
+    [[ "$RUN_STATUS_PUBLICATION_STATE" == validated &&
+      -f "$handle" && "$handle" -ef "$RESULT_DIR/run-status.json" &&
+      "$(stat -Lc '%u:%a:%h' -- "$handle")" == "$(id -u):644:2" ]] ||
+      return 1
+    if commit_published_run_status >/dev/null 2>&1; then
+      return 1
+    fi
+    command rm -f -- "$denial_marker" || return 1
+    commit_published_run_status || return 1
+    [[ "$RUN_STATUS_PUBLICATION_STATE" == committed &&
+      ! -e "$handle" &&
+      "$(stat -Lc '%u:%a:%h' -- "$RESULT_DIR/run-status.json")" == \
+        "$(id -u):644:1" ]]
+  ) || {
+    printf 'run-status commit denial was not persistent and retryable\n' >&2
+    return 1
+  }
+
+  (
+    local target=""
+    RESULT_DIR="$pretoken_dir"
+    RUN_STATUS=failed
+    ACCEPTANCE_EVIDENCE=false
+    ACCEPTANCE_EVIDENCE_REASON=targeted-scenario
+    FAILURE_STAGE=fault
+    FAILURE_LINE=31
+    stat() {
+      target="${*: -1}"
+      if [[ "${target%/*}" == "$RESULT_DIR" &&
+        "${target##*/}" =~ ^\.run-status\.[A-Za-z0-9]{6}$ ]]; then
+        return 47
+      fi
+      command stat "$@"
+    }
+    if write_run_status 17 >/dev/null 2>&1; then
+      return 1
+    fi
+    [[ "$RUN_STATUS_PUBLICATION_STATE" == created &&
+      -z "$RUN_STATUS_CREATED_IDENTITY" &&
+      -f "$RUN_STATUS_PUBLICATION_HANDLE" &&
+      ! -e "$RESULT_DIR/run-status.json" ]] || return 1
+    unset -f stat
+    remove_terminal_owned_run_status_for_rewrite || return 1
+    [[ -z "$RUN_STATUS_PUBLICATION_STATE" &&
+      ! -e "$RESULT_DIR/run-status.json" ]] || return 1
+    if compgen -G "$RESULT_DIR/.run-status.*" >/dev/null; then
+      return 1
+    fi
+  ) || {
+    printf 'run-status lost its created pathname before inode reconciliation\n' >&2
+    return 1
+  }
+
+  (
     RESULT_DIR="$partial_dir"
     RUN_STATUS=failed
     ACCEPTANCE_EVIDENCE=false
@@ -22809,9 +24223,7 @@ test_run_status_publication_is_owned_and_atomic() {
     stat() {
       local target="${*: -1}"
 
-      if [[ "$target" == "$RESULT_DIR/run-status.json" &&
-        "$fail_output_stat" == "true" ]]; then
-        fail_output_stat=false
+      if [[ "$target" == "$RESULT_DIR/run-status.json" ]]; then
         return 47
       fi
       command stat "$@"
@@ -22821,7 +24233,7 @@ test_run_status_publication_is_owned_and_atomic() {
     else
       write_status=$?
     fi
-    [[ "$write_status" == 1 &&
+    [[ "$write_status" != 0 &&
       -f "$RESULT_DIR/run-status.json" &&
       -f "$RUN_STATUS_PUBLICATION_HANDLE" ]] || return 1
     unset -f stat
@@ -22904,8 +24316,10 @@ test_run_status_publication_is_owned_and_atomic() {
     fi
     [[ "$write_status" == 79 &&
       ! -e "$RESULT_DIR/run-status.json" &&
-      -z "$RUN_STATUS_PUBLICATION_HANDLE" &&
-      -z "$RUN_STATUS_PUBLICATION_OUTPUT" ]] || return 1
+      -f "$RUN_STATUS_PUBLICATION_HANDLE" &&
+      -n "$RUN_STATUS_CREATED_IDENTITY" ]] || return 1
+    unset -f ln
+    remove_terminal_owned_run_status_for_rewrite || return 1
   ) || {
     printf 'failed run-status replacement link left owned residue\n' >&2
     return 1
@@ -22933,8 +24347,10 @@ test_run_status_publication_is_owned_and_atomic() {
     fi
     [[ -L "$RESULT_DIR/run-status.json" &&
       "$(<"$collision_target/status")" == "outside-status" &&
-      -z "$RUN_STATUS_PUBLICATION_HANDLE" &&
-      -z "$RUN_STATUS_PUBLICATION_OUTPUT" ]]
+      -f "$RUN_STATUS_PUBLICATION_HANDLE" &&
+      -n "$RUN_STATUS_CREATED_IDENTITY" ]] || return 1
+    command rm -f -- "$RESULT_DIR/run-status.json" || return 1
+    remove_terminal_owned_run_status_for_rewrite
   ) || {
     printf 'run-status publication followed a raced directory symlink\n' >&2
     return 1
@@ -22959,6 +24375,9 @@ write_obi_running_identity_fixture() {
         started_at: $started_at
       }
     ' >"$result_dir/phases/$phase/obi-identity.json"
+  printf '# fixture snapshot\n' \
+    >"$result_dir/phases/$phase/obi-metrics.prom"
+  bind_obi_running_identity_fixture "$result_dir" "$phase"
 }
 
 bind_obi_running_identity_fixture() {
@@ -23054,6 +24473,11 @@ write_obi_metric_pair_fixture() {
 
 test_obi_metric_phase_capture_is_bounded_fenced_and_atomic() {
   local -r result_dir="$TEST_TMP_DIR/obi-metric-capture"
+  local -r stage_result_dir="$TEST_TMP_DIR/obi-metric-stage-retry"
+  local -r stage_stat_result_dir="$TEST_TMP_DIR/obi-metric-stage-stat-retry"
+  local -r active_retry_result_dir="$TEST_TMP_DIR/obi-metric-active-cleanup-retry"
+  local -r preattach_result_dir="$TEST_TMP_DIR/obi-metric-preattach-retry"
+  local -r authority_result_dir="$TEST_TMP_DIR/obi-metric-index-authority"
   local -r outside_dir="$TEST_TMP_DIR/obi-metric-capture-outside"
   local -r symlink_root_dir="$TEST_TMP_DIR/obi-metric-capture-symlink-root"
   local -r first_id="5555555555555555555555555555555555555555555555555555555555555555"
@@ -23061,7 +24485,9 @@ test_obi_metric_phase_capture_is_bounded_fenced_and_atomic() {
   local -r started_at="2026-08-17T00:00:00.000000000Z"
   local phase=""
 
-  mkdir -p -- "$result_dir" "$outside_dir" "$symlink_root_dir"
+  mkdir -p -- "$result_dir" "$stage_result_dir" "$stage_stat_result_dir" \
+    "$active_retry_result_dir" "$preattach_result_dir" \
+    "$authority_result_dir" "$outside_dir" "$symlink_root_dir"
   (
     RESULT_DIR="$result_dir"
     CAPTURE_TEST_MODE=valid
@@ -23140,7 +24566,6 @@ test_obi_metric_phase_capture_is_bounded_fenced_and_atomic() {
 
   (
     local artifact=""
-    local capture_status=0
     local destination=""
     local expected_destination=""
     local phase_name=""
@@ -23168,19 +24593,13 @@ test_obi_metric_phase_capture_is_bounded_fenced_and_atomic() {
     for artifact in metrics.prom identity.json; do
       phase_name="${artifact%%.*}-link-side-effect"
       side_effect_marker="$RESULT_DIR/$phase_name-injected"
-      if capture_bounded_obi_metric_phase "$phase_name" 5 >/dev/null 2>&1; then
+      capture_bounded_obi_metric_phase "$phase_name" 5 || return 1
+      [[ -e "$side_effect_marker" &&
+        "$(stat -Lc '%a:%h' -- \
+          "$RESULT_DIR/phases/$phase_name/obi-metrics.prom")" == 644:1 &&
+        "$(stat -Lc '%a:%h' -- \
+          "$RESULT_DIR/phases/$phase_name/obi-identity.json")" == 644:1 ]] ||
         return 1
-      else
-        capture_status=$?
-      fi
-      [[ "$capture_status" == 77 && -e "$side_effect_marker" &&
-        ! -e "$RESULT_DIR/phases/$phase_name/obi-metrics.prom" &&
-        ! -L "$RESULT_DIR/phases/$phase_name/obi-metrics.prom" &&
-        ! -e "$RESULT_DIR/phases/$phase_name/obi-identity.json" &&
-        ! -L "$RESULT_DIR/phases/$phase_name/obi-identity.json" ]] || return 1
-      if compgen -G "$RESULT_DIR/phases/$phase_name/.obi-*" >/dev/null; then
-        return 1
-      fi
       capture_bounded_obi_metric_phase "$phase_name" 5 || return 1
       [[ "$(stat -Lc '%a:%h' -- \
           "$RESULT_DIR/phases/$phase_name/obi-metrics.prom")" == 644:1 &&
@@ -23214,20 +24633,20 @@ test_obi_metric_phase_capture_is_bounded_fenced_and_atomic() {
     rm() {
       target="${*: -1}"
       if [[ "$target" == "$RESULT_DIR/phases/$phase_name"/.obi-identity.* &&
-        ! -e "$cleanup_marker" ]]; then
-        : >"$cleanup_marker" || return $?
+        -e "$cleanup_marker" ]]; then
         return 78
       fi
       command rm "$@"
     }
 
+    : >"$cleanup_marker" || return 1
     if capture_bounded_obi_metric_phase "$phase_name" 5 >/dev/null 2>&1; then
       return 1
     else
       capture_status=$?
     fi
     handles=("$RESULT_DIR/phases/$phase_name"/.obi-*)
-    [[ "$capture_status" == 1 && ${#handles[@]} == 2 &&
+    [[ "$capture_status" == 78 && ${#handles[@]} == 2 &&
       "$(stat -Lc '%a:%h' -- \
         "$RESULT_DIR/phases/$phase_name/obi-metrics.prom")" == 644:2 &&
       "$(stat -Lc '%a:%h' -- \
@@ -23244,6 +24663,7 @@ test_obi_metric_phase_capture_is_bounded_fenced_and_atomic() {
       "$(stat -Lc '%h' -- \
         "$RESULT_DIR/phases/$phase_name/obi-identity.json")" == 2 ]] || return 1
     command rm -f -- "$foreign_handle" || return 1
+    command rm -f -- "$cleanup_marker" || return 1
     capture_bounded_obi_metric_phase "$phase_name" 5 || return 1
     [[ "$(stat -Lc '%a:%h' -- \
         "$RESULT_DIR/phases/$phase_name/obi-metrics.prom")" == 644:1 &&
@@ -23261,9 +24681,7 @@ test_obi_metric_phase_capture_is_bounded_fenced_and_atomic() {
   (
     local -r phase_name=cleanup-deleted-side-effect
     local -r cleanup_marker="$result_dir/capture-cleanup-deleted"
-    local capture_status=0
-    local first_target=""
-    local second_target=""
+    local target=""
 
     RESULT_DIR="$result_dir"
     current_obi_running_observation_payload() {
@@ -23273,26 +24691,19 @@ test_obi_metric_phase_capture_is_bounded_fenced_and_atomic() {
       printf 'obi_java_remote_parent_operations_total{transport="tcp",operation="take",status="valid"} 7\n'
     }
     rm() {
-      if (($# >= 4)); then
-        first_target="${*: -2:1}"
-        second_target="${*: -1}"
-        if [[ ! -e "$cleanup_marker" &&
-          "$first_target" == "$RESULT_DIR/phases/$phase_name"/.obi-metrics.?????? &&
-          "$second_target" == "$RESULT_DIR/phases/$phase_name"/.obi-identity.?????? ]]; then
-          command rm "$@" || return $?
-          : >"$cleanup_marker" || return $?
-          return 77
-        fi
+      target="${*: -1}"
+      if [[ ! -e "$cleanup_marker" &&
+        "${target%/*}" == "$RESULT_DIR/phases/$phase_name" &&
+        "${target##*/}" =~ ^\.obi-(metrics|identity)\.[A-Za-z0-9]{6}$ ]]; then
+        command rm "$@" || return $?
+        : >"$cleanup_marker" || return $?
+        return 77
       fi
       command rm "$@"
     }
 
-    if capture_bounded_obi_metric_phase "$phase_name" 5 >/dev/null 2>&1; then
-      return 1
-    else
-      capture_status=$?
-    fi
-    [[ "$capture_status" == 1 && -e "$cleanup_marker" &&
+    capture_bounded_obi_metric_phase "$phase_name" 5 || return 1
+    [[ -e "$cleanup_marker" &&
       "$(stat -Lc '%a:%h' -- \
         "$RESULT_DIR/phases/$phase_name/obi-metrics.prom")" == 644:1 &&
       "$(stat -Lc '%a:%h' -- \
@@ -23316,12 +24727,11 @@ test_obi_metric_phase_capture_is_bounded_fenced_and_atomic() {
   }
 
   (
-    local removed_kind=""
+    local denied_kind=""
     local phase_name=""
-    local cleanup_marker=""
+    local denial_marker=""
     local capture_status=0
-    local first_target=""
-    local second_target=""
+    local target=""
     local -a handles=()
 
     RESULT_DIR="$result_dir"
@@ -23332,52 +24742,43 @@ test_obi_metric_phase_capture_is_bounded_fenced_and_atomic() {
       printf 'obi_java_remote_parent_operations_total{transport="tcp",operation="take",status="valid"} 7\n'
     }
     rm() {
-      if (($# >= 4)); then
-        first_target="${*: -2:1}"
-        second_target="${*: -1}"
-        if [[ ! -e "$cleanup_marker" &&
-          "$first_target" == "$RESULT_DIR/phases/$phase_name"/.obi-metrics.?????? &&
-          "$second_target" == "$RESULT_DIR/phases/$phase_name"/.obi-identity.?????? ]]; then
-          if [[ "$removed_kind" == metrics ]]; then
-            command rm -f -- "$first_target" || return $?
-          else
-            command rm -f -- "$second_target" || return $?
-          fi
-          : >"$cleanup_marker" || return $?
-          return 77
-        fi
+      target="${*: -1}"
+      if [[ -e "$denial_marker" &&
+        "${target%/*}" == "$RESULT_DIR/phases/$phase_name" &&
+        "${target##*/}" =~ ^\.obi-${denied_kind}\.[A-Za-z0-9]{6}$ ]]; then
+        return 77
       fi
       command rm "$@"
     }
 
-    for removed_kind in metrics identity; do
-      phase_name="cleanup-partial-$removed_kind"
-      cleanup_marker="$RESULT_DIR/$phase_name-injected"
+    for denied_kind in metrics identity; do
+      phase_name="cleanup-partial-$denied_kind"
+      denial_marker="$RESULT_DIR/$phase_name-denied"
+      : >"$denial_marker" || return 1
       if capture_bounded_obi_metric_phase "$phase_name" 5 >/dev/null 2>&1; then
         return 1
       else
         capture_status=$?
       fi
       handles=("$RESULT_DIR/phases/$phase_name"/.obi-*)
-      [[ "$capture_status" == 1 && -e "$cleanup_marker" &&
-        ${#handles[@]} == 1 ]] || return 1
-      if [[ "$removed_kind" == metrics ]]; then
-        [[ "${handles[0]##*/}" =~ ^\.obi-identity\.[A-Za-z0-9]{6}$ &&
-          "${handles[0]}" -ef \
-            "$RESULT_DIR/phases/$phase_name/obi-identity.json" &&
-          "$(stat -Lc '%a:%h' -- \
-            "$RESULT_DIR/phases/$phase_name/obi-metrics.prom")" == 644:1 &&
-          "$(stat -Lc '%a:%h' -- \
-            "$RESULT_DIR/phases/$phase_name/obi-identity.json")" == 644:2 ]]
-      else
-        [[ "${handles[0]##*/}" =~ ^\.obi-metrics\.[A-Za-z0-9]{6}$ &&
+      [[ "$capture_status" == 77 ]] || return 1
+      if [[ "$denied_kind" == metrics ]]; then
+        [[ ${#handles[@]} == 1 &&
+          "${handles[0]##*/}" =~ ^\.obi-metrics\.[A-Za-z0-9]{6}$ &&
           "${handles[0]}" -ef \
             "$RESULT_DIR/phases/$phase_name/obi-metrics.prom" &&
           "$(stat -Lc '%a:%h' -- \
             "$RESULT_DIR/phases/$phase_name/obi-metrics.prom")" == 644:2 &&
           "$(stat -Lc '%a:%h' -- \
             "$RESULT_DIR/phases/$phase_name/obi-identity.json")" == 644:1 ]]
+      else
+        [[ ${#handles[@]} == 2 &&
+          "$(stat -Lc '%a:%h' -- \
+            "$RESULT_DIR/phases/$phase_name/obi-metrics.prom")" == 644:2 &&
+          "$(stat -Lc '%a:%h' -- \
+            "$RESULT_DIR/phases/$phase_name/obi-identity.json")" == 644:2 ]]
       fi || return 1
+      command rm -f -- "$denial_marker" || return 1
       capture_bounded_obi_metric_phase "$phase_name" 5 || return 1
       [[ "$(stat -Lc '%a:%h' -- \
           "$RESULT_DIR/phases/$phase_name/obi-metrics.prom")" == 644:1 &&
@@ -23390,6 +24791,400 @@ test_obi_metric_phase_capture_is_bounded_fenced_and_atomic() {
     done
   ) || {
     printf 'OBI metric capture could not recover one-sided candidate cleanup\n' >&2
+    return 1
+  }
+
+  (
+    local -r phase_name=active-cleanup-retry
+    local -r denial_marker="$active_retry_result_dir/cleanup-denied"
+    local -r unexpected_capture="$active_retry_result_dir/recaptured"
+    local capture_forbidden=false
+    local capture_status=0
+    local target=""
+
+    RESULT_DIR="$active_retry_result_dir"
+    SCENARIO=uninstrumented
+    TRANSPORT=disabled
+    REPEAT_COUNT=1
+    initialize_obi_metric_boundary_index || return 1
+    begin_obi_metric_boundary uninstrumented || return 1
+    current_obi_running_observation_payload() {
+      print_obi_running_observation_fixture "$first_id" 101 "$started_at"
+    }
+    curl() {
+      if [[ "$capture_forbidden" == true ]]; then
+        : >"$unexpected_capture" || return $?
+        return 99
+      fi
+      printf 'obi_java_remote_parent_operations_total{transport="tcp",operation="take",status="valid"} 7\n'
+    }
+    rm() {
+      target="${*: -1}"
+      if [[ -e "$denial_marker" &&
+        "${target%/*}" == "$RESULT_DIR/phases/$phase_name" &&
+        "${target##*/}" =~ ^\.obi-identity\.[A-Za-z0-9]{6}$ ]]; then
+        return 78
+      fi
+      command rm "$@"
+    }
+
+    : >"$denial_marker" || return 1
+    if capture_bounded_obi_metric_phase "$phase_name" 5 >/dev/null 2>&1; then
+      return 1
+    else
+      capture_status=$?
+    fi
+    [[ "$capture_status" == 78 &&
+      "$(stat -Lc '%a:%h' -- \
+        "$RESULT_DIR/phases/$phase_name/obi-metrics.prom")" == 644:2 &&
+      "$(stat -Lc '%a:%h' -- \
+        "$RESULT_DIR/phases/$phase_name/obi-identity.json")" == 644:2 ]] ||
+      return 1
+    jq -e --arg phase "$phase_name" '
+      [.boundaries[] | select(.state == "active") | .captures[] |
+        select(.id == $phase and .kind == "phase" and
+          .state == "captured")] | length == 1
+    ' "$RESULT_DIR/obi-metric-boundary-index.json" >/dev/null || return 1
+    command rm -f -- "$denial_marker" || return 1
+    capture_forbidden=true
+    capture_bounded_obi_metric_phase "$phase_name" 5 || return 1
+    [[ ! -e "$unexpected_capture" &&
+      "$(stat -Lc '%a:%h' -- \
+        "$RESULT_DIR/phases/$phase_name/obi-metrics.prom")" == 644:1 &&
+      "$(stat -Lc '%a:%h' -- \
+        "$RESULT_DIR/phases/$phase_name/obi-identity.json")" == 644:1 ]] ||
+      return 1
+    if compgen -G "$RESULT_DIR/phases/$phase_name/.obi-*" >/dev/null; then
+      return 1
+    fi
+  ) || {
+    printf 'captured OBI phase cleanup retry performed a fresh scrape\n' >&2
+    return 1
+  }
+
+  (
+    local -r phase_name=preattach-complete-h2
+    local -r matcher_fault="$preattach_result_dir/matcher-faulted"
+    local -r unexpected_capture="$preattach_result_dir/recaptured"
+    local capture_forbidden=false
+    local capture_status=0
+    local target=""
+
+    RESULT_DIR="$preattach_result_dir"
+    SCENARIO=uninstrumented
+    TRANSPORT=disabled
+    REPEAT_COUNT=1
+    initialize_obi_metric_boundary_index || return 1
+    begin_obi_metric_boundary uninstrumented || return 1
+    current_obi_running_observation_payload() {
+      print_obi_running_observation_fixture "$first_id" 101 "$started_at"
+    }
+    curl() {
+      if [[ "$capture_forbidden" == true ]]; then
+        : >"$unexpected_capture" || return $?
+        return 99
+      fi
+      printf 'obi_java_remote_parent_operations_total{transport="tcp",operation="take",status="valid"} 7\n'
+    }
+    sha256sum() {
+      target="${*: -1}"
+      if [[ "$target" == \
+          "$RESULT_DIR/phases/$phase_name/obi-identity.json" &&
+        ! -e "$matcher_fault" && -f "$target" && ! -L "$target" &&
+        "$(stat -Lc '%h' -- "$target")" == 2 ]]; then
+        : >"$matcher_fault" || return $?
+        return 77
+      fi
+      command sha256sum "$@"
+    }
+
+    if capture_bounded_obi_metric_phase "$phase_name" 5 >/dev/null 2>&1; then
+      return 1
+    else
+      capture_status=$?
+    fi
+    [[ "$capture_status" == 1 && -e "$matcher_fault" &&
+      "$(stat -Lc '%a:%h' -- \
+        "$RESULT_DIR/phases/$phase_name/obi-metrics.prom")" == 644:2 &&
+      "$(stat -Lc '%a:%h' -- \
+        "$RESULT_DIR/phases/$phase_name/obi-identity.json")" == 644:2 ]] ||
+      return 1
+    jq -e --arg phase "$phase_name" '
+      [.boundaries[] | select(.state == "active") | .captures[] |
+        select(.id == $phase)] | length == 0
+    ' "$RESULT_DIR/obi-metric-boundary-index.json" >/dev/null || return 1
+    capture_forbidden=true
+    capture_bounded_obi_metric_phase "$phase_name" 5 || return 1
+    [[ ! -e "$unexpected_capture" &&
+      "$(stat -Lc '%a:%h' -- \
+        "$RESULT_DIR/phases/$phase_name/obi-metrics.prom")" == 644:1 &&
+      "$(stat -Lc '%a:%h' -- \
+        "$RESULT_DIR/phases/$phase_name/obi-identity.json")" == 644:1 ]] ||
+      return 1
+    jq -e --arg phase "$phase_name" '
+      [.boundaries[] | select(.state == "active") | .captures[] |
+        select(.id == $phase and .kind == "phase" and
+          .state == "captured")] | length == 1
+    ' "$RESULT_DIR/obi-metric-boundary-index.json" >/dev/null
+  ) || {
+    printf 'complete pre-attach OBI h2 state could not recover without recapture\n' >&2
+    return 1
+  }
+
+  (
+    local -r denial_marker="$stage_stat_result_dir/stage-rmdir-denied"
+    local -r stat_calls="$stage_stat_result_dir/stage-stat-calls"
+    local capture_status=0
+    local target=""
+    local call_count=0
+    local -a stages=()
+
+    RESULT_DIR="$stage_stat_result_dir"
+    stat() {
+      target="${*: -1}"
+      if [[ "$target" == "${RESULT_DIR%/*}"/.obi-metric-capture-stage.* &&
+        "${target##*/}" =~ \
+          ^\.obi-metric-capture-stage\.[A-Za-z0-9]{6}$ ]]; then
+        call_count="$(wc -l <"$stat_calls" 2>/dev/null || printf '0')"
+        if ((call_count < 3)); then
+          printf 'failed\n' >>"$stat_calls" || return $?
+          return 71
+        fi
+      fi
+      command stat "$@"
+    }
+    rmdir() {
+      target="${*: -1}"
+      if [[ -e "$denial_marker" &&
+        "${target%/*}" == "${RESULT_DIR%/*}" &&
+        "${target##*/}" =~ \
+          ^\.obi-metric-capture-stage\.[A-Za-z0-9]{6}$ ]]; then
+        return 79
+      fi
+      command rmdir "$@"
+    }
+
+    : >"$denial_marker" || return 1
+    : >"$stat_calls" || return 1
+    if capture_bounded_obi_metric_phase stage-stat-fault 5 \
+      >/dev/null 2>&1; then
+      return 1
+    else
+      capture_status=$?
+    fi
+    stages=("${RESULT_DIR%/*}"/.obi-metric-capture-stage.*)
+    [[ "$capture_status" == 79 && "$(wc -l <"$stat_calls")" == 3 &&
+      ${#stages[@]} == 1 && -d "${stages[0]}" && ! -L "${stages[0]}" &&
+      "$(command stat -Lc '%u:%a:%h' -- "${stages[0]}")" == \
+        "$(id -u):700:2" ]] || return 1
+    command rm -f -- "$denial_marker" || return 1
+    with_obi_metric_capture_stage_lock \
+      normalize_obi_metric_capture_stage_residue || return 1
+    if compgen -G \
+      "${RESULT_DIR%/*}/.obi-metric-capture-stage.*" >/dev/null; then
+      return 1
+    fi
+  ) || {
+    printf 'stage post-mktemp stat failure lost cleanup ownership or status\n' >&2
+    return 1
+  }
+
+  (
+    local -r denial_marker="$stage_result_dir/stage-rmdir-denied"
+    local capture_forbidden=false
+    local stage=""
+    local stage_a=""
+    local stage_b=""
+    local stage_target=""
+    local stage_status=0
+    local target=""
+    local -a stages=()
+
+    RESULT_DIR="$stage_result_dir"
+    current_obi_running_observation_payload() {
+      print_obi_running_observation_fixture "$first_id" 101 "$started_at"
+    }
+    curl() {
+      [[ "$capture_forbidden" == false ]] || return 97
+      printf 'obi_java_remote_parent_operations_total{transport="tcp",operation="take",status="valid"} 7\n'
+    }
+    rmdir() {
+      target="${*: -1}"
+      if [[ -e "$denial_marker" &&
+        "${target%/*}" == "${RESULT_DIR%/*}" &&
+        "${target##*/}" =~ \
+          ^\.obi-metric-capture-stage\.[A-Za-z0-9]{6}$ ]]; then
+        return 79
+      fi
+      command rmdir "$@"
+    }
+
+    : >"$denial_marker" || return 1
+    if capture_bounded_obi_metric_phase stage-retry 5 >/dev/null 2>&1; then
+      return 1
+    else
+      stage_status=$?
+    fi
+    stages=("${RESULT_DIR%/*}"/.obi-metric-capture-stage.*)
+    [[ "$stage_status" == 79 && ${#stages[@]} == 1 &&
+      -d "${stages[0]}" && ! -L "${stages[0]}" &&
+      "$(stat -Lc '%u:%a:%h' -- "${stages[0]}")" == \
+        "$(id -u):700:2" &&
+      "$(stat -Lc '%a:%h' -- \
+        "$RESULT_DIR/phases/stage-retry/obi-metrics.prom")" == 644:1 &&
+      "$(stat -Lc '%a:%h' -- \
+        "$RESULT_DIR/phases/stage-retry/obi-identity.json")" == 644:1 ]] ||
+      return 1
+    capture_forbidden=true
+    if capture_bounded_obi_metric_phase stage-retry 5 >/dev/null 2>&1; then
+      return 1
+    else
+      stage_status=$?
+    fi
+    [[ "$stage_status" == 79 && -d "${stages[0]}" ]] || return 1
+    command rm -f -- "$denial_marker" || return 1
+    capture_bounded_obi_metric_phase stage-retry 5 || return 1
+    if compgen -G \
+      "${RESULT_DIR%/*}/.obi-metric-capture-stage.*" >/dev/null; then
+      return 1
+    fi
+
+    capture_forbidden=false
+    stage="${RESULT_DIR%/*}/.obi-metric-capture-stage.PQR678"
+    command mkdir -m 0700 -- "$stage" || return 1
+    (umask 077 && printf 'partial-stage\n' >"$stage/metrics.raw") || return 1
+    capture_bounded_obi_metric_phase stage-owned-partial 5 || return 1
+    [[ ! -e "$stage" && ! -L "$stage" &&
+      "$(stat -Lc '%a:%h' -- \
+        "$RESULT_DIR/phases/stage-owned-partial/obi-metrics.prom")" == 644:1 &&
+      "$(stat -Lc '%a:%h' -- \
+        "$RESULT_DIR/phases/stage-owned-partial/obi-identity.json")" == 644:1 ]] ||
+      return 1
+
+    stage="${RESULT_DIR%/*}/.obi-metric-capture-stage.foreign"
+    command mkdir -m 0700 -- "$stage" || return 1
+    if capture_bounded_obi_metric_phase stage-foreign 5 >/dev/null 2>&1; then
+      return 1
+    fi
+    [[ -d "$stage" && ! -L "$stage" ]] || return 1
+    command rmdir -- "$stage" || return 1
+
+    stage_a="${RESULT_DIR%/*}/.obi-metric-capture-stage.ABC123"
+    stage_b="${RESULT_DIR%/*}/.obi-metric-capture-stage.DEF456"
+    command mkdir -m 0700 -- "$stage_a" "$stage_b" || return 1
+    if capture_bounded_obi_metric_phase stage-multiple 5 >/dev/null 2>&1; then
+      return 1
+    fi
+    [[ -d "$stage_a" && ! -L "$stage_a" &&
+      -d "$stage_b" && ! -L "$stage_b" ]] || return 1
+    command rmdir -- "$stage_a" "$stage_b" || return 1
+
+    stage_target="$stage_result_dir/stage-symlink-target"
+    stage="${RESULT_DIR%/*}/.obi-metric-capture-stage.GHI789"
+    command mkdir -m 0700 -- "$stage_target" || return 1
+    command ln -s -- "$stage_target" "$stage" || return 1
+    if capture_bounded_obi_metric_phase stage-symlink 5 >/dev/null 2>&1; then
+      return 1
+    fi
+    [[ -L "$stage" && -d "$stage_target" ]] || return 1
+    command rm -f -- "$stage" || return 1
+    command rmdir -- "$stage_target" || return 1
+
+    stage="${RESULT_DIR%/*}/.obi-metric-capture-stage.JKL012"
+    command mkdir -m 0700 -- "$stage" || return 1
+    command chmod 0755 -- "$stage" || return 1
+    if capture_bounded_obi_metric_phase stage-wrong-mode 5 >/dev/null 2>&1; then
+      return 1
+    fi
+    [[ -d "$stage" && ! -L "$stage" &&
+      "$(stat -Lc '%u:%a:%h' -- "$stage")" == "$(id -u):755:2" ]] ||
+      return 1
+    command chmod 0700 -- "$stage" || return 1
+    command rmdir -- "$stage" || return 1
+
+    stage="${RESULT_DIR%/*}/.obi-metric-capture-stage.MNO345"
+    command mkdir -m 0700 -- "$stage" || return 1
+    (umask 077 && : >"$stage/unknown") || return 1
+    if capture_bounded_obi_metric_phase stage-unknown-child 5 \
+      >/dev/null 2>&1; then
+      return 1
+    fi
+    [[ -d "$stage" && ! -L "$stage" &&
+      -f "$stage/unknown" && ! -L "$stage/unknown" &&
+      "$(stat -Lc '%u:%a:%h' -- "$stage/unknown")" == \
+        "$(id -u):600:1" ]] || return 1
+    command rm -f -- "$stage/unknown" || return 1
+    command rmdir -- "$stage" || return 1
+  ) || {
+    printf 'OBI metric capture stage ownership was not retryable and exclusive\n' >&2
+    return 1
+  }
+
+  (
+    local -r mutation_marker="$authority_result_dir/index-mode-mutated"
+    local capture_status=0
+    local destination=""
+    local -a handles=()
+
+    RESULT_DIR="$authority_result_dir"
+    SCENARIO=uninstrumented
+    TRANSPORT=disabled
+    REPEAT_COUNT=1
+    initialize_obi_metric_boundary_index || return 1
+    begin_obi_metric_boundary uninstrumented || return 1
+    current_obi_running_observation_payload() {
+      print_obi_running_observation_fixture "$first_id" 101 "$started_at"
+    }
+    curl() {
+      printf 'obi_java_remote_parent_operations_total{transport="tcp",operation="take",status="valid"} 7\n'
+    }
+    mv() {
+      destination="${*: -1}"
+      command mv "$@" || return $?
+      if [[ "$destination" == "$RESULT_DIR/obi-metric-boundary-index.json" &&
+        ! -e "$mutation_marker" ]]; then
+        command chmod 0600 -- "$destination" || return $?
+        : >"$mutation_marker" || return $?
+      fi
+    }
+
+    if capture_bounded_obi_metric_phase authority-fault 5 >/dev/null 2>&1; then
+      return 1
+    else
+      capture_status=$?
+    fi
+    handles=("$RESULT_DIR/phases/authority-fault"/.obi-*)
+    [[ "$capture_status" != 0 && -e "$mutation_marker" &&
+      "$(stat -Lc '%u:%a:%h' -- \
+        "$RESULT_DIR/obi-metric-boundary-index.json")" == \
+        "$(id -u):600:1" && ${#handles[@]} == 2 &&
+      "$(stat -Lc '%a:%h' -- \
+        "$RESULT_DIR/phases/authority-fault/obi-metrics.prom")" == 644:2 &&
+      "$(stat -Lc '%a:%h' -- \
+        "$RESULT_DIR/phases/authority-fault/obi-identity.json")" == 644:2 ]] ||
+      return 1
+    command chmod 0644 -- \
+      "$RESULT_DIR/obi-metric-boundary-index.json" || return 1
+    capture_bounded_obi_metric_phase authority-fault 5 || return 1
+    [[ "$(stat -Lc '%u:%a:%h' -- \
+        "$RESULT_DIR/obi-metric-boundary-index.json")" == \
+        "$(id -u):644:1" &&
+      "$(stat -Lc '%a:%h' -- \
+        "$RESULT_DIR/phases/authority-fault/obi-metrics.prom")" == 644:1 &&
+      "$(stat -Lc '%a:%h' -- \
+        "$RESULT_DIR/phases/authority-fault/obi-identity.json")" == 644:1 ]] ||
+      return 1
+    if compgen -G \
+      "$RESULT_DIR/phases/authority-fault/.obi-*" >/dev/null; then
+      return 1
+    fi
+    jq -e '
+      [.boundaries[] | select(.state == "active") | .captures[] |
+        select(.id == "authority-fault" and .kind == "phase" and
+          .state == "captured")] | length == 1
+    ' "$RESULT_DIR/obi-metric-boundary-index.json" >/dev/null
+  ) || {
+    printf 'phase attach trusted or lost ownership across index mode drift\n' >&2
     return 1
   }
 
@@ -23444,11 +25239,12 @@ test_obi_metric_phase_capture_is_bounded_fenced_and_atomic() {
 
 test_direct_obi_publications_normalize_link_side_effects() {
   local -r result_dir="$TEST_TMP_DIR/obi-direct-publications"
+  local -r active_collision_dir="$TEST_TMP_DIR/obi-direct-active-collisions"
   local -r outside_dir="$TEST_TMP_DIR/obi-direct-publications-outside"
   local -r container_id="8888888888888888888888888888888888888888888888888888888888888888"
   local payload=""
 
-  mkdir -p -- "$result_dir" "$outside_dir"
+  mkdir -p -- "$result_dir" "$active_collision_dir" "$outside_dir"
   payload="$(jq -cn \
     --arg container_id "$container_id" '
       {
@@ -23565,6 +25361,70 @@ test_direct_obi_publications_normalize_link_side_effects() {
     printf 'direct OBI publication did not normalize or refuse an exact path\n' >&2
     return 1
   }
+
+  (
+    local -r live_phase=live-unavailable-collision
+    local -r unavailable_phase=unavailable-identity-collision
+    local -r stopped_phase=stopped-metrics-collision
+    RESULT_DIR="$active_collision_dir"
+    SCENARIO=uninstrumented
+    TRANSPORT=disabled
+    REPEAT_COUNT=1
+    initialize_obi_metric_boundary_index || return 1
+    begin_obi_metric_boundary uninstrumented || return 1
+
+    write_obi_stopped_identity_fixture \
+      "$RESULT_DIR" "$unavailable_phase" "$container_id" \
+      '2026-08-17T00:00:00.000000000Z' || return 1
+    if publish_obi_metrics_unavailable_phase \
+      "$unavailable_phase" >/dev/null 2>&1; then
+      return 1
+    fi
+    [[ -f "$RESULT_DIR/phases/$unavailable_phase/obi-identity.json" &&
+      ! -e "$RESULT_DIR/phases/$unavailable_phase/obi-metrics.prom" ]] ||
+      return 1
+
+    plan_obi_metric_pair_capture "$stopped_phase" || return 1
+    ensure_java_diagnostics_phase_directory "$stopped_phase" || return 1
+    printf 'unavailable\n' \
+      >"$RESULT_DIR/phases/$stopped_phase/obi-metrics.prom" || return 1
+    chmod 0644 -- \
+      "$RESULT_DIR/phases/$stopped_phase/obi-metrics.prom" || return 1
+    if publish_obi_process_identity_payload \
+      "$stopped_phase" "$payload" >/dev/null 2>&1; then
+      return 1
+    fi
+    [[ "$(<"$RESULT_DIR/phases/$stopped_phase/obi-metrics.prom")" == \
+        unavailable &&
+      ! -e "$RESULT_DIR/phases/$stopped_phase/obi-identity.json" ]] ||
+      return 1
+
+    ensure_java_diagnostics_phase_directory "$live_phase" || return 1
+    printf 'unavailable\n' \
+      >"$RESULT_DIR/phases/$live_phase/obi-metrics.prom" || return 1
+    chmod 0644 -- "$RESULT_DIR/phases/$live_phase/obi-metrics.prom" || return 1
+    current_obi_running_observation_payload() {
+      print_obi_running_observation_fixture \
+        "$container_id" 101 '2026-08-17T00:00:00.000000000Z'
+    }
+    curl() {
+      printf 'obi_java_remote_parent_operations_total{transport="tcp",operation="take",status="valid"} 7\n'
+    }
+    if capture_bounded_obi_metric_phase "$live_phase" 5 >/dev/null 2>&1; then
+      return 1
+    fi
+    [[ "$(<"$RESULT_DIR/phases/$live_phase/obi-metrics.prom")" == \
+        unavailable &&
+      ! -e "$RESULT_DIR/phases/$live_phase/obi-identity.json" ]] || return 1
+    jq -e '
+      [.boundaries[] | select(.state == "active") | .captures[]] |
+      length == 1 and .[0].id == "stopped-metrics-collision" and
+      .[0].kind == "pair" and .[0].state == "planned"
+    ' "$RESULT_DIR/obi-metric-boundary-index.json" >/dev/null
+  ) || {
+    printf 'active journal accepted a mixed live/unavailable/stopped phase family\n' >&2
+    return 1
+  }
 }
 
 test_direct_obi_publications_recover_candidate_cleanup() {
@@ -23601,8 +25461,7 @@ test_direct_obi_publications_recover_candidate_cleanup() {
     rm() {
       target="${*: -1}"
       if [[ "$target" == "$RESULT_DIR/phases/$cleanup_phase"/.obi-*.* &&
-        ! -e "$failure_marker" ]]; then
-        : >"$failure_marker" || return $?
+        -e "$failure_marker" ]]; then
         return 78
       fi
       command rm "$@"
@@ -23611,6 +25470,7 @@ test_direct_obi_publications_recover_candidate_cleanup() {
     for cleanup_kind in identity unavailable; do
       cleanup_phase="$cleanup_kind-cleanup-retry"
       failure_marker="$RESULT_DIR/$cleanup_kind-cleanup-failed"
+      : >"$failure_marker" || return 1
       if [[ "$cleanup_kind" == identity ]]; then
         output="$RESULT_DIR/phases/$cleanup_phase/obi-identity.json"
         if publish_obi_process_identity_payload "$cleanup_phase" "$payload"; then
@@ -23636,7 +25496,7 @@ test_direct_obi_publications_recover_candidate_cleanup() {
       candidate="${candidates[0]}"
       candidate_digest="$(sha256sum "$candidate")" || return 1
       candidate_digest="${candidate_digest%% *}"
-      [[ "$publication_status" == 1 && -f "$candidate" &&
+      [[ "$publication_status" == 78 && -f "$candidate" &&
         ! -L "$candidate" && "$candidate" -ef "$output" &&
         "$(stat -Lc '%a:%h' -- "$candidate")" == 644:2 ]] || return 1
 
@@ -23655,6 +25515,7 @@ test_direct_obi_publications_recover_candidate_cleanup() {
         "$(<"$foreign")" == foreign-hidden-candidate ]] || return 1
 
       command rm -f -- "$foreign" || return 1
+      command rm -f -- "$failure_marker" || return 1
       if [[ "$cleanup_kind" == identity ]]; then
         publish_obi_process_identity_payload "$cleanup_phase" "$payload" ||
           return 1
@@ -23680,6 +25541,7 @@ test_disabled_phase_evidence_prefers_running_obi_metrics() {
   (
     RESULT_DIR="$result_dir"
     BRIDGE_RUNNING=false
+    OBI_RUNNING=true
     CAPTURE_TEST_MODE=running
     capture_bounded_obi_metric_phase() {
       : >"$RESULT_DIR/capture-$1"
@@ -23711,12 +25573,14 @@ test_disabled_phase_evidence_prefers_running_obi_metrics() {
       ! -e "$RESULT_DIR/unavailable-disabled-running" ]] || return 1
 
     CAPTURE_TEST_MODE=stopped
+    OBI_RUNNING=false
     capture_phase_evidence disabled-stopped || return 1
-    [[ -e "$RESULT_DIR/capture-disabled-stopped" &&
+    [[ ! -e "$RESULT_DIR/capture-disabled-stopped" &&
       -e "$RESULT_DIR/stopped-attestation-stopped" &&
       -e "$RESULT_DIR/unavailable-disabled-stopped" ]] || return 1
 
     CAPTURE_TEST_MODE=scrape-failure
+    OBI_RUNNING=true
     if capture_phase_evidence disabled-scrape-failure >/dev/null 2>&1; then
       return 1
     fi
@@ -23758,11 +25622,16 @@ test_obi_metric_pair_is_bounded_exact_and_mutation_sensitive() {
     18446744073709551615 10
   (
     RESULT_DIR="$same_dir"
+    SCENARIO=basic
+    TRANSPORT=getsockopt
+    REPEAT_COUNT=1
     RUN_STATUS=failed
     ACCEPTANCE_EVIDENCE=false
     ACCEPTANCE_EVIDENCE_REASON=targeted-scenario
     FAILURE_STAGE=metric-pair
     FAILURE_LINE=17
+    initialize_obi_metric_boundary_index || return 1
+    begin_obi_metric_boundary basic || return 1
     record_obi_metric_pair exact exact-before exact-after same_process exact-after ||
       return 1
     jq -e '
@@ -23784,9 +25653,11 @@ test_obi_metric_pair_is_bounded_exact_and_mutation_sensitive() {
     seal_terminal_java_diagnostics || return 1
     write_run_status 17 || return 1
     jq -e --slurpfile terminal "$RESULT_DIR/terminal-obi-metrics.json" '
-      .schema == "obi-apache-java-https-run-status-v2" and
+      .schema == "obi-apache-java-https-run-status-v3" and
       .obi_metric_evidence_reference == "terminal-obi-metrics.json" and
       .obi_metric_evidence == $terminal[0] and
+      .obi_metric_boundary_index_reference ==
+        "obi-metric-boundary-index.json" and
       .obi_metric_evidence.available == true and
       .obi_metric_evidence.pair.boundary == "exact"
     ' "$RESULT_DIR/run-status.json" >/dev/null
@@ -23997,6 +25868,11 @@ test_obi_metric_pair_is_bounded_exact_and_mutation_sensitive() {
     local sort_status=0
 
     RESULT_DIR="$sort_dir"
+    SCENARIO=basic
+    TRANSPORT=getsockopt
+    REPEAT_COUNT=1
+    initialize_obi_metric_boundary_index || return 1
+    begin_obi_metric_boundary basic || return 1
     # ShellCheck cannot see the production call into this injected sort fixture.
     # shellcheck disable=SC2120
     sort() {
@@ -24016,9 +25892,15 @@ test_obi_metric_pair_is_bounded_exact_and_mutation_sensitive() {
     fi
     [[ "$sort_status" == 77 &&
       ! -e "$RESULT_DIR/obi-metric-pairs/sort-failure.json" &&
-      ! -L "$RESULT_DIR/obi-metric-pairs/sort-failure.json" &&
-      ! -e "$RESULT_DIR/.last-valid-terminal-boundary.json" &&
-      ! -L "$RESULT_DIR/.last-valid-terminal-boundary.json" ]] || return 1
+      ! -L "$RESULT_DIR/obi-metric-pairs/sort-failure.json" ]] || return 1
+    jq -e '
+      [.boundaries[0].captures[] |
+        select(.id == "sort-failure" and .kind == "pair")] == [{
+          id: "sort-failure", kind: "pair", state: "planned",
+          pair_reference: null, pair_sha256: null,
+          java_reference: null, java_sha256: null
+        }]
+    ' "$RESULT_DIR/obi-metric-boundary-index.json" >/dev/null || return 1
     if compgen -G "$RESULT_DIR/.obi-metric-union-*" >/dev/null; then
       return 1
     fi
@@ -24037,6 +25919,11 @@ test_obi_metric_pair_is_bounded_exact_and_mutation_sensitive() {
     "$collision_dir" collision-after tcp stage valid 2 absent
   (
     RESULT_DIR="$collision_dir"
+    SCENARIO=basic
+    TRANSPORT=getsockopt
+    REPEAT_COUNT=1
+    initialize_obi_metric_boundary_index || return 1
+    begin_obi_metric_boundary basic || return 1
     ensure_obi_metric_pair_directory || return 1
     printf 'existing-boundary\n' \
       >"$RESULT_DIR/obi-metric-pairs/collision.json" || return 1
@@ -24046,171 +25933,13 @@ test_obi_metric_pair_is_bounded_exact_and_mutation_sensitive() {
       return 1
     fi
     [[ "$(<"$RESULT_DIR/obi-metric-pairs/collision.json")" == \
-      existing-boundary &&
-      ! -e "$RESULT_DIR/.last-valid-terminal-boundary.json" &&
-      ! -L "$RESULT_DIR/.last-valid-terminal-boundary.json" ]]
+      existing-boundary ]] || return 1
+    jq -e '
+      [.boundaries[0].captures[] |
+        select(.id == "collision" and .kind == "pair")][0].state == "planned"
+    ' "$RESULT_DIR/obi-metric-boundary-index.json" >/dev/null
   ) || {
     printf 'OBI metric pair publication clobbered an existing boundary\n' >&2
-    return 1
-  }
-}
-
-test_obi_metric_pair_recovery_boundary_is_shared() {
-  local -r retained_dir="$TEST_TMP_DIR/obi-metric-recovery-retained"
-  local -r unavailable_dir="$TEST_TMP_DIR/obi-metric-recovery-unavailable"
-  local -r container_id="3333333333333333333333333333333333333333333333333333333333333333"
-  local -r started_at="2026-08-17T00:00:00.000000000Z"
-  local result_dir=""
-  local prefix=""
-
-  for result_dir in "$retained_dir" "$unavailable_dir"; do
-    mkdir -p -- "$result_dir"
-    for prefix in fault recovery; do
-      write_obi_running_identity_fixture \
-        "$result_dir" "$prefix-before" "$container_id" "$started_at"
-      write_obi_running_identity_fixture \
-        "$result_dir" "$prefix-after" "$container_id" "$started_at"
-    done
-    write_obi_metric_pair_fixture \
-      "$result_dir" fault-before getsockopt take stale 1 0
-    write_obi_metric_pair_fixture \
-      "$result_dir" fault-after getsockopt take stale 2 0
-    write_obi_metric_pair_fixture \
-      "$result_dir" recovery-before getsockopt take valid 2 0
-    write_obi_metric_pair_fixture \
-      "$result_dir" recovery-after getsockopt take valid 3 0
-  done
-
-  (
-    RESULT_DIR="$retained_dir"
-    record_obi_metric_pair \
-      fault fault-before fault-after same_process fault-after || return 1
-    capture_terminal_java_diagnostics_recovery_boundary || return 1
-    record_obi_metric_pair \
-      recovery recovery-before recovery-after same_process recovery-after ||
-      return 1
-    seal_terminal_java_diagnostics || return 1
-    jq -e '
-      .available == true and .pair.boundary == "fault" and
-      .pair.series[0].delta == "1"
-    ' "$RESULT_DIR/terminal-obi-metrics.json" >/dev/null
-  ) || {
-    printf 'recovery replaced the pre-recovery OBI metric pair\n' >&2
-    return 1
-  }
-
-  (
-    RESULT_DIR="$unavailable_dir"
-    capture_terminal_java_diagnostics_recovery_boundary || return 1
-    record_obi_metric_pair \
-      recovery recovery-before recovery-after same_process recovery-after ||
-      return 1
-    seal_terminal_java_diagnostics || return 1
-    jq -e '
-      .available == false and
-      .reason == "no-valid-pair-before-terminal-boundary"
-    ' "$RESULT_DIR/terminal-obi-metrics.json" >/dev/null
-  ) || {
-    printf 'an unavailable pre-recovery metric boundary became recovery evidence\n' >&2
-    return 1
-  }
-}
-
-test_obi_metric_pair_transaction_rolls_back_and_retries() {
-  local -r result_dir="$TEST_TMP_DIR/obi-metric-pair-transaction"
-  local -r container_id="7777777777777777777777777777777777777777777777777777777777777777"
-  local -r started_at="2026-08-17T00:00:00.000000000Z"
-  local phase=""
-
-  mkdir -p -- "$result_dir"
-  for phase in old-before old-after retry-before retry-after normalized-before normalized-after; do
-    write_obi_running_identity_fixture \
-      "$result_dir" "$phase" "$container_id" "$started_at"
-  done
-  write_obi_metric_pair_fixture \
-    "$result_dir" old-before tcp take valid 1 0
-  write_obi_metric_pair_fixture \
-    "$result_dir" old-after tcp take valid 2 0
-  write_obi_metric_pair_fixture \
-    "$result_dir" retry-before tcp take stale 2 0
-  write_obi_metric_pair_fixture \
-    "$result_dir" retry-after tcp take stale 3 0
-  write_obi_metric_pair_fixture \
-    "$result_dir" normalized-before unix report valid 3 0
-  write_obi_metric_pair_fixture \
-    "$result_dir" normalized-after unix report valid 4 0
-  (
-    local tracker_before=""
-    local tracker_identity_before=""
-    local transaction_status=0
-    local pattern=""
-    local INSTALL_TEST_MODE=fail
-
-    RESULT_DIR="$result_dir"
-    record_obi_metric_pair old old-before old-after same_process old-after \
-      >/dev/null || return 1
-    tracker_before="$(<"$RESULT_DIR/.last-valid-terminal-boundary.json")"
-    tracker_identity_before="$(stat -Lc '%d:%i' -- \
-      "$RESULT_DIR/.last-valid-terminal-boundary.json")" || return 1
-
-    install_last_terminal_boundary_payload_unlocked() {
-      case "$INSTALL_TEST_MODE" in
-        fail) return 77 ;;
-        normal) command mv -fT -- "$1" "$2" ;;
-        normalize)
-          command mv -fT -- "$1" "$2" || return $?
-          return 77
-          ;;
-        *) return 64 ;;
-      esac
-    }
-    if record_obi_metric_pair \
-      retry retry-before retry-after same_process retry-after >/dev/null; then
-      return 1
-    else
-      transaction_status=$?
-    fi
-    [[ "$transaction_status" == 77 &&
-      ! -e "$RESULT_DIR/obi-metric-pairs/retry.json" &&
-      ! -L "$RESULT_DIR/obi-metric-pairs/retry.json" &&
-      "$(<"$RESULT_DIR/.last-valid-terminal-boundary.json")" == \
-        "$tracker_before" &&
-      "$(stat -Lc '%d:%i' -- \
-        "$RESULT_DIR/.last-valid-terminal-boundary.json")" == \
-        "$tracker_identity_before" ]] || return 1
-    INSTALL_TEST_MODE=normal
-    record_obi_metric_pair \
-      retry retry-before retry-after same_process retry-after >/dev/null ||
-      return 1
-    jq -e '.obi_metric_pair.pair.boundary == "retry"' \
-      "$RESULT_DIR/.last-valid-terminal-boundary.json" >/dev/null || return 1
-
-    INSTALL_TEST_MODE=normalize
-    record_obi_metric_pair \
-      normalized normalized-before normalized-after same_process normalized-after \
-      >/dev/null || return 1
-    INSTALL_TEST_MODE=normal
-    record_obi_metric_pair \
-      normalized normalized-before normalized-after same_process normalized-after \
-      >/dev/null || return 1
-    jq -e '.obi_metric_pair.pair.boundary == "normalized"' \
-      "$RESULT_DIR/.last-valid-terminal-boundary.json" >/dev/null || return 1
-    [[ "$(stat -Lc '%h' -- \
-        "$RESULT_DIR/obi-metric-pairs/normalized.json")" == 1 &&
-      "$(stat -Lc '%h' -- \
-        "$RESULT_DIR/.last-valid-terminal-boundary.json")" == 1 ]] || return 1
-
-    for pattern in \
-      "$RESULT_DIR"/.last-valid-terminal-boundary-rollback.* \
-      "$RESULT_DIR"/.last-valid-terminal-boundary-transaction.* \
-      "$RESULT_DIR"/.last-valid-terminal-boundary-publication.* \
-      "$RESULT_DIR"/.last-valid-terminal-boundary-restore.* \
-      "$RESULT_DIR"/obi-metric-pairs/.pair-transaction.*; do
-      compgen -G "$pattern" >/dev/null && return 1
-    done
-    return 0
-  ) || {
-    printf 'OBI metric pair transaction did not roll back, normalize, or retry exactly\n' >&2
     return 1
   }
 }
@@ -24271,11 +26000,16 @@ test_obi_metric_pair_exact_maximum_fits() {
   bind_obi_running_identity_fixture "$result_dir" "$after_phase" || return 1
   (
     RESULT_DIR="$result_dir"
+    SCENARIO=basic
+    TRANSPORT=getsockopt
+    REPEAT_COUNT=1
     RUN_STATUS=failed
     ACCEPTANCE_EVIDENCE=false
     ACCEPTANCE_EVIDENCE_REASON=targeted-scenario
     FAILURE_STAGE=maximum-metric-pair
     FAILURE_LINE=17
+    initialize_obi_metric_boundary_index || return 1
+    begin_obi_metric_boundary basic || return 1
     payload="$(build_obi_metric_pair_payload \
       "$boundary" "$before_phase" "$after_phase" same_process)" || return 1
     [[ "$(jq -r '.series | length' <<<"$payload")" == 792 ]] || return 1
@@ -24307,8 +26041,356 @@ test_obi_metric_pair_exact_maximum_fits() {
   }
 }
 
+current_terminal_evidence_source_contract_is_safe() {
+  local -r runner_source="$1"
+
+  awk '
+    BEGIN {
+      publisher_consumer["extract_java_diagnostics_header_unlocked"] = 1
+      publisher_consumer["extract_terminal_diagnostics_after_unlocked"] = 1
+      publisher_consumer["capture_terminal_java_diagnostics_recovery_boundary_unlocked"] = 1
+      publisher_consumer["commit_terminal_java_diagnostics_recovery_boundary_publication_unlocked"] = 1
+      publisher_consumer["seal_terminal_obi_metrics_unlocked"] = 1
+      publisher_consumer["freeze_terminal_java_diagnostics_publication_unlocked"] = 1
+      publisher_consumer["seal_terminal_java_diagnostics_unlocked"] = 1
+      normalizer_consumer["normalize_terminal_java_phase_and_last_candidates_before_freeze"] = 1
+      normalizer_consumer["normalize_terminal_java_diagnostics_recovery_boundary_residue"] = 1
+      normalizer_consumer["normalize_terminal_java_diagnostics_transition_residue_unlocked"] = 1
+      normalizer_consumer["normalize_terminal_java_diagnostics_residue"] = 1
+      normalizer_consumer["normalize_terminal_obi_metrics_residue"] = 1
+    }
+    function begin(name) { current = name; starts[name]++ }
+    {
+      if ($0 == "with_terminal_java_diagnostics_lock() (") begin("j-lock")
+      else if ($0 == "with_terminal_java_diagnostics_transition_publication_lock() (") begin("t-lock")
+      else if ($0 == "with_obi_metric_capture_stage_lock() (") begin("s-lock")
+      else if ($0 == "capture_bounded_obi_metric_phase_unlocked() {") begin("stage-capture")
+      else if ($0 == "capture_bounded_obi_metric_phase() {") begin("stage-public")
+      else if ($0 == "create_obi_metric_capture_stage() {") begin("stage-create")
+      else if ($0 == "publish_terminal_owned_hardlink_payload() {") begin("hardlink")
+      else if ($0 == "capture_bounded_obi_metric_phase_publication_unlocked() {") begin("live-phase")
+      else if ($0 == "recover_obi_metric_phase_capture_unlocked() {") begin("live-recover")
+      else if ($0 == "freeze_obi_metric_boundary_index_unlocked() {") begin("index-freeze")
+      else if ($0 == "freeze_terminal_java_diagnostics() {") begin("freeze")
+      else if ($0 == "seal_terminal_java_diagnostics() {") begin("seal")
+      else if ($0 == "publish_last_java_diagnostics_payload_unlocked() {") begin("last-publish")
+      else if ($0 == "write_run_status() {") begin("status-write")
+      else if ($0 == "acquire_run_status_created_identity() {") begin("status-acquire")
+      else if ($0 == "classify_owned_run_status_publication() {") begin("status-classify")
+      else if ($0 == "reconcile_owned_run_status_publication() {") begin("status-reconcile")
+      else if ($0 == "remove_terminal_owned_run_status_for_rewrite() {") begin("status-rewrite")
+      else if ($0 == "commit_published_run_status() {") begin("status-commit")
+      else if ($0 == "publish_owned_run_status() {") begin("status-publish")
+      else if ($0 == "cleanup() {") begin("cleanup")
+      else if ($0 ~ /^[a-zA-Z_][a-zA-Z0-9_]*\(\) \{$/) {
+        function_name = $0
+        sub(/\(\) \{$/, "", function_name)
+        if (function_name in publisher_consumer) begin("publisher:" function_name)
+        else if (function_name in normalizer_consumer) begin("normalizer:" function_name)
+      }
+
+      if (current == "j-lock" || current == "t-lock" || current == "s-lock") {
+        if (index($0, "stat -Lc '\''%d:%i:%h:%u:%a'\''") > 0) lock_stats[current]++
+        if (index($0, "flock -x -w") > 0) lock_flocks[current]++
+        if (index($0, "\"$path_identity\" == \"$descriptor_identity\"") > 0) lock_identity[current]++
+        if (index($0, "$(id -u)") > 0 &&
+            ((current == "s-lock" && index($0, "\"$owner\"") > 0) ||
+             (current != "s-lock" && index($0, "lock_owner") > 0))) lock_owner[current]++
+        if ((current == "j-lock" && index($0, "TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER=true") > 0) ||
+            (current == "t-lock" && index($0, "TERMINAL_TRANSITION_PUBLICATION_LOCK_HELD_BY_CALLER=true") > 0) ||
+            (current == "s-lock" && index($0, "OBI_METRIC_CAPTURE_STAGE_LOCK_HELD_BY_CALLER=true") > 0)) lock_tokens[current]++
+        if (index($0, "id -g") > 0 || index($0, "%g") > 0) lock_gid[current]++
+        if (current == "s-lock") {
+          if (index($0, "normalize_obi_metric_capture_stage_residue") > 0) {
+            stage_lock_normalizes++
+            stage_lock_normalize[stage_lock_normalizes] = NR
+          }
+          if ($0 == "    if \"$@\"; then") stage_lock_callback = NR
+        }
+      } else if (current == "stage-capture") {
+        if (index($0, "normalize_obi_metric_capture_stage_residue") > 0) {
+          stage_capture_normalizes++
+          stage_capture_normalize = NR
+        }
+        if (index($0, "create_obi_metric_capture_stage stage") > 0) {
+          stage_capture_creates++
+          stage_capture_create = NR
+        }
+        if (index($0, "recover_obi_metric_phase_capture_unlocked") > 0) {
+          stage_capture_recovers++
+          stage_capture_recover = NR
+        }
+        if (index($0, "with_terminal_java_diagnostics_lock") > 0) {
+          stage_capture_journals++
+          stage_capture_journal[stage_capture_journals] = NR
+        }
+        if (index($0, "cleanup_obi_metric_capture_stage") > 0) {
+          stage_capture_cleanups++
+          stage_capture_cleanup = NR
+        }
+        if (index($0, "((cleanup_status == 0)) || return") > 0) {
+          stage_cleanup_returns++
+          stage_cleanup_return = NR
+        }
+        if ($0 == "  return \"$capture_status\"") {
+          stage_capture_returns++
+          stage_capture_return = NR
+        }
+      } else if (current == "stage-public") {
+        if (index($0, "with_obi_metric_capture_stage_lock") > 0) stage_public_calls++
+      } else if (current == "stage-create") {
+        if (index($0, "if candidate_stage=\"$(mktemp -d") > 0) stage_create_mktemp = NR
+        if (index($0, "printf -v \"$output_name\"") > 0 &&
+            index($0, "\"$candidate_stage\"") > 0) {
+          stage_create_registers++
+          if (!stage_create_register) stage_create_register = NR
+        }
+        if ($0 == "  ((create_status == 0)) || return \"$create_status\"") stage_create_status = NR
+        if ($0 == "  for attempt in 1 2 3; do") stage_create_retries++
+        if (index($0, "stage_identity=\"$(stat -Lc") > 0) stage_create_stats++
+      } else if (current == "hardlink") {
+        if ($0 == "  for attempt in 1 2 3; do") hardlink_retries++
+        if ($0 == "    if ln -T -- \"$candidate\" \"$canonical\"; then") hardlink_links++
+        if (index($0, "normalize_terminal_owned_hardlink_family") > 0) hardlink_normalizers++
+      } else if (current == "live-phase") {
+        if (index($0, "OBI_METRIC_CAPTURE_STAGE_LOCK_HELD_BY_CALLER") > 0) live_s_tokens++
+        if (index($0, "TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER") > 0) live_j_tokens++
+        if (index($0, "validate_obi_process_identity_payload_structure") > 0) live_structure++
+        if ($0 == "  local metrics_link_status=1") metrics_provisional++
+        if ($0 == "  local identity_link_status=1") identity_provisional++
+        if (index($0, "metrics_link_status=1") > 0) metrics_nonzero++
+        if (index($0, "identity_link_status=1") > 0) identity_nonzero++
+        if (index($0, "metrics_link_status=0") > 0) metrics_zero++
+        if (index($0, "identity_link_status=0") > 0) identity_zero++
+      } else if (current == "live-recover") {
+        if (index($0, "OBI_METRIC_CAPTURE_STAGE_LOCK_HELD_BY_CALLER") > 0) recover_s_tokens++
+        if (index($0, "TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER") > 0) recover_j_tokens++
+        if (index($0, "normalize_owned_obi_metric_phase_capture \"$phase\" true") > 0) recover_normalizes++
+        if (index($0, "finalize_obi_metric_phase_publication_unlocked") > 0) recover_finalizes++
+        if (index($0, "obi_phase_capture_attachment_state_unlocked") > 0) recover_classifies++
+      } else if (current == "index-freeze") {
+        if (index($0, "obi_metric_capture_stage_paths_are_cleanly_absent") > 0) index_stage_guards++
+      } else if (current == "freeze" || current == "seal") {
+        if (index($0, "freeze_terminal_java_diagnostics_unlocked") > 0) prefreeze[current] = NR
+        if (index($0, "with_obi_metric_capture_stage_lock") > 0) stage_wait[current] = NR
+        if (index($0, "with_terminal_java_diagnostics_lock") > 0) journal_wait[current] = NR
+      } else if (current == "last-publish") {
+        if (index($0, "validate_last_java_diagnostics_payload_structure") > 0) last_structure++
+        if (index($0, "validate_last_java_diagnostics_payload \"") > 0) last_source_rereads++
+      } else if (current == "status-write") {
+        if ($0 == "  seal_terminal_java_diagnostics || return $?") status_seals++
+        if ($0 == "  seal_terminal_java_diagnostics || return $?") status_seal = NR
+        if (index($0, "mktemp \"$RESULT_DIR/.run-status.XXXXXX\"") > 0) status_mktemp = NR
+        if (index($0, "RUN_STATUS_CREATED_IDENTITY=\"$candidate_created_identity\"") > 0) status_created_identity = NR
+        if (index($0, "RUN_STATUS_PUBLICATION_HANDLE=\"$candidate\"") > 0) status_handle = NR
+        if (index($0, "RUN_STATUS_PUBLICATION_OUTPUT=\"$output\"") > 0) status_output = NR
+        if (index($0, "RUN_STATUS_PUBLICATION_STATE=created") > 0) status_created = NR
+        if (index($0, "if jq -n") > 0) status_payload = NR
+        if (index($0, "RUN_STATUS_PUBLICATION_STATE=prepared") > 0) status_prepared = NR
+        if (index($0, "RUN_STATUS_PUBLICATION_STATE=published") > 0) status_published++
+        if (index($0, "ln -T -- \"$candidate\" \"$output\"") > 0) status_link = NR
+        if (index($0, "reconcile_owned_run_status_publication topology") > 0) status_reconcile = NR
+        if (index($0, "[[ \"$topology\" == published_h2 ]]") > 0) {
+          status_h2_guards++
+          status_h2_guard = NR
+        }
+        if (index($0, "RUN_STATUS_PUBLICATION_STATE=validated") > 0) status_validated = NR
+        if (index($0, "rm -f -- \"$candidate\" || true") > 0) status_raw_cleanup++
+      } else if (current == "status-acquire") {
+        if ($0 == "  for attempt in 1 2 3; do") status_acquire_retries++
+        if (index($0, "\"$owner\" == \"$(id -u)\"") > 0) status_acquire_owner++
+        if (index($0, "\"$links\" == 1 || \"$links\" == 2") > 0) status_acquire_links++
+        if (index($0, "RUN_STATUS_CREATED_IDENTITY=\"$device:$inode:$owner\"") > 0) status_acquire_sets++
+      } else if (current == "status-classify") {
+        if (index($0, "RUN_STATUS_CREATED_IDENTITY") > 0) classifier_created++
+        if (index($0, "^(created|prepared|validated|committed)$") > 0) classifier_states++
+        if (index($0, "-ef \"$output\"") > 0) classifier_same_inode++
+        if (index($0, "RUN_STATUS_PUBLISHED_DIGEST") > 0) classifier_digests++
+        if (index($0, "topology=private_h1") > 0) classifier_private++
+        if (index($0, "topology=published_h2") > 0) classifier_h2++
+        if (index($0, "topology=committed_h1") > 0) classifier_committed++
+      } else if (current == "status-reconcile") {
+        if ($0 == "  for attempt in 1 2 3; do") status_reconcile_retries++
+      } else if (current == "status-rewrite") {
+        if (index($0, "remove_terminal_owned_hardlink_handle") > 0) rewrite_h2++
+        if (index($0, "remove_terminal_owned_private_path") > 0) rewrite_h1++
+        if (index($0, "\"$RUN_STATUS_PUBLISHED_IDENTITY:2\"") > 0) rewrite_h2_identity++
+        if (index($0, "\"$RUN_STATUS_PUBLISHED_IDENTITY:1\"") > 0) rewrite_h1_identity++
+        if (index($0, "[[ \"$topology\" == absent ]]") > 0) rewrite_absent_guard = NR
+        if (index($0, "clear_published_run_status_ownership") > 0) rewrite_clear++
+      } else if (current == "status-commit") {
+        if (index($0, "^(validated|committed)$") > 0) commit_states++
+        if (index($0, "remove_terminal_owned_hardlink_handle") > 0) commit_h2++
+        if (index($0, "\"$RUN_STATUS_PUBLISHED_IDENTITY:2\"") > 0) commit_h2_identity++
+        if (index($0, "RUN_STATUS_PUBLICATION_STATE=committed") > 0) commit_state = NR
+        if (index($0, "[[ \"$topology\" == committed_h1 ]]") > 0) {
+          commit_h1_guards++
+          commit_h1_guard = NR
+        }
+        if (index($0, "clear_published_run_status_ownership") > 0) commit_clear++
+      } else if (current == "status-publish") {
+        if (index($0, "commit_published_run_status") > 0) publish_commits++
+      } else if (current == "cleanup") {
+        if (index($0, "holder_status_authorized=true") > 0) {
+          holder_authorizations++
+          holder_authorization[holder_authorizations] = NR
+        }
+        if (index($0, "holder_status_authorized=false") > 0) {
+          holder_revocations++
+          holder_revocation[holder_revocations] = NR
+        }
+        if ($0 == "  elif [[ -z \"${RESULT_DIR:-}\" ]]; then") {
+          holder_empty_gates++
+          holder_empty_gate = NR
+        }
+        if ($0 == "  if [[ \"$holder_status_authorized\" == true &&") {
+          holder_primary_gates++
+          holder_primary_gate = NR
+        }
+        if ($0 == "      if [[ \"$holder_status_authorized\" == true ]] &&") {
+          holder_retry_gates++
+          holder_retry_gate = NR
+        }
+        if ($0 == "  elif [[ \"$publication_succeeded\" == true ]]; then") holder_log_gates++
+        if (index($0, "publish_owned_run_status \"$final_status\"") > 0) {
+          cleanup_publishes++
+          cleanup_publish[cleanup_publishes] = NR
+        }
+        if (index($0, "publish_project_guard_holder_status_with_retries \"$final_status\"") > 0) {
+          cleanup_holders++
+          cleanup_holder[cleanup_holders] = NR
+        }
+        if (index($0, "commit_published_run_status") > 0) cleanup_late_commit++
+      } else if (current ~ /^publisher:/) {
+        if (index($0, "publish_terminal_owned_hardlink_payload") > 0) {
+          consumer = current
+          sub(/^publisher:/, "", consumer)
+          publisher_calls[consumer]++
+        }
+      } else if (current ~ /^normalizer:/) {
+        if (index($0, "normalize_terminal_owned_hardlink_family") > 0) {
+          consumer = current
+          sub(/^normalizer:/, "", consumer)
+          normalizer_calls[consumer]++
+        }
+      }
+      if (current != "" && ($0 == "}" || $0 == ")")) current = ""
+    }
+    END {
+      split("j-lock t-lock s-lock", locks, " ")
+      for (i in locks) {
+        name = locks[i]
+        if (starts[name] != 1 || lock_stats[name] != 4 ||
+            lock_flocks[name] != 1 || lock_identity[name] != 2 ||
+            lock_owner[name] != 2 || lock_tokens[name] != 1 ||
+            lock_gid[name] != 0) invalid = 1
+      }
+      if (starts["hardlink"] != 1 || hardlink_retries != 2 ||
+          hardlink_links != 1 || hardlink_normalizers != 3 ||
+          starts["live-phase"] != 1 || live_s_tokens < 1 || live_j_tokens < 1 ||
+          live_structure != 1 ||
+          metrics_provisional != 1 || identity_provisional != 1 ||
+          metrics_nonzero != 2 || identity_nonzero != 2 ||
+          metrics_zero != 0 || identity_zero != 0 ||
+          starts["live-recover"] != 1 || recover_s_tokens < 1 ||
+          recover_j_tokens < 1 || recover_normalizes != 1 ||
+          recover_finalizes != 1 || recover_classifies != 1 ||
+          starts["index-freeze"] != 1 || index_stage_guards != 1) invalid = 1
+      if (stage_lock_normalizes != 2 || !stage_lock_callback ||
+          !(stage_lock_normalize[1] < stage_lock_callback &&
+            stage_lock_callback < stage_lock_normalize[2]) ||
+          starts["stage-capture"] != 1 || stage_capture_normalizes != 1 ||
+          stage_capture_recovers != 1 ||
+          stage_capture_creates != 1 || stage_capture_journals != 2 ||
+          stage_capture_cleanups != 1 || stage_cleanup_returns != 1 ||
+          stage_capture_returns != 1 ||
+          !(stage_capture_normalize < stage_capture_journal[1] &&
+            stage_capture_journal[1] < stage_capture_recover &&
+            stage_capture_recover < stage_capture_create &&
+            stage_capture_create < stage_capture_journal[2] &&
+            stage_capture_journal[2] < stage_capture_cleanup &&
+            stage_capture_cleanup < stage_cleanup_return &&
+            stage_cleanup_return < stage_capture_return) ||
+          starts["stage-public"] != 1 || stage_public_calls != 1) invalid = 1
+      if (starts["stage-create"] != 1 || !stage_create_mktemp ||
+          stage_create_registers != 2 || !stage_create_status ||
+          stage_create_retries != 1 || stage_create_stats != 1 ||
+          !(stage_create_mktemp < stage_create_register &&
+            stage_create_register < stage_create_status)) invalid = 1
+      for (name in publisher_consumer) {
+        if (starts["publisher:" name] != 1 || publisher_calls[name] != 1) invalid = 1
+      }
+      for (name in normalizer_consumer) {
+        if (starts["normalizer:" name] != 1 || normalizer_calls[name] != 1) invalid = 1
+      }
+      split("freeze seal", wrappers, " ")
+      for (i in wrappers) {
+        name = wrappers[i]
+        if (starts[name] != 1 || !prefreeze[name] || !stage_wait[name] ||
+            !journal_wait[name] || !(prefreeze[name] < stage_wait[name] &&
+            stage_wait[name] < journal_wait[name])) invalid = 1
+      }
+      if (starts["last-publish"] != 1 || last_structure != 1 ||
+          last_source_rereads != 0 || starts["status-write"] != 1 ||
+          status_seals != 1 || !status_seal || !(status_seal < status_mktemp) ||
+          !status_mktemp || !status_created_identity || !status_handle ||
+          !status_output ||
+          !status_created || !status_payload || !status_prepared || !status_link ||
+          !status_reconcile || !status_validated || status_published != 0 ||
+          status_raw_cleanup != 0 ||
+          !(status_mktemp < status_handle && status_handle < status_output &&
+            status_output < status_created &&
+            status_created < status_created_identity &&
+            status_created_identity < status_payload && status_payload < status_prepared &&
+            status_prepared < status_link && status_link < status_reconcile &&
+            status_reconcile < status_h2_guard &&
+            status_h2_guard < status_validated)) invalid = 1
+      if (starts["status-acquire"] != 1 || status_acquire_retries != 1 ||
+          status_acquire_owner < 1 || status_acquire_links < 1 ||
+          status_acquire_sets != 1) invalid = 1
+      if (starts["status-classify"] != 1 || classifier_created < 2 ||
+          classifier_states != 1 ||
+          classifier_same_inode < 1 || classifier_digests < 4 ||
+          classifier_private != 1 || classifier_h2 != 1 ||
+          classifier_committed != 1 || starts["status-reconcile"] != 1 ||
+          status_reconcile_retries != 1 || status_h2_guards != 1 ||
+          starts["status-rewrite"] != 1 ||
+          rewrite_h2 != 1 || rewrite_h1 != 2 || rewrite_h2_identity != 1 ||
+          rewrite_h1_identity != 1 || !rewrite_absent_guard || rewrite_clear != 2 ||
+          starts["status-commit"] != 1 || commit_states != 1 || commit_h2 != 1 ||
+          commit_h2_identity != 1 || commit_h1_guards != 1 ||
+          !(commit_h1_guard < commit_state) || !commit_state ||
+          commit_clear != 0 || starts["status-publish"] != 1 ||
+          publish_commits != 1 || starts["cleanup"] != 1 ||
+          cleanup_publishes != 3 || cleanup_holders != 2 ||
+          holder_primary_gates != 1 || holder_retry_gates != 1 ||
+          holder_log_gates != 1 || holder_authorizations != 4 ||
+          holder_revocations != 3 || holder_empty_gates != 1 ||
+          !(holder_revocation[1] < cleanup_publish[1] &&
+            cleanup_publish[1] < holder_authorization[1] &&
+            holder_authorization[1] < holder_revocation[2] &&
+            holder_revocation[2] < cleanup_publish[2] &&
+            cleanup_publish[2] < holder_authorization[2] &&
+            holder_authorization[2] < holder_empty_gate &&
+            holder_empty_gate < holder_authorization[3] &&
+            holder_authorization[3] < holder_primary_gate &&
+            holder_primary_gate < cleanup_holder[1] &&
+            cleanup_holder[1] < holder_revocation[3] &&
+            holder_revocation[3] < cleanup_publish[3] &&
+            cleanup_publish[3] < holder_authorization[4] &&
+            holder_authorization[4] < holder_retry_gate &&
+            holder_retry_gate < cleanup_holder[2]) ||
+          cleanup_late_commit != 0) invalid = 1
+      exit invalid ? 1 : 0
+    }
+  ' <<<"$runner_source"
+}
+
 terminal_java_diagnostics_source_contract_is_safe() {
   local -r runner_source="$1"
+
+  current_terminal_evidence_source_contract_is_safe "$runner_source" ||
+    return $?
 
   awk '
     BEGIN {
@@ -24336,12 +26418,12 @@ terminal_java_diagnostics_source_contract_is_safe() {
       outer_arm_marker["run_unix_generation_mismatch_control"] = "  trap restore_unix_generation_mismatch_stack EXIT"
       outer_arm_marker["run_primary_live_fd_security_control"] = "  trap restore_primary_live_fd_security_stack EXIT"
       outer_arm_marker["run_restart_during_traffic_control"] = "  trap cleanup_restart_traffic EXIT"
-      outer_success_marker["run_permanent_absence_control"] = "scenario-permanent-absence-status.json"
-      outer_success_marker["run_auto_unavailable_control"] = "scenario-auto-unavailable-status.json"
+      outer_success_marker["run_permanent_absence_control"] = "    scenario-permanent-absence-status.json || return $?"
+      outer_success_marker["run_auto_unavailable_control"] = "    scenario-auto-unavailable-status.json || return $?"
       outer_success_marker["run_helper_attach_failure_control"] = "  SCENARIO_SEED=\"$original_seed\""
       outer_success_marker["run_primary_w3c_fault_control"] = "  SCENARIO_VARIANT=\"primary-w3c-fault-recovery\""
-      outer_success_marker["run_primary_generation_mismatch_control"] = "scenario-primary-generation-mismatch-status.json"
-      outer_success_marker["run_unix_generation_mismatch_control"] = "scenario-unix-generation-mismatch-status.json"
+      outer_success_marker["run_primary_generation_mismatch_control"] = "    scenario-primary-generation-mismatch-status.json || return $?"
+      outer_success_marker["run_unix_generation_mismatch_control"] = "    scenario-unix-generation-mismatch-status.json || return $?"
       outer_success_marker["run_primary_live_fd_security_control"] = "  run_primary_live_fd_security_recovery_scenario \"$original_variant\""
       outer_success_marker["run_restart_during_traffic_control"] = "  SCENARIO_VARIANT=\"\""
       outer_recovery_marker["run_permanent_absence_control"] = "  stop_permanent_absence_jvm || return $?"
@@ -24363,206 +26445,6 @@ terminal_java_diagnostics_source_contract_is_safe() {
       recovery_requires_guard["unix-stale"] = 1
     }
     {
-      if ($0 == "record_last_java_diagnostics_reference() {") {
-        current_lock_wrapper = "record"
-        lock_wrapper_starts[current_lock_wrapper]++
-      } else if ($0 == "capture_terminal_java_diagnostics_recovery_boundary() {") {
-        current_lock_wrapper = "capture-boundary"
-        lock_wrapper_starts[current_lock_wrapper]++
-      } else if ($0 == "commit_terminal_java_diagnostics_recovery_boundary() {") {
-        current_lock_wrapper = "commit-boundary"
-        lock_wrapper_starts[current_lock_wrapper]++
-      } else if ($0 == "clear_terminal_java_diagnostics_recovery_boundary() {") {
-        current_lock_wrapper = "clear-boundary"
-        lock_wrapper_starts[current_lock_wrapper]++
-      } else if ($0 == "freeze_terminal_java_diagnostics() {") {
-        current_lock_wrapper = "freeze"
-        lock_wrapper_starts[current_lock_wrapper]++
-      } else if ($0 == "seal_terminal_java_diagnostics() {") {
-        current_lock_wrapper = "seal"
-        lock_wrapper_starts[current_lock_wrapper]++
-      }
-      if (current_lock_wrapper != "") {
-        if ($0 == "  freeze_terminal_java_diagnostics_unlocked || return $?") {
-          lock_wrapper_prefreezes[current_lock_wrapper]++
-          lock_wrapper_prefreeze[current_lock_wrapper] = NR
-        } else if ($0 == "  with_terminal_java_diagnostics_lock \\" ||
-                   (current_lock_wrapper == "seal" &&
-                    $0 == "    with_terminal_java_diagnostics_lock \\")) {
-          lock_wrapper_calls[current_lock_wrapper]++
-          if (lock_wrapper_calls[current_lock_wrapper] == 1) {
-            lock_wrapper_first_call[current_lock_wrapper] = NR
-          }
-          lock_wrapper_call[current_lock_wrapper] = NR
-        } else if ((current_lock_wrapper == "record" &&
-                    $0 == "    record_last_java_diagnostics_reference_unlocked \"$@\"") ||
-                   (current_lock_wrapper == "capture-boundary" &&
-                    $0 == "    capture_terminal_java_diagnostics_recovery_boundary_unlocked") ||
-                   (current_lock_wrapper == "commit-boundary" &&
-                    $0 == "    commit_terminal_java_diagnostics_recovery_boundary_unlocked") ||
-                   (current_lock_wrapper == "clear-boundary" &&
-                    $0 == "    clear_terminal_java_diagnostics_recovery_boundary_unlocked") ||
-                   (current_lock_wrapper == "freeze" &&
-                    $0 == "    terminal_java_diagnostics_transition_is_valid") ||
-                   (current_lock_wrapper == "seal" &&
-                    $0 == "    seal_terminal_java_diagnostics_from_recovery_state_unlocked")) {
-          lock_wrapper_targets[current_lock_wrapper]++
-          lock_wrapper_target[current_lock_wrapper] = NR
-        }
-        if ($0 == "}") {
-          current_lock_wrapper = ""
-        }
-      }
-      if ($0 == "with_terminal_java_diagnostics_lock() (") {
-        in_terminal_lock = 1
-        terminal_lock_starts++
-      }
-      if (in_terminal_lock) {
-        if (index($0, "stat -Lc '\''%d:%i:%h:%u:%a'\''") > 0) {
-          terminal_lock_stat_formats++
-        }
-        if ($0 == "    \"$path_identity\" == *\":1:$(id -u):600\" ]] || return 1") {
-          terminal_lock_owner_suffixes++
-        }
-        if (index($0, "%g") > 0 || index($0, "id -g") > 0) {
-          terminal_lock_gid_checks++
-        }
-        if ($0 == ")") {
-          in_terminal_lock = 0
-        }
-      }
-      if ($0 == "seal_terminal_java_diagnostics_unlocked() {") {
-        in_unlocked_seal = 1
-        unlocked_seal_starts++
-      }
-      if (in_unlocked_seal) {
-        if ($0 == "  freeze_terminal_java_diagnostics_unlocked || return $?") {
-          unlocked_seal_freezes++
-        } else if ($0 == "  freeze_terminal_java_diagnostics || return $?") {
-          unlocked_seal_public_freezes++
-        }
-        if ($0 == "}") {
-          in_unlocked_seal = 0
-        }
-      }
-      if ($0 == "seal_terminal_java_diagnostics_from_recovery_state_unlocked() {") {
-        in_recovery_state_seal = 1
-        recovery_state_seal_starts++
-      }
-      if (in_recovery_state_seal) {
-        if ($0 == "  transition_state=\"$(terminal_java_diagnostics_transition_state)\" || return $?") {
-          recovery_state_transition_reads++
-          recovery_state_transition_read = NR
-        } else if ($0 == "  if [[ \"$transition_state\" == \"committed\" ]]; then") {
-          recovery_state_commit_guards++
-          recovery_state_commit_guard = NR
-        } else if ($0 == "    terminal_java_diagnostics_recovery_commit_is_valid || return $?") {
-          recovery_state_committed_boundary_validators++
-        } else if ($0 == "      terminal_java_diagnostics_recovery_boundary_payload") {
-          recovery_state_boundary_captures++
-          recovery_state_boundary_capture = NR
-        } else if ($0 == "    seal_terminal_java_diagnostics_unlocked \\") {
-          recovery_state_boundary_seals++
-          recovery_state_boundary_seal = NR
-        } else if ($0 == "    seal_terminal_java_diagnostics_unlocked") {
-          recovery_state_live_seals++
-        } else if ($0 == "  seal_terminal_java_diagnostics_unlocked") {
-          recovery_state_live_seals++
-        }
-        if ($0 == "}") {
-          in_recovery_state_seal = 0
-        }
-      }
-      if (index($0, "TERMINAL_JAVA_DIAGNOSTICS_RECOVERY_BOUNDARY") > 0) {
-        legacy_dynamic_boundaries++
-      }
-      if ($0 == "capture_terminal_java_diagnostics_recovery_boundary_unlocked() {") {
-        in_boundary_capture = 1
-        boundary_capture_starts++
-      }
-      if (in_boundary_capture) {
-        if ($0 == "    ! -e \"$freeze\" && ! -L \"$freeze\" &&") {
-          boundary_capture_freeze_guards++
-        } else if ($0 == "    ! -e \"$boundary\" && ! -L \"$boundary\" ]] || return 1") {
-          boundary_capture_pending_guards++
-        }
-        if ($0 == "}") {
-          in_boundary_capture = 0
-        }
-      }
-      if ($0 == "commit_terminal_java_diagnostics_recovery_boundary_unlocked() {") {
-        in_boundary_commit = 1
-        boundary_commit_starts++
-      }
-      if (in_boundary_commit) {
-        if ($0 == "    ! -e \"$freeze\" && ! -L \"$freeze\" &&") {
-          boundary_commit_freeze_guards++
-        } else if ($0 == "  terminal_java_diagnostics_recovery_boundary_payload >/dev/null || return $?") {
-          boundary_commit_payload_validators++
-        }
-        if ($0 == "}") {
-          in_boundary_commit = 0
-        }
-      }
-      if ($0 == "terminal_java_diagnostics_recovery_commit_is_valid() {") {
-        in_recovery_commit_validator = 1
-        recovery_commit_validator_starts++
-      }
-      if (in_recovery_commit_validator) {
-        if ($0 == "  expected_boundary_digest=\"${BASH_REMATCH[1]}\"") {
-          recovery_commit_expected_digests++
-          recovery_commit_expected_digest = NR
-        } else if ($0 == "    boundary_digest=\"$(sha256sum \"$boundary\")\" || return $?") {
-          recovery_commit_digest_reads++
-          recovery_commit_digest_read = NR
-        } else if ($0 == "    [[ \"$boundary_digest\" == \"$expected_boundary_digest\" ]] || return 1") {
-          recovery_commit_digest_comparisons++
-          recovery_commit_digest_comparison = NR
-        }
-        if ($0 == "}") {
-          in_recovery_commit_validator = 0
-        }
-      }
-      if (in_boundary_commit &&
-          $0 == "    \"$boundary_digest\" >\"$candidate\" &&") {
-        recovery_commit_digest_publications++
-      }
-      if ($0 == "clear_terminal_java_diagnostics_recovery_boundary_unlocked() {") {
-        in_boundary_clear = 1
-        boundary_clear_starts++
-      }
-      if (in_boundary_clear) {
-        if ($0 == "    rm -f -- \"$boundary\" || return $?") {
-          boundary_clears++
-          boundary_clear = NR
-        } else if ($0 == "  rm -f -- \"$transition\" || return $?") {
-          commit_clears++
-          commit_clear = NR
-        }
-        if ($0 == "}") {
-          in_boundary_clear = 0
-        }
-      }
-      if ($0 == "    if ln -T -- \"$candidate\" \"$freeze\"; then" ||
-          $0 == "  if ln -T -- \"$candidate\" \"$freeze\"; then") {
-        if (in_boundary_commit) {
-          recovery_commit_no_follow_links++
-        } else {
-          freeze_no_follow_links++
-        }
-      } else if ($0 == "  if ln -T -- \"$candidate\" \"$terminal\"; then") {
-        terminal_no_follow_links++
-      } else if ($0 == "  if ln -T -- \"$candidate\" \"$boundary\"; then") {
-        recovery_boundary_no_follow_links++
-      } else if (!in_status &&
-                 $0 == "  if ln -T -- \"$candidate\" \"$output\"; then") {
-        extractor_no_follow_links++
-      } else if ($0 == "  for attempt in 1 2 3; do") {
-        freeze_retry_loops++
-      } else if ($0 == "  flock -x -w \"$TERMINAL_JAVA_DIAGNOSTICS_LOCK_TIMEOUT_SECONDS\" \\") {
-        bounded_lock_acquires++
-      }
-
       for (name in required) {
         if ($0 == "  " name "() {") {
           current = name
@@ -24729,7 +26611,7 @@ terminal_java_diagnostics_source_contract_is_safe() {
         } else if (index($0, "mv -fT -- \"$candidate\" \"$output\"") > 0) {
           capture_moves++
           capture_move = NR
-        } else if ($0 == "  record_last_java_diagnostics_phase \"$phase\"") {
+        } else if ($0 == "  record_last_java_diagnostics_phase \"$phase\" || return $?") {
           capture_records++
           capture_record = NR
         }
@@ -24738,12 +26620,12 @@ terminal_java_diagnostics_source_contract_is_safe() {
         }
       }
 
-      if ($0 == "extract_java_diagnostics_header() {") {
+      if ($0 == "extract_java_diagnostics_header_unlocked() {") {
         in_header = 1
         header_starts++
       }
       if (in_header) {
-        if ($0 == "  record_last_java_diagnostics_reference \\") {
+        if ($0 == "  record_last_java_diagnostics_reference_unlocked \"$reference\"") {
           header_records++
           header_record = NR
         }
@@ -24752,137 +26634,17 @@ terminal_java_diagnostics_source_contract_is_safe() {
         }
       }
 
-      if ($0 == "extract_terminal_diagnostics_after() {") {
+      if ($0 == "extract_terminal_diagnostics_after_unlocked() {") {
         in_terminal_extract = 1
         terminal_extract_starts++
       }
       if (in_terminal_extract) {
-        if ($0 == "  record_last_java_diagnostics_reference \\") {
+        if ($0 == "  record_last_java_diagnostics_reference_unlocked \"$reference\"") {
           terminal_extract_records++
           terminal_extract_record = NR
         }
         if ($0 == "}") {
           in_terminal_extract = 0
-        }
-      }
-
-      if ($0 == "write_run_status() {") {
-        in_status = 1
-        status_starts++
-      }
-      if (in_status) {
-        if ($0 == "  seal_terminal_java_diagnostics || return $?") {
-          status_seals++
-          status_seal = NR
-        } else if (index($0, "if jq -n") > 0) {
-          status_writes++
-          status_write = NR
-        } else if ($0 == "  if ln -T -- \"$candidate\" \"$output\"; then") {
-          status_links++
-          status_link = NR
-        } else if ($0 == "  RUN_STATUS_PUBLICATION_HANDLE=\"$candidate\"") {
-          status_handle_sets++
-          status_handle_set = NR
-        } else if ($0 == "  RUN_STATUS_PUBLICATION_OUTPUT=\"$output\"") {
-          status_output_sets++
-          status_output_set = NR
-        } else if ($0 == "  RUN_STATUS_PUBLICATION_STATE=prepared") {
-          status_prepared_sets++
-          status_prepared_set = NR
-        } else if ($0 == "    RUN_STATUS_PUBLICATION_STATE=published") {
-          status_published_sets++
-          status_published_set = NR
-        } else if ($0 == "      -f \"$output\" && ! -L \"$output\" && \"$candidate\" -ef \"$output\" ]]; then") {
-          status_side_effect_guards++
-          status_side_effect_guard = NR
-        } else if ($0 == "      RUN_STATUS_PUBLICATION_STATE=published") {
-          status_side_effect_published_sets++
-          status_side_effect_published_set = NR
-        } else if ($0 == "  RUN_STATUS_PUBLICATION_STATE=validated") {
-          status_validated_sets++
-          status_validated_set = NR
-        } else if (index($0, "\"$output_identity\" == \"$candidate_identity\"") > 0) {
-          status_identity_checks++
-          status_identity_check = NR
-        }
-        if ($0 == "}") {
-          in_status = 0
-        }
-      }
-
-      if ($0 == "remove_published_run_status() {") {
-        in_status_remove = 1
-        status_remove_starts++
-      }
-      if (in_status_remove) {
-        if (index($0, "RUN_STATUS_PUBLICATION_HANDLE") > 0 &&
-            index($0, "$RESULT_DIR\"/.run-status.*") > 0) {
-          status_remove_handle_path_checks++
-        } else if ($0 == "    rm -f -- \"$output\" || return $?") {
-          status_remove_outputs++
-          status_remove_output = NR
-        } else if ($0 == "    rm -f -- \"$RUN_STATUS_PUBLICATION_HANDLE\" || return $?") {
-          status_remove_handles++
-          status_remove_handle = NR
-        }
-        if ($0 == "}") {
-          in_status_remove = 0
-        }
-      }
-
-      if ($0 == "remove_terminal_owned_run_status_for_rewrite() {") {
-        in_terminal_status_remove = 1
-        terminal_status_remove_starts++
-      }
-      if (in_terminal_status_remove) {
-        if ($0 == "    \"$RUN_STATUS_PUBLICATION_STATE\" =~ ^(published|validated)$ ]] || return 1") {
-          terminal_status_remove_state_guards++
-          terminal_status_remove_state_guard = NR
-        } else if ($0 == "  rm -f -- \"$output\" || return $?") {
-          terminal_status_remove_outputs++
-          terminal_status_remove_output = NR
-        } else if ($0 == "  rm -f -- \"$RUN_STATUS_PUBLICATION_HANDLE\" || return $?") {
-          terminal_status_remove_handles++
-          terminal_status_remove_handle = NR
-        } else if ($0 == "  clear_published_run_status_ownership") {
-          terminal_status_remove_clears++
-          terminal_status_remove_clear = NR
-        }
-        if ($0 == "}") {
-          in_terminal_status_remove = 0
-        }
-      }
-
-      if ($0 == "publish_owned_run_status() {") {
-        in_owned_status_publish = 1
-        owned_status_publish_starts++
-      }
-      if (in_owned_status_publish) {
-        if ($0 == "    remove_terminal_owned_run_status_for_rewrite || return \"$publication_status\"") {
-          owned_status_publish_terminal_removals++
-        }
-        if ($0 == "}") {
-          in_owned_status_publish = 0
-        }
-      }
-
-      if ($0 == "commit_published_run_status() {") {
-        in_status_commit = 1
-        status_commit_starts++
-      }
-      if (in_status_commit) {
-        if ($0 == "    \"$RUN_STATUS_PUBLICATION_STATE\" == validated &&") {
-          status_commit_validated_guards++
-          status_commit_validated_guard = NR
-        } else if ($0 == "  rm -f -- \"$RUN_STATUS_PUBLICATION_HANDLE\" || return $?") {
-          status_commit_handle_removals++
-          status_commit_handle_removal = NR
-        } else if ($0 == "  clear_published_run_status_ownership") {
-          status_commit_clears++
-          status_commit_clear = NR
-        }
-        if ($0 == "}") {
-          in_status_commit = 0
         }
       }
 
@@ -24907,18 +26669,6 @@ terminal_java_diagnostics_source_contract_is_safe() {
         } else if (index($0, "if safe_compose_down") > 0) {
           cleanup_stops++
           cleanup_stop = NR
-        } else if ($0 == "    if publish_owned_run_status \"$final_status\"; then") {
-          cleanup_status_publications++
-          cleanup_status_publication = NR
-        } else if ($0 == "    if publish_project_guard_holder_status_with_retries \"$final_status\"; then") {
-          cleanup_holder_publications++
-          cleanup_holder_publication = NR
-        } else if ($0 == "          remove_terminal_owned_run_status_for_rewrite; then") {
-          cleanup_terminal_status_rewrites++
-          cleanup_terminal_status_rewrite = NR
-        } else if ($0 == "    if commit_published_run_status; then") {
-          cleanup_status_commits++
-          cleanup_status_commit = NR
         }
         if ($0 == "}") {
           in_cleanup = 0
@@ -25062,75 +26812,9 @@ terminal_java_diagnostics_source_contract_is_safe() {
       }
     }
     END {
-      for (name in lock_wrapper_starts) {
-        if (lock_wrapper_starts[name] != 1) {
-          invalid = 1
-        }
-        if ((name == "record" || name == "capture-boundary" ||
-             name == "commit-boundary" || name == "clear-boundary") &&
-            (lock_wrapper_calls[name] != 1 || lock_wrapper_targets[name] != 1 ||
-             lock_wrapper_prefreezes[name] != 0 ||
-             !(lock_wrapper_call[name] < lock_wrapper_target[name]))) {
-          invalid = 1
-        }
-        if (name == "freeze" &&
-            (lock_wrapper_calls[name] != 1 || lock_wrapper_targets[name] != 1 ||
-             lock_wrapper_prefreezes[name] != 1 ||
-             !(lock_wrapper_prefreeze[name] < lock_wrapper_call[name] &&
-               lock_wrapper_call[name] < lock_wrapper_target[name]))) {
-          invalid = 1
-        }
-        if (name == "seal" &&
-            (lock_wrapper_calls[name] != 1 || lock_wrapper_targets[name] != 1 ||
-             lock_wrapper_prefreezes[name] != 1 ||
-             !(lock_wrapper_prefreeze[name] < lock_wrapper_call[name] &&
-               lock_wrapper_call[name] < lock_wrapper_target[name]))) {
-          invalid = 1
-        }
-      }
-      if (lock_wrapper_starts["record"] != 1 ||
-          lock_wrapper_starts["capture-boundary"] != 1 ||
-          lock_wrapper_starts["commit-boundary"] != 1 ||
-          lock_wrapper_starts["clear-boundary"] != 1 ||
-          lock_wrapper_starts["freeze"] != 1 ||
-          lock_wrapper_starts["seal"] != 1 ||
-          unlocked_seal_starts != 1 || unlocked_seal_freezes != 1 ||
-          unlocked_seal_public_freezes != 0 ||
-          recovery_state_seal_starts != 1 ||
-          recovery_state_transition_reads != 1 ||
-          recovery_state_commit_guards != 1 ||
-          recovery_state_committed_boundary_validators != 1 ||
-          recovery_state_boundary_captures != 1 ||
-          recovery_state_boundary_seals != 1 ||
-          recovery_state_live_seals != 2 ||
-          !(recovery_state_transition_read < recovery_state_commit_guard &&
-            recovery_state_commit_guard < recovery_state_boundary_capture &&
-            recovery_state_boundary_capture < recovery_state_boundary_seal) ||
-          legacy_dynamic_boundaries != 0 ||
-          boundary_capture_starts != 1 ||
-          boundary_capture_freeze_guards != 1 ||
-          boundary_capture_pending_guards != 1 ||
-          boundary_commit_starts != 1 ||
-          boundary_commit_freeze_guards != 1 ||
-          boundary_commit_payload_validators != 1 ||
-          recovery_commit_validator_starts != 1 ||
-          recovery_commit_expected_digests != 1 ||
-          recovery_commit_digest_reads != 1 ||
-          recovery_commit_digest_comparisons != 1 ||
-          recovery_commit_digest_publications != 1 ||
-          !(recovery_commit_expected_digest < recovery_commit_digest_read &&
-            recovery_commit_digest_read < recovery_commit_digest_comparison) ||
-          boundary_clear_starts != 1 || boundary_clears != 1 ||
-          commit_clears != 1 || !(boundary_clear < commit_clear) ||
-          freeze_no_follow_links != 1 || terminal_no_follow_links != 2 ||
-          recovery_boundary_no_follow_links != 1 ||
-          recovery_commit_no_follow_links != 1 ||
-          extractor_no_follow_links != 4 || freeze_retry_loops != 1 ||
-          bounded_lock_acquires != 1 || terminal_lock_starts != 1 ||
-          terminal_lock_stat_formats != 2 ||
-          terminal_lock_owner_suffixes != 1 || terminal_lock_gid_checks != 0) {
-        invalid = 1
-      }
+      # Current lock, hardlink, stage, and run-status mechanics are asserted by
+      # the compact checker above. This retained pass covers the independent
+      # recovery handlers and control-flow ordering only.
       for (name in required) {
         if (starts[name] != 1 || traps[name] != 1 || relaxed[name] != 1 ||
             seals[name] != 1 || seal_statuses[name] != 1 || mutation[name] != 1 ||
@@ -25189,55 +26873,13 @@ terminal_java_diagnostics_source_contract_is_safe() {
           terminal_extract_starts != 1 || terminal_extract_records != 1) {
         invalid = 1
       }
-      if (status_starts != 1 || status_seals != 1 || status_writes != 1 ||
-          status_links != 1 || status_handle_sets != 1 || status_output_sets != 1 ||
-          status_prepared_sets != 1 || status_published_sets != 1 ||
-          status_side_effect_guards != 1 ||
-          status_side_effect_published_sets != 1 ||
-          status_validated_sets != 1 ||
-          status_identity_checks != 1 ||
-          !(status_seal < status_write && status_write < status_handle_set &&
-            status_handle_set < status_output_set &&
-            status_output_set < status_prepared_set &&
-            status_prepared_set < status_link && status_link < status_published_set &&
-            status_published_set < status_side_effect_guard &&
-            status_side_effect_guard < status_side_effect_published_set &&
-            status_side_effect_published_set < status_identity_check &&
-            status_identity_check < status_validated_set)) {
-        invalid = 1
-      }
-      if (status_remove_starts != 1 || status_remove_handle_path_checks != 1 ||
-          status_remove_outputs != 1 || status_remove_handles != 1 ||
-          !(status_remove_output < status_remove_handle) ||
-          terminal_status_remove_starts != 1 ||
-          terminal_status_remove_state_guards != 1 ||
-          terminal_status_remove_outputs != 1 ||
-          terminal_status_remove_handles != 1 ||
-          terminal_status_remove_clears != 1 ||
-          !(terminal_status_remove_state_guard < terminal_status_remove_output &&
-            terminal_status_remove_output < terminal_status_remove_handle &&
-            terminal_status_remove_clear == terminal_status_remove_handle + 1) ||
-          owned_status_publish_starts != 1 ||
-          owned_status_publish_terminal_removals != 1 ||
-          status_commit_starts != 1 || status_commit_handle_removals != 1 ||
-          status_commit_clears != 1 || status_commit_validated_guards != 1 ||
-          !(status_commit_validated_guard < status_commit_handle_removal &&
-            status_commit_clear == status_commit_handle_removal + 1)) {
-        invalid = 1
-      }
       if (cleanup_starts != 1 || cleanup_terminal_guards != 1 ||
           cleanup_terminal_seals != 1 || cleanup_security_calls != 1 ||
           cleanup_captures != 1 || cleanup_stops != 1 ||
-          cleanup_status_publications != 1 || cleanup_holder_publications != 1 ||
-          cleanup_terminal_status_rewrites != 1 || cleanup_status_commits != 1 ||
           !(cleanup_terminal_guard < cleanup_terminal_seal &&
             cleanup_terminal_seal < cleanup_security_call &&
             cleanup_security_call < cleanup_capture &&
-            cleanup_capture < cleanup_stop &&
-            cleanup_stop < cleanup_status_publication &&
-            cleanup_status_publication < cleanup_holder_publication &&
-            cleanup_holder_publication < cleanup_terminal_status_rewrite &&
-            cleanup_terminal_status_rewrite < cleanup_status_commit)) {
+            cleanup_capture < cleanup_stop)) {
         invalid = 1
       }
       if (primary_security_starts != 1 || primary_security_boundaries != 1 ||
@@ -25311,36 +26953,11 @@ terminal_java_diagnostics_source_contract_is_safe() {
             outer_disarms[name], outer_clears[name] \
             > "/dev/stderr"
         }
-        for (name in lock_wrapper_starts) {
-          printf "lock=%s start=%d call=%d target=%d prefreeze=%d first=%d last=%d target_line=%d\n", \
-            name, lock_wrapper_starts[name], lock_wrapper_calls[name], \
-            lock_wrapper_targets[name], lock_wrapper_prefreezes[name], \
-            lock_wrapper_first_call[name], lock_wrapper_call[name], \
-            lock_wrapper_target[name] > "/dev/stderr"
-        }
-        printf "lock-core terminal=%d format=%d owner=%d gid=%d seal=%d/freeze%d/public%d links=%d/%d/%d/%d/%d retry=%d acquire=%d\n", \
-          terminal_lock_starts, terminal_lock_stat_formats, \
-          terminal_lock_owner_suffixes, terminal_lock_gid_checks, \
-          unlocked_seal_starts, unlocked_seal_freezes, \
-          unlocked_seal_public_freezes, freeze_no_follow_links, \
-          terminal_no_follow_links, recovery_boundary_no_follow_links, \
-          recovery_commit_no_follow_links, extractor_no_follow_links, \
-          freeze_retry_loops, bounded_lock_acquires > "/dev/stderr"
-        printf "recovery-state=%d read=%d guard=%d committed-valid=%d capture=%d boundary-seal=%d live-seal=%d legacy=%d helpers=%d/%d/%d capture-guards=%d/%d commit-guard=%d/validator=%d clear=%d/%d\n", \
-          recovery_state_seal_starts, recovery_state_transition_reads, \
-          recovery_state_commit_guards, recovery_state_committed_boundary_validators, \
-          recovery_state_boundary_captures, recovery_state_boundary_seals, \
-          recovery_state_live_seals, legacy_dynamic_boundaries, \
-          boundary_capture_starts, boundary_commit_starts, boundary_clear_starts, \
-          boundary_capture_freeze_guards, boundary_capture_pending_guards, \
-          boundary_commit_freeze_guards, boundary_commit_payload_validators, \
-          boundary_clears, commit_clears > "/dev/stderr"
-        printf "abort=%d/%d/%d/%d deliberate=%d/%d/%d/%d capture=%d/%d/%d/%d/%d/%d/%d status=%d/%d/%d/link%d/id%d cleanup=%d/%d/%d\n", \
+        printf "abort=%d/%d/%d/%d deliberate=%d/%d/%d/%d capture=%d/%d/%d/%d/%d/%d/%d cleanup=%d/%d/%d\n", \
           abort_starts, abort_seals, abort_captures, abort_stops, \
           deliberate_starts, deliberate_seals, deliberate_reads, deliberate_dies, \
           capture_starts, capture_curls, capture_heads, capture_bounds, \
           capture_validators, capture_moves, capture_records, \
-          status_starts, status_seals, status_writes, status_links, status_identity_checks, \
           cleanup_starts, cleanup_captures, cleanup_stops > "/dev/stderr"
         for (name in recovery_starts) {
           printf "recovery=%s start=%d guard=%d seal=%d seal_status=%d boundary=%d mutation=%d commit=%d clear=%d lines=%d/%d/%d/%d/%d\n", \
@@ -25391,6 +27008,187 @@ test_terminal_java_diagnostics_hooks_are_mutation_sensitive() {
     printf 'terminal Java diagnostics source contract is incomplete\n' >&2
     return 1
   }
+
+  for spec in \
+    'with_terminal_java_diagnostics_lock|  local TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER=true' \
+    'with_terminal_java_diagnostics_transition_publication_lock|  local TERMINAL_TRANSITION_PUBLICATION_LOCK_HELD_BY_CALLER=true' \
+    'with_obi_metric_capture_stage_lock|  local OBI_METRIC_CAPTURE_STAGE_LOCK_HELD_BY_CALLER=true' \
+    'capture_bounded_obi_metric_phase_unlocked|  normalize_obi_metric_capture_stage_residue || return $?' \
+    'capture_bounded_obi_metric_phase_unlocked|    recover_obi_metric_phase_capture_unlocked "$phase"; then' \
+    'capture_bounded_obi_metric_phase_unlocked|  if create_obi_metric_capture_stage stage; then' \
+    'capture_bounded_obi_metric_phase_unlocked|    with_terminal_java_diagnostics_lock \' \
+    'capture_bounded_obi_metric_phase_unlocked|    cleanup_obi_metric_capture_stage \' \
+    'capture_bounded_obi_metric_phase|  with_obi_metric_capture_stage_lock \' \
+    'create_obi_metric_capture_stage|  if candidate_stage="$(mktemp -d \' \
+    'create_obi_metric_capture_stage|    printf -v "$output_name" '\''%s'\'' "$candidate_stage"' \
+    'create_obi_metric_capture_stage|  [[ -n "${!output_name}" ]] || printf -v "$output_name" '\''%s'\'' "$candidate_stage"' \
+    'create_obi_metric_capture_stage|  ((create_status == 0)) || return "$create_status"' \
+    'create_obi_metric_capture_stage|  for attempt in 1 2 3; do' \
+    'publish_terminal_owned_hardlink_payload|    if ln -T -- "$candidate" "$canonical"; then' \
+    'capture_bounded_obi_metric_phase_publication_unlocked|  [[ "${OBI_METRIC_CAPTURE_STAGE_LOCK_HELD_BY_CALLER:-false}" == true &&' \
+    'capture_bounded_obi_metric_phase_publication_unlocked|  validate_obi_process_identity_payload_structure \' \
+    'capture_bounded_obi_metric_phase_publication_unlocked|  local metrics_link_status=1' \
+    'capture_bounded_obi_metric_phase_publication_unlocked|  local identity_link_status=1' \
+    'capture_bounded_obi_metric_phase_publication_unlocked|      metrics_link_status=1' \
+    'capture_bounded_obi_metric_phase_publication_unlocked|      identity_link_status=1' \
+    'recover_obi_metric_phase_capture_unlocked|  if normalize_owned_obi_metric_phase_capture "$phase" true; then' \
+    'recover_obi_metric_phase_capture_unlocked|    finalize_obi_metric_phase_publication_unlocked \' \
+    'recover_obi_metric_phase_capture_unlocked|    attachment_state="$(obi_phase_capture_attachment_state_unlocked \' \
+    'freeze_obi_metric_boundary_index_unlocked|  obi_metric_capture_stage_paths_are_cleanly_absent || return 1' \
+    'freeze_terminal_java_diagnostics|  with_obi_metric_capture_stage_lock \' \
+    'seal_terminal_java_diagnostics|  with_obi_metric_capture_stage_lock \' \
+    'publish_last_java_diagnostics_payload_unlocked|    validate_last_java_diagnostics_payload_structure "$payload" >/dev/null || {' \
+    'write_run_status|  RUN_STATUS_PUBLICATION_HANDLE="$candidate"' \
+    'write_run_status|  RUN_STATUS_PUBLICATION_OUTPUT="$output"' \
+    'write_run_status|  RUN_STATUS_CREATED_IDENTITY="$candidate_created_identity"' \
+    'write_run_status|  RUN_STATUS_PUBLICATION_STATE=created' \
+    'write_run_status|  RUN_STATUS_PUBLICATION_STATE=prepared' \
+    'write_run_status|  RUN_STATUS_PUBLICATION_STATE=validated' \
+    'acquire_run_status_created_identity|  RUN_STATUS_CREATED_IDENTITY="$device:$inode:$owner"' \
+    'classify_owned_run_status_publication|      ^(created|prepared|validated|committed)$ ]] || return 1' \
+    'reconcile_owned_run_status_publication|  for attempt in 1 2 3; do' \
+    'remove_terminal_owned_run_status_for_rewrite|        "$RUN_STATUS_PUBLISHED_IDENTITY:2" || return $?' \
+    'remove_terminal_owned_run_status_for_rewrite|        "$output" "$RUN_STATUS_PUBLISHED_IDENTITY:1" || return $?' \
+    'write_run_status|  if ! reconcile_owned_run_status_publication topology; then' \
+    'write_run_status|  [[ "$topology" == published_h2 ]] || return "$publication_status"' \
+    'commit_published_run_status|  [[ "$RUN_STATUS_PUBLICATION_STATE" =~ ^(validated|committed)$ ]] ||' \
+    'commit_published_run_status|        "$RUN_STATUS_PUBLISHED_IDENTITY:2" || return $?' \
+    'commit_published_run_status|  [[ "$topology" == committed_h1 ]] || return 1' \
+    'commit_published_run_status|  RUN_STATUS_PUBLICATION_STATE=committed' \
+    'publish_owned_run_status|  commit_published_run_status' \
+    'cleanup|    if publish_owned_run_status "$final_status"; then' \
+    'cleanup|  elif [[ -z "${RESULT_DIR:-}" ]]; then' \
+    'cleanup|  if [[ "$holder_status_authorized" == true &&' \
+    'cleanup|      if [[ "$holder_status_authorized" == true ]] &&' \
+    'cleanup|  elif [[ "$publication_succeeded" == true ]]; then'; do
+    target="${spec%%|*}"
+    marker="${spec#*|}"
+    mutation="$(MARKER="$marker" awk -v target="$target" '
+      BEGIN { marker = ENVIRON["MARKER"] }
+      $0 == target "() {" || $0 == target "() (" { inside = 1 }
+      inside && !removed && $0 == marker { removed = 1; next }
+      { print }
+      inside && $0 == "}" { inside = 0 }
+      inside && $0 == ")" { inside = 0 }
+      END { if (removed != 1) exit 1 }
+    ' <<<"$runner_source")" || return 1
+    if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+      printf 'terminal evidence accepted missing %s marker in %s\n' \
+        "$marker" "$target" >&2
+      return 1
+    fi
+  done
+
+  for spec in \
+    'publish_owned_run_status "$final_status"|2' \
+    'publish_owned_run_status "$final_status"|3' \
+    'publish_project_guard_holder_status_with_retries "$final_status"|1' \
+    'publish_project_guard_holder_status_with_retries "$final_status"|2' \
+    'holder_status_authorized=true|1' \
+    'holder_status_authorized=true|2' \
+    'holder_status_authorized=true|3' \
+    'holder_status_authorized=true|4' \
+    'holder_status_authorized=false|1' \
+    'holder_status_authorized=false|2' \
+    'holder_status_authorized=false|3'; do
+    marker="${spec%%|*}"
+    occurrence="${spec##*|}"
+    mutation="$(awk -v marker="$marker" -v wanted="$occurrence" '
+      $0 == "cleanup() {" { inside = 1 }
+      inside && index($0, marker) > 0 {
+        seen++
+        if (seen == wanted) { removed = 1; next }
+      }
+      { print }
+      inside && $0 == "}" { inside = 0 }
+      END { if (removed != 1) exit 1 }
+    ' <<<"$runner_source")" || return 1
+    if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+      printf 'terminal evidence accepted missing cleanup authority step %s #%s\n' \
+        "$marker" "$occurrence" >&2
+      return 1
+    fi
+  done
+
+  mutation="$(awk '
+    $0 == "publish_terminal_owned_hardlink_payload() {" { inside = 1 }
+    inside && !changed && $0 == "  for attempt in 1 2 3; do" {
+      sub(/1 2 3/, "1")
+      changed = 1
+    }
+    { print }
+    inside && $0 == "}" { inside = 0 }
+    END { if (changed != 1) exit 1 }
+  ' <<<"$runner_source")" || return 1
+  if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+    printf 'terminal evidence accepted a single-attempt generic publication\n' >&2
+    return 1
+  fi
+
+  mutation="$(awk '
+    $0 == "with_obi_metric_capture_stage_lock() (" { inside = 1 }
+    inside && index($0, "normalize_obi_metric_capture_stage_residue") > 0 {
+      seen++
+      if (seen == 2) { removed = 1; next }
+    }
+    { print }
+    inside && $0 == ")" { inside = 0 }
+    END { if (removed != 1) exit 1 }
+  ' <<<"$runner_source")" || return 1
+  if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+    printf 'terminal evidence accepted a stage lock without exit normalization\n' >&2
+    return 1
+  fi
+
+  for target in \
+    extract_java_diagnostics_header_unlocked \
+    extract_terminal_diagnostics_after_unlocked \
+    capture_terminal_java_diagnostics_recovery_boundary_unlocked \
+    commit_terminal_java_diagnostics_recovery_boundary_publication_unlocked \
+    seal_terminal_obi_metrics_unlocked \
+    freeze_terminal_java_diagnostics_publication_unlocked \
+    seal_terminal_java_diagnostics_unlocked; do
+    mutation="$(awk -v target="$target" '
+      $0 == target "() {" { inside = 1 }
+      inside && !removed &&
+        index($0, "publish_terminal_owned_hardlink_payload") > 0 {
+        sub(/publish_terminal_owned_hardlink_payload/, "true")
+        removed = 1
+      }
+      { print }
+      inside && $0 == "}" { inside = 0 }
+      END { if (removed != 1) exit 1 }
+    ' <<<"$runner_source")" || return 1
+    if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+      printf 'terminal evidence accepted missing generic publisher in %s\n' \
+        "$target" >&2
+      return 1
+    fi
+  done
+
+  for target in \
+    normalize_terminal_java_phase_and_last_candidates_before_freeze \
+    normalize_terminal_java_diagnostics_recovery_boundary_residue \
+    normalize_terminal_java_diagnostics_transition_residue_unlocked \
+    normalize_terminal_java_diagnostics_residue \
+    normalize_terminal_obi_metrics_residue; do
+    mutation="$(awk -v target="$target" '
+      $0 == target "() {" { inside = 1 }
+      inside && !removed &&
+        index($0, "normalize_terminal_owned_hardlink_family") > 0 {
+        sub(/normalize_terminal_owned_hardlink_family/, "true")
+        removed = 1
+      }
+      { print }
+      inside && $0 == "}" { inside = 0 }
+      END { if (removed != 1) exit 1 }
+    ' <<<"$runner_source")" || return 1
+    if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
+      printf 'terminal evidence accepted missing generic normalizer in %s\n' \
+        "$target" >&2
+      return 1
+    fi
+  done
 
   mutation="$(awk '
     $0 == "cleanup() {" { inside = 1 }
@@ -25506,161 +27304,6 @@ test_terminal_java_diagnostics_hooks_are_mutation_sensitive() {
   ' <<<"$runner_source")" || return 1
   if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
     printf 'terminal diagnostics accepted a post-restore permissive capture\n' >&2
-    return 1
-  fi
-
-  for target in \
-    record_last_java_diagnostics_reference \
-    capture_terminal_java_diagnostics_recovery_boundary \
-    commit_terminal_java_diagnostics_recovery_boundary \
-    clear_terminal_java_diagnostics_recovery_boundary \
-    freeze_terminal_java_diagnostics \
-    seal_terminal_java_diagnostics; do
-    mutation="$(awk -v target="$target" '
-      $0 == target "() {" { inside = 1 }
-      inside && !removed &&
-        $0 ~ /^  +with_terminal_java_diagnostics_lock \\$/ {
-        removed = 1
-        next
-      }
-      { print }
-      inside && $0 == "}" { inside = 0 }
-      END { if (!removed) exit 1 }
-    ' <<<"$runner_source")" || return 1
-    if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
-      printf 'terminal diagnostics accepted an unlocked %s\n' "$target" >&2
-      return 1
-    fi
-  done
-
-  for target in \
-    freeze_terminal_java_diagnostics \
-    seal_terminal_java_diagnostics; do
-    mutation="$(awk -v target="$target" '
-      $0 == target "() {" { inside = 1 }
-      inside && !removed &&
-        $0 == "  freeze_terminal_java_diagnostics_unlocked || return $?" {
-        removed = 1
-        next
-      }
-      { print }
-      inside && $0 == "}" { inside = 0 }
-      END { if (!removed) exit 1 }
-    ' <<<"$runner_source")" || return 1
-    if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
-      printf 'terminal diagnostics accepted a pre-lock freeze omission in %s\n' \
-        "$target" >&2
-      return 1
-    fi
-  done
-
-  mutation="$(awk '
-    $0 == "with_terminal_java_diagnostics_lock() (" { inside = 1 }
-    {
-      line = $0
-      if (inside && index(line, "stat -Lc") > 0 &&
-          index(line, "%d:%i:%h:%u:%a") > 0) {
-        sub(/%u:%a/, "%u:%g:%a", line)
-        changed++
-      }
-      if (inside && index(line, "$path_identity") > 0 &&
-          index(line, "$(id -u):600") > 0) {
-        sub(/\$\(id -u\):600/, "$(id -u):$(id -g):600", line)
-        changed++
-      }
-      print line
-    }
-    inside && $0 == ")" { inside = 0 }
-    END { if (changed != 3) exit 1 }
-  ' <<<"$runner_source")" || return 1
-  if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
-    printf 'terminal diagnostics accepted a primary-GID lock restriction\n' >&2
-    return 1
-  fi
-
-  for target in freeze terminal boundary output; do
-    mutation="$(awk -v target="\$$target" '
-      !changed && index($0,
-        "if ln -T -- \"$candidate\" \"" target "\"; then") > 0 {
-        sub(/ln -T --/, "ln --")
-        changed = 1
-      }
-      { print }
-      END { if (!changed) exit 1 }
-    ' <<<"$runner_source")" || return 1
-    if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
-      printf 'terminal diagnostics accepted a directory-following %s link\n' \
-        "$target" >&2
-      return 1
-    fi
-  done
-
-  mutation="$(awk '
-    $0 == "commit_terminal_java_diagnostics_recovery_boundary_unlocked() {" {
-      inside = 1
-    }
-    inside && !changed &&
-      $0 == "  if ln -T -- \"$candidate\" \"$freeze\"; then" {
-      sub(/ln -T --/, "ln --")
-      changed = 1
-    }
-    { print }
-    inside && $0 == "}" { inside = 0 }
-    END { if (!changed) exit 1 }
-  ' <<<"$runner_source")" || return 1
-  if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
-    printf 'terminal diagnostics accepted a directory-following recovery commit\n' >&2
-    return 1
-  fi
-
-  mutation="$(awk '
-    $0 == "terminal_java_diagnostics_recovery_commit_is_valid() {" {
-      inside = 1
-    }
-    inside && !changed &&
-      $0 == "    [[ \"$boundary_digest\" == \"$expected_boundary_digest\" ]] || return 1" {
-      print "    [[ -n \"$expected_boundary_digest\" ]] || return 1"
-      changed = 1
-      next
-    }
-    { print }
-    inside && $0 == "}" { inside = 0 }
-    END { if (!changed) exit 1 }
-  ' <<<"$runner_source")" || return 1
-  if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
-    printf 'terminal diagnostics accepted an unbound recovery commit digest\n' >&2
-    return 1
-  fi
-
-  mutation="$(awk '
-    $0 == "commit_terminal_java_diagnostics_recovery_boundary_unlocked() {" {
-      inside = 1
-    }
-    inside && !changed &&
-      $0 == "    \"$boundary_digest\" >\"$candidate\" &&" {
-      print "    \"0000000000000000000000000000000000000000000000000000000000000000\" >\"$candidate\" &&"
-      changed = 1
-      next
-    }
-    { print }
-    inside && $0 == "}" { inside = 0 }
-    END { if (!changed) exit 1 }
-  ' <<<"$runner_source")" || return 1
-  if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
-    printf 'terminal diagnostics accepted a substituted recovery commit digest\n' >&2
-    return 1
-  fi
-
-  mutation="$(awk '
-    !changed && $0 == "  for attempt in 1 2 3; do" {
-      sub(/1 2 3/, "1")
-      changed = 1
-    }
-    { print }
-    END { if (!changed) exit 1 }
-  ' <<<"$runner_source")" || return 1
-  if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
-    printf 'terminal diagnostics accepted a single-attempt freeze publication\n' >&2
     return 1
   fi
 
@@ -25786,176 +27429,6 @@ test_terminal_java_diagnostics_hooks_are_mutation_sensitive() {
   fi
 
   mutation="$(awk '
-    $0 == "seal_terminal_java_diagnostics_from_recovery_state_unlocked() {" {
-      inside = 1
-    }
-    inside && !changed &&
-      $0 == "      terminal_java_diagnostics_recovery_boundary_payload" {
-      print "      printf '\''null\\n'\''"
-      changed = 1
-      next
-    }
-    { print }
-    inside && $0 == "}" { inside = 0 }
-    END { if (!changed) exit 1 }
-  ' <<<"$runner_source")" || return 1
-  if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
-    printf 'terminal diagnostics accepted pending-boundary substitution\n' >&2
-    return 1
-  fi
-
-  mutation="$(awk '
-    $0 == "seal_terminal_java_diagnostics_from_recovery_state_unlocked() {" {
-      inside = 1
-    }
-    inside && !changed &&
-      $0 == "    terminal_java_diagnostics_recovery_commit_is_valid || return $?" {
-      print "    terminal_java_diagnostics_transition_is_valid || return $?"
-      changed = 1
-      next
-    }
-    { print }
-    inside && $0 == "}" { inside = 0 }
-    END { if (!changed) exit 1 }
-  ' <<<"$runner_source")" || return 1
-  if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
-    printf 'terminal diagnostics accepted an unvalidated committed recovery state\n' >&2
-    return 1
-  fi
-
-  mutation="$(awk '
-    $0 == "commit_terminal_java_diagnostics_recovery_boundary_unlocked() {" {
-      inside = 1
-    }
-    inside && !removed &&
-      $0 == "    ! -e \"$freeze\" && ! -L \"$freeze\" &&" {
-      removed = 1
-      next
-    }
-    { print }
-    inside && $0 == "}" { inside = 0 }
-    END { if (!removed) exit 1 }
-  ' <<<"$runner_source")" || return 1
-  if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
-    printf 'terminal diagnostics accepted a commit without a freeze fence\n' >&2
-    return 1
-  fi
-
-  mutation="$(awk '
-    $0 == "clear_terminal_java_diagnostics_recovery_boundary_unlocked() {" {
-      inside = 1
-    }
-    {
-      lines[NR] = $0
-      if (inside && $0 == "    rm -f -- \"$boundary\" || return $?") {
-        boundary = NR
-      } else if (inside && $0 == "  rm -f -- \"$transition\" || return $?") {
-        transition = NR
-      }
-      if (inside && $0 == "}") inside = 0
-    }
-    END {
-      if (!boundary || !transition || !(boundary < transition)) exit 1
-      for (line = 1; line <= NR; line++) {
-        if (line == boundary) print lines[transition]
-        else if (line == transition) print lines[boundary]
-        else print lines[line]
-      }
-    }
-  ' <<<"$runner_source")" || return 1
-  if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
-    printf 'terminal diagnostics accepted commit-first recovery cleanup\n' >&2
-    return 1
-  fi
-
-  for marker in \
-    '  RUN_STATUS_PUBLICATION_HANDLE="$candidate"' \
-    '  RUN_STATUS_PUBLICATION_OUTPUT="$output"' \
-    '  RUN_STATUS_PUBLICATION_STATE=prepared' \
-    '    RUN_STATUS_PUBLICATION_STATE=published' \
-    '      -f "$output" && ! -L "$output" && "$candidate" -ef "$output" ]]; then' \
-    '      RUN_STATUS_PUBLICATION_STATE=published' \
-    '  RUN_STATUS_PUBLICATION_STATE=validated' \
-    '    "$RUN_STATUS_PUBLICATION_STATE" =~ ^(published|validated)$ ]] || return 1' \
-    '    remove_terminal_owned_run_status_for_rewrite || return "$publication_status"' \
-    '          remove_terminal_owned_run_status_for_rewrite; then' \
-    '    if publish_owned_run_status "$final_status"; then' \
-    '    if commit_published_run_status; then'; do
-    mutation="$(awk -v marker="$marker" '
-      !removed && $0 == marker {
-        removed = 1
-        next
-      }
-      { print }
-      END { if (!removed) exit 1 }
-    ' <<<"$runner_source")" || return 1
-    if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
-      printf 'terminal diagnostics accepted a missing run-status ownership marker\n' >&2
-      return 1
-    fi
-  done
-
-  mutation="$(awk '
-    $0 == "write_run_status() {" { inside = 1 }
-    inside && !changed &&
-      $0 == "  if ln -T -- \"$candidate\" \"$output\"; then" {
-      sub(/ln -T --/, "ln --")
-      changed = 1
-    }
-    { print }
-    inside && $0 == "}" { inside = 0 }
-    END { if (!changed) exit 1 }
-  ' <<<"$runner_source")" || return 1
-  if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
-    printf 'terminal diagnostics accepted a directory-following run status\n' >&2
-    return 1
-  fi
-
-  mutation="$(awk '
-    $0 == "remove_published_run_status() {" { inside = 1 }
-    {
-      lines[NR] = $0
-      if (inside && $0 == "    rm -f -- \"$output\" || return $?") output = NR
-      if (inside && $0 == "    rm -f -- \"$RUN_STATUS_PUBLICATION_HANDLE\" || return $?") handle = NR
-      if (inside && $0 == "}") inside = 0
-    }
-    END {
-      if (!output || !handle || !(output < handle)) exit 1
-      for (line = 1; line <= NR; line++) {
-        if (line == output) print lines[handle]
-        else if (line == handle) print lines[output]
-        else print lines[line]
-      }
-    }
-  ' <<<"$runner_source")" || return 1
-  if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
-    printf 'terminal diagnostics accepted handle-first run-status removal\n' >&2
-    return 1
-  fi
-
-  mutation="$(awk '
-    $0 == "remove_terminal_owned_run_status_for_rewrite() {" { inside = 1 }
-    {
-      lines[NR] = $0
-      if (inside && $0 == "  rm -f -- \"$output\" || return $?") output = NR
-      if (inside && $0 == "  rm -f -- \"$RUN_STATUS_PUBLICATION_HANDLE\" || return $?") handle = NR
-      if (inside && $0 == "}") inside = 0
-    }
-    END {
-      if (!output || !handle || !(output < handle)) exit 1
-      for (line = 1; line <= NR; line++) {
-        if (line == output) print lines[handle]
-        else if (line == handle) print lines[output]
-        else print lines[line]
-      }
-    }
-  ' <<<"$runner_source")" || return 1
-  if terminal_java_diagnostics_source_contract_is_safe "$mutation"; then
-    printf 'terminal diagnostics accepted handle-first terminal status removal\n' >&2
-    return 1
-  fi
-
-  mutation="$(awk '
     $0 == "  restore_auto_unavailable_stack() {" { inside = 1 }
     inside && !held && $0 == "    seal_terminal_java_diagnostics" {
       held = 1
@@ -25980,8 +27453,8 @@ test_terminal_java_diagnostics_hooks_are_mutation_sensitive() {
     abort_w3c_fault_mode \
     run_deliberate_assertion_failure_control \
     capture_java_diagnostics \
-    extract_java_diagnostics_header \
-    extract_terminal_diagnostics_after \
+    extract_java_diagnostics_header_unlocked \
+    extract_terminal_diagnostics_after_unlocked \
     write_run_status; do
     mutation="$(awk -v target="$target" '
       $0 == target "() {" { inside = 1 }
@@ -26081,6 +27554,7 @@ test_terminal_java_diagnostics_capture_is_bounded_and_atomic() {
   local -r oversized_dir="$TEST_TMP_DIR/java-diagnostics-capture-oversized"
   local -r unavailable_dir="$TEST_TMP_DIR/java-diagnostics-capture-unavailable"
   local -r publication_failure_dir="$TEST_TMP_DIR/java-diagnostics-capture-publication-failure"
+  local -r last_publication_failure_dir="$TEST_TMP_DIR/java-diagnostics-last-publication-failure"
   local -r redirected_dir="$TEST_TMP_DIR/java-diagnostics-capture-redirected"
   local -r redirected_target="$TEST_TMP_DIR/java-diagnostics-capture-outside"
   local -r fixture="$TEST_TMP_DIR/java-diagnostics-capture-fixture.txt"
@@ -26089,7 +27563,8 @@ test_terminal_java_diagnostics_capture_is_bounded_and_atomic() {
   write_diagnostics_fixture "$fixture" 0 1 0 0 0 0
   snapshot="$(<"$fixture")" || return 1
   mkdir -p -- \
-    "$valid_dir" "$oversized_dir" "$unavailable_dir" "$publication_failure_dir"
+    "$valid_dir" "$oversized_dir" "$unavailable_dir" "$publication_failure_dir" \
+    "$last_publication_failure_dir"
   mkdir -p -- "$redirected_dir" "$redirected_target/redirected"
 
   (
@@ -26184,6 +27659,37 @@ test_terminal_java_diagnostics_capture_is_bounded_and_atomic() {
     return 1
   }
 
+  (
+    local publication_status=0
+    RESULT_DIR="$last_publication_failure_dir"
+    CERT_DIR="$last_publication_failure_dir/certs"
+    curl() {
+      printf '%s\n' "$snapshot"
+    }
+    mv() {
+      local destination="${*: -1}"
+
+      if [[ "$destination" == \
+        "$RESULT_DIR/.last-valid-java-diagnostics.json" ]]; then
+        return 48
+      fi
+      command mv "$@"
+    }
+
+    set +e
+    capture_java_diagnostics last-publication-failure
+    publication_status=$?
+    set -e
+    [[ "$publication_status" == 48 &&
+      -f "$RESULT_DIR/phases/last-publication-failure/java-diagnostics.txt" &&
+      ! -e "$RESULT_DIR/.last-valid-java-diagnostics.json" &&
+      -z "$(find "$RESULT_DIR" -maxdepth 1 \
+        -name '.last-valid-java-diagnostics.*' -print -quit)" ]]
+  ) || {
+    printf 'last-valid Java diagnostics publication failure returned success or residue\n' >&2
+    return 1
+  }
+
   printf 'outside-sentinel\n' >"$redirected_target/sentinel"
   write_diagnostics_fixture \
     "$redirected_target/redirected/java-diagnostics.txt" 0 1 0 0 0 0
@@ -26214,17 +27720,17 @@ test_terminal_java_diagnostics_freeze_survives_failed_publication() {
   local -r result_dir="$TEST_TMP_DIR/terminal-java-diagnostics-freeze"
   local -r fault="$result_dir/phases/fault/java-diagnostics.txt"
   local -r recovery="$result_dir/phases/recovery/java-diagnostics.txt"
+  local -r terminal_link_failed_marker="$result_dir/terminal-link-failed-once"
   local -r freeze_failure_dir="$TEST_TMP_DIR/terminal-java-diagnostics-freeze-link-failure"
   local -r freeze_failure_fault="$freeze_failure_dir/phases/fault/java-diagnostics.txt"
   local -r freeze_failure_recovery="$freeze_failure_dir/phases/recovery/java-diagnostics.txt"
   local -r freeze_link_failed_marker="$freeze_failure_dir/freeze-link-failed"
+  local -r freeze_status_dir="$TEST_TMP_DIR/terminal-java-diagnostics-freeze-status"
 
   mkdir -p -- "${fault%/*}" "${recovery%/*}"
   write_diagnostics_fixture "$fault" 0 1 0 0 0 0
   write_diagnostics_fixture "$recovery" 1 0 0 1 0 0
   (
-    local seal_status=0
-    local fail_terminal_link=true
     RESULT_DIR="$result_dir"
     RUN_STATUS=failed
     ACCEPTANCE_EVIDENCE=false
@@ -26235,26 +27741,24 @@ test_terminal_java_diagnostics_freeze_survives_failed_publication() {
       local destination="${*: -1}"
 
       if [[ "$destination" == "$RESULT_DIR/terminal-java-diagnostics.json" &&
-        "$fail_terminal_link" == "true" ]]; then
-        fail_terminal_link=false
+        ! -e "$terminal_link_failed_marker" ]]; then
+        : >"$terminal_link_failed_marker" || return $?
         return 47
       fi
       command ln "$@"
     }
 
     record_last_java_diagnostics_phase fault || return 1
-    set +e
-    seal_terminal_java_diagnostics
-    seal_status=$?
-    set -e
-    [[ "$seal_status" == 47 &&
+    seal_terminal_java_diagnostics || return 1
+    [[ -e "$terminal_link_failed_marker" &&
       -f "$RESULT_DIR/.terminal-java-diagnostics.freeze" &&
-      ! -e "$RESULT_DIR/terminal-java-diagnostics.json" ]] || return 1
+      -f "$RESULT_DIR/terminal-java-diagnostics.json" &&
+      "$(stat -Lc '%a:%h' -- \
+        "$RESULT_DIR/terminal-java-diagnostics.json")" == 644:1 ]] || return 1
     if record_last_java_diagnostics_phase recovery; then
       printf 'recovery diagnostics replaced a failed terminal seal\n' >&2
       return 1
     fi
-    unset -f ln
     write_run_status 17 || return 1
     jq -e '
       .status == "failed" and
@@ -26265,7 +27769,7 @@ test_terminal_java_diagnostics_freeze_survives_failed_publication() {
         "phases/fault/java-diagnostics.txt"
     ' "$RESULT_DIR/run-status.json" >/dev/null
   ) || {
-    printf 'failed terminal publication did not preserve the fault snapshot\n' >&2
+    printf 'transient terminal publication did not retry the fault snapshot\n' >&2
     return 1
   }
 
@@ -26292,7 +27796,10 @@ test_terminal_java_diagnostics_freeze_survives_failed_publication() {
 
     record_last_java_diagnostics_phase fault || return 1
     seal_terminal_java_diagnostics || return 1
-    record_last_java_diagnostics_phase recovery || return 1
+    if record_last_java_diagnostics_phase recovery; then
+      printf 'recovery diagnostics replaced a sealed terminal fault\n' >&2
+      return 1
+    fi
     write_run_status 17 || return 1
     [[ -f "$freeze_link_failed_marker" ]] || return 1
     jq -e '
@@ -26305,6 +27812,32 @@ test_terminal_java_diagnostics_freeze_survives_failed_publication() {
     ' "$RESULT_DIR/run-status.json" >/dev/null
   ) || {
     printf 'freeze-link failure allowed recovery diagnostics to replace the fault\n' >&2
+    return 1
+  }
+
+  mkdir -p -- "$freeze_status_dir"
+  (
+    local freeze_status=0
+    RESULT_DIR="$freeze_status_dir"
+    ln() {
+      local destination="${*: -1}"
+
+      if [[ "$destination" == "$RESULT_DIR/.terminal-java-diagnostics.freeze" ]]; then
+        return 49
+      fi
+      command ln "$@"
+    }
+
+    set +e
+    freeze_terminal_java_diagnostics_unlocked
+    freeze_status=$?
+    set -e
+    [[ "$freeze_status" == 49 &&
+      ! -e "$RESULT_DIR/.terminal-java-diagnostics.freeze" &&
+      -z "$(find "$RESULT_DIR" -maxdepth 1 \
+        -name '.terminal-java-diagnostics-freeze.??????' -print -quit)" ]]
+  ) || {
+    printf 'terminal freeze link failure returned success or residue\n' >&2
     return 1
   }
 }
@@ -26351,7 +27884,6 @@ test_terminal_metric_retry_uses_implicit_boundary() {
 
   (
     local destination=""
-    local seal_status=0
 
     RESULT_DIR="$publication_dir"
     ln() {
@@ -26364,15 +27896,12 @@ test_terminal_metric_retry_uses_implicit_boundary() {
       command ln "$@"
     }
 
-    if seal_terminal_java_diagnostics; then
-      return 1
-    else
-      seal_status=$?
-    fi
-    [[ "$seal_status" == 77 && -e "$publication_failed" &&
+    seal_terminal_java_diagnostics || return 1
+    [[ -e "$publication_failed" &&
       -f "$RESULT_DIR/terminal-java-diagnostics.json" &&
-      ! -e "$RESULT_DIR/terminal-obi-metrics.json" &&
-      ! -L "$RESULT_DIR/terminal-obi-metrics.json" ]] || return 1
+      -f "$RESULT_DIR/terminal-obi-metrics.json" &&
+      "$(stat -Lc '%a:%h' -- \
+        "$RESULT_DIR/terminal-obi-metrics.json")" == 644:1 ]] || return 1
     seal_terminal_java_diagnostics || return 1
     terminal_java_diagnostics_json >/dev/null || return 1
     terminal_obi_metrics_json >/dev/null || return 1
@@ -26389,7 +27918,7 @@ test_terminal_metric_retry_uses_implicit_boundary() {
 
 test_terminal_obi_metric_publication_recovers_owned_handles() {
   local -r cleanup_dir="$TEST_TMP_DIR/terminal-obi-metric-cleanup-retry"
-  local -r cleanup_failed="$cleanup_dir/candidate-cleanup-failed"
+  local -r cleanup_denied="$cleanup_dir/candidate-cleanup-denied"
   local -r link_dir="$TEST_TMP_DIR/terminal-obi-metric-link-side-effect"
   local -r link_injected="$link_dir/link-side-effect-injected"
 
@@ -26401,17 +27930,19 @@ test_terminal_obi_metric_publication_recovers_owned_handles() {
     local -a candidates=()
 
     RESULT_DIR="$cleanup_dir"
+    : >"$cleanup_denied" || return $?
     rm() {
       target="${*: -1}"
       if [[ "$target" == "$RESULT_DIR"/.terminal-obi-metrics.* &&
-        ! -e "$cleanup_failed" ]]; then
-        : >"$cleanup_failed" || return $?
+        -e "$cleanup_denied" ]]; then
         return 78
       fi
       command rm "$@"
     }
 
-    if seal_terminal_obi_metrics_unlocked; then
+    freeze_terminal_java_diagnostics_unlocked || return 1
+    if with_terminal_java_diagnostics_lock \
+      seal_terminal_obi_metrics_unlocked; then
       return 1
     else
       publication_status=$?
@@ -26419,11 +27950,18 @@ test_terminal_obi_metric_publication_recovers_owned_handles() {
     candidates=("$RESULT_DIR"/.terminal-obi-metrics.*)
     ((${#candidates[@]} == 1)) || return 1
     candidate="${candidates[0]}"
-    [[ "$publication_status" == 1 && -f "$candidate" &&
+    [[ "$publication_status" == 78 && -f "$candidate" &&
       ! -L "$candidate" &&
       "$candidate" -ef "$RESULT_DIR/terminal-obi-metrics.json" &&
       "$(stat -Lc '%h' -- "$candidate")" == 2 ]] || return 1
-    seal_terminal_obi_metrics_unlocked || return 1
+    if with_terminal_java_diagnostics_lock \
+      seal_terminal_obi_metrics_unlocked; then
+      printf 'terminal OBI metric retry ignored persistent cleanup denial\n' >&2
+      return 1
+    fi
+    command rm -f -- "$cleanup_denied" || return $?
+    with_terminal_java_diagnostics_lock \
+      seal_terminal_obi_metrics_unlocked || return 1
     [[ "$(stat -Lc '%a:%h' -- \
         "$RESULT_DIR/terminal-obi-metrics.json")" == 644:1 ]] || return 1
     terminal_obi_metrics_json >/dev/null || return 1
@@ -26450,7 +27988,9 @@ test_terminal_obi_metric_publication_recovers_owned_handles() {
       command ln "$@"
     }
 
-    seal_terminal_obi_metrics_unlocked || return 1
+    freeze_terminal_java_diagnostics_unlocked || return 1
+    with_terminal_java_diagnostics_lock \
+      seal_terminal_obi_metrics_unlocked || return 1
     [[ -e "$link_injected" &&
       "$(stat -Lc '%a:%h' -- \
         "$RESULT_DIR/terminal-obi-metrics.json")" == 644:1 ]] || return 1
@@ -26462,6 +28002,590 @@ test_terminal_obi_metric_publication_recovers_owned_handles() {
     printf 'terminal OBI metric link side effect was not normalized exactly\n' >&2
     return 1
   }
+}
+
+test_terminal_publication_families_recover_owned_residue() {
+  local -r transition_dir="$TEST_TMP_DIR/terminal-transition-owned-residue"
+  local -r recovery_dir="$TEST_TMP_DIR/terminal-recovery-owned-residue"
+  local -r terminal_dir="$TEST_TMP_DIR/terminal-java-owned-residue"
+  local -r metric_dir="$TEST_TMP_DIR/terminal-metric-owned-residue"
+  local -r prelink_dir="$TEST_TMP_DIR/terminal-recovery-prelink-residue"
+  local -r side_effect_dir="$TEST_TMP_DIR/terminal-recovery-link-side-effect"
+  local -r hostile_dir="$TEST_TMP_DIR/terminal-recovery-hostile-collision"
+  local -r legacy_dir="$TEST_TMP_DIR/terminal-legacy-output-residue"
+  local -r legacy_hostile_dir="$TEST_TMP_DIR/terminal-legacy-output-hostile"
+  local -r phase_dir="$TEST_TMP_DIR/terminal-phase-owned-residue"
+  local -r phase_seal_dir="$TEST_TMP_DIR/terminal-phase-direct-seal-recovery"
+  local -r after_dir="$TEST_TMP_DIR/terminal-after-owned-residue"
+  local -r last_dir="$TEST_TMP_DIR/terminal-last-owned-residue"
+  local -r last_seal_dir="$TEST_TMP_DIR/terminal-last-direct-seal-recovery"
+  local -r serialization_dir="$TEST_TMP_DIR/terminal-transition-serialized"
+
+  mkdir -p -- \
+    "$transition_dir" "$recovery_dir" "$terminal_dir" "$metric_dir" \
+    "$prelink_dir" "$side_effect_dir" "$hostile_dir" \
+    "$legacy_dir" "$legacy_hostile_dir" \
+    "$phase_dir/phases/header" "$phase_seal_dir/phases/header" \
+    "$after_dir/phases/after" \
+    "$last_dir/phases/first" "$last_dir/phases/second" \
+    "$last_seal_dir/phases/first" \
+    "$serialization_dir"
+
+  (
+    local deny="$transition_dir/.deny-transition-handle"
+    local handle=""
+    local target=""
+    RESULT_DIR="$transition_dir"
+    : >"$deny" || return $?
+    rm() {
+      target="${*: -1}"
+      if [[ -e "$deny" && "${target%/*}" == "$RESULT_DIR" &&
+        "${target##*/}" =~ \
+          ^\.terminal-java-diagnostics-freeze\.[A-Za-z0-9]{6}$ ]]; then
+        return 71
+      fi
+      command rm "$@"
+    }
+
+    if freeze_terminal_java_diagnostics_unlocked; then
+      printf 'terminal transition ignored persistent h2 cleanup denial\n' >&2
+      return 1
+    fi
+    handle="$(find "$RESULT_DIR" -maxdepth 1 -type f \
+      -name '.terminal-java-diagnostics-freeze.??????' -print -quit)" ||
+      return 1
+    [[ -n "$handle" &&
+      "$handle" -ef "$RESULT_DIR/.terminal-java-diagnostics.freeze" &&
+      "$(stat -Lc '%u:%a:%h' -- "$handle")" == "$(id -u):600:2" ]] ||
+      return 1
+    if freeze_terminal_java_diagnostics_unlocked; then
+      printf 'terminal transition retry ignored persistent h2 denial\n' >&2
+      return 1
+    fi
+    [[ "$handle" -ef "$RESULT_DIR/.terminal-java-diagnostics.freeze" &&
+      "$(stat -Lc '%h' -- "$handle")" == 2 ]] || return 1
+    command rm -f -- "$deny" || return $?
+    freeze_terminal_java_diagnostics_unlocked || return 1
+    terminal_java_diagnostics_freeze_is_valid || return 1
+    [[ "$(stat -Lc '%u:%a:%h' -- \
+        "$RESULT_DIR/.terminal-java-diagnostics.freeze")" == \
+        "$(id -u):600:1" &&
+      -z "$(find "$RESULT_DIR" -maxdepth 1 -type f \
+        -name '.terminal-java-diagnostics-freeze.??????' -print -quit)" ]]
+  ) || return 1
+
+  (
+    local boundary_deny="$recovery_dir/.deny-boundary-handle"
+    local commit_deny="$recovery_dir/.deny-commit-handle"
+    local handle=""
+    local target=""
+    RESULT_DIR="$recovery_dir"
+    : >"$boundary_deny" || return $?
+    rm() {
+      target="${*: -1}"
+      if [[ -e "$boundary_deny" && "${target%/*}" == "$RESULT_DIR" &&
+        "${target##*/}" =~ \
+          ^\.terminal-java-diagnostics-recovery-boundary\.[A-Za-z0-9]{6}$ ]]; then
+        return 72
+      fi
+      if [[ -e "$commit_deny" && "${target%/*}" == "$RESULT_DIR" &&
+        "${target##*/}" =~ \
+          ^\.terminal-java-diagnostics-recovery-commit\.[A-Za-z0-9]{6}$ ]]; then
+        return 73
+      fi
+      command rm "$@"
+    }
+
+    if capture_terminal_java_diagnostics_recovery_boundary; then
+      printf 'recovery boundary ignored persistent h2 cleanup denial\n' >&2
+      return 1
+    fi
+    handle="$(find "$RESULT_DIR" -maxdepth 1 -type f \
+      -name '.terminal-java-diagnostics-recovery-boundary.??????' \
+      -print -quit)" || return 1
+    [[ -n "$handle" && "$handle" -ef \
+        "$RESULT_DIR/.terminal-java-diagnostics-recovery-boundary.json" &&
+      "$(stat -Lc '%u:%a:%h' -- "$handle")" == "$(id -u):600:2" ]] ||
+      return 1
+    if capture_terminal_java_diagnostics_recovery_boundary; then
+      printf 'recovery boundary retry ignored persistent h2 denial\n' >&2
+      return 1
+    fi
+    command rm -f -- "$boundary_deny" || return $?
+    capture_terminal_java_diagnostics_recovery_boundary || return 1
+    terminal_java_diagnostics_recovery_boundary_payload >/dev/null || return 1
+    : >"$commit_deny" || return $?
+    if commit_terminal_java_diagnostics_recovery_boundary; then
+      printf 'recovery commit ignored persistent h2 cleanup denial\n' >&2
+      return 1
+    fi
+    handle="$(find "$RESULT_DIR" -maxdepth 1 -type f \
+      -name '.terminal-java-diagnostics-recovery-commit.??????' \
+      -print -quit)" || return 1
+    [[ -n "$handle" &&
+      "$handle" -ef "$RESULT_DIR/.terminal-java-diagnostics.freeze" &&
+      "$(stat -Lc '%u:%a:%h' -- "$handle")" == "$(id -u):600:2" ]] ||
+      return 1
+    if commit_terminal_java_diagnostics_recovery_boundary; then
+      printf 'recovery commit retry ignored persistent h2 denial\n' >&2
+      return 1
+    fi
+    command rm -f -- "$commit_deny" || return $?
+    commit_terminal_java_diagnostics_recovery_boundary || return 1
+    terminal_java_diagnostics_recovery_commit_is_valid || return 1
+    [[ "$(stat -Lc '%h' -- \
+        "$RESULT_DIR/.terminal-java-diagnostics.freeze")" == 1 &&
+      -z "$(find "$RESULT_DIR" -maxdepth 1 -type f \
+        -name '.terminal-java-diagnostics-recovery-commit.??????' \
+        -print -quit)" ]]
+  ) || return 1
+
+  (
+    local deny="$terminal_dir/.deny-terminal-java-handle"
+    local handle=""
+    local target=""
+    RESULT_DIR="$terminal_dir"
+    : >"$deny" || return $?
+    rm() {
+      target="${*: -1}"
+      if [[ -e "$deny" && "${target%/*}" == "$RESULT_DIR" &&
+        "${target##*/}" =~ \
+          ^\.terminal-java-diagnostics-output\.[A-Za-z0-9]{6}$ ]]; then
+        return 74
+      fi
+      command rm "$@"
+    }
+
+    if seal_terminal_java_diagnostics; then
+      printf 'terminal Java publisher ignored persistent h2 cleanup denial\n' >&2
+      return 1
+    fi
+    handle="$(find "$RESULT_DIR" -maxdepth 1 -type f \
+      -name '.terminal-java-diagnostics-output.??????' -print -quit)" || return 1
+    [[ -n "$handle" &&
+      "$handle" -ef "$RESULT_DIR/terminal-java-diagnostics.json" &&
+      "$(stat -Lc '%u:%a:%h' -- "$handle")" == "$(id -u):644:2" ]] ||
+      return 1
+    if seal_terminal_java_diagnostics; then
+      printf 'terminal Java retry ignored persistent h2 denial\n' >&2
+      return 1
+    fi
+    command rm -f -- "$deny" || return $?
+    seal_terminal_java_diagnostics || return 1
+    terminal_java_diagnostics_json >/dev/null || return 1
+    terminal_obi_metrics_json >/dev/null || return 1
+    [[ "$(stat -Lc '%h' -- \
+        "$RESULT_DIR/terminal-java-diagnostics.json")" == 1 &&
+      -z "$(find "$RESULT_DIR" -maxdepth 1 -type f \
+        -name '.terminal-java-diagnostics-output.??????' -print -quit)" ]]
+  ) || return 1
+
+  (
+    local deny="$metric_dir/.deny-terminal-metric-handle"
+    local handle=""
+    local target=""
+    RESULT_DIR="$metric_dir"
+    : >"$deny" || return $?
+    rm() {
+      target="${*: -1}"
+      if [[ -e "$deny" && "${target%/*}" == "$RESULT_DIR" &&
+        "${target##*/}" =~ ^\.terminal-obi-metrics\.[A-Za-z0-9]{6}$ ]]; then
+        return 75
+      fi
+      command rm "$@"
+    }
+
+    if seal_terminal_java_diagnostics; then
+      printf 'terminal metric publisher ignored persistent h2 cleanup denial\n' >&2
+      return 1
+    fi
+    handle="$(find "$RESULT_DIR" -maxdepth 1 -type f \
+      -name '.terminal-obi-metrics.??????' -print -quit)" || return 1
+    [[ -n "$handle" &&
+      "$handle" -ef "$RESULT_DIR/terminal-obi-metrics.json" &&
+      "$(stat -Lc '%u:%a:%h' -- "$handle")" == "$(id -u):644:2" ]] ||
+      return 1
+    if seal_terminal_java_diagnostics; then
+      printf 'terminal metric retry ignored persistent h2 denial\n' >&2
+      return 1
+    fi
+    command rm -f -- "$deny" || return $?
+    seal_terminal_java_diagnostics || return 1
+    terminal_obi_metrics_json >/dev/null || return 1
+    [[ "$(stat -Lc '%h' -- \
+        "$RESULT_DIR/terminal-obi-metrics.json")" == 1 &&
+      -z "$(find "$RESULT_DIR" -maxdepth 1 -type f \
+        -name '.terminal-obi-metrics.??????' -print -quit)" ]]
+  ) || return 1
+
+  (
+    local deny="$prelink_dir/.deny-prelink-cleanup"
+    local target=""
+    RESULT_DIR="$prelink_dir"
+    : >"$deny" || return $?
+    ln() {
+      local destination="${*: -1}"
+      if [[ "$destination" == \
+        "$RESULT_DIR/.terminal-java-diagnostics-recovery-boundary.json" ]]; then
+        return 76
+      fi
+      command ln "$@"
+    }
+    rm() {
+      target="${*: -1}"
+      if [[ -e "$deny" && "${target%/*}" == "$RESULT_DIR" &&
+        "${target##*/}" =~ \
+          ^\.terminal-java-diagnostics-recovery-boundary\.[A-Za-z0-9]{6}$ ]]; then
+        return 77
+      fi
+      command rm "$@"
+    }
+
+    if capture_terminal_java_diagnostics_recovery_boundary; then
+      printf 'recovery boundary hid a pre-link failure with h1 residue\n' >&2
+      return 1
+    fi
+    [[ ! -e "$RESULT_DIR/.terminal-java-diagnostics-recovery-boundary.json" &&
+      -n "$(find "$RESULT_DIR" -maxdepth 1 -type f \
+        -name '.terminal-java-diagnostics-recovery-boundary.??????' \
+        -print -quit)" ]] || return 1
+    if capture_terminal_java_diagnostics_recovery_boundary; then
+      printf 'pre-link h1 retry ignored persistent cleanup denial\n' >&2
+      return 1
+    fi
+    command rm -f -- "$deny" || return $?
+    unset -f ln
+    capture_terminal_java_diagnostics_recovery_boundary || return 1
+    terminal_java_diagnostics_recovery_boundary_payload >/dev/null || return 1
+    [[ -z "$(find "$RESULT_DIR" -maxdepth 1 -type f \
+      -name '.terminal-java-diagnostics-recovery-boundary.??????' \
+      -print -quit)" ]]
+  ) || return 1
+
+  (
+    local injected="$side_effect_dir/link-side-effect-injected"
+    RESULT_DIR="$side_effect_dir"
+    ln() {
+      local destination="${*: -1}"
+      if [[ "$destination" == \
+        "$RESULT_DIR/.terminal-java-diagnostics-recovery-boundary.json" &&
+        ! -e "$injected" ]]; then
+        command ln "$@" || return $?
+        : >"$injected" || return $?
+        return 78
+      fi
+      command ln "$@"
+    }
+
+    capture_terminal_java_diagnostics_recovery_boundary || return 1
+    [[ -e "$injected" &&
+      "$(stat -Lc '%u:%a:%h' -- \
+        "$RESULT_DIR/.terminal-java-diagnostics-recovery-boundary.json")" == \
+        "$(id -u):600:1" &&
+      -z "$(find "$RESULT_DIR" -maxdepth 1 -type f \
+        -name '.terminal-java-diagnostics-recovery-boundary.??????' \
+        -print -quit)" ]]
+  ) || return 1
+
+  (
+    local collision="$hostile_dir/.terminal-java-diagnostics-recovery-boundary.ABC123"
+    RESULT_DIR="$hostile_dir"
+    ln -s -- "$hostile_dir/outside" "$collision" || return 1
+    if capture_terminal_java_diagnostics_recovery_boundary >/dev/null 2>&1; then
+      printf 'recovery boundary accepted a symlink candidate collision\n' >&2
+      return 1
+    fi
+    [[ -L "$collision" &&
+      ! -e "$RESULT_DIR/.terminal-java-diagnostics-recovery-boundary.json" ]]
+  ) || return 1
+
+  (
+    local -r residue="$legacy_dir/.terminal-java-diagnostics.ABC123"
+    RESULT_DIR="$legacy_dir"
+    printf 'interrupted-old-private-payload\n' >"$residue" || return 1
+    chmod 0600 -- "$residue" || return 1
+    seal_terminal_java_diagnostics || return 1
+    [[ ! -e "$residue" && ! -L "$residue" ]] || return 1
+    terminal_java_diagnostics_json >/dev/null || return 1
+    terminal_obi_metrics_json >/dev/null
+  ) || {
+    printf 'terminal migration could not normalize an exact legacy h1 residue\n' >&2
+    return 1
+  }
+
+  (
+    local -r collision="$legacy_hostile_dir/.terminal-java-diagnostics.foreign"
+    RESULT_DIR="$legacy_hostile_dir"
+    printf 'foreign-legacy-residue\n' >"$collision" || return 1
+    chmod 0600 -- "$collision" || return 1
+    if seal_terminal_java_diagnostics >/dev/null 2>&1; then
+      printf 'terminal migration accepted a malformed reserved-prefix residue\n' >&2
+      return 1
+    fi
+    [[ "$(<"$collision")" == foreign-legacy-residue &&
+      ! -e "$RESULT_DIR/terminal-java-diagnostics.json" ]]
+  ) || return 1
+
+  write_diagnostics_fixture \
+    "$phase_dir/header-snapshot" 0 1 0 0 0 0 || return 1
+  printf 'X-Obi-Java-Diagnostics: %s\n' \
+    "$(<"$phase_dir/header-snapshot")" >"$phase_dir/headers" || return 1
+  (
+    local deny="$phase_dir/.deny-header-handle"
+    local handle=""
+    local target=""
+    RESULT_DIR="$phase_dir"
+    : >"$deny" || return $?
+    rm() {
+      target="${*: -1}"
+      if [[ -e "$deny" && "${target%/*}" == \
+          "$RESULT_DIR/phases/header" &&
+        "${target##*/}" =~ ^\.java-diagnostics-header\.[A-Za-z0-9]{6}$ ]]; then
+        return 79
+      fi
+      command rm "$@"
+    }
+
+    if extract_java_diagnostics_header \
+      "$RESULT_DIR/headers" \
+      "$RESULT_DIR/phases/header/java-diagnostics.txt"; then
+      printf 'header diagnostics ignored persistent h2 cleanup denial\n' >&2
+      return 1
+    fi
+    handle="$(find "$RESULT_DIR/phases/header" -maxdepth 1 -type f \
+      -name '.java-diagnostics-header.??????' -print -quit)" || return 1
+    [[ -n "$handle" && "$handle" -ef \
+        "$RESULT_DIR/phases/header/java-diagnostics.txt" &&
+      "$(stat -Lc '%h' -- "$handle")" == 2 ]] || return 1
+    if extract_java_diagnostics_header \
+      "$RESULT_DIR/headers" \
+      "$RESULT_DIR/phases/header/java-diagnostics.txt"; then
+      printf 'header diagnostics retry ignored persistent h2 denial\n' >&2
+      return 1
+    fi
+    command rm -f -- "$deny" || return $?
+    extract_java_diagnostics_header \
+      "$RESULT_DIR/headers" \
+      "$RESULT_DIR/phases/header/java-diagnostics.txt" || return 1
+    validate_last_java_diagnostics_json \
+      "$RESULT_DIR/.last-valid-java-diagnostics.json" >/dev/null || return 1
+    [[ "$(stat -Lc '%h' -- \
+        "$RESULT_DIR/phases/header/java-diagnostics.txt")" == 1 ]]
+  ) || return 1
+
+  write_diagnostics_fixture \
+    "$phase_seal_dir/header-snapshot" 0 1 0 0 0 0 || return 1
+  printf 'X-Obi-Java-Diagnostics: %s\n' \
+    "$(<"$phase_seal_dir/header-snapshot")" \
+    >"$phase_seal_dir/headers" || return 1
+  (
+    local deny="$phase_seal_dir/.deny-phase-prelink-cleanup"
+    local target=""
+    RESULT_DIR="$phase_seal_dir"
+    : >"$deny" || return $?
+    ln() {
+      local destination="${*: -1}"
+      if [[ "$destination" == "$RESULT_DIR/phases/header/java-diagnostics.txt" ]]; then
+        return 85
+      fi
+      command ln "$@"
+    }
+    rm() {
+      target="${*: -1}"
+      if [[ -e "$deny" && "${target%/*}" == \
+          "$RESULT_DIR/phases/header" &&
+        "${target##*/}" =~ ^\.java-diagnostics-header\.[A-Za-z0-9]{6}$ ]]; then
+        return 86
+      fi
+      command rm "$@"
+    }
+
+    if extract_java_diagnostics_header \
+      "$RESULT_DIR/headers" \
+      "$RESULT_DIR/phases/header/java-diagnostics.txt"; then
+      printf 'phase publisher hid a pre-link cleanup failure\n' >&2
+      return 1
+    fi
+    [[ -n "$(find "$RESULT_DIR/phases/header" -maxdepth 1 -type f \
+      -name '.java-diagnostics-header.??????' -print -quit)" ]] || return 1
+    command rm -f -- "$deny" || return $?
+    seal_terminal_java_diagnostics || return 1
+    [[ -z "$(find "$RESULT_DIR/phases/header" -maxdepth 1 -type f \
+      -name '.java-diagnostics-header.??????' -print -quit)" ]] || return 1
+    terminal_java_diagnostics_json >/dev/null || return 1
+    terminal_obi_metrics_json >/dev/null
+  ) || return 1
+
+  write_diagnostics_fixture \
+    "$after_dir/after-snapshot" 0 1 0 0 0 0 || return 1
+  printf '  "fault_diagnostics_after": "%s"\n' \
+    "$(<"$after_dir/after-snapshot")" >"$after_dir/response" || return 1
+  (
+    local deny="$after_dir/.deny-after-handle"
+    local target=""
+    RESULT_DIR="$after_dir"
+    : >"$deny" || return $?
+    rm() {
+      target="${*: -1}"
+      if [[ -e "$deny" && "${target%/*}" == "$RESULT_DIR/phases/after" &&
+        "${target##*/}" =~ ^\.terminal-diagnostics\.[A-Za-z0-9]{6}$ ]]; then
+        return 80
+      fi
+      command rm "$@"
+    }
+    if extract_fault_diagnostics_after \
+      "$RESULT_DIR/response" \
+      "$RESULT_DIR/phases/after/java-diagnostics.txt"; then
+      printf 'response diagnostics ignored persistent h2 cleanup denial\n' >&2
+      return 1
+    fi
+    command rm -f -- "$deny" || return $?
+    extract_fault_diagnostics_after \
+      "$RESULT_DIR/response" \
+      "$RESULT_DIR/phases/after/java-diagnostics.txt" || return 1
+    [[ "$(stat -Lc '%h' -- \
+        "$RESULT_DIR/phases/after/java-diagnostics.txt")" == 1 ]]
+  ) || return 1
+
+  write_diagnostics_fixture \
+    "$last_dir/phases/first/java-diagnostics.txt" 0 1 0 0 0 0
+  write_diagnostics_fixture \
+    "$last_dir/phases/second/java-diagnostics.txt" 1 0 0 1 0 0
+  (
+    local deny="$last_dir/.deny-last-candidate"
+    local fail_before="$last_dir/fail-before-injected"
+    local fail_after="$last_dir/fail-after-injected"
+    local target=""
+    RESULT_DIR="$last_dir"
+    : >"$deny" || return $?
+    mv() {
+      local destination="${*: -1}"
+      if [[ "$destination" == "$RESULT_DIR/.last-valid-java-diagnostics.json" &&
+        ! -e "$fail_before" ]]; then
+        : >"$fail_before" || return $?
+        return 81
+      fi
+      if [[ "$destination" == "$RESULT_DIR/.last-valid-java-diagnostics.json" &&
+        ! -e "$fail_after" && ! -e "$deny" ]]; then
+        command mv "$@" || return $?
+        : >"$fail_after" || return $?
+        return 82
+      fi
+      command mv "$@"
+    }
+    rm() {
+      target="${*: -1}"
+      if [[ -e "$deny" && "${target%/*}" == "$RESULT_DIR" &&
+        "${target##*/}" =~ \
+          ^\.last-valid-java-diagnostics\.[A-Za-z0-9]{6}$ ]]; then
+        return 83
+      fi
+      command rm "$@"
+    }
+
+    if record_last_java_diagnostics_phase first; then
+      printf 'last-valid publisher hid pre-effect failure and cleanup denial\n' >&2
+      return 1
+    fi
+    [[ -n "$(find "$RESULT_DIR" -maxdepth 1 -type f \
+      -name '.last-valid-java-diagnostics.??????' -print -quit)" ]] || return 1
+    if record_last_java_diagnostics_phase first; then
+      printf 'last-valid retry ignored persistent h1 cleanup denial\n' >&2
+      return 1
+    fi
+    command rm -f -- "$deny" || return $?
+    record_last_java_diagnostics_phase first || return 1
+    record_last_java_diagnostics_phase second || return 1
+    [[ -e "$fail_before" && -e "$fail_after" &&
+      "$(jq -r '.phase' \
+        "$RESULT_DIR/.last-valid-java-diagnostics.json")" == second &&
+      -z "$(find "$RESULT_DIR" -maxdepth 1 -type f \
+        -name '.last-valid-java-diagnostics.??????' -print -quit)" ]]
+  ) || return 1
+
+  write_diagnostics_fixture \
+    "$last_seal_dir/phases/first/java-diagnostics.txt" 0 1 0 0 0 0
+  (
+    local deny="$last_seal_dir/.deny-last-pre-mv-cleanup"
+    local target=""
+    RESULT_DIR="$last_seal_dir"
+    : >"$deny" || return $?
+    mv() {
+      local destination="${*: -1}"
+      if [[ "$destination" == "$RESULT_DIR/.last-valid-java-diagnostics.json" ]]; then
+        return 87
+      fi
+      command mv "$@"
+    }
+    rm() {
+      target="${*: -1}"
+      if [[ -e "$deny" && "${target%/*}" == "$RESULT_DIR" &&
+        "${target##*/}" =~ \
+          ^\.last-valid-java-diagnostics\.[A-Za-z0-9]{6}$ ]]; then
+        return 88
+      fi
+      command rm "$@"
+    }
+
+    if record_last_java_diagnostics_phase first; then
+      printf 'last-valid publisher hid pre-mv cleanup failure\n' >&2
+      return 1
+    fi
+    [[ -n "$(find "$RESULT_DIR" -maxdepth 1 -type f \
+      -name '.last-valid-java-diagnostics.??????' -print -quit)" ]] || return 1
+    command rm -f -- "$deny" || return $?
+    seal_terminal_java_diagnostics || return 1
+    [[ -z "$(find "$RESULT_DIR" -maxdepth 1 -type f \
+      -name '.last-valid-java-diagnostics.??????' -print -quit)" ]] || return 1
+    terminal_java_diagnostics_json >/dev/null || return 1
+    terminal_obi_metrics_json >/dev/null
+  ) || return 1
+
+  (
+    local first_attempted="$serialization_dir/first-attempted"
+    local release_first="$serialization_dir/release-first"
+    local second_attempted="$serialization_dir/second-attempted"
+    local first_pid=""
+    local second_pid=""
+    local attempt=0
+    RESULT_DIR="$serialization_dir"
+    ln() {
+      local destination="${*: -1}"
+      if [[ "$destination" == "$RESULT_DIR/.terminal-java-diagnostics.freeze" &&
+        "${TRANSITION_ROLE:-}" == first ]]; then
+        : >"$first_attempted" || return $?
+        for ((attempt = 0; attempt < 500; attempt++)); do
+          [[ -e "$release_first" ]] && break
+          sleep 0.01
+        done
+        [[ -e "$release_first" ]] || return 84
+      elif [[ "$destination" == \
+        "$RESULT_DIR/.terminal-java-diagnostics.freeze" &&
+        "${TRANSITION_ROLE:-}" == second ]]; then
+        : >"$second_attempted" || return $?
+      fi
+      command ln "$@"
+    }
+
+    (TRANSITION_ROLE=first freeze_terminal_java_diagnostics_unlocked) &
+    first_pid=$!
+    for ((attempt = 0; attempt < 500; attempt++)); do
+      [[ -e "$first_attempted" ]] && break
+      sleep 0.01
+    done
+    [[ -e "$first_attempted" ]] || return 1
+    (TRANSITION_ROLE=second freeze_terminal_java_diagnostics_unlocked) &
+    second_pid=$!
+    sleep 0.05
+    [[ ! -e "$second_attempted" ]] || return 1
+    : >"$release_first" || return $?
+    wait "$first_pid" || return 1
+    wait "$second_pid" || return 1
+    [[ ! -e "$second_attempted" &&
+      "$(stat -Lc '%u:%a:%h' -- \
+        "$RESULT_DIR/.terminal-java-diagnostics.freeze")" == \
+        "$(id -u):600:1" ]]
+  ) || return 1
 }
 
 test_terminal_java_diagnostics_consumes_one_validated_snapshot() {
@@ -26477,12 +28601,17 @@ test_terminal_java_diagnostics_consumes_one_validated_snapshot() {
   write_diagnostics_fixture "$snapshot_file" 0 1 0 0 0 0
   original_snapshot="$(<"$snapshot_file")" || return 1
   (
-    local replace_after_read=true
+    local replace_after_validation=true
+    local validator_source=""
     RESULT_DIR="$snapshot_dir"
-    mapfile() {
-      builtin mapfile "$@" || return $?
-      if [[ "$replace_after_read" == "true" ]]; then
-        replace_after_read=false
+    validator_source="$(declare -f \
+      assert_sanitized_java_diagnostics_snapshot)" || return 1
+    validator_source="${validator_source/#assert_sanitized_java_diagnostics_snapshot/original_assert_sanitized_java_diagnostics_snapshot}"
+    eval "$validator_source" || return 1
+    assert_sanitized_java_diagnostics_snapshot() {
+      original_assert_sanitized_java_diagnostics_snapshot "$@" || return $?
+      if [[ "$replace_after_validation" == true ]]; then
+        replace_after_validation=false
         printf 'secret=unvalidated\n' >"$snapshot_file" || return $?
       fi
     }
@@ -26520,14 +28649,16 @@ test_terminal_java_diagnostics_consumes_one_validated_snapshot() {
     }
 
     record_last_java_diagnostics_phase fault || return 1
-    seal_terminal_java_diagnostics || return 1
+    if seal_terminal_java_diagnostics >/dev/null 2>&1; then
+      return 1
+    fi
     jq -e '
       .sealed == true and
       .available == false and
       .reason == "no-valid-snapshot-before-terminal-boundary"
     ' "$RESULT_DIR/terminal-java-diagnostics.json" >/dev/null
   ) || {
-    printf 'terminal Java diagnostics overwrote a concurrent boundary\n' >&2
+    printf 'terminal Java diagnostics accepted or overwrote a mismatched collision\n' >&2
     return 1
   }
 
@@ -26630,7 +28761,13 @@ test_terminal_java_diagnostics_serializes_record_and_seal() {
       command mv "$@"
     }
     flock() {
-      if [[ "${DIAGNOSTIC_LOCK_ROLE:-}" == "seal" && "$1" == "-x" ]]; then
+      local lock_path=""
+
+      if [[ "$1" == "-x" ]]; then
+        lock_path="$(readlink -f -- "/proc/self/fd/${*: -1}")" || return $?
+      fi
+      if [[ "${DIAGNOSTIC_LOCK_ROLE:-}" == "seal" &&
+        "$lock_path" == "$RESULT_DIR/.terminal-java-diagnostics.lock" ]]; then
         : >"$seal_lock_attempted" || return $?
       fi
       command flock "$@"
@@ -26694,7 +28831,13 @@ test_terminal_java_diagnostics_serializes_record_and_seal() {
     FAILURE_STAGE=fault
     FAILURE_LINE=19
     flock() {
-      if [[ "${DIAGNOSTIC_LOCK_ROLE:-}" == "seal-timeout" && "$1" == "-x" ]]; then
+      local lock_path=""
+
+      if [[ "$1" == "-x" ]]; then
+        lock_path="$(readlink -f -- "/proc/self/fd/${*: -1}")" || return $?
+      fi
+      if [[ "${DIAGNOSTIC_LOCK_ROLE:-}" == "seal-timeout" &&
+        "$lock_path" == "$RESULT_DIR/.terminal-java-diagnostics.lock" ]]; then
         : >"$timeout_attempted" || return $?
         return 75
       fi
@@ -26795,7 +28938,13 @@ test_terminal_java_diagnostics_recovery_boundary_is_durable() {
     capture_terminal_java_diagnostics_recovery_boundary || return 1
     record_last_java_diagnostics_phase recovery || return 1
     flock() {
-      if [[ "${DIAGNOSTIC_LOCK_ROLE:-}" == "first_seal" && "$1" == "-x" ]]; then
+      local lock_path=""
+
+      if [[ "$1" == "-x" ]]; then
+        lock_path="$(readlink -f -- "/proc/self/fd/${*: -1}")" || return $?
+      fi
+      if [[ "${DIAGNOSTIC_LOCK_ROLE:-}" == "first_seal" &&
+        "$lock_path" == "$RESULT_DIR/.terminal-java-diagnostics.lock" ]]; then
         return 75
       fi
       command flock "$@"
@@ -26833,7 +28982,13 @@ test_terminal_java_diagnostics_recovery_boundary_is_durable() {
     capture_terminal_java_diagnostics_recovery_boundary || return 1
     record_last_java_diagnostics_phase recovery || return 1
     flock() {
-      if [[ "${DIAGNOSTIC_LOCK_ROLE:-}" == "first_seal" && "$1" == "-x" ]]; then
+      local lock_path=""
+
+      if [[ "$1" == "-x" ]]; then
+        lock_path="$(readlink -f -- "/proc/self/fd/${*: -1}")" || return $?
+      fi
+      if [[ "${DIAGNOSTIC_LOCK_ROLE:-}" == "first_seal" &&
+        "$lock_path" == "$RESULT_DIR/.terminal-java-diagnostics.lock" ]]; then
         return 75
       fi
       command flock "$@"
@@ -27029,7 +29184,10 @@ test_terminal_java_diagnostics_retains_last_valid_fault_boundary() {
     fi
     seal_terminal_java_diagnostics || return 1
     write_diagnostics_fixture "$phase_c" 1 0 0 1 0 0
-    record_last_java_diagnostics_phase recovery-c || return 1
+    if record_last_java_diagnostics_phase recovery-c; then
+      printf 'recovery diagnostics replaced the sealed fault boundary\n' >&2
+      return 1
+    fi
     write_run_status 17 || return 1
 
     jq -e --arg snapshot "$snapshot_b" '
@@ -31841,7 +33999,37 @@ test_pid_reuse_controller_precedes_backend_readiness() {
     assert_pid_reuse_compose_contract() { printf 'compose:contract\n' >>"$observed"; }
     wait_for_http() { printf 'http:%s\n' "$2" >>"$observed"; }
     wait_for_log() { printf 'log:%s\n' "$3" >>"$observed"; }
+    plan_obi_metric_pair_capture() {
+      [[ "$#" == 1 && "$1" == pid-reuse-controller-window ]] || return 1
+      printf 'pid-reuse:plan\n' >>"$observed"
+    }
+    capture_phase_evidence() {
+      [[ "$#" == 1 ]] || return 1
+      case "$1" in
+        pid-reuse-controller-before)
+          printf 'pid-reuse:before\n' >>"$observed"
+          ;;
+        pid-reuse-controller-after)
+          printf 'pid-reuse:after\n' >>"$observed"
+          ;;
+        *)
+          return 1
+          ;;
+      esac
+    }
     run_pid_reuse_controller() { printf 'pid-reuse:controller\n' >>"$observed"; }
+    record_obi_metric_pair() {
+      [[ "$#" == 5 && "$1" == pid-reuse-controller-window &&
+        "$2" == pid-reuse-controller-before &&
+        "$3" == pid-reuse-controller-after &&
+        "$4" == same_process && -z "$5" ]] || return 1
+      printf 'pid-reuse:pair\n' >>"$observed"
+    }
+    attach_obi_artifact_capture() {
+      [[ "$#" == 2 && "$1" == pid-reuse-controller &&
+        "$2" == pid-reuse-controller.json ]] || return 1
+      printf 'pid-reuse:artifact\n' >>"$observed"
+    }
     assert_selected_transport() { printf 'transport\n' >>"$observed"; }
     wait_for_apache_instrumentation() { printf 'apache\n' >>"$observed"; }
     assert_apache_denies_java_diagnostics() { printf 'denials\n' >>"$observed"; }
@@ -31858,12 +34046,19 @@ test_pid_reuse_controller_precedes_backend_readiness() {
     $0 == "compose:contract" { contract = NR }
     $0 == "compose:up" { up = NR }
     $0 == "log:OBI remote-parent bridge" { bridge = NR }
-    $0 == "pid-reuse:controller" { controller = NR }
-    $0 == "log:external OTel extension" { extension = NR }
     $0 == "pid-reuse:runtime" { runtime = NR }
+    $0 == "pid-reuse:plan" { plan = NR }
+    $0 == "pid-reuse:before" { before = NR }
+    $0 == "pid-reuse:controller" { controller = NR }
+    $0 == "pid-reuse:after" { after = NR }
+    $0 == "pid-reuse:pair" { pair = NR }
+    $0 == "pid-reuse:artifact" { artifact = NR }
+    $0 == "log:external OTel extension" { extension = NR }
     END {
       exit !(absent > 0 && absent < contract && contract < up &&
-        bridge > 0 && bridge < runtime && runtime < controller && controller < extension)
+        bridge > 0 && bridge < runtime && runtime < plan && plan < before &&
+        before < controller && controller < after && after < pair &&
+        pair < artifact && artifact < extension)
     }
   ' "$observed" || {
     printf 'PID reuse controller did not fence backend readiness\n' >&2
@@ -31889,11 +34084,1854 @@ test_pid_reuse_dispatch_runs_only_recovered_basic() {
   }
 }
 
+test_obi_metric_boundary_journal_unavailable_capture_is_exact() {
+  local -r fixture="$TEST_TMP_DIR/obi-boundary-journal-unavailable"
+  local -r active_fixture="$TEST_TMP_DIR/obi-boundary-journal-unavailable-active"
+  local -r java_only_fixture="$TEST_TMP_DIR/obi-boundary-journal-java-only"
+  local -r repeat_fixture="$TEST_TMP_DIR/obi-boundary-journal-unavailable-repeat"
+  local phase=""
+  local payload=""
+  local mutated=""
+  local original_digest=""
+  local cross_digest=""
+
+  printf -v phase 'p%063d' 0
+  (
+    RESULT_DIR="$fixture"
+    SCENARIO=uninstrumented
+    TRANSPORT=disabled
+    REPEAT_COUNT=1
+    mkdir -p -- "$RESULT_DIR/phases/$phase"
+    initialize_obi_metric_boundary_index || return 1
+    begin_obi_metric_boundary uninstrumented || return 1
+    printf 'unavailable\n' >"$RESULT_DIR/phases/$phase/obi-metrics.prom"
+    chmod 0644 -- "$RESULT_DIR/phases/$phase/obi-metrics.prom"
+    attach_obi_unavailable_phase_capture "$phase" || return 1
+    jq -cn --arg boundary_id uninstrumented '
+      {
+        status: "passed",
+        scenario: "uninstrumented",
+        obi_metric_boundary_ids: [$boundary_id]
+      }
+    ' >"$RESULT_DIR/scenario-uninstrumented-status.json"
+    bind_status_to_active_obi_metric_boundary \
+      scenario-uninstrumented-status.json || return 1
+    payload="$(obi_metric_boundary_index_payload full)" || return 1
+    mutated="$(jq -cS '.boundaries[0].captures[0].id = "wrong-phase"' \
+      <<<"$payload")" || return 1
+    if validate_obi_metric_boundary_index_payload "$mutated" full; then
+      printf 'boundary journal accepted an unavailable capture ID/reference mismatch\n' >&2
+      return 1
+    fi
+    for mutated in \
+      "$(jq -cS '.boundaries[0].captures[0].extra = true' <<<"$payload")" \
+      "$(jq -cS 'del(.boundaries[0].captures[0].reason)' <<<"$payload")" \
+      "$(jq -cS '.boundaries[0].captures[0].reason = "wrong"' <<<"$payload")" \
+      "$(jq -cS '.boundaries[0].captures += [{
+        id: .boundaries[0].captures[0].id,
+        kind: "java", state: "captured",
+        reference: "phases/other/java-diagnostics.txt",
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+      }]' <<<"$payload")"; do
+      if validate_obi_metric_boundary_index_payload "$mutated" structure; then
+        printf 'boundary journal accepted malformed unavailable capture structure\n' >&2
+        return 1
+      fi
+    done
+    mkdir -p -- "$RESULT_DIR/phases/cross-phase"
+    printf 'unavailable\n' >"$RESULT_DIR/phases/cross-phase/obi-metrics.prom"
+    chmod 0644 -- "$RESULT_DIR/phases/cross-phase/obi-metrics.prom"
+    cross_digest="$(sha256sum \
+      "$RESULT_DIR/phases/cross-phase/obi-metrics.prom")"
+    cross_digest="${cross_digest%% *}"
+    mutated="$(jq -cS --arg digest "$cross_digest" '
+      .boundaries[0].captures[0].reference =
+        "phases/cross-phase/obi-metrics.prom" |
+      .boundaries[0].captures[0].sha256 = $digest
+    ' <<<"$payload")" || return 1
+    if validate_obi_metric_boundary_index_payload "$mutated" full; then
+      printf 'boundary journal accepted a cross-phase unavailable reference\n' >&2
+      return 1
+    fi
+    original_digest="$(sha256sum "$RESULT_DIR/phases/$phase/obi-metrics.prom")"
+    original_digest="${original_digest%% *}"
+    mutated="$(jq -cS '.boundaries[0].captures[0].sha256 =
+      "0000000000000000000000000000000000000000000000000000000000000000"' \
+      <<<"$payload")" || return 1
+    if validate_obi_metric_boundary_index_payload "$mutated" full; then
+      printf 'boundary journal accepted a wrong unavailable digest\n' >&2
+      return 1
+    fi
+    printf 'available\n' >"$RESULT_DIR/phases/$phase/obi-metrics.prom"
+    if validate_obi_metric_boundary_index_payload "$payload" full; then
+      printf 'boundary journal accepted wrong unavailable content\n' >&2
+      return 1
+    fi
+    printf 'unavailable\nextra\n' >"$RESULT_DIR/phases/$phase/obi-metrics.prom"
+    if validate_obi_metric_boundary_index_payload "$payload" full; then
+      printf 'boundary journal accepted multiline unavailable content\n' >&2
+      return 1
+    fi
+    rm -f -- "$RESULT_DIR/phases/$phase/obi-metrics.prom"
+    ln -s -- ../cross-phase/obi-metrics.prom \
+      "$RESULT_DIR/phases/$phase/obi-metrics.prom"
+    if validate_obi_metric_boundary_index_payload "$payload" full; then
+      printf 'boundary journal accepted symlinked unavailable content\n' >&2
+      return 1
+    fi
+    rm -f -- "$RESULT_DIR/phases/$phase/obi-metrics.prom"
+    printf 'unavailable\n' >"$RESULT_DIR/phases/$phase/obi-metrics.prom"
+    chmod 0644 -- "$RESULT_DIR/phases/$phase/obi-metrics.prom"
+    [[ "$(sha256sum "$RESULT_DIR/phases/$phase/obi-metrics.prom" | \
+      awk '{print $1}')" == "$original_digest" ]] || return 1
+    : >"$RESULT_DIR/phases/$phase/obi-identity.json"
+    if obi_metric_boundary_index_payload full >/dev/null 2>&1; then
+      printf 'boundary journal accepted unavailable and identity evidence for one phase\n' >&2
+      return 1
+    fi
+    rm -f -- "$RESULT_DIR/phases/$phase/obi-identity.json"
+    complete_obi_metric_boundary uninstrumented || return 1
+    jq -e '.boundaries[0].state == "complete"' \
+      "$RESULT_DIR/obi-metric-boundary-index.json" >/dev/null || return 1
+    freeze_terminal_java_diagnostics || return 1
+    jq -e '
+      .schema == "obi-java-remote-parent-terminal-metrics-v2" and
+      .available == false and .reason == "no-active-boundary" and
+      .active_boundary_id == null
+    ' <<<"$(terminal_obi_metrics_payload_from_frozen_index)" >/dev/null
+  ) || return 1
+  (
+    RESULT_DIR="$java_only_fixture"
+    SCENARIO=uninstrumented
+    TRANSPORT=disabled
+    REPEAT_COUNT=1
+    mkdir -p -- "$RESULT_DIR/phases/uninstrumented-java-only"
+    initialize_obi_metric_boundary_index || return 1
+    begin_obi_metric_boundary uninstrumented || return 1
+    write_diagnostics_fixture \
+      "$RESULT_DIR/phases/uninstrumented-java-only/java-diagnostics.txt" \
+      0 0 0 0 0 0
+    attach_obi_java_capture uninstrumented-java-only || return 1
+    jq -cn '
+      {status:"passed",scenario:"uninstrumented",
+        obi_metric_boundary_ids:["uninstrumented"]}
+    ' >"$RESULT_DIR/scenario-uninstrumented-status.json"
+    bind_status_to_active_obi_metric_boundary \
+      scenario-uninstrumented-status.json || return 1
+    if complete_obi_metric_boundary uninstrumented 2>/dev/null; then
+      printf 'boundary journal completed with Java-only evidence\n' >&2
+      return 1
+    fi
+    jq -e '.boundaries[0].state == "active"' \
+      "$RESULT_DIR/obi-metric-boundary-index.json" >/dev/null
+  ) || return 1
+  (
+    RESULT_DIR="$active_fixture"
+    SCENARIO=uninstrumented
+    TRANSPORT=disabled
+    REPEAT_COUNT=1
+    mkdir -p -- "$RESULT_DIR/phases/uninstrumented-before"
+    initialize_obi_metric_boundary_index || return 1
+    begin_obi_metric_boundary uninstrumented || return 1
+    printf 'unavailable\n' \
+      >"$RESULT_DIR/phases/uninstrumented-before/obi-metrics.prom"
+    chmod 0644 -- "$RESULT_DIR/phases/uninstrumented-before/obi-metrics.prom"
+    attach_obi_unavailable_phase_capture uninstrumented-before || return 1
+    freeze_terminal_java_diagnostics || return 1
+    jq -e '
+      .available == false and .reason == "active-boundary-incomplete" and
+      .active_boundary_id == "uninstrumented" and
+      (has("pair") | not) and (has("pair_reference") | not)
+    ' <<<"$(terminal_obi_metrics_payload_from_frozen_index)" >/dev/null
+  ) || return 1
+  (
+    local run_number=""
+    local boundary_id=""
+    local repeat_phase=""
+    RESULT_DIR="$repeat_fixture"
+    SCENARIO=uninstrumented
+    TRANSPORT=disabled
+    REPEAT_COUNT=2
+    mkdir -p -- "$RESULT_DIR"
+    initialize_obi_metric_boundary_index || return 1
+    for run_number in 01 02; do
+      boundary_id="uninstrumented-run-$run_number"
+      repeat_phase="$boundary_id-before"
+      mkdir -p -- "$RESULT_DIR/phases/$repeat_phase"
+      begin_obi_metric_boundary "$boundary_id" || return 1
+      printf 'unavailable\n' >"$RESULT_DIR/phases/$repeat_phase/obi-metrics.prom"
+      chmod 0644 -- "$RESULT_DIR/phases/$repeat_phase/obi-metrics.prom"
+      attach_obi_unavailable_phase_capture "$repeat_phase" || return 1
+      jq -cn --arg boundary_id "$boundary_id" '
+        {status:"passed",scenario:"uninstrumented",
+          obi_metric_boundary_ids:[$boundary_id]}
+      ' >"$RESULT_DIR/scenario-$boundary_id-status.json"
+      bind_status_to_active_obi_metric_boundary \
+        "scenario-$boundary_id-status.json" || return 1
+      complete_obi_metric_boundary "$boundary_id" || return 1
+    done
+    jq -e '
+      [.boundaries[].id] == ["uninstrumented-run-01", "uninstrumented-run-02"] and
+      [.boundaries[].ordinal] == [1, 2] and
+      all(.boundaries[]; .state == "complete")
+    ' "$RESULT_DIR/obi-metric-boundary-index.json" >/dev/null || return 1
+    obi_metric_boundary_index_payload full >/dev/null
+  )
+}
+
+test_clean_preindex_failure_is_legacy_unavailable_and_collision_exact() {
+  local -r clean_fixture="$TEST_TMP_DIR/preindex-clean-failure"
+  local -r partial_fixture="$TEST_TMP_DIR/preindex-partial-journal"
+  local -r init_residue_fixture="$TEST_TMP_DIR/preindex-init-residue"
+  local -r index_residue_fixture="$TEST_TMP_DIR/preindex-index-residue"
+  local -r collision_fixture="$TEST_TMP_DIR/preindex-metric-collision"
+  local -r container_id="abababababababababababababababababababababababababababababababab"
+  local -r started_at="2026-08-17T00:00:00.000000000Z"
+
+  mkdir -p -- "$clean_fixture" "$partial_fixture" \
+    "$init_residue_fixture" "$index_residue_fixture" "$collision_fixture"
+  (
+    RESULT_DIR="$clean_fixture"
+    RUN_STATUS=failed
+    ACCEPTANCE_EVIDENCE=false
+    ACCEPTANCE_EVIDENCE_REASON=pre-index-failure
+    FAILURE_STAGE=journal-initialization
+    FAILURE_LINE=17
+    write_run_status 17 || return 1
+    jq -e '
+      .schema == "obi-apache-java-https-run-status-v2" and
+      .status == "failed" and .exit_status == 17 and
+      (.obi_metric_boundary_index_reference? | not) and
+      .obi_metric_evidence.schema ==
+        "obi-java-remote-parent-terminal-metrics-v1" and
+      .obi_metric_evidence.available == false and
+      .obi_metric_evidence.reason ==
+        "no-valid-pair-before-terminal-boundary"
+    ' "$RESULT_DIR/run-status.json" >/dev/null || return 1
+    [[ ! -e "$RESULT_DIR/obi-metric-boundary-index.json" &&
+      ! -L "$RESULT_DIR/obi-metric-boundary-index.json" &&
+      ! -e "$RESULT_DIR/.obi-metric-boundary-index.freeze" &&
+      ! -L "$RESULT_DIR/.obi-metric-boundary-index.freeze" ]]
+  ) || return 1
+  (
+    local -r denial_marker="$init_residue_fixture/plan-cleanup-denied"
+    local initialize_status=0
+    local target=""
+    local -a candidates=()
+
+    RESULT_DIR="$init_residue_fixture"
+    SCENARIO=uninstrumented
+    TRANSPORT=disabled
+    REPEAT_COUNT=1
+    planned_obi_metric_boundary_ids() {
+      printf 'uninstrumented\n'
+      return 77
+    }
+    rm() {
+      target="${*: -1}"
+      if [[ -e "$denial_marker" && "${target%/*}" == "$RESULT_DIR" &&
+        "${target##*/}" =~ \
+          ^\.obi-metric-boundary-plan\.[A-Za-z0-9]{6}$ ]]; then
+        return 78
+      fi
+      command rm "$@"
+    }
+
+    : >"$denial_marker" || return 1
+    if initialize_obi_metric_boundary_index >/dev/null 2>&1; then
+      return 1
+    else
+      initialize_status=$?
+    fi
+    candidates=("$RESULT_DIR"/.obi-metric-boundary-plan.*)
+    [[ "$initialize_status" == 78 && ${#candidates[@]} == 1 &&
+      -f "${candidates[0]}" && ! -L "${candidates[0]}" &&
+      "$(stat -Lc '%u:%a:%h' -- "${candidates[0]}")" == \
+        "$(id -u):600:1" ]] || return 1
+    if seal_terminal_java_diagnostics >/dev/null 2>&1; then
+      return 1
+    fi
+    [[ -f "${candidates[0]}" ]] || return 1
+    command rm -f -- "$denial_marker" || return 1
+    seal_terminal_java_diagnostics || return 1
+    if compgen -G \
+      "$RESULT_DIR/.obi-metric-boundary-plan.*" >/dev/null; then
+      return 1
+    fi
+    jq -e '
+      .schema == "obi-java-remote-parent-terminal-metrics-v1" and
+      .available == false
+    ' "$RESULT_DIR/terminal-obi-metrics.json" >/dev/null
+  ) || {
+    printf 'pre-index plan residue could not fail closed and recover\n' >&2
+    return 1
+  }
+  (
+    local -r denial_marker="$index_residue_fixture/index-cleanup-denied"
+    local initialize_status=0
+    local destination=""
+    local target=""
+    local -a candidates=()
+
+    RESULT_DIR="$index_residue_fixture"
+    SCENARIO=uninstrumented
+    TRANSPORT=disabled
+    REPEAT_COUNT=1
+    mv() {
+      destination="${*: -1}"
+      if [[ "$destination" == "$RESULT_DIR/obi-metric-boundary-index.json" ]]; then
+        return 77
+      fi
+      command mv "$@"
+    }
+    rm() {
+      target="${*: -1}"
+      if [[ -e "$denial_marker" && "${target%/*}" == "$RESULT_DIR" &&
+        "${target##*/}" =~ \
+          ^\.obi-metric-boundary-index\.[A-Za-z0-9]{6}$ ]]; then
+        return 78
+      fi
+      command rm "$@"
+    }
+
+    : >"$denial_marker" || return 1
+    if initialize_obi_metric_boundary_index >/dev/null 2>&1; then
+      return 1
+    else
+      initialize_status=$?
+    fi
+    candidates=("$RESULT_DIR"/.obi-metric-boundary-index.*)
+    [[ "$initialize_status" != 0 && ${#candidates[@]} == 1 &&
+      -f "${candidates[0]}" && ! -L "${candidates[0]}" &&
+      "$(stat -Lc '%u:%a:%h' -- "${candidates[0]}")" == \
+        "$(id -u):644:1" ]] || return 1
+    if seal_terminal_java_diagnostics >/dev/null 2>&1; then
+      return 1
+    fi
+    [[ -f "${candidates[0]}" ]] || return 1
+    command rm -f -- "$denial_marker" || return 1
+    unset -f mv
+    seal_terminal_java_diagnostics || return 1
+    if compgen -G \
+      "$RESULT_DIR/.obi-metric-boundary-index.*" >/dev/null; then
+      return 1
+    fi
+    terminal_java_diagnostics_json >/dev/null || return 1
+    terminal_obi_metrics_json >/dev/null
+  ) || {
+    printf 'pre-index publisher residue could not fail closed and recover\n' >&2
+    return 1
+  }
+  (
+    RESULT_DIR="$partial_fixture"
+    RUN_STATUS=failed
+    ACCEPTANCE_EVIDENCE=false
+    ACCEPTANCE_EVIDENCE_REASON=pre-index-failure
+    FAILURE_STAGE=journal-initialization
+    FAILURE_LINE=18
+    printf 'malformed-journal\n' >"$RESULT_DIR/obi-metric-boundary-index.json"
+    chmod 0644 -- "$RESULT_DIR/obi-metric-boundary-index.json"
+    if write_run_status 18 >/dev/null 2>&1; then
+      printf 'partial journal downgraded to a legacy run status\n' >&2
+      return 1
+    fi
+    [[ ! -e "$RESULT_DIR/run-status.json" &&
+      ! -L "$RESULT_DIR/run-status.json" ]]
+  ) || return 1
+  (
+    local collision_payload=""
+    local embedded_pair=""
+    local observed_payload=""
+    local pair_payload=""
+
+    RESULT_DIR="$collision_fixture"
+    write_obi_running_identity_fixture \
+      "$RESULT_DIR" collision-before "$container_id" "$started_at"
+    write_obi_metric_pair_fixture \
+      "$RESULT_DIR" collision-before getsockopt take valid 1 0
+    write_obi_running_identity_fixture \
+      "$RESULT_DIR" collision-after "$container_id" "$started_at"
+    write_obi_metric_pair_fixture \
+      "$RESULT_DIR" collision-after getsockopt take valid 2 0
+    record_obi_metric_pair \
+      collision collision-before collision-after same_process "" \
+      >/dev/null || return 1
+    pair_payload="$(obi_metric_pair_payload_from_reference \
+      obi-metric-pairs/collision.json)" || return 1
+    collision_payload="$(jq -cnS --argjson pair "$pair_payload" '
+      {
+        schema: "obi-java-remote-parent-terminal-metrics-v1",
+        sealed: true,
+        available: true,
+        pair_reference: "obi-metric-pairs/collision.json",
+        pair: $pair
+      }
+    ')" || return 1
+    embedded_pair="$(jq -c '.pair' <<<"$collision_payload")" || return 1
+    [[ "$embedded_pair" != "$pair_payload" ]] || {
+      printf 'legacy metric collision did not reorder its nested pair fixture\n' >&2
+      return 1
+    }
+    jq -e --argjson expected_pair "$pair_payload" \
+      '.pair == $expected_pair' <<<"$collision_payload" >/dev/null || return 1
+    printf '%s\n' "$collision_payload" \
+      >"$RESULT_DIR/terminal-obi-metrics.json"
+    chmod 0644 -- "$RESULT_DIR/terminal-obi-metrics.json"
+    if seal_terminal_java_diagnostics >/dev/null 2>&1; then
+      printf 'clean pre-index seal accepted a valid available-v1 collision\n' >&2
+      return 1
+    fi
+    observed_payload="$(terminal_obi_metrics_json)" || return 1
+    [[ "$observed_payload" == "$collision_payload" ]]
+  )
+}
+
+test_obi_metric_boundary_journal_reference_budget_and_plan_are_bounded() {
+  local -r budget_fixture="$TEST_TMP_DIR/obi-boundary-journal-budget"
+  local -r transitive_fixture="$TEST_TMP_DIR/obi-boundary-journal-budget-transitive"
+  local -r planner_fixture="$TEST_TMP_DIR/obi-boundary-journal-max-plan"
+  local payload=""
+  local duplicate_payload=""
+  local zero_payload=""
+  local pair_number=0
+  local pair_id=""
+  local before_phase=""
+  local after_phase=""
+  local transport=""
+
+  (
+    RESULT_DIR="$budget_fixture"
+    mkdir -p -- "$RESULT_DIR"
+    truncate -s "$OBI_METRIC_BOUNDARY_REFERENCED_MAX_BYTES" \
+      "$RESULT_DIR/exact-cap.bin"
+    payload="$(jq -cnS '
+      {
+        schema: "obi-metric-boundary-index-v1",
+        selection: {
+          scenario: "uninstrumented", requested_transport: "disabled",
+          selected_transport: null, repeat_count: 1
+        },
+        boundaries: [{
+          id: "uninstrumented", ordinal: 1, state: "active",
+          not_applicable_reason: null, status_references: [],
+          captures: [{
+            id: "exact-cap", kind: "artifact", state: "captured",
+            reference: "exact-cap.bin",
+            sha256: ("0" * 64)
+          }]
+        }]
+      }
+    ')" || return 1
+    validate_obi_metric_boundary_index_payload "$payload" structure || return 1
+    validate_obi_metric_boundary_referenced_byte_budget "$payload" || return 1
+
+    duplicate_payload="$(jq -cS '
+      .boundaries[0].captures += [{
+        id: "exact-cap-again", kind: "artifact", state: "captured",
+        reference: "exact-cap.bin", sha256: ("0" * 64)
+      }]
+    ' <<<"$payload")" || return 1
+    validate_obi_metric_boundary_index_payload \
+      "$duplicate_payload" structure || return 1
+    validate_obi_metric_boundary_referenced_byte_budget \
+      "$duplicate_payload" || return 1
+
+    : >"$RESULT_DIR/zero.bin"
+    zero_payload="$(jq -cS '
+      .boundaries[0].captures = [{
+        id: "zero", kind: "artifact", state: "captured",
+        reference: "zero.bin", sha256: ("0" * 64)
+      }]
+    ' <<<"$payload")" || return 1
+    validate_obi_metric_boundary_referenced_byte_budget "$zero_payload" ||
+      return 1
+
+    truncate -s "$((OBI_METRIC_BOUNDARY_REFERENCED_MAX_BYTES + 1))" \
+      "$RESULT_DIR/over-cap.bin"
+    payload="$(jq -cS '
+      .boundaries[0].captures[0].reference = "over-cap.bin"
+    ' <<<"$payload")" || return 1
+    sha256sum() {
+      : >"$RESULT_DIR/referenced-sha-invoked"
+      command sha256sum "$@"
+    }
+    if validate_obi_metric_boundary_index_payload "$payload" full 2>/dev/null; then
+      printf 'boundary journal accepted a referenced-byte budget overflow\n' >&2
+      return 1
+    fi
+    [[ ! -e "$RESULT_DIR/referenced-sha-invoked" ]] || {
+      printf 'boundary journal hashed referenced evidence before rejecting overflow\n' >&2
+      return 1
+    }
+  ) || return 1
+
+  (
+    RESULT_DIR="$budget_fixture"
+    payload="$(jq -cnS '
+      {
+        schema: "obi-metric-boundary-index-v1",
+        selection: {
+          scenario: "uninstrumented", requested_transport: "disabled",
+          selected_transport: null, repeat_count: 1
+        },
+        boundaries: [{
+          id: "uninstrumented", ordinal: 1, state: "active",
+          not_applicable_reason: null, status_references: [],
+          captures: [{
+            id: "zero", kind: "artifact", state: "captured",
+            reference: "zero.bin", sha256: ("0" * 64)
+          }]
+        }]
+      }
+    ')" || return 1
+    stat() {
+      if [[ "$1" == -Lc && "$2" == '%s' && "$4" == /proc/self/fd/* ]]; then
+        printf '999999999999999999999999999999999999\n'
+        return 0
+      fi
+      command stat "$@"
+    }
+    sha256sum() {
+      : >"$RESULT_DIR/oversized-stat-sha-invoked"
+      command sha256sum "$@"
+    }
+    if validate_obi_metric_boundary_referenced_byte_budget "$payload"; then
+      printf 'boundary journal accepted an overflowing stat size\n' >&2
+      return 1
+    fi
+    [[ ! -e "$RESULT_DIR/oversized-stat-sha-invoked" ]]
+  ) || return 1
+
+  (
+    RESULT_DIR="$transitive_fixture"
+    mkdir -p -- "$RESULT_DIR/obi-metric-pairs"
+    for ((pair_number = 1; pair_number <= 33; pair_number++)); do
+      printf -v pair_id 'pair-%02d' "$pair_number"
+      printf -v before_phase 'before-%02d' "$pair_number"
+      printf -v after_phase 'after-%02d' "$pair_number"
+      mkdir -p -- \
+        "$RESULT_DIR/phases/$before_phase" "$RESULT_DIR/phases/$after_phase"
+      jq -cn \
+        --arg before "phases/$before_phase/obi-identity.json" \
+        --arg after "phases/$after_phase/obi-identity.json" \
+        '{before:{identity_reference:$before},after:{identity_reference:$after}}' \
+        >"$RESULT_DIR/obi-metric-pairs/$pair_id.json"
+      jq -cn --arg reference "phases/$before_phase/obi-metrics.prom" \
+        '{state:"running",metrics_reference:$reference}' \
+        >"$RESULT_DIR/phases/$before_phase/obi-identity.json"
+      jq -cn --arg reference "phases/$after_phase/obi-metrics.prom" \
+        '{state:"running",metrics_reference:$reference}' \
+        >"$RESULT_DIR/phases/$after_phase/obi-identity.json"
+      truncate -s "$OBI_METRIC_SNAPSHOT_MAX_BYTES" \
+        "$RESULT_DIR/phases/$before_phase/obi-metrics.prom" \
+        "$RESULT_DIR/phases/$after_phase/obi-metrics.prom"
+    done
+    payload="$(jq -cnS '
+      def two_digits:
+        tostring as $raw | if length == 1 then "0" + $raw else $raw end;
+      {
+        schema: "obi-metric-boundary-index-v1",
+        selection: {
+          scenario: "uninstrumented", requested_transport: "disabled",
+          selected_transport: null, repeat_count: 1
+        },
+        boundaries: [{
+          id: "uninstrumented", ordinal: 1, state: "active",
+          not_applicable_reason: null, status_references: [],
+          captures: [range(1; 34) as $number |
+            ($number | two_digits) as $suffix | {
+              id: ("pair-" + $suffix), kind: "pair", state: "captured",
+              pair_reference: ("obi-metric-pairs/pair-" + $suffix + ".json"),
+              pair_sha256: ("0" * 64),
+              java_reference: null, java_sha256: null
+            }]
+        }]
+      }
+    ')" || return 1
+    validate_obi_metric_boundary_index_payload "$payload" structure || return 1
+    sha256sum() {
+      : >"$RESULT_DIR/transitive-sha-invoked"
+      command sha256sum "$@"
+    }
+    if validate_obi_metric_boundary_index_payload "$payload" full 2>/dev/null; then
+      printf 'boundary journal omitted transitive evidence from its byte budget\n' >&2
+      return 1
+    fi
+    [[ ! -e "$RESULT_DIR/transitive-sha-invoked" ]] || {
+      printf 'boundary journal hashed transitive evidence before rejecting overflow\n' >&2
+      return 1
+    }
+  ) || return 1
+
+  for transport in auto getsockopt unix; do
+    (
+      RESULT_DIR="$planner_fixture-$transport"
+      SCENARIO=all
+      TRANSPORT="$transport"
+      REPEAT_COUNT=10
+      mkdir -p -- "$RESULT_DIR"
+      initialize_obi_metric_boundary_index || return 1
+      jq -e \
+        --argjson maximum "$OBI_METRIC_BOUNDARY_INDEX_MAX_BOUNDARIES" '
+          (.boundaries | length) == 197 and
+          (.boundaries | length) <= $maximum and
+          ([.boundaries[].id] | length == (unique | length)) and
+          .boundaries[0].id == "basic-run-01" and
+          .boundaries[-1].id == "uninstrumented"
+        ' "$RESULT_DIR/obi-metric-boundary-index.json" >/dev/null || return 1
+      obi_metric_boundary_index_payload full >/dev/null
+    ) || return 1
+  done
+
+  (
+    RESULT_DIR="$budget_fixture"
+    payload="$(jq -cnS '
+      {
+        schema: "obi-metric-boundary-index-v1",
+        selection: {
+          scenario: "uninstrumented", requested_transport: "disabled",
+          selected_transport: null, repeat_count: 1
+        },
+        boundaries: [{
+          id: "uninstrumented", ordinal: 1, state: "active",
+          not_applicable_reason: null, status_references: [],
+          captures: [{
+            id: "zero", kind: "artifact", state: "captured",
+            reference: "zero.bin", sha256: ("0" * 64)
+          }]
+        }]
+      }
+    ')" || return 1
+    jq() {
+      local argument=""
+      for argument in "$@"; do
+        if [[ "$argument" == *'$boundary.captures[]'* &&
+          "$argument" == *'.java_reference'* ]]; then
+          return 74
+        fi
+      done
+      command jq "$@"
+    }
+    sha256sum() {
+      : >"$RESULT_DIR/manifest-fault-sha-invoked"
+      command sha256sum "$@"
+    }
+    if validate_obi_metric_boundary_index_payload "$payload" full; then
+      printf 'boundary journal ignored a budget-manifest jq failure\n' >&2
+      return 1
+    fi
+    [[ ! -e "$RESULT_DIR/manifest-fault-sha-invoked" ]]
+  )
+}
+
+test_obi_metric_boundary_manual_controls_are_pair_bound() {
+  local function_name=""
+  local pair_id=""
+  local first_mutation=""
+  local before_checkpoint=""
+  local fault_checkpoint=""
+  local recovery_marker=""
+  local recovery_occurrence=""
+  local record_tuple=""
+  local source=""
+  local normalized_source=""
+  local plan_line=""
+  local first_mutation_line=""
+  local side_effect_line=""
+  local before_checkpoint_line=""
+  local fault_checkpoint_line=""
+  local recovery_line=""
+  local record_line=""
+  local occurrence_count=""
+  local record_occurrence_count=""
+  local specification=""
+  local -a fault_specifications=(
+    'run_delayed_otlp_suppression_sequence|delayed-otlp-prime-suppression|x-obi-demo-id: $DELAYED_OTLP_PRIME_MARKER|capture_phase_evidence "$after_phase"|record_obi_metric_pair delayed-otlp-prime-suppression "$before_phase" "$after_phase" same_process "$after_phase"|none|first'
+    'run_helper_attach_failure_control|helper-attach-rejection|JAVA_TOOL_OPTIONS_VALUE="$HELPER_ATTACH_FAILURE_JAVA_TOOL_OPTIONS"|capture_phase_evidence "$after_phase"|record_obi_metric_pair helper-attach-rejection "$before_phase" "$after_phase" same_process ""|capture_terminal_java_diagnostics_recovery_boundary|first'
+    'run_primary_generation_mismatch_control|primary-generation-mismatch-fault|recovery_required|capture_phase_evidence "$after_phase"|record_obi_metric_pair primary-generation-mismatch-fault "$before_phase" "$after_phase" same_process "$after_phase"|capture_terminal_java_diagnostics_recovery_boundary|first'
+    'run_unix_generation_mismatch_control|unix-generation-mismatch-fault|recovery_required|capture_phase_evidence "$after_phase"|record_obi_metric_pair unix-generation-mismatch-fault "$before_phase" "$after_phase" same_process "$after_phase"|capture_terminal_java_diagnostics_recovery_boundary|first'
+    'run_primary_live_fd_security_control|primary-live-fd-probe|recovery_required|capture_metric_phase_evidence "$probe_phase"|record_obi_metric_pair primary-live-fd-probe "$before_phase" "$probe_phase" same_process ""|release_primary_live_fd_barrier|last'
+    'run_primary_live_fd_security_control|primary-live-fd-full|recovery_required|capture_metric_phase_evidence "$after_phase"|record_obi_metric_pair primary-live-fd-full "$before_phase" "$after_phase" same_process ""|capture_terminal_java_diagnostics_recovery_boundary|first'
+    'run_primary_security_control|security-primary-sibling|SECURITY_PROBE_MODE="primary"|capture_metric_phase_evidence "security-primary-sibling-ready"|record_obi_metric_pair security-primary-sibling security-primary-before security-primary-sibling-ready same_process ""|docker kill --signal SIGUSR1|first'
+    'run_primary_security_control|security-primary-same-cgroup|PRIMARY_SECURITY_JAVA_CONTAINER="$java_container"|capture_metric_phase_evidence "security-primary-probe-ready"|record_obi_metric_pair security-primary-same-cgroup security-primary-sibling-complete security-primary-probe-ready same_process ""|kill -USR1 "$1"|first'
+    'run_unix_security_control|security-unix-endpoint-refusal|SECURITY_PROBE_MODE="endpoint"|capture_phase_evidence security-unix-endpoint-fault|record_obi_metric_pair security-unix-endpoint-refusal security-unix-endpoint-before security-unix-endpoint-fault process_replaced ""|kill --signal SIGUSR1 security-probe|first'
+    'run_unix_permissive_directory_control|security-unix-permissive-refusal|invalidate_selected_transport|capture_phase_evidence security-unix-permissive-fault|record_obi_metric_pair security-unix-permissive-refusal security-unix-permissive-before security-unix-permissive-fault process_replaced ""|capture_terminal_java_diagnostics_recovery_boundary|first'
+    'start_stack|pid-reuse-controller-window|if run_pid_reuse_controller|capture_phase_evidence pid-reuse-controller-after|record_obi_metric_pair pid-reuse-controller-window pid-reuse-controller-before pid-reuse-controller-after same_process ""|none|first'
+  )
+  local -a recovery_specifications=(
+    'run_unix_security_control|security-unix-endpoint-recovery|SECURITY_PROBE_MODE="endpoint"|capture_phase_evidence security-unix-endpoint-fault|kill --signal SIGUSR1 security-probe|capture_phase_evidence security-unix-endpoint-after|record_obi_metric_pair security-unix-endpoint-recovery security-unix-endpoint-fault security-unix-endpoint-after same_process ""'
+    'run_unix_permissive_directory_control|security-unix-permissive-recovery|invalidate_selected_transport|capture_phase_evidence security-unix-permissive-fault|capture_terminal_java_diagnostics_recovery_boundary|capture_phase_evidence security-unix-permissive-after|record_obi_metric_pair security-unix-permissive-recovery security-unix-permissive-fault security-unix-permissive-after process_replaced ""'
+  )
+
+  for specification in "${fault_specifications[@]}"; do
+    IFS='|' read -r function_name pair_id first_mutation fault_checkpoint \
+      record_tuple recovery_marker recovery_occurrence \
+      <<<"$specification"
+    source="$(declare -f "$function_name")" || return 1
+    normalized_source="$(tr '\n\t' '  ' <<<"$source" | \
+      sed -E 's/[[:space:]]+/ /g')" || return 1
+    occurrence_count="$(grep -Fc -- \
+      "plan_obi_metric_pair_capture $pair_id" <<<"$source")" || true
+    record_occurrence_count="$(grep -Fo -- "$record_tuple" \
+      <<<"$normalized_source" | wc -l | tr -d '[:space:]')" || true
+    [[ "$occurrence_count" == 1 && "$record_occurrence_count" == 1 ]] || {
+      printf '%s did not plan and record the exact tuple for pair %s\n' \
+        "$function_name" "$pair_id" >&2
+      return 1
+    }
+    plan_line="$(awk -v id="$pair_id" '
+      index($0, "plan_obi_metric_pair_capture " id) { print NR; exit }
+    ' <<<"$source")"
+    first_mutation_line="$(awk -v marker="$first_mutation" '
+      index($0, marker) { print NR; exit }
+    ' <<<"$source")"
+    fault_checkpoint_line="$(awk -v marker="$fault_checkpoint" '
+      index($0, marker) { print NR; exit }
+    ' <<<"$source")"
+    record_line="$(awk -v id="$pair_id" '
+      index($0, "record_obi_metric_pair " id) { print NR; exit }
+    ' <<<"$source")"
+    recovery_line=""
+    if [[ "$recovery_marker" != none ]]; then
+      if [[ "$recovery_occurrence" == last ]]; then
+        recovery_line="$(awk -v marker="$recovery_marker" '
+          index($0, marker) { line = NR }
+          END { if (line) print line }
+        ' <<<"$source")"
+      else
+        recovery_line="$(awk -v marker="$recovery_marker" '
+          index($0, marker) { print NR; exit }
+        ' <<<"$source")"
+      fi
+    fi
+    [[ "$plan_line" =~ ^[1-9][0-9]*$ &&
+      "$first_mutation_line" =~ ^[1-9][0-9]*$ &&
+      "$fault_checkpoint_line" =~ ^[1-9][0-9]*$ &&
+      "$record_line" =~ ^[1-9][0-9]*$ &&
+      "$plan_line" -lt "$first_mutation_line" &&
+      "$first_mutation_line" -lt "$fault_checkpoint_line" &&
+      "$fault_checkpoint_line" -lt "$record_line" &&
+      ( "$recovery_marker" == none ||
+        ( "$recovery_line" =~ ^[1-9][0-9]*$ && "$record_line" -lt "$recovery_line" ) ) ]] || {
+      printf '%s pair %s did not bracket its controlled fault checkpoint\n' \
+        "$function_name" "$pair_id" >&2
+      return 1
+    }
+  done
+
+  for specification in "${recovery_specifications[@]}"; do
+    IFS='|' read -r function_name pair_id first_mutation before_checkpoint \
+      recovery_marker fault_checkpoint record_tuple <<<"$specification"
+    source="$(declare -f "$function_name")" || return 1
+    normalized_source="$(tr '\n\t' '  ' <<<"$source" | \
+      sed -E 's/[[:space:]]+/ /g')" || return 1
+    occurrence_count="$(grep -Fc -- \
+      "plan_obi_metric_pair_capture $pair_id" <<<"$source")" || true
+    record_occurrence_count="$(grep -Fo -- "$record_tuple" \
+      <<<"$normalized_source" | wc -l | tr -d '[:space:]')" || true
+    [[ "$occurrence_count" == 1 && "$record_occurrence_count" == 1 ]] || {
+      printf '%s did not plan and record the exact recovery tuple for pair %s\n' \
+        "$function_name" "$pair_id" >&2
+      return 1
+    }
+    plan_line="$(awk -v id="$pair_id" '
+      index($0, "plan_obi_metric_pair_capture " id) { print NR; exit }
+    ' <<<"$source")"
+    first_mutation_line="$(awk -v marker="$first_mutation" '
+      index($0, marker) { print NR; exit }
+    ' <<<"$source")"
+    before_checkpoint_line="$(awk -v marker="$before_checkpoint" '
+      index($0, marker) { print NR; exit }
+    ' <<<"$source")"
+    recovery_line="$(awk -v marker="$recovery_marker" '
+      index($0, marker) { print NR; exit }
+    ' <<<"$source")"
+    fault_checkpoint_line="$(awk -v marker="$fault_checkpoint" '
+      index($0, marker) { print NR; exit }
+    ' <<<"$source")"
+    record_line="$(awk -v id="$pair_id" '
+      index($0, "record_obi_metric_pair " id) { print NR; exit }
+    ' <<<"$source")"
+    [[ "$plan_line" =~ ^[1-9][0-9]*$ &&
+      "$first_mutation_line" =~ ^[1-9][0-9]*$ &&
+      "$before_checkpoint_line" =~ ^[1-9][0-9]*$ &&
+      "$recovery_line" =~ ^[1-9][0-9]*$ &&
+      "$fault_checkpoint_line" =~ ^[1-9][0-9]*$ &&
+      "$record_line" =~ ^[1-9][0-9]*$ &&
+      "$plan_line" -lt "$first_mutation_line" &&
+      "$first_mutation_line" -lt "$before_checkpoint_line" &&
+      "$before_checkpoint_line" -lt "$recovery_line" &&
+      "$recovery_line" -lt "$fault_checkpoint_line" &&
+      "$fault_checkpoint_line" -lt "$record_line" ]] || {
+      printf '%s recovery pair %s did not bind fault through recovery\n' \
+        "$function_name" "$pair_id" >&2
+      return 1
+    }
+  done
+
+  source="$(declare -f run_primary_w3c_fault_scenario)" || return 1
+  normalized_source="$(tr '\n\t' '  ' <<<"$source" | \
+    sed -E 's/[[:space:]]+/ /g')" || return 1
+  record_tuple='record_obi_metric_pair "$label" "$before_phase" "$after_phase" same_process "$after_phase"'
+  occurrence_count="$(grep -Fc -- \
+    'plan_obi_metric_pair_capture "$label"' <<<"$source")" || true
+  record_occurrence_count="$(grep -Fo -- "$record_tuple" \
+    <<<"$normalized_source" | wc -l | tr -d '[:space:]')" || true
+  plan_line="$(awk '/plan_obi_metric_pair_capture "\$label"/ { print NR; exit }' \
+    <<<"$source")"
+  side_effect_line="$(awk '/arm_primary_w3c_fault_control/ { print NR; exit }' \
+    <<<"$source")"
+  fault_checkpoint_line="$(awk '/capture_phase_evidence "\$after_phase"/ { print NR; exit }' \
+    <<<"$source")"
+  record_line="$(awk '/"\$label" "\$before_phase" "\$after_phase" same_process/ {
+    print NR; exit
+  }' <<<"$source")"
+  [[ "$occurrence_count" == 1 && "$record_occurrence_count" == 1 &&
+    "$plan_line" =~ ^[1-9][0-9]*$ &&
+    "$side_effect_line" =~ ^[1-9][0-9]*$ &&
+    "$fault_checkpoint_line" =~ ^[1-9][0-9]*$ &&
+    "$record_line" =~ ^[1-9][0-9]*$ &&
+    "$plan_line" -lt "$side_effect_line" &&
+    "$side_effect_line" -lt "$fault_checkpoint_line" &&
+    "$fault_checkpoint_line" -lt "$record_line" ]] || {
+    printf 'primary W3C fault mode pair did not bracket its controlled request\n' >&2
+    return 1
+  }
+
+  source="$(declare -f run_scenario)" || return 1
+  normalized_source="$(tr '\n\t' '  ' <<<"$source" | \
+    sed -E 's/[[:space:]]+/ /g')" || return 1
+  record_tuple='record_obi_metric_pair "$label" "$before_phase" "$after_phase" same_process "$after_phase"'
+  occurrence_count="$(grep -Fc -- \
+    'plan_obi_metric_pair_capture "$label"' <<<"$source")" || true
+  record_occurrence_count="$(grep -Fo -- "$record_tuple" \
+    <<<"$normalized_source" | wc -l | tr -d '[:space:]')" || true
+  plan_line="$(awk '/plan_obi_metric_pair_capture "\$label"/ { print NR; exit }' \
+    <<<"$source")"
+  side_effect_line="$(awk '/log_info "running \$label scenario"/ { print NR; exit }' \
+    <<<"$source")"
+  record_line="$(awk '/"\$label" "\$before_phase" "\$after_phase" same_process/ {
+    print NR; exit
+  }' <<<"$source")"
+  [[ "$occurrence_count" == 1 && "$record_occurrence_count" == 1 &&
+    "$plan_line" =~ ^[1-9][0-9]*$ &&
+    "$side_effect_line" =~ ^[1-9][0-9]*$ &&
+    "$record_line" =~ ^[1-9][0-9]*$ &&
+    "$plan_line" -lt "$side_effect_line" &&
+    "$side_effect_line" -lt "$record_line" ]] || {
+    printf 'generic scenario did not publish pair intent before its controlled workload\n' >&2
+    return 1
+  }
+
+  source="$(declare -f stop_obi_for_no_state_control)" || return 1
+  normalized_source="$(tr '\n\t' '  ' <<<"$source" | \
+    sed -E 's/[[:space:]]+/ /g')" || return 1
+  record_tuple='record_obi_metric_pair "$label-obi-stopped" "$label-obi-running" "$label-obi-stopped" same_process "$label-obi-stopped"'
+  occurrence_count="$(grep -Fc -- \
+    'plan_obi_metric_pair_capture "$label-obi-stopped"' <<<"$source")" || true
+  record_occurrence_count="$(grep -Fo -- "$record_tuple" \
+    <<<"$normalized_source" | wc -l | tr -d '[:space:]')" || true
+  plan_line="$(awk '/plan_obi_metric_pair_capture "\$label-obi-stopped"/ {
+    print NR; exit
+  }' <<<"$source")"
+  side_effect_line="$(awk '/invalidate_selected_transport/ { print NR; exit }' \
+    <<<"$source")"
+  fault_checkpoint_line="$(awk '/capture_obi_stopped_attestation/ { print NR; exit }' \
+    <<<"$source")"
+  record_line="$(awk '/record_obi_metric_pair "\$label-obi-stopped"/ {
+    print NR; exit
+  }' \
+    <<<"$source")"
+  [[ "$occurrence_count" == 1 && "$record_occurrence_count" == 1 &&
+    "$plan_line" =~ ^[1-9][0-9]*$ &&
+    "$side_effect_line" =~ ^[1-9][0-9]*$ &&
+    "$fault_checkpoint_line" =~ ^[1-9][0-9]*$ &&
+    "$record_line" =~ ^[1-9][0-9]*$ &&
+    "$plan_line" -lt "$side_effect_line" &&
+    "$side_effect_line" -lt "$fault_checkpoint_line" &&
+    "$fault_checkpoint_line" -lt "$record_line" ]] || {
+    printf 'stopped control did not publish intent before invalidating transport\n' >&2
+    return 1
+  }
+
+  source="$(declare -f run_restart_during_traffic_control)" || return 1
+  normalized_source="$(tr '\n\t' '  ' <<<"$source" | \
+    sed -E 's/[[:space:]]+/ /g')" || return 1
+  record_tuple='record_obi_metric_pair "$label" "$before_phase" "$after_phase" process_replaced "$after_phase"'
+  occurrence_count="$(grep -Fc -- \
+    'plan_obi_metric_pair_capture "$label"' <<<"$source")" || true
+  record_occurrence_count="$(grep -Fo -- "$record_tuple" \
+    <<<"$normalized_source" | wc -l | tr -d '[:space:]')" || true
+  plan_line="$(awk '/plan_obi_metric_pair_capture "\$label"/ { print NR; exit }' \
+    <<<"$source")"
+  side_effect_line="$(awk '
+    index($0, "--scenario restart-fault") && index($0, "&") {
+      print NR; exit
+    }
+  ' <<<"$source")"
+  fault_checkpoint_line="$(awk '/capture_phase_evidence "\$after_phase"/ {
+    print NR; exit
+  }' <<<"$source")"
+  record_line="$(awk '/"\$label" "\$before_phase" "\$after_phase" process_replaced/ {
+    print NR; exit
+  }' <<<"$source")"
+  [[ "$occurrence_count" == 1 && "$record_occurrence_count" == 1 &&
+    "$plan_line" =~ ^[1-9][0-9]*$ &&
+    "$side_effect_line" =~ ^[1-9][0-9]*$ &&
+    "$fault_checkpoint_line" =~ ^[1-9][0-9]*$ &&
+    "$record_line" =~ ^[1-9][0-9]*$ &&
+    "$plan_line" -lt "$side_effect_line" &&
+    "$side_effect_line" -lt "$fault_checkpoint_line" &&
+    "$fault_checkpoint_line" -lt "$record_line" ]] || {
+    printf 'restart traffic did not publish intent before its first side effect\n' >&2
+    return 1
+  }
+
+  source="$(declare -f execute_requested_scenarios)" || return 1
+  normalized_source="$(tr '\n\t' '  ' <<<"$source" | \
+    sed -E 's/[[:space:]]+/ /g')" || return 1
+  record_tuple='record_obi_metric_pair restart-process-replaced restart-obi-before restart-obi-after process_replaced restart-obi-after'
+  occurrence_count="$(grep -Fc -- \
+    'plan_obi_metric_pair_capture restart-process-replaced' \
+    <<<"$source")" || true
+  record_occurrence_count="$(grep -Fo -- "$record_tuple" \
+    <<<"$normalized_source" | wc -l | tr -d '[:space:]')" || true
+  plan_line="$(awk '/plan_obi_metric_pair_capture restart-process-replaced/ {
+    print NR; exit
+  }' <<<"$source")"
+  side_effect_line="$(awk '/invalidate_selected_transport/ { print NR; exit }' \
+    <<<"$source")"
+  fault_checkpoint_line="$(awk '/capture_phase_evidence restart-obi-after/ {
+    print NR; exit
+  }' <<<"$source")"
+  record_line="$(awk '/restart-process-replaced restart-obi-before restart-obi-after/ {
+    print NR; exit
+  }' <<<"$source")"
+  [[ "$occurrence_count" == 1 && "$record_occurrence_count" == 1 &&
+    "$plan_line" =~ ^[1-9][0-9]*$ &&
+    "$side_effect_line" =~ ^[1-9][0-9]*$ &&
+    "$fault_checkpoint_line" =~ ^[1-9][0-9]*$ &&
+    "$record_line" =~ ^[1-9][0-9]*$ &&
+    "$plan_line" -lt "$side_effect_line" &&
+    "$side_effect_line" -lt "$fault_checkpoint_line" &&
+    "$fault_checkpoint_line" -lt "$record_line" ]] || {
+    printf 'direct restart did not publish intent before invalidating transport\n' >&2
+    return 1
+  }
+}
+
+run_obi_metric_boundary_all_repeat_lifecycle_fixture() {
+  local -r fixture="$1"
+  local -r timing_output="$2"
+  local boundary_id=""
+  local phase=""
+  local status_reference=""
+  local started=""
+  local elapsed=""
+  local -a boundary_ids=()
+
+  RESULT_DIR="$fixture"
+  SCENARIO=all
+  TRANSPORT=unix
+  REPEAT_COUNT=10
+  mkdir -p -- "$RESULT_DIR"
+  started="$(date +%s)" || return 1
+  initialize_obi_metric_boundary_index || return 1
+  mapfile -t boundary_ids < <(jq -er '.boundaries[].id' \
+    "$RESULT_DIR/obi-metric-boundary-index.json")
+  ((${#boundary_ids[@]} == 197)) || return 1
+  for boundary_id in "${boundary_ids[@]}"; do
+    phase="$boundary_id-evidence"
+    status_reference="scenario-$boundary_id-status.json"
+    begin_obi_metric_boundary "$boundary_id" || return 1
+    mkdir -p -- "$RESULT_DIR/phases/$phase"
+    printf 'unavailable\n' >"$RESULT_DIR/phases/$phase/obi-metrics.prom"
+    chmod 0644 -- "$RESULT_DIR/phases/$phase/obi-metrics.prom"
+    attach_obi_unavailable_phase_capture "$phase" || return 1
+    jq -cn --arg boundary_id "$boundary_id" '
+      {status:"passed",scenario:"all",obi_metric_boundary_ids:[$boundary_id]}
+    ' >"$RESULT_DIR/$status_reference"
+    chmod 0644 -- "$RESULT_DIR/$status_reference"
+    bind_status_to_active_obi_metric_boundary "$status_reference" || return 1
+    complete_obi_metric_boundary "$boundary_id" || return 1
+  done
+  obi_metric_boundary_index_payload full >/dev/null || return 1
+  seal_terminal_java_diagnostics || return 1
+  jq -e '
+    (.boundaries | length) == 197 and
+    all(.boundaries[]; .state == "complete")
+  ' "$RESULT_DIR/obi-metric-boundary-index.json" >/dev/null || return 1
+  jq -e '
+    .schema == "obi-java-remote-parent-terminal-metrics-v2" and
+    .available == false and .reason == "no-active-boundary"
+  ' "$RESULT_DIR/terminal-obi-metrics.json" >/dev/null || return 1
+  elapsed="$(( $(date +%s) - started ))"
+  printf '%s\n' "$elapsed" >"$timing_output"
+}
+
+test_obi_metric_boundary_journal_caches_and_full_lifecycle_are_bounded() {
+  local -r cache_fixture="$TEST_TMP_DIR/obi-boundary-cache"
+  local -r structure_fixture="$TEST_TMP_DIR/obi-boundary-structure-only"
+  local -r lifecycle_fixture="$TEST_TMP_DIR/obi-boundary-lifecycle-child"
+  local -r lifecycle_timing="$TEST_TMP_DIR/obi-boundary-lifecycle.seconds"
+  local -r lifecycle_child_tmp="$TEST_TMP_DIR/obi-boundary-lifecycle-tmp"
+  local -r first_id="abababababababababababababababababababababababababababababababab"
+  local -r started_at="2026-08-17T00:00:00.000000000Z"
+  local parse_count=""
+  local elapsed=""
+  local payload=""
+  local mutated=""
+  local pretty_payload=""
+  local validator_jq_count=""
+
+  (
+    RESULT_DIR="$cache_fixture"
+    SCENARIO=late-attach
+    TRANSPORT=getsockopt
+    REPEAT_COUNT=1
+    mkdir -p -- "$RESULT_DIR"
+    initialize_obi_metric_boundary_index || return 1
+    begin_obi_metric_boundary late-attach || return 1
+    write_obi_running_identity_fixture \
+      "$RESULT_DIR" shared-before "$first_id" "$started_at"
+    write_obi_metric_pair_fixture \
+      "$RESULT_DIR" shared-before tcp take valid 1 0
+    write_obi_running_identity_fixture \
+      "$RESULT_DIR" shared-after "$first_id" "$started_at"
+    write_obi_metric_pair_fixture \
+      "$RESULT_DIR" shared-after tcp take valid 2 0
+    record_obi_metric_pair \
+      shared-one shared-before shared-after same_process "" >/dev/null || return 1
+    record_obi_metric_pair \
+      shared-two shared-before shared-after same_process "" >/dev/null || return 1
+    eval "$(declare -f parse_obi_metric_snapshot | \
+      sed '1s/parse_obi_metric_snapshot/parse_obi_metric_snapshot_saved/')"
+    parse_obi_metric_snapshot() {
+      printf '%s\n' "$1" >>"$RESULT_DIR/parse-invocations"
+      parse_obi_metric_snapshot_saved "$@"
+    }
+    obi_metric_boundary_index_payload full >/dev/null || return 1
+    parse_count="$(wc -l <"$RESULT_DIR/parse-invocations")" || return 1
+    [[ "$parse_count" == 2 &&
+      "$(sort -u "$RESULT_DIR/parse-invocations" | wc -l)" == 2 ]] || {
+      printf 'full journal validation reparsed shared metric snapshots %s times\n' \
+        "$parse_count" >&2
+      return 1
+    }
+  ) || return 1
+
+  (
+    RESULT_DIR="$structure_fixture"
+    SCENARIO=uninstrumented
+    TRANSPORT=disabled
+    REPEAT_COUNT=1
+    mkdir -p -- "$RESULT_DIR"
+    initialize_obi_metric_boundary_index || return 1
+    begin_obi_metric_boundary uninstrumented || return 1
+    payload="$(obi_metric_boundary_index_payload)" || return 1
+    mutated="$(jq -cS '
+      .boundaries[0].state = "planned" |
+      .boundaries += [{
+        id: "later-boundary",
+        ordinal: 2,
+        state: "active",
+        captures: [],
+        status_references: [],
+        not_applicable_reason: null
+      }]
+    ' <<<"$payload")" || return 1
+    if validate_obi_metric_boundary_index_payload "$mutated" structure; then
+      printf 'boundary journal accepted a shape-valid invalid lifecycle order\n' >&2
+      return 1
+    fi
+    pretty_payload="$(jq . <<<"$payload")" || return 1
+    [[ "$pretty_payload" != "$payload" ]] || return 1
+    if validate_obi_metric_boundary_index_payload "$pretty_payload" structure; then
+      printf 'boundary journal accepted noncanonical pretty JSON\n' >&2
+      return 1
+    fi
+    printf '{"retained":true}\n' >"$RESULT_DIR/earlier.json"
+    chmod 0644 -- "$RESULT_DIR/earlier.json"
+    attach_obi_artifact_capture earlier earlier.json || return 1
+    eval "$(declare -f validate_obi_metric_boundary_index_payload | \
+      sed '1s/validate_obi_metric_boundary_index_payload/validate_obi_metric_boundary_index_payload_saved/')"
+    validate_obi_metric_boundary_index_payload() {
+      if [[ "${2:-structure}" == structure ]]; then
+        printf 'structure\n' >>"$RESULT_DIR/structure-validation-count"
+      fi
+      validate_obi_metric_boundary_index_payload_saved "$@"
+    }
+    jq() {
+      local caller=""
+
+      for caller in "${FUNCNAME[@]:1}"; do
+        if [[ "$caller" == validate_obi_metric_boundary_index_payload_saved ]]; then
+          printf 'validator-jq\n' >>"$RESULT_DIR/structure-validation-jq-count"
+          break
+        fi
+      done
+      command jq "$@"
+    }
+    sha256sum() {
+      printf '%s\n' "$@" >>"$RESULT_DIR/later-mutation-sha.log"
+      command sha256sum "$@"
+    }
+    plan_obi_metric_pair_capture later-pair || return 1
+    [[ "$(wc -l <"$RESULT_DIR/structure-validation-count")" == 2 ]] || {
+      printf 'one journal transition performed redundant structure validation\n' >&2
+      return 1
+    }
+    validator_jq_count="$(wc -l \
+      <"$RESULT_DIR/structure-validation-jq-count")" || return 1
+    [[ "$validator_jq_count" == 2 ]] || {
+      printf 'two structure validations spawned %s internal jq calls\n' \
+        "$validator_jq_count" >&2
+      return 1
+    }
+    jq -cn '
+      {status:"passed",scenario:"uninstrumented",
+        obi_metric_boundary_ids:["uninstrumented"]}
+    ' >"$RESULT_DIR/scenario-uninstrumented-status.json"
+    bind_status_to_active_obi_metric_boundary \
+      scenario-uninstrumented-status.json || return 1
+    if grep -Fxq -- "$RESULT_DIR/earlier.json" \
+      "$RESULT_DIR/later-mutation-sha.log"; then
+      printf 'structure-only journal mutation rehashed prior evidence\n' >&2
+      return 1
+    fi
+  ) || return 1
+
+  mkdir -p -- "$lifecycle_child_tmp"
+  if ! timeout --signal=TERM --kill-after=10s 300s bash -c '
+    source "$1"
+    TEST_TMP_DIR="$2"
+    run_obi_metric_boundary_all_repeat_lifecycle_fixture "$3" "$4"
+  ' bash "$TEST_SCRIPT_DIR/run_test.sh" "$lifecycle_child_tmp" \
+    "$lifecycle_fixture" "$lifecycle_timing"; then
+    printf 'all/repeat-10 boundary lifecycle exceeded its 300-second bound\n' >&2
+    return 1
+  fi
+  elapsed="$(<"$lifecycle_timing")"
+  [[ "$elapsed" =~ ^[0-9]+$ && "$elapsed" -le 300 ]] || return 1
+  printf 'all/repeat-10 boundary lifecycle: %ss\n' "$elapsed" >&2
+}
+
+test_obi_metric_boundary_journal_pending_pair_never_falls_back() {
+  local -r pending_fixture="$TEST_TMP_DIR/obi-boundary-pending-pair"
+  local -r post_java_fixture="$TEST_TMP_DIR/obi-boundary-pending-pair-post-java"
+  local -r captured_fixture="$TEST_TMP_DIR/obi-boundary-captured-second-pair"
+  local -r attach_failure_fixture="$TEST_TMP_DIR/obi-boundary-pair-attach-failure"
+  local -r captured_cleanup_fixture="$TEST_TMP_DIR/obi-boundary-pair-captured-cleanup"
+  local -r commit_read_fixture="$TEST_TMP_DIR/obi-boundary-pair-commit-read"
+  local -r no_java_fixture="$TEST_TMP_DIR/obi-boundary-pair-no-java"
+  local -r first_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  local -r second_id="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  local -r first_started="2026-08-17T00:00:00.000000000Z"
+  local -r second_started="2026-08-17T00:02:00.000000000Z"
+  local payload=""
+  local mutated=""
+  local metric_payload=""
+
+  prepare_pending_pair_fixture() {
+    local -r result_dir="$1"
+
+    RESULT_DIR="$result_dir"
+    SCENARIO=late-attach
+    TRANSPORT=getsockopt
+    REPEAT_COUNT=1
+    mkdir -p -- "$RESULT_DIR"
+    initialize_obi_metric_boundary_index || return 1
+    begin_obi_metric_boundary late-attach || return 1
+    write_obi_running_identity_fixture \
+      "$RESULT_DIR" pair-a-before "$first_id" "$first_started"
+    write_obi_metric_pair_fixture \
+      "$RESULT_DIR" pair-a-before tcp take valid 1 0
+    write_obi_stopped_identity_fixture \
+      "$RESULT_DIR" pair-a-after "$first_id" "$first_started"
+    write_diagnostics_fixture \
+      "$RESULT_DIR/phases/pair-a-after/java-diagnostics.txt" 0 0 0 0 0 0
+    record_obi_metric_pair \
+      pair-a pair-a-before pair-a-after same_process pair-a-after >/dev/null ||
+      return 1
+    attach_obi_metric_phase_capture pair-a-before || return 1
+    mkdir -p -- "$RESULT_DIR/phases/pre-pair-b"
+    write_diagnostics_fixture \
+      "$RESULT_DIR/phases/pre-pair-b/java-diagnostics.txt" 1 0 0 0 0 0
+    attach_obi_java_capture pre-pair-b || return 1
+    write_obi_running_identity_fixture \
+      "$RESULT_DIR" pair-b-before "$second_id" "$second_started"
+    write_obi_metric_pair_fixture \
+      "$RESULT_DIR" pair-b-before tcp take valid 2 0
+    write_obi_running_identity_fixture \
+      "$RESULT_DIR" pair-b-after "$second_id" "$second_started"
+    write_obi_metric_pair_fixture \
+      "$RESULT_DIR" pair-b-after tcp take valid 3 0
+    write_diagnostics_fixture \
+      "$RESULT_DIR/phases/pair-b-after/java-diagnostics.txt" 0 1 0 0 0 0
+  }
+
+  (
+    prepare_pending_pair_fixture "$pending_fixture" || return 1
+    [[ "$(active_stopped_obi_metric_pair_reference)" == \
+      obi-metric-pairs/pair-a.json ]] || return 1
+    plan_obi_metric_pair_capture pair-b || return 1
+    [[ -z "$(active_stopped_obi_metric_pair_reference)" ]] || {
+      printf 'pending pair reused an older stopped pair\n' >&2
+      return 1
+    }
+    if complete_obi_metric_boundary late-attach 2>/dev/null; then
+      printf 'boundary journal completed with a pending pair\n' >&2
+      return 1
+    fi
+    payload="$(obi_metric_boundary_index_payload)" || return 1
+    mutated="$(jq -cS '
+      .boundaries[0].captures += [{
+        id: "pair-c", kind: "pair", state: "captured",
+        pair_reference: "obi-metric-pairs/pair-c.json",
+        pair_sha256: ("0" * 64), java_reference: null, java_sha256: null
+      }]
+    ' <<<"$payload")" || return 1
+    if validate_obi_metric_boundary_index_payload "$mutated" structure; then
+      printf 'boundary journal accepted a captured pair after a planned pair\n' >&2
+      return 1
+    fi
+    mutated="$(jq -cS '
+      (.boundaries[0].captures[] | select(.kind == "phase")).id = "wrong-phase"
+    ' <<<"$payload")" || return 1
+    if validate_obi_metric_boundary_index_payload "$mutated" full; then
+      printf 'boundary journal accepted a phase capture ID/reference mismatch\n' >&2
+      return 1
+    fi
+    mutated="$(jq -cS '
+      (.boundaries[0].captures[] | select(.kind == "java")).id = "wrong-java"
+    ' <<<"$payload")" || return 1
+    if validate_obi_metric_boundary_index_payload "$mutated" full; then
+      printf 'boundary journal accepted a Java capture ID/reference mismatch\n' >&2
+      return 1
+    fi
+    mutated="$(jq -cS '
+      (.boundaries[0].captures[] |
+        select(.kind == "pair" and .state == "captured")).id = "wrong-pair"
+    ' <<<"$payload")" || return 1
+    if validate_obi_metric_boundary_index_payload "$mutated" full; then
+      printf 'boundary journal accepted a pair capture ID/reference mismatch\n' >&2
+      return 1
+    fi
+    freeze_terminal_java_diagnostics || return 1
+    jq -e '
+      .available == false and .reason == "active-boundary-incomplete" and
+      .active_boundary_id == "late-attach" and
+      (has("pair") | not) and (has("pair_reference") | not)
+    ' <<<"$(terminal_obi_metrics_payload_from_frozen_index)" >/dev/null ||
+      return 1
+    jq -e '
+      .available == false and
+      .reason == "no-valid-snapshot-before-terminal-boundary"
+    ' <<<"$(terminal_java_diagnostics_payload_from_frozen_index)" >/dev/null
+  ) || return 1
+
+  (
+    prepare_pending_pair_fixture "$post_java_fixture" || return 1
+    plan_obi_metric_pair_capture pair-b || return 1
+    mkdir -p -- "$RESULT_DIR/phases/post-pair-b"
+    write_diagnostics_fixture \
+      "$RESULT_DIR/phases/post-pair-b/java-diagnostics.txt" 0 0 1 0 0 0
+    attach_obi_java_capture post-pair-b || return 1
+    freeze_terminal_java_diagnostics || return 1
+    jq -e '
+      .available == false and .reason == "active-boundary-incomplete"
+    ' <<<"$(terminal_obi_metrics_payload_from_frozen_index)" >/dev/null ||
+      return 1
+    jq -e '
+      .available == true and .phase == "post-pair-b" and
+      .reference == "phases/post-pair-b/java-diagnostics.txt"
+    ' <<<"$(terminal_java_diagnostics_payload_from_frozen_index)" >/dev/null
+  ) || return 1
+
+  (
+    prepare_pending_pair_fixture "$captured_fixture" || return 1
+    record_obi_metric_pair \
+      pair-b pair-b-before pair-b-after same_process pair-b-after >/dev/null ||
+      return 1
+    freeze_terminal_java_diagnostics || return 1
+    jq -e '
+      .available == true and
+      .pair_reference == "obi-metric-pairs/pair-b.json" and
+      .pair.boundary == "pair-b"
+    ' <<<"$(terminal_obi_metrics_payload_from_frozen_index)" >/dev/null ||
+      return 1
+    jq -e '
+      .available == true and .phase == "pair-b-after" and
+      .reference == "phases/pair-b-after/java-diagnostics.txt"
+    ' <<<"$(terminal_java_diagnostics_payload_from_frozen_index)" >/dev/null
+  ) || return 1
+
+  (
+    local fail_attach_install_once=true
+    local deny_orphan_removal=""
+    local pair_handle=""
+    local pair_output=""
+    prepare_pending_pair_fixture "$attach_failure_fixture" || return 1
+    plan_obi_metric_pair_capture pair-b || return 1
+    deny_orphan_removal="$RESULT_DIR/.deny-pair-orphan-removal"
+    pair_output="$RESULT_DIR/obi-metric-pairs/pair-b.json"
+    : >"$deny_orphan_removal"
+    metric_payload="$(build_obi_metric_pair_payload \
+      pair-b pair-b-before pair-b-after same_process)" || return 1
+    mv() {
+      if [[ "$fail_attach_install_once" == true &&
+        "$*" == *'.obi-metric-boundary-index.'* &&
+        "$*" == *'obi-metric-boundary-index.json'* ]]; then
+        fail_attach_install_once=false
+        return 80
+      fi
+      command mv "$@"
+    }
+    rm() {
+      local target="${*: -1}"
+      if [[ -e "$deny_orphan_removal" && "$target" == "$pair_output" ]]; then
+        return 81
+      fi
+      command rm "$@"
+    }
+    if with_terminal_java_diagnostics_lock record_obi_metric_pair_unlocked \
+      pair-b "$metric_payload" pair-b-after; then
+      printf 'pair recording accepted a journal-attach failure\n' >&2
+      return 1
+    fi
+    pair_handle="$(find "$RESULT_DIR/obi-metric-pairs" -maxdepth 1 \
+      -name '.pair.??????' -print -quit)" || return 1
+    [[ -n "$pair_handle" &&
+      -f "$RESULT_DIR/obi-metric-pairs/pair-b.json" &&
+      "$pair_handle" -ef "$RESULT_DIR/obi-metric-pairs/pair-b.json" &&
+      "$(jq -r '
+        [.boundaries[0].captures[] | select(.kind == "pair")][-1].state
+      ' "$RESULT_DIR/obi-metric-boundary-index.json")" == planned ]] || {
+      printf 'pair attach failure lost its exact rollback ownership\n' >&2
+      return 1
+    }
+    if normalize_obi_metric_pair_candidate_residue "$pair_output"; then
+      printf 'pair residue normalizer ignored persistent orphan removal failure\n' >&2
+      return 1
+    fi
+    [[ -f "$pair_output" && -f "$pair_handle" &&
+      "$pair_handle" -ef "$pair_output" &&
+      "$(stat -Lc '%h' -- "$pair_handle")" == 2 ]] || return 1
+    command rm -f -- "$deny_orphan_removal" || return 1
+    normalize_obi_metric_pair_candidate_residue "$pair_output" || return 1
+    [[ ! -e "$pair_output" && ! -L "$pair_output" &&
+      ! -e "$pair_handle" && ! -L "$pair_handle" ]] || return 1
+    seal_terminal_java_diagnostics || return 1
+    jq -e '
+      .available == false and .reason == "active-boundary-incomplete"
+    ' "$RESULT_DIR/terminal-obi-metrics.json" >/dev/null || return 1
+    [[ ! -e "$RESULT_DIR/obi-metric-pairs/pair-b.json" &&
+      ! -e "$pair_handle" ]] || return 1
+    [[ "$(find "$RESULT_DIR/obi-metric-pairs" -mindepth 1 -maxdepth 1 \
+      -type f -printf '%f\n' | LC_ALL=C sort)" == pair-a.json ]]
+  ) || return 1
+
+  (
+    local deny_handle_removal=""
+    local pair_handle=""
+    local rm_call_log=""
+    prepare_pending_pair_fixture "$captured_cleanup_fixture" || return 1
+    deny_handle_removal="$RESULT_DIR/.deny-pair-handle-removal"
+    rm_call_log="$RESULT_DIR/pair-handle-rm-calls.log"
+    : >"$deny_handle_removal"
+    rm() {
+      local target="${*: -1}"
+      if [[ "${target%/*}" == "$RESULT_DIR/obi-metric-pairs" &&
+        "${target##*/}" =~ ^\.pair\.[A-Za-z0-9]{6}$ ]]; then
+        printf '%s\n' "$target" >>"$rm_call_log" || return $?
+        if [[ -e "$deny_handle_removal" ]]; then
+          return 82
+        fi
+      fi
+      command rm "$@"
+    }
+    if record_obi_metric_pair \
+      pair-b pair-b-before pair-b-after same_process pair-b-after >/dev/null;
+    then
+      printf 'pair recording ignored captured-handle cleanup failures\n' >&2
+      if [[ -s "$rm_call_log" ]]; then
+        sed 's/^/intercepted handle rm: /' "$rm_call_log" >&2
+      else
+        printf 'intercepted handle rm: none\n' >&2
+      fi
+      return 1
+    fi
+    pair_handle="$(find "$RESULT_DIR/obi-metric-pairs" -maxdepth 1 \
+      -name '.pair.??????' -print -quit)" || return 1
+    [[ -n "$pair_handle" &&
+      -f "$RESULT_DIR/obi-metric-pairs/pair-b.json" &&
+      "$pair_handle" -ef "$RESULT_DIR/obi-metric-pairs/pair-b.json" &&
+      "$(stat -Lc '%h' -- "$pair_handle")" == 2 &&
+      "$(jq -r '
+      [.boundaries[0].captures[] | select(.id == "pair-b")][0].state
+    ' "$RESULT_DIR/obi-metric-boundary-index.json")" == captured ]] || return 1
+    command rm -f -- "$deny_handle_removal" || return 1
+    record_obi_metric_pair \
+      pair-b pair-b-before pair-b-after same_process pair-b-after >/dev/null ||
+      return 1
+    [[ "$(stat -Lc '%h' -- \
+      "$RESULT_DIR/obi-metric-pairs/pair-b.json")" == 1 &&
+      -z "$(find "$RESULT_DIR/obi-metric-pairs" -maxdepth 1 \
+        -name '.pair.??????' -print -quit)" ]] || return 1
+    if with_terminal_java_diagnostics_lock \
+      attach_obi_metric_pair_capture_unlocked \
+        pair-b obi-metric-pairs/pair-b.json pair-a-after; then
+      printf 'captured pair idempotency accepted a mismatched Java reference\n' >&2
+      return 1
+    fi
+    freeze_terminal_java_diagnostics || return 1
+    jq -e '
+      .available == true and .pair_reference == "obi-metric-pairs/pair-b.json"
+    ' <<<"$(terminal_obi_metrics_payload_from_frozen_index)" >/dev/null
+  ) || return 1
+
+  (
+    local fail_read_after_install=false
+    local read_fault_marker=""
+    local pair_handle=""
+    prepare_pending_pair_fixture "$commit_read_fixture" || return 1
+    plan_obi_metric_pair_capture pair-b || return 1
+    read_fault_marker="$RESULT_DIR/.commit-read-faulted"
+    eval "$(declare -f obi_metric_boundary_index_payload | \
+      sed '1s/obi_metric_boundary_index_payload/obi_metric_boundary_index_payload_saved/')"
+    mv() {
+      command mv "$@" || return $?
+      if [[ "$*" == *'.obi-metric-boundary-index.'* &&
+        "$*" == *'obi-metric-boundary-index.json'* ]]; then
+        fail_read_after_install=true
+      fi
+      return 0
+    }
+    obi_metric_boundary_index_payload() {
+      if [[ "$fail_read_after_install" == true && ! -e "$read_fault_marker" ]]; then
+        printf 'faulted\n' >"$read_fault_marker" || return $?
+        return 83
+      fi
+      obi_metric_boundary_index_payload_saved "$@"
+    }
+    if record_obi_metric_pair \
+      pair-b pair-b-before pair-b-after same_process pair-b-after >/dev/null;
+    then
+      printf 'pair recording ignored a committed-index read fault\n' >&2
+      return 1
+    fi
+    pair_handle="$(find "$RESULT_DIR/obi-metric-pairs" -maxdepth 1 \
+      -name '.pair.??????' -print -quit)" || return 1
+    [[ -f "$read_fault_marker" && "$(<"$read_fault_marker")" == faulted &&
+      -n "$pair_handle" &&
+      -f "$RESULT_DIR/obi-metric-pairs/pair-b.json" &&
+      "$pair_handle" -ef "$RESULT_DIR/obi-metric-pairs/pair-b.json" &&
+      "$(stat -Lc '%h' -- "$pair_handle")" == 2 ]] || return 1
+    jq -e '
+      [.boundaries[0].captures[] | select(.id == "pair-b")][0] |
+      .state == "captured" and
+      .pair_reference == "obi-metric-pairs/pair-b.json"
+    ' "$RESULT_DIR/obi-metric-boundary-index.json" >/dev/null || return 1
+    record_obi_metric_pair \
+      pair-b pair-b-before pair-b-after same_process pair-b-after >/dev/null ||
+      return 1
+    [[ "$(stat -Lc '%h' -- \
+      "$RESULT_DIR/obi-metric-pairs/pair-b.json")" == 1 &&
+      -z "$(find "$RESULT_DIR/obi-metric-pairs" -maxdepth 1 \
+        -name '.pair.??????' -print -quit)" ]]
+  ) || {
+    printf 'pair attach ambiguity deleted evidence after a committed index install\n' >&2
+    return 1
+  }
+
+  (
+    prepare_pending_pair_fixture "$no_java_fixture" || return 1
+    rm -f -- "$RESULT_DIR/phases/pair-b-after/java-diagnostics.txt"
+    record_obi_metric_pair \
+      pair-b pair-b-before pair-b-after same_process "" >/dev/null || return 1
+    jq -e '
+      [.boundaries[0].captures[] | select(.id == "pair-a")][0] |
+      .java_reference == "phases/pair-a-after/java-diagnostics.txt"
+    ' "$RESULT_DIR/obi-metric-boundary-index.json" >/dev/null || return 1
+    jq -e '
+      [.boundaries[0].captures[] | select(.id == "pair-b")][0] |
+      .state == "captured" and .java_reference == null and .java_sha256 == null
+    ' "$RESULT_DIR/obi-metric-boundary-index.json" >/dev/null || return 1
+    [[ -z "$(find "$RESULT_DIR/obi-metric-pairs" -maxdepth 1 \
+      -name '.pair.??????' -print -quit)" ]]
+  )
+}
+
+test_obi_metric_boundary_journal_freeze_intent_orders_writers() {
+  local -r barrier_fixture="$TEST_TMP_DIR/obi-boundary-journal-freeze-barrier"
+  local -r before_fixture="$TEST_TMP_DIR/obi-boundary-journal-mv-before"
+  local -r after_fixture="$TEST_TMP_DIR/obi-boundary-journal-mv-after"
+  local -r publisher_stat_fixture="$TEST_TMP_DIR/obi-boundary-publisher-stat-retry"
+  local -r publisher_postinstall_fixture="$TEST_TMP_DIR/obi-boundary-publisher-postinstall-retry"
+  local -r publisher_mode_fixture="$TEST_TMP_DIR/obi-boundary-publisher-mode-authority"
+  local -r candidate_mode_fixture="$TEST_TMP_DIR/obi-boundary-candidate-mode-authority"
+  local -r direct_seal_fixture="$TEST_TMP_DIR/obi-boundary-publisher-seal-recovery"
+  local -r freeze_stat_fixture="$TEST_TMP_DIR/obi-boundary-freeze-stat-retry"
+  local -r freeze_rm_fixture="$TEST_TMP_DIR/obi-boundary-freeze-rm-retry"
+  local -r freeze_index_mode_fixture="$TEST_TMP_DIR/obi-boundary-freeze-index-mode"
+
+  (
+    RESULT_DIR="$barrier_fixture"
+    SCENARIO=uninstrumented
+    TRANSPORT=disabled
+    REPEAT_COUNT=1
+    mkdir -p -- "$RESULT_DIR"
+    initialize_obi_metric_boundary_index || return 1
+    mv() {
+      if [[ "$*" == *'.obi-metric-boundary-index.'* &&
+        "$*" == *'obi-metric-boundary-index.json'* &&
+        ! -e "$RESULT_DIR/.barrier-fired" ]]; then
+        : >"$RESULT_DIR/.barrier-fired"
+        printf 'terminal-java-diagnostics-frozen-v1\n' \
+          >"$RESULT_DIR/.terminal-java-diagnostics.freeze"
+        chmod 0600 -- "$RESULT_DIR/.terminal-java-diagnostics.freeze"
+      fi
+      command mv "$@"
+    }
+    begin_obi_metric_boundary uninstrumented || return 1
+    [[ "$(active_obi_metric_boundary_id)" == uninstrumented ]] || return 1
+    with_terminal_java_diagnostics_lock \
+      freeze_obi_metric_boundary_index_unlocked || return 1
+    obi_metric_boundary_index_freeze_payload >/dev/null || return 1
+    if bind_selected_transport_to_obi_metric_boundary_index getsockopt; then
+      printf 'journal admitted a writer queued after freeze intent\n' >&2
+      return 1
+    fi
+    [[ "$(jq -r '.selection.selected_transport' \
+      "$RESULT_DIR/obi-metric-boundary-index.json")" == null ]]
+  ) || return 1
+  (
+    local fail_postinstall=false
+
+    RESULT_DIR="$publisher_postinstall_fixture"
+    SCENARIO=uninstrumented
+    TRANSPORT=disabled
+    REPEAT_COUNT=1
+    mkdir -p -- "$RESULT_DIR"
+    initialize_obi_metric_boundary_index || return 1
+    mv() {
+      if [[ "$*" == *'.obi-metric-boundary-index.'* &&
+        "$*" == *'obi-metric-boundary-index.json'* ]]; then
+        command mv "$@" || return $?
+        fail_postinstall=true
+        return 0
+      fi
+      command mv "$@"
+    }
+    sha256sum() {
+      if [[ "$fail_postinstall" == true &&
+        "$1" == "$RESULT_DIR/obi-metric-boundary-index.json" ]]; then
+        fail_postinstall=false
+        return 81
+      fi
+      command sha256sum "$@"
+    }
+    if begin_obi_metric_boundary uninstrumented; then
+      printf 'journal publisher hid a post-install readback failure\n' >&2
+      return 1
+    fi
+    jq -e '.boundaries[0].state == "active"' \
+      "$RESULT_DIR/obi-metric-boundary-index.json" >/dev/null || return 1
+    begin_obi_metric_boundary uninstrumented || return 1
+    [[ "$(active_obi_metric_boundary_id)" == uninstrumented ]]
+  ) || return 1
+  (
+    local original_payload=""
+
+    RESULT_DIR="$publisher_mode_fixture"
+    SCENARIO=uninstrumented
+    TRANSPORT=disabled
+    REPEAT_COUNT=1
+    mkdir -p -- "$RESULT_DIR"
+    initialize_obi_metric_boundary_index || return 1
+    original_payload="$(<"$RESULT_DIR/obi-metric-boundary-index.json")"
+    chmod 0600 -- "$RESULT_DIR/obi-metric-boundary-index.json"
+    if begin_obi_metric_boundary uninstrumented >/dev/null 2>&1; then
+      printf 'journal publisher replaced a wrong-mode canonical index\n' >&2
+      return 1
+    fi
+    [[ "$(<"$RESULT_DIR/obi-metric-boundary-index.json")" == "$original_payload" &&
+      "$(stat -Lc '%a' -- "$RESULT_DIR/obi-metric-boundary-index.json")" == 600 ]]
+  ) || return 1
+  (
+    RESULT_DIR="$candidate_mode_fixture"
+    SCENARIO=uninstrumented
+    TRANSPORT=disabled
+    REPEAT_COUNT=1
+    mkdir -p -- "$RESULT_DIR"
+    initialize_obi_metric_boundary_index || return 1
+    chmod() {
+      local target="${*: -1}"
+      if [[ "$target" == "$RESULT_DIR"/.obi-metric-boundary-index.?????? ]]; then
+        command chmod 0600 -- "$target" || return $?
+        return 0
+      fi
+      command chmod "$@"
+    }
+    if begin_obi_metric_boundary uninstrumented >/dev/null 2>&1; then
+      printf 'journal publisher installed a wrong-mode private candidate\n' >&2
+      return 1
+    fi
+    jq -e '.boundaries[0].state == "planned"' \
+      "$RESULT_DIR/obi-metric-boundary-index.json" >/dev/null || return 1
+    [[ -z "$(find "$RESULT_DIR" -maxdepth 1 \
+      -name '.obi-metric-boundary-index.??????' -print -quit)" ]]
+  ) || return 1
+  (
+    RESULT_DIR="$before_fixture"
+    SCENARIO=uninstrumented
+    TRANSPORT=disabled
+    REPEAT_COUNT=1
+    mkdir -p -- "$RESULT_DIR"
+    initialize_obi_metric_boundary_index || return 1
+    mv() {
+      if [[ ! -e "$RESULT_DIR/.mv-failed" &&
+        "$*" == *'.obi-metric-boundary-index.'* &&
+        "$*" == *'obi-metric-boundary-index.json'* ]]; then
+        : >"$RESULT_DIR/.mv-failed"
+        return 73
+      fi
+      command mv "$@"
+    }
+    if begin_obi_metric_boundary uninstrumented; then
+      printf 'journal accepted a pre-side-effect mv failure\n' >&2
+      return 1
+    fi
+    jq -e '.boundaries[0].state == "planned"' \
+      "$RESULT_DIR/obi-metric-boundary-index.json" >/dev/null || return 1
+    [[ -z "$(find "$RESULT_DIR" -maxdepth 1 \
+      -name '.obi-metric-boundary-index.*' -print -quit)" ]] || return 1
+    begin_obi_metric_boundary uninstrumented
+  ) || return 1
+  (
+    RESULT_DIR="$after_fixture"
+    SCENARIO=uninstrumented
+    TRANSPORT=disabled
+    REPEAT_COUNT=1
+    mkdir -p -- "$RESULT_DIR"
+    initialize_obi_metric_boundary_index || return 1
+    mv() {
+      if [[ ! -e "$RESULT_DIR/.mv-failed" &&
+        "$*" == *'.obi-metric-boundary-index.'* &&
+        "$*" == *'obi-metric-boundary-index.json'* ]]; then
+        : >"$RESULT_DIR/.mv-failed"
+        command mv "$@" || return $?
+        return 73
+      fi
+      command mv "$@"
+    }
+    begin_obi_metric_boundary uninstrumented || return 1
+    [[ "$(active_obi_metric_boundary_id)" == uninstrumented ]] || return 1
+    [[ -z "$(find "$RESULT_DIR" -maxdepth 1 \
+      -name '.obi-metric-boundary-index.*' -print -quit)" ]]
+  ) || return 1
+  (
+    local remaining=""
+    RESULT_DIR="$publisher_stat_fixture"
+    SCENARIO=uninstrumented
+    TRANSPORT=disabled
+    REPEAT_COUNT=1
+    mkdir -p -- "$RESULT_DIR"
+    initialize_obi_metric_boundary_index || return 1
+    printf '3\n' >"$RESULT_DIR/.stat-failures"
+    stat() {
+      if [[ "$1" == -Lc && "$2" == '%d:%i:%u' &&
+        "$4" == "$RESULT_DIR"/.obi-metric-boundary-index.?????? ]]; then
+        remaining="$(<"$RESULT_DIR/.stat-failures")"
+        if ((remaining > 0)); then
+          printf '%s\n' "$((remaining - 1))" >"$RESULT_DIR/.stat-failures"
+          return 75
+        fi
+      fi
+      command stat "$@"
+    }
+    if begin_obi_metric_boundary uninstrumented; then
+      printf 'journal publisher ignored repeated candidate stat failures\n' >&2
+      return 1
+    fi
+    [[ -n "$(find "$RESULT_DIR" -maxdepth 1 \
+      -name '.obi-metric-boundary-index.??????' \
+      ! -name '.obi-metric-boundary-index.freeze' -print -quit)" ]] || return 1
+    begin_obi_metric_boundary uninstrumented || return 1
+    [[ "$(active_obi_metric_boundary_id)" == uninstrumented ]] || return 1
+    [[ -z "$(find "$RESULT_DIR" -maxdepth 1 \
+      -name '.obi-metric-boundary-index.??????' \
+      ! -name '.obi-metric-boundary-index.freeze' -print -quit)" ]]
+  ) || return 1
+  (
+    local remaining=""
+    RESULT_DIR="$direct_seal_fixture"
+    SCENARIO=uninstrumented
+    TRANSPORT=disabled
+    REPEAT_COUNT=1
+    mkdir -p -- "$RESULT_DIR"
+    initialize_obi_metric_boundary_index || return 1
+    printf '3\n' >"$RESULT_DIR/.rm-failures"
+    mv() {
+      if [[ ! -e "$RESULT_DIR/.mv-failed" &&
+        "$*" == *'.obi-metric-boundary-index.'* &&
+        "$*" == *'obi-metric-boundary-index.json'* ]]; then
+        : >"$RESULT_DIR/.mv-failed"
+        return 76
+      fi
+      command mv "$@"
+    }
+    rm() {
+      local target="${*: -1}"
+      if [[ "$target" == "$RESULT_DIR"/.obi-metric-boundary-index.?????? ]]; then
+        remaining="$(<"$RESULT_DIR/.rm-failures")"
+        if ((remaining > 0)); then
+          printf '%s\n' "$((remaining - 1))" >"$RESULT_DIR/.rm-failures"
+          return 77
+        fi
+      fi
+      command rm "$@"
+    }
+    if begin_obi_metric_boundary uninstrumented; then
+      printf 'journal publisher accepted a failed install and failed cleanup\n' >&2
+      return 1
+    fi
+    [[ -n "$(find "$RESULT_DIR" -maxdepth 1 \
+      -name '.obi-metric-boundary-index.??????' \
+      ! -name '.obi-metric-boundary-index.freeze' -print -quit)" ]] || return 1
+    seal_terminal_java_diagnostics || return 1
+    jq -e '.boundaries[0].state == "planned"' \
+      "$RESULT_DIR/obi-metric-boundary-index.json" >/dev/null || return 1
+    obi_metric_boundary_index_freeze_payload >/dev/null || return 1
+    [[ -z "$(find "$RESULT_DIR" -maxdepth 1 \
+      -name '.obi-metric-boundary-index.??????' \
+      ! -name '.obi-metric-boundary-index.freeze' -print -quit)" ]]
+  ) || return 1
+  (
+    local remaining=""
+    RESULT_DIR="$freeze_stat_fixture"
+    SCENARIO=uninstrumented
+    TRANSPORT=disabled
+    REPEAT_COUNT=1
+    mkdir -p -- "$RESULT_DIR"
+    initialize_obi_metric_boundary_index || return 1
+    freeze_terminal_java_diagnostics_unlocked || return 1
+    printf '3\n' >"$RESULT_DIR/.stat-failures"
+    stat() {
+      if [[ "$1" == -Lc && "$2" == '%d:%i:%u' &&
+        "$4" == "$RESULT_DIR"/.obi-metric-boundary-index-freeze.?????? ]]; then
+        remaining="$(<"$RESULT_DIR/.stat-failures")"
+        if ((remaining > 0)); then
+          printf '%s\n' "$((remaining - 1))" >"$RESULT_DIR/.stat-failures"
+          return 78
+        fi
+      fi
+      command stat "$@"
+    }
+    if with_terminal_java_diagnostics_lock \
+      freeze_obi_metric_boundary_index_unlocked; then
+      printf 'boundary freeze ignored repeated candidate stat failures\n' >&2
+      return 1
+    fi
+    with_terminal_java_diagnostics_lock \
+      freeze_obi_metric_boundary_index_unlocked || return 1
+    obi_metric_boundary_index_freeze_payload >/dev/null || return 1
+    [[ -z "$(find "$RESULT_DIR" -maxdepth 1 \
+      -name '.obi-metric-boundary-index-freeze.??????' -print -quit)" ]]
+  ) || return 1
+  (
+    local deny_handle_removal=""
+    local freeze_handle=""
+    RESULT_DIR="$freeze_rm_fixture"
+    SCENARIO=uninstrumented
+    TRANSPORT=disabled
+    REPEAT_COUNT=1
+    mkdir -p -- "$RESULT_DIR"
+    initialize_obi_metric_boundary_index || return 1
+    freeze_terminal_java_diagnostics_unlocked || return 1
+    deny_handle_removal="$RESULT_DIR/.deny-freeze-handle-removal"
+    : >"$deny_handle_removal"
+    rm() {
+      local target="${*: -1}"
+      if [[ -e "$deny_handle_removal" && "${target%/*}" == "$RESULT_DIR" &&
+        "${target##*/}" =~ ^\.obi-metric-boundary-index-freeze\.[A-Za-z0-9]{6}$ ]]; then
+        return 79
+      fi
+      command rm "$@"
+    }
+    if with_terminal_java_diagnostics_lock \
+      freeze_obi_metric_boundary_index_unlocked; then
+      printf 'boundary freeze ignored repeated candidate cleanup failures\n' >&2
+      return 1
+    fi
+    freeze_handle="$(find "$RESULT_DIR" -maxdepth 1 \
+      -name '.obi-metric-boundary-index-freeze.??????' -print -quit)" ||
+      return 1
+    [[ -n "$freeze_handle" &&
+      -f "$RESULT_DIR/.obi-metric-boundary-index.freeze" &&
+      "$freeze_handle" -ef "$RESULT_DIR/.obi-metric-boundary-index.freeze" &&
+      "$(stat -Lc '%h' -- "$freeze_handle")" == 2 ]] || return 1
+    if normalize_obi_metric_boundary_index_freeze_owned_handle; then
+      printf 'boundary freeze normalizer ignored persistent handle cleanup failure\n' >&2
+      return 1
+    fi
+    [[ -f "$freeze_handle" &&
+      -f "$RESULT_DIR/.obi-metric-boundary-index.freeze" &&
+      "$freeze_handle" -ef "$RESULT_DIR/.obi-metric-boundary-index.freeze" &&
+      "$(stat -Lc '%h' -- "$freeze_handle")" == 2 ]] || return 1
+    command rm -f -- "$deny_handle_removal" || return 1
+    with_terminal_java_diagnostics_lock \
+      freeze_obi_metric_boundary_index_unlocked || return 1
+    obi_metric_boundary_index_freeze_payload >/dev/null || return 1
+    [[ "$(stat -Lc '%h' -- \
+      "$RESULT_DIR/.obi-metric-boundary-index.freeze")" == 1 &&
+      -z "$(find "$RESULT_DIR" -maxdepth 1 \
+        -name '.obi-metric-boundary-index-freeze.??????' -print -quit)" ]] ||
+        return 1
+    chmod 0644 -- "$RESULT_DIR/.obi-metric-boundary-index.freeze"
+    if obi_metric_boundary_index_freeze_payload >/dev/null 2>&1; then
+      printf 'boundary freeze accepted a marker with the wrong mode\n' >&2
+      return 1
+    fi
+  ) || return 1
+  (
+    RESULT_DIR="$freeze_index_mode_fixture"
+    SCENARIO=uninstrumented
+    TRANSPORT=disabled
+    REPEAT_COUNT=1
+    mkdir -p -- "$RESULT_DIR"
+    initialize_obi_metric_boundary_index || return 1
+    freeze_terminal_java_diagnostics_unlocked || return 1
+    chmod 0600 -- "$RESULT_DIR/obi-metric-boundary-index.json"
+    if with_terminal_java_diagnostics_lock \
+      freeze_obi_metric_boundary_index_unlocked >/dev/null 2>&1; then
+      printf 'boundary freeze accepted a wrong-mode canonical index\n' >&2
+      return 1
+    fi
+    [[ ! -e "$RESULT_DIR/.obi-metric-boundary-index.freeze" &&
+      ! -L "$RESULT_DIR/.obi-metric-boundary-index.freeze" ]]
+  )
+}
+
 main() {
-  TEST_TMP_DIR="$(mktemp -d)"
+  local test_tmp_parent="${TMPDIR:-/tmp}"
+  local test_tmp_candidate=""
+
+  [[ "$test_tmp_parent" == /* && -d "$test_tmp_parent" &&
+    ! -L "$test_tmp_parent" ]] || return 1
+  test_tmp_parent="$(cd -- "$test_tmp_parent" && pwd -P)" || return 1
+  case "$test_tmp_parent" in
+    /|"$TEST_REPOSITORY_ROOT"|"$TEST_REPOSITORY_ROOT"/*) return 1 ;;
+  esac
+  test_tmp_candidate="$(mktemp -d \
+    "$test_tmp_parent/obi-apache-java-https-test.XXXXXX")" || return $?
+  register_harness_test_tmp_dir "$test_tmp_candidate" || return 1
+  test_sourced_harness_cleanup_requires_registered_ownership
   test_project_name_validation
   test_compose_cleanup_requires_ownership_sentinel
   test_successful_cleanup_invalidates_current_transport_before_down
+  test_cleanup_without_result_publishes_exact_guard_status
+  test_result_directory_is_assigned_only_after_creation
   test_delayed_otlp_temporary_cleanup_preserves_failure
   test_cleanup_refuses_down_when_transport_invalidation_fails
   test_cleanup_failure_changes_successful_run_status
@@ -31902,10 +35940,10 @@ main() {
   test_primary_live_fd_recovery_marker_forces_cleanup_with_keep
   test_run_status_publication_failure_changes_successful_exit
   test_run_status_commit_failure_preserves_authoritative_status
-  test_run_status_link_side_effect_failure_changes_successful_exit
+  test_run_status_link_side_effect_failure_is_reconciled
   test_run_status_link_side_effect_with_verifier_fault_cannot_leave_stale_status
   test_run_status_post_link_verifier_failure_cannot_leave_stale_status
-  test_holder_failure_with_verifier_fault_cannot_leave_stale_status
+  test_holder_failure_with_foreign_status_cannot_rewrite_authority
   test_project_guard_holder_retry_accepts_exact_side_effect
   test_holder_atomic_side_effect_is_terminal_authority
   test_cleanup_only_invalidates_matching_project_evidence_before_down
@@ -31950,6 +35988,13 @@ main() {
   test_pid_reuse_static_overlay_and_build_wiring_are_exact
   test_pid_reuse_controller_precedes_backend_readiness
   test_pid_reuse_dispatch_runs_only_recovered_basic
+  test_obi_metric_boundary_journal_unavailable_capture_is_exact
+  test_clean_preindex_failure_is_legacy_unavailable_and_collision_exact
+  test_obi_metric_boundary_journal_reference_budget_and_plan_are_bounded
+  test_obi_metric_boundary_manual_controls_are_pair_bound
+  test_obi_metric_boundary_journal_caches_and_full_lifecycle_are_bounded
+  test_obi_metric_boundary_journal_pending_pair_never_falls_back
+  test_obi_metric_boundary_journal_freeze_intent_orders_writers
   test_primary_w3c_fault_modes_are_exact
   test_primary_w3c_fault_control_scripts_publish_and_consume_exactly
   test_primary_w3c_stale_control_restores_the_normal_ttls
@@ -32119,6 +36164,8 @@ main() {
   test_auto_unavailable_startup_uses_healthy_auto_contract
   test_permanent_absence_startup_refuses_prior_run_recovery
   test_permanent_absence_project_guard_is_host_shared
+  test_project_guard_acceptance_attempt_requires_terminal_status
+  test_project_guard_terminal_decision_normalizes_atomic_side_effects
   test_project_guard_terminal_handoff_is_status_truthful
   test_project_guard_terminal_handoff_wraps_real_runner
   test_permanent_absence_global_marker_is_exact_and_daemon_bound
@@ -32171,14 +36218,13 @@ main() {
   test_direct_obi_publications_recover_candidate_cleanup
   test_disabled_phase_evidence_prefers_running_obi_metrics
   test_obi_metric_pair_is_bounded_exact_and_mutation_sensitive
-  test_obi_metric_pair_recovery_boundary_is_shared
-  test_obi_metric_pair_transaction_rolls_back_and_retries
   test_obi_metric_pair_exact_maximum_fits
   test_terminal_java_diagnostics_hooks_are_mutation_sensitive
   test_terminal_java_diagnostics_capture_is_bounded_and_atomic
   test_terminal_java_diagnostics_freeze_survives_failed_publication
   test_terminal_metric_retry_uses_implicit_boundary
   test_terminal_obi_metric_publication_recovers_owned_handles
+  test_terminal_publication_families_recover_owned_residue
   test_terminal_java_diagnostics_consumes_one_validated_snapshot
   test_terminal_java_diagnostics_serializes_record_and_seal
   test_terminal_java_diagnostics_recovery_boundary_is_durable

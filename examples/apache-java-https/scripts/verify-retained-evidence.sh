@@ -19,6 +19,15 @@ readonly OBI_PROCESS_IDENTITY_MAX_BYTES=2048
 readonly OBI_METRIC_PAIR_MAX_SERIES=792
 readonly OBI_METRIC_SNAPSHOT_MAX_BYTES=8388608
 readonly OBI_METRIC_SNAPSHOT_MAX_LINES=20000
+readonly OBI_METRIC_BOUNDARY_INDEX_MAX_BYTES=4194304
+readonly OBI_METRIC_BOUNDARY_INDEX_MAX_BOUNDARIES=256
+readonly OBI_METRIC_BOUNDARY_INDEX_MAX_CAPTURES=4096
+readonly OBI_METRIC_BOUNDARY_INDEX_MAX_STATUS_REFERENCES=1024
+readonly OBI_METRIC_BOUNDARY_STATUS_MAX_BYTES=262144
+readonly OBI_METRIC_BOUNDARY_REFERENCED_MAX_BYTES=536870912
+readonly OBI_METRIC_BOUNDARY_FREEZE_MAX_BYTES=160
+readonly BUNDLE_ARCHIVE_MAX_BYTES=603979776
+readonly BUNDLE_ARCHIVE_MAX_FILES=32768
 
 BUNDLE_DIR=""
 BUNDLE_NAME=""
@@ -28,6 +37,19 @@ REPO_ROOT=""
 TMP_DIR=""
 BUNDLE_SNAPSHOT_ROOT=""
 REQUIRE_CURRENT_CODE=false
+OBI_METRIC_BOUNDARY_INDEX_PAYLOAD=""
+OBI_METRIC_BOUNDARY_INDEX_SHA256=""
+declare -A VERIFIED_REFERENCE_SHA256=()
+declare -A VALIDATED_JAVA_DIAGNOSTICS_REFERENCES=()
+declare -A VALIDATED_OBI_IDENTITY_REFERENCES=()
+declare -A VALIDATED_OBI_PAIR_REFERENCES=()
+declare -A VALIDATED_OBI_UNAVAILABLE_REFERENCES=()
+declare -A VALIDATED_STATUS_REFERENCES=()
+declare -A PARSED_OBI_METRIC_REFERENCES=()
+declare -A OBI_IDENTITY_STATE=()
+declare -A OBI_IDENTITY_CONTAINER_ID=()
+declare -A OBI_IDENTITY_STARTED_AT=()
+declare -A OBI_IDENTITY_METRICS_REFERENCE=()
 
 usage() {
   printf '%s\n' \
@@ -235,7 +257,7 @@ check_dependencies() {
   local -a missing=()
   local command_name=""
 
-  for command_name in awk chmod cmp find git jq mkdir mktemp rm sha256sum sort stat tar; do
+  for command_name in awk chmod cmp cp find git jq mkdir mktemp rm sha256sum sort stat tar; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
       missing+=("$command_name")
     fi
@@ -273,6 +295,48 @@ is_safe_relative_path() {
   done
 }
 
+is_runtime_private_retained_path() {
+  local -r relative_path="$1"
+
+  # Every hidden path used by the producer is private transaction state or
+  # scratch space. A checksum entry cannot turn stranded state into retained
+  # evidence. The root boundary-index freeze is the sole published exception.
+  [[ "$relative_path" == .obi-metric-boundary-index.freeze ]] && return 1
+  [[ "$relative_path" == .* || "$relative_path" == */.* ]]
+}
+
+reset_reference_validation_caches() {
+  VERIFIED_REFERENCE_SHA256=()
+  VALIDATED_JAVA_DIAGNOSTICS_REFERENCES=()
+  VALIDATED_OBI_IDENTITY_REFERENCES=()
+  VALIDATED_OBI_PAIR_REFERENCES=()
+  VALIDATED_OBI_UNAVAILABLE_REFERENCES=()
+  VALIDATED_STATUS_REFERENCES=()
+  PARSED_OBI_METRIC_REFERENCES=()
+  OBI_IDENTITY_STATE=()
+  OBI_IDENTITY_CONTAINER_ID=()
+  OBI_IDENTITY_STARTED_AT=()
+  OBI_IDENTITY_METRICS_REFERENCE=()
+}
+
+verify_reference_sha256() {
+  local -r reference="$1"
+  local -r expected_digest="$2"
+  local observed_digest=""
+
+  is_safe_relative_path "$reference" || return 1
+  is_sha256 "$expected_digest" || return 1
+  [[ -f "$BUNDLE_DIR/$reference" && ! -L "$BUNDLE_DIR/$reference" ]] || return 1
+  if [[ -n "${VERIFIED_REFERENCE_SHA256[$reference]+present}" ]]; then
+    [[ "${VERIFIED_REFERENCE_SHA256[$reference]}" == "$expected_digest" ]]
+    return
+  fi
+  observed_digest="$(sha256sum "$BUNDLE_DIR/$reference")" || return 1
+  observed_digest="${observed_digest%% *}"
+  [[ "$observed_digest" == "$expected_digest" ]] || return 1
+  VERIFIED_REFERENCE_SHA256["$reference"]="$observed_digest"
+}
+
 require_regular_file() {
   local -r relative_path="$1"
   local -r path="$BUNDLE_DIR/$relative_path"
@@ -295,6 +359,53 @@ resolve_trusted_repository() {
   TRUSTED_HEAD="$(git -C "$TRUSTED_REPO_ROOT" rev-parse --verify --quiet 'HEAD^{commit}')" || {
     die "the verifier Git checkout does not have a HEAD commit"
   }
+}
+
+validate_tracked_bundle_archive_budget() {
+  local -r relative_path="$1"
+  local tree_manifest="$TMP_DIR/tracked-bundle-tree"
+  local entry=""
+  local metadata=""
+  local entry_path=""
+  local bundle_relative_path=""
+  local mode=""
+  local object_type=""
+  local object_id=""
+  local size=""
+  local extra=""
+  local remaining_bytes=""
+  local size_comparison=""
+  local -i file_count=0
+  local -i total_bytes=0
+
+  git -C "$REPO_ROOT" ls-tree -lr -z --long \
+    "$TRUSTED_HEAD" -- "$relative_path" >"$tree_manifest" || return 1
+  while IFS= read -r -d '' entry; do
+    [[ "$entry" == *$'\t'* ]] || return 1
+    metadata="${entry%%$'\t'*}"
+    entry_path="${entry#*$'\t'}"
+    mode=""
+    object_type=""
+    object_id=""
+    size=""
+    extra=""
+    read -r mode object_type object_id size extra <<<"$metadata"
+    [[ -z "$extra" && ( "$mode" == 100644 || "$mode" == 100755 ) &&
+      "$object_type" == blob ]] || return 1
+    is_sha1 "$object_id" || return 1
+    [[ "$entry_path" == "$relative_path/"* ]] || return 1
+    bundle_relative_path="${entry_path#"$relative_path"/}"
+    is_safe_relative_path "$bundle_relative_path" || return 1
+    ! is_runtime_private_retained_path "$bundle_relative_path" || return 1
+    canonical_uint64_string "$size" || return 1
+    ((file_count < BUNDLE_ARCHIVE_MAX_FILES)) || return 1
+    file_count=$((file_count + 1))
+    remaining_bytes="$((BUNDLE_ARCHIVE_MAX_BYTES - total_bytes))"
+    uint64_string_compare "$size" "$remaining_bytes" size_comparison || return 1
+    [[ "$size_comparison" != 1 ]] || return 1
+    total_bytes=$((total_bytes + size))
+  done <"$tree_manifest"
+  ((file_count > 0))
 }
 
 snapshot_bundle() {
@@ -328,6 +439,9 @@ snapshot_bundle() {
   verify_bundle_worktree_matches_pinned_head "$relative_path"
 
   assert_private_verification_tmp_dir
+  validate_tracked_bundle_archive_budget "$relative_path" || {
+    die "tracked bundle exceeds the safe archive budget or has unsupported entries"
+  }
   snapshot_parent="$(mktemp -d "$TMP_DIR/archive.XXXXXX")" || {
     die "could not create the private verification archive directory"
   }
@@ -382,9 +496,12 @@ validate_bundle_file_types() {
   while IFS= read -r -d '' path; do
     relative_path="${path#"$BUNDLE_DIR"/}"
     is_safe_relative_path "$relative_path" || {
-      die "bundle contains an unsafe file path"
+      die "bundle contains an unsafe path"
     }
-  done < <(find -- "$BUNDLE_DIR" -type f -print0)
+    ! is_runtime_private_retained_path "$relative_path" || {
+      die "bundle contains a runtime-private publication path: $relative_path"
+    }
+  done < <(find -- "$BUNDLE_DIR" -mindepth 1 -print0)
 }
 
 validate_checksum_manifest() {
@@ -821,16 +938,21 @@ parse_obi_metric_snapshot() {
   local process_name=""
   local key=""
   local unsorted=""
+  local cache_file=""
   local attach_value=0
   local attach_present=false
   local -a label_entries=()
   declare -A seen_series=()
   declare -A seen_labels=()
 
+  [[ ! -L "$output" ]] || return 1
+  if [[ -n "${PARSED_OBI_METRIC_REFERENCES[$relative_path]+present}" ]]; then
+    cp -- "${PARSED_OBI_METRIC_REFERENCES[$relative_path]}" "$output"
+    return
+  fi
   validate_bounded_regular_file \
     "$relative_path" "$OBI_METRIC_SNAPSHOT_MAX_BYTES" \
     "$OBI_METRIC_SNAPSHOT_MAX_LINES" || return 1
-  [[ ! -L "$output" ]] || return 1
   unsorted="$(mktemp "$TMP_DIR/obi-metric-snapshot.XXXXXX")" || return $?
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ "$line" != *$'\r'* ]] || {
@@ -956,6 +1078,12 @@ parse_obi_metric_snapshot() {
   if LC_ALL=C sort -- "$unsorted" >"$output" &&
     printf 'attach\t%s\t%s\n' "$attach_present" "$attach_value" >>"$output"; then
     rm -f -- "$unsorted" || return 1
+    cache_file="$(mktemp "$TMP_DIR/obi-metric-parsed-cache.XXXXXX")" || return $?
+    if ! cp -- "$output" "$cache_file"; then
+      rm -f -- "$cache_file"
+      return 1
+    fi
+    PARSED_OBI_METRIC_REFERENCES["$relative_path"]="$cache_file"
     return 0
   fi
   rm -f -- "$unsorted" "$output" || true
@@ -997,6 +1125,28 @@ validate_java_diagnostics_snapshot() {
   done
 }
 
+validate_java_diagnostics_reference() {
+  local -r reference="$1"
+  local phase=""
+  local diagnostics=""
+  local -a lines=()
+
+  [[ "$reference" =~ ^phases/([a-z0-9][a-z0-9-]{0,63})/java-diagnostics\.txt$ ]] ||
+    return 1
+  phase="${BASH_REMATCH[1]}"
+  [[ "$reference" == "phases/$phase/java-diagnostics.txt" ]] || return 1
+  if [[ -n "${VALIDATED_JAVA_DIAGNOSTICS_REFERENCES[$reference]+present}" ]]; then
+    return 0
+  fi
+  validate_bounded_regular_file \
+    "$reference" "$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES" 1 || return 1
+  mapfile -t lines <"$BUNDLE_DIR/$reference"
+  (( ${#lines[@]} == 1 )) || return 1
+  diagnostics="${lines[0]}"
+  validate_java_diagnostics_snapshot "$diagnostics" || return 1
+  VALIDATED_JAVA_DIAGNOSTICS_REFERENCES["$reference"]=1
+}
+
 validate_terminal_java_diagnostics() {
   local -r relative_path='terminal-java-diagnostics.json'
   local -r input="$BUNDLE_DIR/$relative_path"
@@ -1004,7 +1154,6 @@ validate_terminal_java_diagnostics() {
   local phase=""
   local snapshot=""
   local diagnostics=""
-  local -a lines=()
 
   validate_single_json_object \
     "$relative_path" "$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES" || return 1
@@ -1022,12 +1171,8 @@ validate_terminal_java_diagnostics() {
   phase="$(jq -er '.phase' "$input")" || return 1
   [[ "$phase" =~ ^[a-z0-9][a-z0-9-]{0,63}$ &&
     "$reference" == "phases/$phase/java-diagnostics.txt" ]] || return 1
-  validate_bounded_regular_file \
-    "$reference" "$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES" 1 || return 1
-  mapfile -t lines <"$BUNDLE_DIR/$reference"
-  (( ${#lines[@]} == 1 )) || return 1
-  diagnostics="${lines[0]}"
-  validate_java_diagnostics_snapshot "$diagnostics" || return 1
+  validate_java_diagnostics_reference "$reference" || return 1
+  IFS= read -r diagnostics <"$BUNDLE_DIR/$reference" || return 1
   snapshot="$(jq -er '.snapshot' "$input")" || return 1
   [[ "$snapshot" == "$diagnostics" ]] || return 1
   jq -e --arg snapshot "$snapshot" '
@@ -1038,6 +1183,22 @@ validate_terminal_java_diagnostics() {
       | add
     )
   ' "$input" >/dev/null
+}
+
+validate_terminal_java_diagnostics_any() {
+  local -r relative_path='terminal-java-diagnostics.json'
+
+  validate_single_json_object \
+    "$relative_path" "$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES" || return 1
+  if jq -e '
+    keys == ["available", "reason", "schema", "sealed"] and
+    .schema == "obi-java-bridge-terminal-diagnostics-v1" and
+    .sealed == true and .available == false and
+    .reason == "no-valid-snapshot-before-terminal-boundary"
+  ' "$BUNDLE_DIR/$relative_path" >/dev/null; then
+    return 0
+  fi
+  validate_terminal_java_diagnostics
 }
 
 validate_obi_process_identity_reference() {
@@ -1051,12 +1212,14 @@ validate_obi_process_identity_reference() {
   local exit_code=""
   local metrics_reference=""
   local metrics_sha256=""
-  local observed_sha256=""
   local input=""
 
   [[ "$reference" =~ ^phases/([a-z0-9][a-z0-9-]{0,63})/obi-identity\.json$ ]] ||
     return 1
   phase="${BASH_REMATCH[1]}"
+  if [[ -n "${VALIDATED_OBI_IDENTITY_REFERENCES[$reference]+present}" ]]; then
+    return 0
+  fi
   validate_single_json_object "$reference" "$OBI_PROCESS_IDENTITY_MAX_BYTES" ||
     return 1
   input="$BUNDLE_DIR/$reference"
@@ -1103,9 +1266,7 @@ validate_obi_process_identity_reference() {
     validate_bounded_regular_file \
       "$metrics_reference" "$OBI_METRIC_SNAPSHOT_MAX_BYTES" \
       "$OBI_METRIC_SNAPSHOT_MAX_LINES" || return 1
-    observed_sha256="$(sha256sum "$BUNDLE_DIR/$metrics_reference")" || return 1
-    observed_sha256="${observed_sha256%% *}"
-    [[ "$observed_sha256" == "$metrics_sha256" ]] || return 1
+    verify_reference_sha256 "$metrics_reference" "$metrics_sha256" || return 1
   else
     finished_at="$(jq -er '.finished_at' "$input")" || return 1
     exit_code="$(jq -er '.exit_code' "$input")" || return 1
@@ -1114,6 +1275,11 @@ validate_obi_process_identity_reference() {
     [[ ! -e "$BUNDLE_DIR/phases/$phase/obi-metrics.prom" &&
       ! -L "$BUNDLE_DIR/phases/$phase/obi-metrics.prom" ]] || return 1
   fi
+  OBI_IDENTITY_STATE["$reference"]="$state"
+  OBI_IDENTITY_CONTAINER_ID["$reference"]="$container_id"
+  OBI_IDENTITY_STARTED_AT["$reference"]="$started_at"
+  OBI_IDENTITY_METRICS_REFERENCE["$reference"]="$metrics_reference"
+  VALIDATED_OBI_IDENTITY_REFERENCES["$reference"]=1
 }
 
 validate_obi_metric_pair() {
@@ -1123,8 +1289,6 @@ validate_obi_metric_pair() {
   local continuity=""
   local before_reference=""
   local after_reference=""
-  local before_identity=""
-  local after_identity=""
   local before_state=""
   local after_state=""
   local before_container_id=""
@@ -1169,6 +1333,9 @@ validate_obi_metric_pair() {
   [[ "$pair_reference" =~ ^obi-metric-pairs/([a-z0-9][a-z0-9-]{0,63})\.json$ ]] ||
     return 1
   boundary="${BASH_REMATCH[1]}"
+  if [[ -n "${VALIDATED_OBI_PAIR_REFERENCES[$pair_reference]+present}" ]]; then
+    return 0
+  fi
   validate_single_json_object "$pair_reference" "$OBI_METRIC_PAIR_MAX_BYTES" ||
     return 1
   pair="$BUNDLE_DIR/$pair_reference"
@@ -1209,14 +1376,12 @@ validate_obi_metric_pair() {
   after_state="$(jq -er '.after.state' "$pair")" || return 1
   validate_obi_process_identity_reference "$before_reference" || return 1
   validate_obi_process_identity_reference "$after_reference" || return 1
-  before_identity="$BUNDLE_DIR/$before_reference"
-  after_identity="$BUNDLE_DIR/$after_reference"
-  [[ "$(jq -er '.state' "$before_identity")" == "$before_state" &&
-    "$(jq -er '.state' "$after_identity")" == "$after_state" ]] || return 1
-  before_container_id="$(jq -er '.container_id' "$before_identity")" || return 1
-  after_container_id="$(jq -er '.container_id' "$after_identity")" || return 1
-  before_started_at="$(jq -er '.started_at' "$before_identity")" || return 1
-  after_started_at="$(jq -er '.started_at' "$after_identity")" || return 1
+  [[ "${OBI_IDENTITY_STATE[$before_reference]}" == "$before_state" &&
+    "${OBI_IDENTITY_STATE[$after_reference]}" == "$after_state" ]] || return 1
+  before_container_id="${OBI_IDENTITY_CONTAINER_ID[$before_reference]}"
+  after_container_id="${OBI_IDENTITY_CONTAINER_ID[$after_reference]}"
+  before_started_at="${OBI_IDENTITY_STARTED_AT[$before_reference]}"
+  after_started_at="${OBI_IDENTITY_STARTED_AT[$after_reference]}"
   if [[ "$after_state" == obi_stopped ]]; then
     [[ "$continuity" == same_process &&
       "$before_container_id" == "$after_container_id" &&
@@ -1229,14 +1394,12 @@ validate_obi_metric_pair() {
       "$before_started_at" != "$after_started_at" ]] || return 1
   fi
 
-  before_metrics_reference="$(jq -er '.metrics_reference' "$before_identity")" ||
-    return 1
+  before_metrics_reference="${OBI_IDENTITY_METRICS_REFERENCE[$before_reference]}"
   before_parsed="$(mktemp "$TMP_DIR/obi-metric-before.XXXXXX")" || return $?
   after_parsed="$(mktemp "$TMP_DIR/obi-metric-after.XXXXXX")" || return $?
   parse_obi_metric_snapshot "$before_metrics_reference" "$before_parsed" || return 1
   if [[ "$after_state" == running ]]; then
-    after_metrics_reference="$(jq -er '.metrics_reference' "$after_identity")" ||
-      return 1
+    after_metrics_reference="${OBI_IDENTITY_METRICS_REFERENCE[$after_reference]}"
     parse_obi_metric_snapshot "$after_metrics_reference" "$after_parsed" || return 1
   else
     : >"$after_parsed"
@@ -1345,6 +1508,536 @@ validate_obi_metric_pair() {
     [[ "$attach_before" != 0 ||
       ( "$attach_after" != __null__ && "$attach_after" != 0 ) ]] || return 1
   fi
+  VALIDATED_OBI_PAIR_REFERENCES["$pair_reference"]=1
+}
+
+read_canonical_obi_metric_boundary_index() {
+  local -r relative_path='obi-metric-boundary-index.json'
+  local payload=""
+  local canonical=""
+  local size=""
+  local -a lines=()
+
+  validate_bounded_regular_file \
+    "$relative_path" "$OBI_METRIC_BOUNDARY_INDEX_MAX_BYTES" 1 || return 1
+  mapfile -t lines <"$BUNDLE_DIR/$relative_path"
+  (( ${#lines[@]} == 1 )) || return 1
+  payload="${lines[0]}"
+  size="$(stat -Lc '%s' -- "$BUNDLE_DIR/$relative_path")" || return 1
+  [[ "$size" == "$(( ${#payload} + 1 ))" ]] || return 1
+  canonical="$(jq -cS . <<<"$payload")" || return 1
+  [[ "$payload" == "$canonical" ]] || return 1
+  jq -e \
+    --argjson maximum_boundaries "$OBI_METRIC_BOUNDARY_INDEX_MAX_BOUNDARIES" \
+    --argjson maximum_captures "$OBI_METRIC_BOUNDARY_INDEX_MAX_CAPTURES" \
+    --argjson maximum_statuses "$OBI_METRIC_BOUNDARY_INDEX_MAX_STATUS_REFERENCES" '
+      keys == ["boundaries", "schema", "selection"] and
+      .schema == "obi-metric-boundary-index-v1" and
+      (.selection | keys == [
+        "repeat_count", "requested_transport", "scenario", "selected_transport"
+      ]) and
+      (.selection.scenario | type == "string") and
+      (.selection.requested_transport == "auto" or
+        .selection.requested_transport == "getsockopt" or
+        .selection.requested_transport == "unix" or
+        .selection.requested_transport == "disabled") and
+      (.selection.selected_transport == null or
+        .selection.selected_transport == "getsockopt" or
+        .selection.selected_transport == "unix") and
+      (.selection.repeat_count | type == "number" and floor == . and
+        . >= 1 and . <= 10) and
+      (.boundaries | type == "array" and length >= 1 and
+        length <= $maximum_boundaries) and
+      ([.boundaries[].id] | length == (unique | length)) and
+      ([.boundaries[].ordinal] | length == (unique | length)) and
+      ([.boundaries[] | select(.state == "active")] | length <= 1) and
+      ([.boundaries[].captures[]] | length <= $maximum_captures) and
+      ([.boundaries[].status_references[]] | length <= $maximum_statuses) and
+      (.boundaries | to_entries | all(.[]; .value.ordinal == (.key + 1))) and
+      all(.boundaries[];
+        keys == [
+          "captures", "id", "not_applicable_reason", "ordinal", "state",
+          "status_references"
+        ] and
+        (.id | type == "string" and test("^[a-z0-9][a-z0-9-]{0,63}$")) and
+        (.ordinal | type == "number" and floor == . and . >= 1) and
+        (.state == "planned" or .state == "active" or
+          .state == "complete" or .state == "not_applicable") and
+        (.captures | type == "array") and
+        (.status_references | type == "array") and
+        ([.captures[].id] | length == (unique | length)) and
+        ([.status_references[].reference] | length == (unique | length)) and
+        (if .state == "planned" then
+          .captures == [] and .status_references == [] and
+          .not_applicable_reason == null
+        elif .state == "active" then
+          .not_applicable_reason == null
+        elif .state == "complete" then
+          (.captures | length) > 0 and
+          all(.captures[]; .state == "captured") and
+          (any(.captures[]; .kind == "pair" and .state == "captured") or
+            all(.captures[]; .kind == "unavailable")) and
+          (.status_references | length) > 0 and
+          .not_applicable_reason == null
+        else
+          .captures == [] and (.status_references | length) == 1 and
+          (.not_applicable_reason | type == "string" and length >= 1 and
+            length <= 160)
+        end) and
+        all(.status_references[];
+          keys == ["reference", "sha256"] and
+          (.reference | type == "string" and
+            test("^scenario-[a-z0-9][a-z0-9-]{0,95}-status\\.json$")) and
+          (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))) and
+        all(.captures[];
+          ((.kind == "phase" and .state == "captured" and
+            keys == ["id", "identity_reference", "identity_sha256", "kind", "state"] and
+            (.identity_reference | type == "string") and
+            (.identity_sha256 | type == "string" and test("^[0-9a-f]{64}$"))) or
+          (.kind == "java" and .state == "captured" and
+            keys == ["id", "kind", "reference", "sha256", "state"] and
+            (.reference | type == "string") and
+            (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))) or
+          (.kind == "artifact" and .state == "captured" and
+            keys == ["id", "kind", "reference", "sha256", "state"] and
+            (.reference | type == "string") and
+            (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))) or
+          (.kind == "unavailable" and .state == "captured" and
+            keys == ["id", "kind", "reason", "reference", "sha256", "state"] and
+            .reason == "obi_process_not_running" and
+            (.reference | type == "string") and
+            (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))) or
+          (.kind == "pair" and
+            keys == [
+              "id", "java_reference", "java_sha256", "kind", "pair_reference",
+              "pair_sha256", "state"
+            ] and
+            (.state == "planned" or .state == "captured") and
+            (.id | type == "string" and test("^[a-z0-9][a-z0-9-]{0,63}$")) and
+            (if .state == "planned" then
+              .pair_reference == null and .pair_sha256 == null and
+              .java_reference == null and .java_sha256 == null
+            else
+              (.pair_reference | type == "string") and
+              (.pair_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+              ((.java_reference == null and .java_sha256 == null) or
+                ((.java_reference | type == "string") and
+                  (.java_sha256 | type == "string" and test("^[0-9a-f]{64}$"))))
+            end)) and
+          (.id | type == "string" and test("^[a-z0-9][a-z0-9-]{0,95}$")))
+        )
+      )
+    ' <<<"$payload" >/dev/null || return 1
+  jq -e '
+    [.boundaries[].state] as $states |
+    ($states | length) as $count |
+    all(range(0; $count); . as $index |
+      if ($states[$index] == "complete" or
+        $states[$index] == "not_applicable") then
+        all(range(0; $index); . as $prior |
+          $states[$prior] == "complete" or
+          $states[$prior] == "not_applicable")
+      elif $states[$index] == "active" then
+        all(range(0; $index); . as $prior |
+          $states[$prior] == "complete" or
+          $states[$prior] == "not_applicable") and
+        all(range($index + 1; $count); . as $later |
+          $states[$later] == "planned")
+      else
+        all(range($index + 1; $count); . as $later |
+          $states[$later] == "planned")
+      end) and
+    all(.boundaries[];
+      ([.captures[] | select(.kind == "pair") | .state]) as $pair_states |
+      all(range(0; ($pair_states | length)); . as $index |
+        if $pair_states[$index] == "planned" then
+          all(range($index + 1; ($pair_states | length)); . as $later |
+            $pair_states[$later] == "planned")
+        else true end))
+  ' <<<"$payload" >/dev/null || return 1
+  printf '%s\n' "$payload"
+}
+
+preflight_obi_metric_boundary_referenced_bytes() {
+  local payload=""
+  local raw_references="$TMP_DIR/obi-boundary-references.raw"
+  local direct_references="$TMP_DIR/obi-boundary-references.direct"
+  local expanded_references="$TMP_DIR/obi-boundary-references.expanded"
+  local final_references="$TMP_DIR/obi-boundary-references.final"
+  local pair_identity_references="$TMP_DIR/obi-boundary-pair-identities"
+  local reference=""
+  local identity_reference=""
+  local metrics_reference=""
+  local state=""
+  local size=""
+  local remaining_bytes=""
+  local size_comparison=""
+  local -i total_bytes=0
+
+  payload="$(read_canonical_obi_metric_boundary_index)" || return 1
+  jq -r '
+    .boundaries[] |
+    (.captures[] |
+      if .kind == "phase" then .identity_reference
+      elif .kind == "pair" and .state == "captured" then
+        .pair_reference, (.java_reference // empty)
+      elif .kind == "pair" then empty
+      else .reference end),
+    (.status_references[].reference)
+  ' <<<"$payload" >"$raw_references" || return 1
+  LC_ALL=C sort -u -- "$raw_references" >"$direct_references" || return 1
+  : >"$expanded_references"
+  while IFS= read -r reference; do
+    [[ -n "$reference" ]] || continue
+    is_safe_relative_path "$reference" || return 1
+    [[ -f "$BUNDLE_DIR/$reference" && ! -L "$BUNDLE_DIR/$reference" ]] || return 1
+    printf '%s\n' "$reference" >>"$expanded_references" || return 1
+    if [[ "$reference" =~ ^obi-metric-pairs/[a-z0-9][a-z0-9-]{0,63}\.json$ ]]; then
+      validate_single_json_object "$reference" "$OBI_METRIC_PAIR_MAX_BYTES" || return 1
+      jq -er '
+        [.before.identity_reference, .after.identity_reference] as $references |
+        if ($references | length) == 2 and
+          all($references[]; type == "string")
+        then $references[] else error("invalid pair identity references") end
+      ' "$BUNDLE_DIR/$reference" >"$pair_identity_references" || return 1
+      [[ "$(awk 'END { print NR + 0 }' "$pair_identity_references")" == 2 ]] ||
+        return 1
+      while IFS= read -r identity_reference; do
+        is_safe_relative_path "$identity_reference" || return 1
+        printf '%s\n' "$identity_reference" >>"$expanded_references" || return 1
+      done <"$pair_identity_references"
+    fi
+  done <"$direct_references"
+  LC_ALL=C sort -u -- "$expanded_references" >"$final_references.tmp" || return 1
+  cp -- "$final_references.tmp" "$expanded_references" || return 1
+  while IFS= read -r reference; do
+    [[ "$reference" =~ ^phases/[a-z0-9][a-z0-9-]{0,63}/obi-identity\.json$ ]] ||
+      continue
+    validate_single_json_object "$reference" "$OBI_PROCESS_IDENTITY_MAX_BYTES" ||
+      return 1
+    state="$(jq -er '.state' "$BUNDLE_DIR/$reference")" || return 1
+    case "$state" in
+      running)
+        metrics_reference="$(jq -er '.metrics_reference' "$BUNDLE_DIR/$reference")" ||
+          return 1
+        is_safe_relative_path "$metrics_reference" || return 1
+        printf '%s\n' "$metrics_reference" >>"$expanded_references" || return 1
+        ;;
+      obi_stopped) ;;
+      *) return 1 ;;
+    esac
+  done <"$final_references.tmp"
+  LC_ALL=C sort -u -- "$expanded_references" >"$final_references" || return 1
+  while IFS= read -r reference; do
+    [[ -n "$reference" && -f "$BUNDLE_DIR/$reference" &&
+      ! -L "$BUNDLE_DIR/$reference" ]] || return 1
+    size="$(stat -Lc '%s' -- "$BUNDLE_DIR/$reference")" || return 1
+    canonical_uint64_string "$size" || return 1
+    remaining_bytes="$((OBI_METRIC_BOUNDARY_REFERENCED_MAX_BYTES - total_bytes))"
+    uint64_string_compare "$size" "$remaining_bytes" size_comparison || return 1
+    [[ "$size_comparison" != 1 ]] || return 1
+    total_bytes=$((total_bytes + size))
+  done <"$final_references"
+}
+
+emit_repeated_planned_obi_metric_boundary_ids() {
+  local -r base="$1"
+  local -r repeat_count="$2"
+  local -i run_number=0
+
+  for ((run_number = 1; run_number <= repeat_count; run_number++)); do
+    if ((repeat_count == 1)); then
+      printf '%s\n' "$base"
+    else
+      printf '%s-run-%02d\n' "$base" "$run_number"
+    fi
+  done
+}
+
+planned_obi_metric_boundary_ids() {
+  local -r scenario="$1"
+  local -r repeat_count="$2"
+  local name=""
+  local -a direct_after_controls=(
+    keepalive pipelining concurrency connection-churn fd-port-reuse
+    slow-body tls-boundary coalesced-bridge timeout-retry pressure handoff
+    virtual-thread netty netty-server dispatch w3c
+  )
+
+  [[ "$repeat_count" =~ ^([1-9]|10)$ ]] || return 1
+  if [[ "$scenario" == all ]]; then
+    emit_repeated_planned_obi_metric_boundary_ids basic "$repeat_count"
+    printf '%s\n' delayed-otlp-suppression security
+    for name in "${direct_after_controls[@]}"; do
+      emit_repeated_planned_obi_metric_boundary_ids "$name" "$repeat_count"
+    done
+    printf 'w3c-match\n'
+    emit_repeated_planned_obi_metric_boundary_ids obi-flags "$repeat_count"
+    printf '%s\n' \
+      primary-w3c-stale primary-generation-mismatch primary-w3c-fault \
+      unix-w3c-stale unix-generation-mismatch w3c-fault \
+      permanent-absence auto-unavailable late-attach restart-during-traffic \
+      helper-attach-failure disabled extension-controls uninstrumented
+    return 0
+  fi
+  case "$scenario" in
+    assertion-failure)
+      emit_repeated_planned_obi_metric_boundary_ids basic "$repeat_count"
+      ;;
+    restart-fault) printf 'restart-during-traffic\n' ;;
+    benchmark-disabled|benchmark-uninstrumented|pid-reuse|restart)
+      printf '%s\n' "$scenario"
+      ;;
+    fail-open|w3c-only|w3c-match|w3c-fault|primary-w3c-stale|unix-w3c-stale|\
+    primary-w3c-fault|primary-generation-mismatch|unix-generation-mismatch|\
+    permanent-absence|auto-unavailable|security|delayed-otlp-suppression|\
+    helper-attach-failure)
+      printf '%s\n' "$scenario"
+      ;;
+    *) emit_repeated_planned_obi_metric_boundary_ids "$scenario" "$repeat_count" ;;
+  esac
+}
+
+validate_obi_metric_boundary_index() {
+  local -r environment="$1"
+  local -r index_relative='obi-metric-boundary-index.json'
+  local -r freeze_relative='.obi-metric-boundary-index.freeze'
+  local payload=""
+  local index_digest=""
+  local frozen_index_digest=""
+  local freeze_payload=""
+  local scenario=""
+  local requested_transport=""
+  local repeat_count=""
+  local expected_ids="$TMP_DIR/obi-boundary-ids.expected"
+  local observed_ids="$TMP_DIR/obi-boundary-ids.observed"
+  local capture_manifest="$TMP_DIR/obi-boundary-captures"
+  local status_manifest="$TMP_DIR/obi-boundary-statuses"
+  local expected_pairs="$TMP_DIR/obi-boundary-pairs.expected"
+  local actual_pairs="$TMP_DIR/obi-boundary-pairs.actual"
+  local expected_statuses="$TMP_DIR/obi-boundary-statuses.expected"
+  local actual_statuses="$TMP_DIR/obi-boundary-statuses.actual"
+  local expected_owners="$TMP_DIR/obi-boundary-status-owners.expected"
+  local actual_owners="$TMP_DIR/obi-boundary-status-owners.actual"
+  local boundary_id=""
+  local boundary_state=""
+  local not_applicable_reason=""
+  local capture_id=""
+  local kind=""
+  local capture_state=""
+  local reference=""
+  local expected_digest=""
+  local java_reference=""
+  local java_digest=""
+  local unavailable_phase=""
+  local path=""
+  local expected_capture_count=""
+  local expected_status_count=""
+  local -i capture_count=0
+  local -i status_count=0
+  local -a freeze_lines=()
+
+  reset_reference_validation_caches
+  payload="$(read_canonical_obi_metric_boundary_index)" || return 1
+  preflight_obi_metric_boundary_referenced_bytes || return 1
+  validate_bounded_regular_file \
+    "$freeze_relative" "$OBI_METRIC_BOUNDARY_FREEZE_MAX_BYTES" 1 || return 1
+  mapfile -t freeze_lines <"$BUNDLE_DIR/$freeze_relative"
+  (( ${#freeze_lines[@]} == 1 )) || return 1
+  freeze_payload="${freeze_lines[0]}"
+  [[ "$(stat -Lc '%s' -- "$BUNDLE_DIR/$freeze_relative")" == \
+    "$(( ${#freeze_payload} + 1 ))" ]] || return 1
+  [[ "$freeze_payload" =~ ^obi-metric-boundary-index-frozen-v1:([0-9a-f]{64})$ ]] ||
+    return 1
+  frozen_index_digest="${BASH_REMATCH[1]}"
+  index_digest="$(sha256sum "$BUNDLE_DIR/$index_relative")" || return 1
+  index_digest="${index_digest%% *}"
+  [[ "$index_digest" == "$frozen_index_digest" ]] || return 1
+
+  scenario="$(key_value "$environment" scenario)" || return 1
+  requested_transport="$(key_value "$environment" transport)" || return 1
+  repeat_count="$(key_value "$environment" repeat_count)" || return 1
+  [[ "$requested_transport" =~ ^(auto|getsockopt|unix|disabled)$ &&
+    "$repeat_count" =~ ^([1-9]|10)$ ]] || return 1
+  jq -e --arg scenario "$scenario" \
+    --arg requested_transport "$requested_transport" \
+    --argjson repeat_count "$repeat_count" '
+      .selection.scenario == $scenario and
+      .selection.requested_transport == $requested_transport and
+      .selection.repeat_count == $repeat_count and
+      (if $requested_transport == "getsockopt" then
+        (.selection.selected_transport == null or
+          .selection.selected_transport == "getsockopt")
+      elif $requested_transport == "unix" then
+        (.selection.selected_transport == null or
+          .selection.selected_transport == "unix")
+      elif $requested_transport == "disabled" then
+        .selection.selected_transport == null
+      else
+        (.selection.selected_transport == null or
+          .selection.selected_transport == "getsockopt" or
+          .selection.selected_transport == "unix")
+      end)
+    ' <<<"$payload" >/dev/null || return 1
+  planned_obi_metric_boundary_ids "$scenario" "$repeat_count" >"$expected_ids" ||
+    return 1
+  jq -r '.boundaries[].id' <<<"$payload" >"$observed_ids" || return 1
+  cmp -s -- "$expected_ids" "$observed_ids" || return 1
+
+  jq -r '
+    .boundaries[] as $boundary |
+    $boundary.captures[] |
+    [
+      $boundary.id, $boundary.state,
+      ($boundary.not_applicable_reason // "__null__"),
+      .id, .kind, .state,
+      (if .kind == "phase" then .identity_reference
+       elif .kind == "pair" then (.pair_reference // "__null__")
+       else .reference end),
+      (if .kind == "phase" then .identity_sha256
+       elif .kind == "pair" then (.pair_sha256 // "__null__")
+       else .sha256 end),
+      (.java_reference // "__null__"), (.java_sha256 // "__null__")
+    ] | @tsv
+  ' <<<"$payload" >"$capture_manifest" || return 1
+  expected_capture_count="$(jq -er '[.boundaries[].captures[]] | length' \
+    <<<"$payload")" || return 1
+  : >"$expected_pairs"
+  while IFS=$'\t' read -r \
+    boundary_id boundary_state not_applicable_reason capture_id kind capture_state \
+    reference expected_digest java_reference java_digest; do
+    [[ -n "$boundary_id" ]] || continue
+    ((capture_count += 1))
+    case "$kind:$capture_state" in
+      pair:planned)
+        continue
+        ;;
+      phase:captured)
+        [[ "$reference" =~ ^phases/([a-z0-9][a-z0-9-]{0,63})/obi-identity\.json$ &&
+          "$capture_id" == "${BASH_REMATCH[1]}" ]] || return 1
+        validate_obi_process_identity_reference "$reference" || return 1
+        ;;
+      java:captured)
+        [[ "$reference" =~ ^phases/([a-z0-9][a-z0-9-]{0,63})/java-diagnostics\.txt$ &&
+          "$capture_id" == "java-${BASH_REMATCH[1]}" ]] || return 1
+        validate_java_diagnostics_reference "$reference" || return 1
+        ;;
+      artifact:captured)
+        [[ "$reference" =~ ^[a-z0-9][a-z0-9._-]{0,127}$ &&
+          -f "$BUNDLE_DIR/$reference" && ! -L "$BUNDLE_DIR/$reference" ]] ||
+          return 1
+        ;;
+      unavailable:captured)
+        [[ "$reference" =~ ^phases/([a-z0-9][a-z0-9-]{0,63})/obi-metrics\.prom$ ]] ||
+          return 1
+        unavailable_phase="${BASH_REMATCH[1]}"
+        [[ "$capture_id" == "$unavailable_phase" ]] || return 1
+        if [[ -z "${VALIDATED_OBI_UNAVAILABLE_REFERENCES[$reference]+present}" ]]; then
+          [[ ! -e "$BUNDLE_DIR/phases/$unavailable_phase/obi-identity.json" &&
+            ! -L "$BUNDLE_DIR/phases/$unavailable_phase/obi-identity.json" &&
+            "$(stat -Lc '%s' -- "$BUNDLE_DIR/$reference")" == 12 &&
+            "$(<"$BUNDLE_DIR/$reference")" == unavailable ]] || return 1
+          VALIDATED_OBI_UNAVAILABLE_REFERENCES["$reference"]=1
+        fi
+        ;;
+      pair:captured)
+        [[ "$reference" =~ ^obi-metric-pairs/([a-z0-9][a-z0-9-]{0,63})\.json$ &&
+          "$capture_id" == "${BASH_REMATCH[1]}" ]] ||
+          return 1
+        validate_obi_metric_pair "$reference" || return 1
+        printf '%s\n' "$reference" >>"$expected_pairs" || return 1
+        if [[ "$java_reference" != __null__ ]]; then
+          validate_java_diagnostics_reference "$java_reference" || return 1
+          verify_reference_sha256 "$java_reference" "$java_digest" || return 1
+        fi
+        ;;
+      *) return 1 ;;
+    esac
+    verify_reference_sha256 "$reference" "$expected_digest" || return 1
+  done <"$capture_manifest"
+  ((capture_count == expected_capture_count)) || return 1
+
+  LC_ALL=C sort -- "$expected_pairs" >"$expected_pairs.sorted" || return 1
+  [[ "$(LC_ALL=C sort -u -- "$expected_pairs" | awk 'END { print NR + 0 }')" == \
+    "$(awk 'END { print NR + 0 }' "$expected_pairs")" ]] || return 1
+  : >"$actual_pairs"
+  if [[ -e "$BUNDLE_DIR/obi-metric-pairs" || -L "$BUNDLE_DIR/obi-metric-pairs" ]]; then
+    [[ -d "$BUNDLE_DIR/obi-metric-pairs" &&
+      ! -L "$BUNDLE_DIR/obi-metric-pairs" ]] || return 1
+    while IFS= read -r -d '' path; do
+      [[ -f "$path" && ! -L "$path" ]] || return 1
+      reference="obi-metric-pairs/${path##*/}"
+      [[ "$reference" =~ ^obi-metric-pairs/[a-z0-9][a-z0-9-]{0,63}\.json$ ]] ||
+        return 1
+      printf '%s\n' "$reference" >>"$actual_pairs" || return 1
+    done < <(find -- "$BUNDLE_DIR/obi-metric-pairs" -mindepth 1 -maxdepth 1 -print0)
+  fi
+  LC_ALL=C sort -- "$actual_pairs" >"$actual_pairs.sorted" || return 1
+  cmp -s -- "$expected_pairs.sorted" "$actual_pairs.sorted" || return 1
+
+  jq -r '
+    .boundaries[] as $boundary |
+    $boundary.status_references[] |
+    [
+      $boundary.id, $boundary.state,
+      ($boundary.not_applicable_reason // "__null__"),
+      .reference, .sha256
+    ] | @tsv
+  ' <<<"$payload" >"$status_manifest" || return 1
+  expected_status_count="$(jq -er \
+    '[.boundaries[].status_references[]] | length' <<<"$payload")" || return 1
+  : >"$expected_statuses"
+  while IFS=$'\t' read -r \
+    boundary_id boundary_state not_applicable_reason reference expected_digest; do
+    [[ -n "$boundary_id" ]] || continue
+    ((status_count += 1))
+    [[ "$reference" =~ ^scenario-[a-z0-9][a-z0-9-]{0,95}-status\.json$ ]] ||
+      return 1
+    if [[ -z "${VALIDATED_STATUS_REFERENCES[$reference]+present}" ]]; then
+      validate_single_json_object \
+        "$reference" "$OBI_METRIC_BOUNDARY_STATUS_MAX_BYTES" || return 1
+      VALIDATED_STATUS_REFERENCES["$reference"]=1
+    fi
+    verify_reference_sha256 "$reference" "$expected_digest" || return 1
+    if [[ "$boundary_state" == not_applicable ]]; then
+      [[ "$reference" == "scenario-$boundary_id-status.json" &&
+        "$not_applicable_reason" != __null__ ]] || return 1
+      jq -e --arg boundary_id "$boundary_id" \
+        --arg reason "$not_applicable_reason" '
+          .status == "not_applicable" and
+          .obi_metric_boundary_ids == [$boundary_id] and
+          .reason == $reason
+        ' "$BUNDLE_DIR/$reference" >/dev/null || return 1
+    fi
+    printf '%s\n' "$reference" >>"$expected_statuses" || return 1
+  done <"$status_manifest"
+  ((status_count == expected_status_count)) || return 1
+
+  LC_ALL=C sort -u -- "$expected_statuses" >"$expected_statuses.sorted" || return 1
+  find -- "$BUNDLE_DIR" -mindepth 1 -maxdepth 1 \
+    -name 'scenario-*-status.json' -printf '%f\n' | LC_ALL=C sort \
+    >"$actual_statuses" || return 1
+  cmp -s -- "$expected_statuses.sorted" "$actual_statuses" || return 1
+  while IFS= read -r reference; do
+    [[ -n "$reference" ]] || continue
+    jq -e '
+      (.obi_metric_boundary_ids | type == "array" and length >= 1) and
+      ([.obi_metric_boundary_ids[]] | length == (unique | length)) and
+      all(.obi_metric_boundary_ids[];
+        type == "string" and test("^[a-z0-9][a-z0-9-]{0,63}$"))
+    ' "$BUNDLE_DIR/$reference" >/dev/null || return 1
+    jq -r --arg reference "$reference" '
+      [.boundaries[] |
+        select(any(.status_references[]; .reference == $reference)) | .id] |
+      unique[]
+    ' <<<"$payload" | LC_ALL=C sort >"$expected_owners" || return 1
+    jq -r '.obi_metric_boundary_ids[]' "$BUNDLE_DIR/$reference" |
+      LC_ALL=C sort >"$actual_owners" || return 1
+    cmp -s -- "$expected_owners" "$actual_owners" || return 1
+  done <"$expected_statuses.sorted"
+
+  OBI_METRIC_BOUNDARY_INDEX_PAYLOAD="$payload"
+  OBI_METRIC_BOUNDARY_INDEX_SHA256="$index_digest"
 }
 
 validate_terminal_obi_metrics() {
@@ -1394,10 +2087,121 @@ validate_terminal_evidence_crosslinks() {
     "$java_reference" == "phases/$after_phase/java-diagnostics.txt" ]]
 }
 
+journal_paths_are_absent() {
+  [[ ! -e "$BUNDLE_DIR/obi-metric-boundary-index.json" &&
+    ! -L "$BUNDLE_DIR/obi-metric-boundary-index.json" &&
+    ! -e "$BUNDLE_DIR/.obi-metric-boundary-index.freeze" &&
+    ! -L "$BUNDLE_DIR/.obi-metric-boundary-index.freeze" ]]
+}
+
+validate_terminal_obi_metrics_v2() {
+  local -r relative_path='terminal-obi-metrics.json'
+  local -r terminal="$BUNDLE_DIR/$relative_path"
+  local active_boundary_id=""
+  local pair_state=""
+  local pair_reference=""
+
+  [[ -n "$OBI_METRIC_BOUNDARY_INDEX_PAYLOAD" &&
+    "$OBI_METRIC_BOUNDARY_INDEX_SHA256" =~ ^[0-9a-f]{64}$ ]] || return 1
+  validate_single_json_object "$relative_path" "$OBI_METRIC_PAIR_MAX_BYTES" ||
+    return 1
+  jq -e --arg index_digest "$OBI_METRIC_BOUNDARY_INDEX_SHA256" '
+    .schema == "obi-java-remote-parent-terminal-metrics-v2" and
+    .sealed == true and
+    .boundary_index_reference == "obi-metric-boundary-index.json" and
+    .boundary_index_sha256 == $index_digest
+  ' "$terminal" >/dev/null || return 1
+  active_boundary_id="$(jq -r '
+    [.boundaries[] | select(.state == "active") | .id] |
+    if length == 0 then "" elif length == 1 then .[0]
+    else error("multiple active boundaries") end
+  ' <<<"$OBI_METRIC_BOUNDARY_INDEX_PAYLOAD")" || return 1
+  if [[ -z "$active_boundary_id" ]]; then
+    jq -e '
+      keys == [
+        "active_boundary_id", "available", "boundary_index_reference",
+        "boundary_index_sha256", "reason", "schema", "sealed"
+      ] and
+      .available == false and .active_boundary_id == null and
+      .reason == "no-active-boundary"
+    ' "$terminal" >/dev/null
+    return
+  fi
+  pair_state="$(jq -r --arg boundary_id "$active_boundary_id" '
+    [.boundaries[] | select(.id == $boundary_id) | .captures[] |
+      select(.kind == "pair") | .state] |
+    if length == 0 then "none" else .[-1] end
+  ' <<<"$OBI_METRIC_BOUNDARY_INDEX_PAYLOAD")" || return 1
+  if [[ "$pair_state" != captured ]]; then
+    jq -e --arg active_boundary_id "$active_boundary_id" '
+      keys == [
+        "active_boundary_id", "available", "boundary_index_reference",
+        "boundary_index_sha256", "reason", "schema", "sealed"
+      ] and
+      .available == false and .active_boundary_id == $active_boundary_id and
+      .reason == "active-boundary-incomplete"
+    ' "$terminal" >/dev/null
+    return
+  fi
+  pair_reference="$(jq -er --arg boundary_id "$active_boundary_id" '
+    [.boundaries[] | select(.id == $boundary_id) | .captures[] |
+      select(.kind == "pair")][-1].pair_reference
+  ' <<<"$OBI_METRIC_BOUNDARY_INDEX_PAYLOAD")" || return 1
+  jq -e --arg active_boundary_id "$active_boundary_id" \
+    --arg pair_reference "$pair_reference" '
+      keys == [
+        "active_boundary_id", "available", "boundary_index_reference",
+        "boundary_index_sha256", "pair", "pair_reference", "schema", "sealed"
+      ] and
+      .available == true and .active_boundary_id == $active_boundary_id and
+      .pair_reference == $pair_reference and (.pair | type == "object")
+    ' "$terminal" >/dev/null || return 1
+  jq -e -s 'length == 2 and .[0].pair == .[1]' \
+    "$terminal" "$BUNDLE_DIR/$pair_reference" >/dev/null
+}
+
+validate_terminal_java_diagnostics_context() {
+  local -r terminal="$BUNDLE_DIR/terminal-java-diagnostics.json"
+  local active_boundary_id=""
+  local expected_reference=""
+
+  validate_terminal_java_diagnostics_any || return 1
+  active_boundary_id="$(jq -r '
+    [.boundaries[] | select(.state == "active") | .id] |
+    if length == 0 then "" elif length == 1 then .[0]
+    else error("multiple active boundaries") end
+  ' <<<"$OBI_METRIC_BOUNDARY_INDEX_PAYLOAD")" || return 1
+  # With no active boundary the last valid Java checkpoint remains independent.
+  [[ -n "$active_boundary_id" ]] || return 0
+  expected_reference="$(jq -r --arg boundary_id "$active_boundary_id" '
+    [.boundaries[] | select(.id == $boundary_id) | .captures][0] as $captures |
+    [$captures | to_entries[] | select(.value.kind == "pair")] as $pairs |
+    if ($pairs | length) == 0 then
+      [$captures[] | select(.kind == "java" and .state == "captured") |
+        .reference] | if length == 0 then "" else .[-1] end
+    elif $pairs[-1].value.state == "captured" then
+      ($pairs[-1].value.java_reference // "")
+    else
+      [$captures | to_entries[] |
+        select(.key > $pairs[-1].key and .value.kind == "java" and
+          .value.state == "captured") | .value.reference] |
+      if length == 0 then "" else .[-1] end
+    end
+  ' <<<"$OBI_METRIC_BOUNDARY_INDEX_PAYLOAD")" || return 1
+  if [[ -z "$expected_reference" ]]; then
+    jq -e '.available == false' "$terminal" >/dev/null
+  else
+    jq -e --arg reference "$expected_reference" '
+      .available == true and .reference == $reference
+    ' "$terminal" >/dev/null
+  fi
+}
+
 validate_pre_v2_run_status() {
   local -r evidence_id="$1"
   local -r allow_historical_status_schema="$2"
 
+  journal_paths_are_absent || return 1
   jq -e -s --arg evidence_id "$evidence_id" \
     --argjson allow_historical_status_schema "$allow_historical_status_schema" '
     length == 1 and
@@ -1423,6 +2227,8 @@ validate_pre_v2_run_status() {
 validate_run_status_v2() {
   local -r evidence_id="$1"
 
+  journal_paths_are_absent || return 1
+  reset_reference_validation_caches
   require_regular_file terminal-java-diagnostics.json
   require_regular_file terminal-obi-metrics.json
   validate_terminal_java_diagnostics || return 1
@@ -1448,6 +2254,50 @@ validate_run_status_v2() {
       .evidence_id == $evidence_id and
       .java_bridge_diagnostics_reference == "terminal-java-diagnostics.json" and
       .obi_metric_evidence_reference == "terminal-obi-metrics.json") and
+    .[0].java_bridge_diagnostics == .[1] and
+    .[0].obi_metric_evidence == .[2]
+  ' \
+    "$BUNDLE_DIR/run-status.json" \
+    "$BUNDLE_DIR/terminal-java-diagnostics.json" \
+    "$BUNDLE_DIR/terminal-obi-metrics.json" >/dev/null
+}
+
+validate_run_status_v3() {
+  local -r evidence_id="$1"
+  local -r environment="$BUNDLE_DIR/environment.txt"
+
+  require_regular_file terminal-java-diagnostics.json
+  require_regular_file terminal-obi-metrics.json
+  require_regular_file obi-metric-boundary-index.json
+  require_regular_file .obi-metric-boundary-index.freeze
+  validate_obi_metric_boundary_index "$environment" || return 1
+  jq -e '
+    all(.boundaries[];
+      .state == "complete" or .state == "not_applicable")
+  ' <<<"$OBI_METRIC_BOUNDARY_INDEX_PAYLOAD" >/dev/null || return 1
+  validate_terminal_java_diagnostics_context || return 1
+  validate_terminal_obi_metrics_v2 || return 1
+  jq -e -s --arg evidence_id "$evidence_id" \
+    --arg index_digest "$OBI_METRIC_BOUNDARY_INDEX_SHA256" '
+    length == 3 and
+    (.[0] |
+      type == "object" and
+      keys == [
+        "acceptance_evidence", "acceptance_evidence_reason", "evidence_id",
+        "exit_status", "failure_line", "failure_stage",
+        "java_bridge_diagnostics", "java_bridge_diagnostics_reference",
+        "obi_metric_boundary_index_reference", "obi_metric_boundary_index_sha256",
+        "obi_metric_evidence", "obi_metric_evidence_reference", "schema", "status"
+      ] and
+      .schema == "obi-apache-java-https-run-status-v3" and
+      .status == "passed" and .exit_status == 0 and
+      .acceptance_evidence == true and .acceptance_evidence_reason == "none" and
+      .failure_stage == "none" and .failure_line == 0 and
+      .evidence_id == $evidence_id and
+      .java_bridge_diagnostics_reference == "terminal-java-diagnostics.json" and
+      .obi_metric_evidence_reference == "terminal-obi-metrics.json" and
+      .obi_metric_boundary_index_reference == "obi-metric-boundary-index.json" and
+      .obi_metric_boundary_index_sha256 == $index_digest) and
     .[0].java_bridge_diagnostics == .[1] and
     .[0].obi_metric_evidence == .[2]
   ' \
@@ -1482,6 +2332,11 @@ validate_json_provenance() {
     die "run status is malformed"
   }
   case "$run_status_schema" in
+    obi-apache-java-https-run-status-v3)
+      validate_run_status_v3 "$evidence_id" || {
+        die "run-status v3 evidence is malformed or inconsistent"
+      }
+      ;;
     obi-apache-java-https-run-status-v2)
       validate_run_status_v2 "$evidence_id" || {
         die "run-status v2 evidence is malformed or inconsistent"
@@ -1721,6 +2576,20 @@ main() {
   require_regular_file bridge-source-tree.sha256
   require_regular_file bridge-artifacts.json
   validate_bundle_file_types
+  if [[ -e "$BUNDLE_DIR/obi-metric-boundary-index.json" ||
+    -L "$BUNDLE_DIR/obi-metric-boundary-index.json" ||
+    -e "$BUNDLE_DIR/.obi-metric-boundary-index.freeze" ||
+    -L "$BUNDLE_DIR/.obi-metric-boundary-index.freeze" ]]; then
+    [[ -f "$BUNDLE_DIR/obi-metric-boundary-index.json" &&
+      ! -L "$BUNDLE_DIR/obi-metric-boundary-index.json" &&
+      -f "$BUNDLE_DIR/.obi-metric-boundary-index.freeze" &&
+      ! -L "$BUNDLE_DIR/.obi-metric-boundary-index.freeze" ]] || {
+      die "boundary journal paths are incomplete or unsafe"
+    }
+    preflight_obi_metric_boundary_referenced_bytes || {
+      die "boundary journal references are malformed or exceed the byte budget"
+    }
+  fi
   validate_checksum_manifest
   validate_provenance
   printf 'retained evidence verified: %s (checkout commit %s)\n' \

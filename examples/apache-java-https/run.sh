@@ -21,6 +21,12 @@ TERMINAL_JAVA_DIAGNOSTICS_MAX_LINES=1
 TERMINAL_JAVA_DIAGNOSTICS_LOCK_TIMEOUT_SECONDS=5
 OBI_METRIC_PAIR_MAX_BYTES=131072
 OBI_TERMINAL_BOUNDARY_MAX_BYTES=155648
+OBI_METRIC_BOUNDARY_INDEX_MAX_BYTES=4194304
+OBI_METRIC_BOUNDARY_INDEX_MAX_BOUNDARIES=256
+OBI_METRIC_BOUNDARY_INDEX_MAX_CAPTURES=4096
+OBI_METRIC_BOUNDARY_INDEX_MAX_STATUS_REFERENCES=1024
+OBI_METRIC_BOUNDARY_STATUS_MAX_BYTES=262144
+OBI_METRIC_BOUNDARY_REFERENCED_MAX_BYTES=536870912
 OBI_PROCESS_IDENTITY_MAX_BYTES=2048
 OBI_METRIC_PAIR_MAX_SERIES=792
 OBI_METRIC_SNAPSHOT_MAX_BYTES=8388608
@@ -177,6 +183,12 @@ readonly TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES
 readonly TERMINAL_JAVA_DIAGNOSTICS_MAX_LINES
 readonly TERMINAL_JAVA_DIAGNOSTICS_LOCK_TIMEOUT_SECONDS
 readonly OBI_METRIC_PAIR_MAX_BYTES OBI_TERMINAL_BOUNDARY_MAX_BYTES
+readonly OBI_METRIC_BOUNDARY_INDEX_MAX_BYTES
+readonly OBI_METRIC_BOUNDARY_INDEX_MAX_BOUNDARIES
+readonly OBI_METRIC_BOUNDARY_INDEX_MAX_CAPTURES
+readonly OBI_METRIC_BOUNDARY_INDEX_MAX_STATUS_REFERENCES
+readonly OBI_METRIC_BOUNDARY_STATUS_MAX_BYTES
+readonly OBI_METRIC_BOUNDARY_REFERENCED_MAX_BYTES
 readonly OBI_PROCESS_IDENTITY_MAX_BYTES OBI_METRIC_PAIR_MAX_SERIES
 readonly OBI_METRIC_SNAPSHOT_MAX_BYTES OBI_METRIC_SNAPSHOT_MAX_LINES
 readonly BRIDGE_METRIC_QUIESCENCE_TIMEOUT_SECONDS SCENARIO_RUN_TIMEOUT_SECONDS
@@ -332,12 +344,16 @@ BRIDGE_BUILD_MODE="fresh"
 ACCEPTANCE_EVIDENCE=true
 ACCEPTANCE_EVIDENCE_REASON=""
 BRIDGE_RUNNING=false
-OBI_STOPPED_METRIC_PAIR_REFERENCE=""
+OBI_RUNNING=false
+OBI_METRIC_BOUNDARY_ACTIVE_ID=""
+OBI_METRIC_BOUNDARY_FROZEN_PAYLOAD=""
+OBI_METRIC_BOUNDARY_FROZEN_SHA256=""
 MATCHING_BRIDGE_RUNNING=false
 FAULT_BRIDGE_RUNNING=false
 SELECTED_TRANSPORT=""
 CONTEXT_PROPAGATION="tcp"
 RUN_STATUS="failed"
+RUN_STATUS_CREATED_IDENTITY=""
 RUN_STATUS_PUBLISHED_DIGEST=""
 RUN_STATUS_PUBLISHED_IDENTITY=""
 RUN_STATUS_PUBLICATION_HANDLE=""
@@ -856,7 +872,7 @@ sha256_file() {
 check_dependencies() {
   local -a missing=()
   local command_name=""
-  for command_name in awk cmp curl cut docker env find flock git grep head id install jq ln mktemp mv openssl readlink realpath rmdir sed sha256sum sort stat tail tar tee timeout wc; do
+  for command_name in awk cmp cp curl cut docker env find flock git grep head id install jq ln mktemp mv openssl readlink realpath rmdir sed sha256sum sort stat tail tar tee timeout wc; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
       missing+=("$command_name")
     fi
@@ -1225,6 +1241,8 @@ complete_project_guard_terminal_handoff() {
 
 publish_project_guard_terminal_decision() {
   local decision=commit
+  local publication_status=0
+  local -i attempt=0
 
   # This is the signal-aware relay's terminal commit point. A signal handled
   # before this trap update remains in PROJECT_GUARD_PENDING_SIGNAL and is
@@ -1237,8 +1255,20 @@ publish_project_guard_terminal_decision() {
     INT|TERM) decision=signal:130 ;;
     *) return 1 ;;
   esac
-  publish_project_guard_control_file \
-    "$PROJECT_GUARD_CONTROL_DIR/decision" "$decision" || return $?
+  if publish_project_guard_control_file \
+    "$PROJECT_GUARD_CONTROL_DIR/decision" "$decision"; then
+    :
+  else
+    publication_status=$?
+    for attempt in 1 2 3; do
+      if project_guard_control_file_matches \
+        "$PROJECT_GUARD_CONTROL_DIR/decision" "$decision"; then
+        publication_status=0
+        break
+      fi
+    done
+    ((publication_status == 0)) || return "$publication_status"
+  fi
   PROJECT_GUARD_PENDING_SIGNAL=""
 }
 
@@ -2305,10 +2335,15 @@ run_project_guard_relay() {
     forward_project_guard_signal "$PROJECT_GUARD_PENDING_SIGNAL" || true
   fi
   if [[ -z "$launch_signal" && -z "$PROJECT_GUARD_PENDING_SIGNAL" ]]; then
+    # The atomic acceptance publication may become visible even when its
+    # command reports an error. From this attempt onward, require the
+    # authenticated holder status and never fall back to the child-table
+    # status of a worker that may already be mutating guarded state.
+    launch_accepted=true
     if publish_project_guard_supervisor_launch_acceptance \
       "$relay_pid" "$relay_start_time" \
       "$holder_pid" "$holder_start_time"; then
-      launch_accepted=true
+      :
     else
       log_error "could not acknowledge the guarded worker launch"
     fi
@@ -2667,6 +2702,7 @@ cleanup() {
   local primary_fault_recovery_marker=""
   local primary_fault_recovery_stage=""
   local publication_succeeded=false
+  local holder_status_authorized=false
   local holder_status_before=0
   CLEANUP_ENTRY_ACTIVE=true
   trap record_cleanup_hup HUP
@@ -2766,6 +2802,7 @@ cleanup() {
       invalidate_project_transport_evidence; then
       BRIDGE_RUNNING=false
       if safe_compose_down >/dev/null 2>&1; then
+        OBI_RUNNING=false
         if clear_pending_permanent_absence_recovery; then
           :
         else
@@ -2790,6 +2827,7 @@ cleanup() {
       cleanup_status=$?
       log_error "project guard or transport state could not be validated before cleanup"
       if ((final_status == 0)); then
+        ((cleanup_status != 0)) || cleanup_status=1
         final_status="$cleanup_status"
         record_failure \
           "compose-cleanup" 0 "$cleanup_status" \
@@ -2857,74 +2895,70 @@ cleanup() {
   if [[ -n "${RESULT_DIR:-}" && -d "$RESULT_DIR" ]]; then
     if publish_owned_run_status "$final_status"; then
       publication_succeeded=true
+      holder_status_authorized=true
     else
       cleanup_status=$?
       log_error "could not publish and commit the final run status"
       if ((final_status == 0)); then
+        ((cleanup_status != 0)) || cleanup_status=1
         final_status="$cleanup_status"
         record_failure \
           "evidence-publication" 0 "$cleanup_status" \
           "publish_owned_run_status"
       fi
       publication_succeeded=false
-      if [[ -n "$RUN_STATUS_PUBLISHED_IDENTITY" ||
-        -n "$RUN_STATUS_PUBLISHED_DIGEST" ||
-        -n "$RUN_STATUS_PUBLICATION_STATE" ]]; then
-        remove_published_run_status ||
-          log_error "refusing to remove an unverified partial run status"
-      fi
-      if [[ ! -e "$RESULT_DIR/run-status.json" &&
-        ! -L "$RESULT_DIR/run-status.json" ]] &&
-        publish_owned_run_status "$final_status"; then
+      holder_status_authorized=false
+      if publish_owned_run_status "$final_status"; then
         publication_succeeded=true
+        holder_status_authorized=true
       else
         cleanup_status=$?
         log_error "could not publish and commit the failed final run status"
-        if [[ -n "$RUN_STATUS_PUBLISHED_IDENTITY" ||
-          -n "$RUN_STATUS_PUBLISHED_DIGEST" ||
-          -n "$RUN_STATUS_PUBLICATION_STATE" ]]; then
-          remove_published_run_status ||
-            log_error "refusing to remove an unverified failed run status"
-        fi
       fi
     fi
+  elif [[ -z "${RESULT_DIR:-}" ]]; then
+    holder_status_authorized=true
   fi
 
-  if [[ "$PROJECT_GUARD_STATUS_RELAY_PID" =~ ^[1-9][0-9]*$ ]]; then
+  if [[ "$holder_status_authorized" == true &&
+    "$PROJECT_GUARD_STATUS_RELAY_PID" =~ ^[1-9][0-9]*$ ]]; then
     if publish_project_guard_holder_status_with_retries "$final_status"; then
-      :
+      if [[ "$publication_succeeded" == true ]]; then
+        log_info "retained run evidence: $RESULT_DIR"
+      fi
     else
+      cleanup_status=$?
       log_error "could not publish the guarded runner terminal status"
       holder_status_before="$final_status"
-      final_status=1
-      if [[ -z "$FAILURE_STAGE" ]]; then
+      if ((final_status == 0)); then
+        ((cleanup_status != 0)) || cleanup_status=1
+        final_status="$cleanup_status"
         record_failure \
           "project-guard-status" 0 "$final_status" \
           "publish_project_guard_holder_status: original_status=$holder_status_before"
       fi
       if ((holder_status_before != final_status)) &&
         [[ -n "${RESULT_DIR:-}" && -d "$RESULT_DIR" ]]; then
-        if [[ "$publication_succeeded" == true ]] &&
-          remove_terminal_owned_run_status_for_rewrite; then
-          publication_succeeded=false
-          if publish_owned_run_status "$final_status"; then
-            publication_succeeded=true
-          fi
+        publication_succeeded=false
+        holder_status_authorized=false
+        if publish_owned_run_status "$final_status"; then
+          publication_succeeded=true
+          holder_status_authorized=true
         else
-          log_error "refusing to replace an unverified published run status"
-          publication_succeeded=false
+          log_error "could not replace the committed run status after holder failure"
         fi
       fi
-      publish_project_guard_holder_status_with_retries "$final_status" || true
+      if [[ "$holder_status_authorized" == true ]] &&
+        publish_project_guard_holder_status_with_retries "$final_status"; then
+        if [[ "$publication_succeeded" == true ]]; then
+          log_info "retained run evidence: $RESULT_DIR"
+        fi
+      else
+        log_error "could not publish the final guarded runner terminal status"
+      fi
     fi
-  fi
-
-  if [[ "$publication_succeeded" == "true" ]]; then
-    if commit_published_run_status; then
-      log_info "retained run evidence: $RESULT_DIR"
-    else
-      log_error "could not remove the private run-status ownership link"
-    fi
+  elif [[ "$publication_succeeded" == true ]]; then
+    log_info "retained run evidence: $RESULT_DIR"
   fi
 
   exit "$final_status"
@@ -2986,14 +3020,25 @@ install_traps() {
 
 prepare_directories() {
   local run_id=""
+  local candidate_result_dir=""
+  local creation_status=0
 
   prepare_runtime_directory "$RUNTIME_DIR"
   prepare_runtime_directory "$ARTIFACT_DIR"
   prepare_runtime_directory "$CERT_DIR"
   prepare_runtime_directory "$RESULTS_ROOT"
   run_id="$(date -u +'%Y%m%dT%H%M%SZ')-$$"
-  RESULT_DIR="$RESULTS_ROOT/$run_id"
-  mkdir -- "$RESULT_DIR"
+  candidate_result_dir="$RESULTS_ROOT/$run_id"
+  if RESULT_DIR="$(
+    mkdir -- "$candidate_result_dir" || exit $?
+    printf '%s\n' "$candidate_result_dir"
+  )"; then
+    return 0
+  else
+    creation_status=$?
+  fi
+  RESULT_DIR=""
+  return "$creation_status"
 }
 
 prepare_runtime_directory() {
@@ -4679,6 +4724,7 @@ assert_pid_reuse_runtime_contract() {
 
 start_stack() {
   local start_status=0
+  local controller_status=0
   local startup_since=""
   local runtime_contract_mode="$SCENARIO"
   local -a recreate_arguments=()
@@ -4751,8 +4797,11 @@ start_stack() {
   if ((start_status != 0)); then
     return "$start_status"
   fi
-  if ! uses_uninstrumented_runtime && [[ "$TRANSPORT" != "disabled" ]]; then
-    BRIDGE_RUNNING=true
+  if ! uses_uninstrumented_runtime; then
+    OBI_RUNNING=true
+    if [[ "$TRANSPORT" != "disabled" ]]; then
+      BRIDGE_RUNNING=true
+    fi
   fi
 
   RUN_STAGE="readiness"
@@ -4765,7 +4814,24 @@ start_stack() {
       "$startup_since" || return $?
     if [[ "$SCENARIO" == "pid-reuse" ]]; then
       assert_pid_reuse_runtime_contract || return $?
-      run_pid_reuse_controller || return $?
+      plan_obi_metric_pair_capture pid-reuse-controller-window || return $?
+      capture_phase_evidence pid-reuse-controller-before || return $?
+      if run_pid_reuse_controller; then
+        capture_phase_evidence pid-reuse-controller-after || return $?
+        record_obi_metric_pair \
+          pid-reuse-controller-window pid-reuse-controller-before \
+          pid-reuse-controller-after same_process "" >/dev/null || return $?
+        attach_obi_artifact_capture \
+          pid-reuse-controller pid-reuse-controller.json || return $?
+      else
+        controller_status=$?
+        if [[ -f "$RESULT_DIR/pid-reuse-controller.json" &&
+          ! -L "$RESULT_DIR/pid-reuse-controller.json" ]]; then
+          attach_obi_artifact_capture \
+            pid-reuse-controller pid-reuse-controller.json || return $?
+        fi
+        return "$controller_status"
+      fi
     fi
     wait_for_log \
       java-backend \
@@ -5489,6 +5555,7 @@ assert_selected_transport() {
     return "$publication_status"
   fi
   SELECTED_TRANSPORT="$selected"
+  bind_selected_transport_to_obi_metric_boundary_index "$selected" || return $?
   return 0
 }
 
@@ -9063,7 +9130,11 @@ run_scenario() {
   local after_diagnostics_status_json="null"
   local obi_metric_evidence_json="null"
   local obi_metric_pair_reference=""
+  local obi_metric_boundary_id=""
+  local obi_metric_boundary_ids_json="[]"
+  local owns_obi_metric_boundary=false
   local bridge_was_running=false
+  local obi_was_running=false
   local controlled_bridge_was_running=false
   local fixture_status=0
   local scenario_status=0
@@ -9183,15 +9254,33 @@ run_scenario() {
     if (( REPEAT_COUNT > 1 )); then
       printf -v label '%s-run-%02d' "$label" "$run_number"
     fi
+    obi_metric_boundary_id=""
+    obi_metric_boundary_ids_json="[]"
+    owns_obi_metric_boundary=false
+    if obi_metric_boundary_index_is_initialized; then
+      if obi_metric_boundary_id="$(active_obi_metric_boundary_id 2>/dev/null)"; then
+        :
+      else
+        obi_metric_boundary_id="$label"
+        begin_obi_metric_boundary "$obi_metric_boundary_id" || return $?
+        owns_obi_metric_boundary=true
+      fi
+      obi_metric_boundary_ids_json="$(jq -cn \
+        --arg boundary_id "$obi_metric_boundary_id" '[$boundary_id]')" || return 1
+      if [[ "$OBI_RUNNING" == true ]]; then
+        plan_obi_metric_pair_capture "$label" || return $?
+      fi
+    fi
     output="$RESULT_DIR/scenario-$label.json"
     stderr_output="$RESULT_DIR/scenario-$label.stderr.log"
     before_phase="$label-before"
     after_phase="$label-after"
     before_diagnostics="$RESULT_DIR/phases/$before_phase/java-diagnostics.txt"
     after_diagnostics="$RESULT_DIR/phases/$after_phase/java-diagnostics.txt"
-    if [[ "$BRIDGE_RUNNING" == false &&
-      -n "$OBI_STOPPED_METRIC_PAIR_REFERENCE" ]]; then
-      obi_metric_pair_reference="$OBI_STOPPED_METRIC_PAIR_REFERENCE"
+    if [[ "$OBI_RUNNING" == false ]] &&
+      obi_metric_pair_reference="$(
+        active_stopped_obi_metric_pair_reference 2>/dev/null
+      )" && [[ -n "$obi_metric_pair_reference" ]]; then
       if ! obi_metric_evidence_json="$(
         obi_metric_pair_evidence_json_from_reference "$obi_metric_pair_reference"
       )"; then
@@ -9254,6 +9343,7 @@ run_scenario() {
       metric_status=1
     fi
     bridge_was_running="$BRIDGE_RUNNING"
+    obi_was_running="$OBI_RUNNING"
     if [[ "$bridge_was_running" == "true" ]]; then
       before_success="$(bridge_success_total \
         "$RESULT_DIR/phases/$before_phase/obi-metrics.prom")" || return $?
@@ -9534,7 +9624,7 @@ run_scenario() {
         obi_metric_evidence_json="null"
         metric_status=1
       fi
-    elif [[ "$bridge_was_running" == true ]]; then
+    elif [[ "$obi_was_running" == true ]]; then
       log_error "could not bind the $label metric snapshots to one OBI process"
       metric_status=1
     fi
@@ -9695,7 +9785,7 @@ run_scenario() {
     if [[ "$name" == "tls-boundary" || "$name" == "coalesced-bridge" ]]; then
       receive_cursor_map_status_json="$RECEIVE_CURSOR_MAP_STATUS_JSON"
     fi
-    if ! printf '{\n  "status": "%s",\n  "scenario": "%s",\n  "exit_status": %d,\n  "metric_status": %d,\n  "pressure_correlation": %s,\n  "scenario_reconciliation": %s,\n  "receive_coordination_maps": %s,\n  "java_diagnostics": {"before": %s, "after": %s},\n  "obi_metric_evidence": %s,\n  "result": "%s",\n  "stderr": "%s",\n  "before_phase": "%s",\n  "after_phase": "%s"\n}\n' \
+    if ! printf '{\n  "status": "%s",\n  "scenario": "%s",\n  "exit_status": %d,\n  "metric_status": %d,\n  "pressure_correlation": %s,\n  "scenario_reconciliation": %s,\n  "receive_coordination_maps": %s,\n  "java_diagnostics": {"before": %s, "after": %s},\n  "obi_metric_evidence": %s,\n  "obi_metric_boundary_ids": %s,\n  "result": "%s",\n  "stderr": "%s",\n  "before_phase": "%s",\n  "after_phase": "%s"\n}\n' \
       "$status_name" \
       "$name" \
       "$scenario_status" \
@@ -9706,18 +9796,24 @@ run_scenario() {
       "$before_diagnostics_status_json" \
       "$after_diagnostics_status_json" \
       "$obi_metric_evidence_json" \
+      "$obi_metric_boundary_ids_json" \
       "$(basename -- "$output")" \
       "$(basename -- "$stderr_output")" \
       "phases/$before_phase" \
       "phases/$after_phase" >"$RESULT_DIR/scenario-$label-status.json"; then
       return 1
     fi
+    bind_status_to_active_obi_metric_boundary \
+      "scenario-$label-status.json" || return $?
     log_info "$label status=$status_name evidence=$RESULT_DIR/scenario-$label-status.json"
     if ((scenario_status != 0)); then
       return "$scenario_status"
     fi
     if ((metric_status != 0)); then
       return "$metric_status"
+    fi
+    if [[ "$owns_obi_metric_boundary" == true ]]; then
+      complete_obi_metric_boundary "$obi_metric_boundary_id" || return $?
     fi
     if [[ "$name" == "w3c-fault" ]] && ((run_number < REPEAT_COUNT)); then
       sleep "$JAVA_PROVIDER_RETRY_SETTLE_SECONDS" || return 1
@@ -9729,11 +9825,13 @@ run_deliberate_assertion_failure_control() {
   local -r label="assertion-failure"
   local -r result="$RESULT_DIR/scenario-$label.json"
   local java_bridge_diagnostics=""
+  local obi_metric_boundary_ids="[]"
 
   run_scenario basic || return $?
   RUN_STAGE="deliberate-assertion-failure"
   seal_terminal_java_diagnostics || return $?
   java_bridge_diagnostics="$(terminal_java_diagnostics_json)" || return $?
+  obi_metric_boundary_ids="$(completed_obi_metric_boundary_ids_json)" || return $?
   if ! printf '{"status":"failed","scenario":"assertion-failure","reason":"deliberate assertion failure requested","expected_exit_status":2}\n' \
     >"$result"; then
     return 1
@@ -9741,7 +9839,8 @@ run_deliberate_assertion_failure_control() {
   if ! jq -cn \
     --arg result "$(basename -- "$result")" \
     --arg java_bridge_diagnostics_reference 'terminal-java-diagnostics.json' \
-    --argjson java_bridge_diagnostics "$java_bridge_diagnostics" '
+    --argjson java_bridge_diagnostics "$java_bridge_diagnostics" \
+    --argjson obi_metric_boundary_ids "$obi_metric_boundary_ids" '
       {
         status: "failed",
         scenario: "assertion-failure",
@@ -9749,6 +9848,7 @@ run_deliberate_assertion_failure_control() {
         metric_status: 0,
         result: $result,
         failure_context: "failure-context.txt",
+        obi_metric_boundary_ids: $obi_metric_boundary_ids,
         java_bridge_diagnostics_reference: $java_bridge_diagnostics_reference,
         java_bridge_diagnostics: $java_bridge_diagnostics
       }
@@ -9762,8 +9862,10 @@ run_deliberate_assertion_failure_control() {
 stop_obi_for_no_state_control() {
   local -r label="$1"
   local -r diagnostics_output="${2:-}"
+  local stopped_metric_pair_reference=""
   local stop_status=0
 
+  plan_obi_metric_pair_capture "$label-obi-stopped" || return $?
   if ! flush_bridge_metric_boundary "$label" 1 1 "$diagnostics_output"; then
     log_error "could not establish the $label pre-stop bridge boundary"
     return 1
@@ -9782,7 +9884,7 @@ stop_obi_for_no_state_control() {
   BRIDGE_RUNNING=false
   if run_bounded "$OBI_COMPOSE_COMMAND_TIMEOUT_SECONDS" \
     "${COMPOSE[@]}" stop --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" obi; then
-    :
+    OBI_RUNNING=false
   else
     stop_status=$?
     log_error "could not stop OBI for the $label control"
@@ -9797,14 +9899,14 @@ stop_obi_for_no_state_control() {
     log_error "could not capture valid $label post-stop Java diagnostics"
     return 1
   fi
-  OBI_STOPPED_METRIC_PAIR_REFERENCE="$(record_obi_metric_pair \
+  stopped_metric_pair_reference="$(record_obi_metric_pair \
     "$label-obi-stopped" \
     "$label-obi-running" \
     "$label-obi-stopped" \
     same_process \
     "$label-obi-stopped")" || return $?
   obi_metric_pair_evidence_json_from_reference \
-    "$OBI_STOPPED_METRIC_PAIR_REFERENCE" >/dev/null
+    "$stopped_metric_pair_reference" >/dev/null
 }
 
 run_fail_open_control() {
@@ -9827,6 +9929,7 @@ run_late_attach_recovery_sequence() {
   run_bounded 120 \
     "${COMPOSE[@]}" up --detach \
       --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" obi || return $?
+  OBI_RUNNING=true
   wait_for_log \
     obi \
     "Java remote parent bridge ready" \
@@ -10241,7 +10344,9 @@ run_permanent_absence_control() (
   restore_required=true
 
   assert_project_docker_identity_unchanged || return $?
+  SCENARIO_VARIANT="permanent-absence-baseline"
   run_disabled_control || return $?
+  SCENARIO_VARIANT="$original_variant"
   capture_control_response permanent-absence-disabled || return $?
   printf 'disabled_baseline=captured\n' >"$timeline" || return $?
 
@@ -10251,6 +10356,7 @@ run_permanent_absence_control() (
   run_bounded "$OBI_COMPOSE_MULTI_SERVICE_COMMAND_TIMEOUT_SECONDS" \
     "${COMPOSE[@]}" stop --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" \
     apache-proxy java-backend obi || return $?
+  OBI_RUNNING=false
   assert_compose_service_stopped apache-proxy || return $?
   assert_compose_service_stopped java-backend || return $?
   assert_compose_service_stopped obi || return $?
@@ -10312,6 +10418,8 @@ run_permanent_absence_control() (
   SCENARIO_VARIANT="$original_variant"
   printf '{"status":"passed","scenario":"permanent-absence","obi_started_during_jvm_lifetime":false,"single_jvm_lifetime":true,"disabled_baseline_equivalent":true,"fail_open":"passed","w3c_precedence":"passed","diagnostics":"bounded","post_absence_recovery":"passed"}\n' \
     >"$RESULT_DIR/scenario-permanent-absence-status.json"
+  crosslink_and_bind_active_obi_metric_boundary_status \
+    scenario-permanent-absence-status.json || return $?
 
   commit_terminal_java_diagnostics_recovery_boundary || return $?
   trap - EXIT
@@ -10374,7 +10482,9 @@ run_auto_unavailable_control() (
   }
   restore_required=true
 
+  SCENARIO_VARIANT="auto-unavailable-baseline"
   run_disabled_control || return $?
+  SCENARIO_VARIANT="$original_variant"
   capture_control_response auto-unavailable-disabled || return $?
   recreate_instrumented_stack \
     "$original_propagation" "auto-unavailable preparation" auto || return $?
@@ -10414,6 +10524,7 @@ run_auto_unavailable_control() (
   run_bounded 120 \
     "${COMPOSE[@]}" up --detach \
       --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" obi || return $?
+  OBI_RUNNING=true
   wait_for_log \
     obi \
     "Java remote parent bridge ready" \
@@ -10443,6 +10554,8 @@ run_auto_unavailable_control() (
   restore_required=false
   printf '{"status":"passed","scenario":"auto-unavailable","requested_transport":"auto","attempted_transports":["getsockopt","unix"],"selected_transport":"none","disabled_baseline_equivalent":true,"fail_open":"passed","w3c_precedence":"passed","single_jvm_lifetime":true,"retry_storm":"absent","post_fault_recovery":"passed"}\n' \
     >"$RESULT_DIR/scenario-auto-unavailable-status.json"
+  crosslink_and_bind_active_obi_metric_boundary_status \
+    scenario-auto-unavailable-status.json || return $?
 
   commit_terminal_java_diagnostics_recovery_boundary || return $?
   trap - EXIT
@@ -10597,6 +10710,7 @@ run_restart_during_traffic_control() (
     log_error "restart-during-traffic control requires a running bridge"
     return 1
   }
+  plan_obi_metric_pair_capture "$label" || return $?
   prepare_restart_control_directory "$control_dir" || return $?
   log_info "running valid-W3C traffic while OBI restarts"
   capture_phase_evidence "$before_phase" || return $?
@@ -10626,6 +10740,7 @@ run_restart_during_traffic_control() (
   run_bounded "$OBI_COMPOSE_COMMAND_TIMEOUT_SECONDS" \
     "${COMPOSE[@]}" stop --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" obi || \
     return $?
+  OBI_RUNNING=false
   publish_restart_control_release \
     "$control_dir" \
     "$RESTART_RELEASE_OBI_STOPPED" || return $?
@@ -10638,6 +10753,7 @@ run_restart_during_traffic_control() (
   run_bounded 120 \
     "${COMPOSE[@]}" up --detach \
       --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" obi || return $?
+  OBI_RUNNING=true
   wait_for_log \
     obi \
     "Java remote parent bridge ready" \
@@ -10702,6 +10818,8 @@ run_restart_during_traffic_control() (
       }
     ' <<<"$obi_metric_evidence_json" \
     >"$RESULT_DIR/scenario-$label-status.json" || return $?
+  crosslink_and_bind_active_obi_metric_boundary_status \
+    "scenario-$label-status.json" || return $?
 
   capture_terminal_java_diagnostics_recovery_boundary || return $?
   SCENARIO_VARIANT="restart-recovery"
@@ -10821,6 +10939,7 @@ recreate_instrumented_stack() {
     "${compose_command[@]}" up --detach \
       --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" --force-recreate \
       "${services[@]}" || return $?
+  OBI_RUNNING=true
   if [[ "$fresh_trace_receiver" == "true" ]]; then
     wait_for_http "http://127.0.0.1:14318/healthz" \
       "$label trace receiver" || return $?
@@ -10885,6 +11004,8 @@ run_delayed_otlp_suppression_sequence() {
   local scenario_status=0
   local earliest_export_millisecond=""
   local -r provider_ready_since="$DELAYED_OTLP_PROVIDER_READY_SINCE"
+  local -r before_phase="delayed-otlp-prime-before"
+  local -r after_phase="delayed-otlp-suppression-after"
 
   [[ -n "$provider_ready_since" ]] || {
     log_error "delayed OTLP provider-readiness cursor is unavailable"
@@ -10892,6 +11013,8 @@ run_delayed_otlp_suppression_sequence() {
   }
 
   initialize_delayed_otlp_run_identity || return $?
+  plan_obi_metric_pair_capture delayed-otlp-prime-suppression || return $?
+  capture_phase_evidence "$before_phase" || return $?
   earliest_export_millisecond="$(delayed_otlp_earliest_export_millisecond)" || return $?
   assert_delayed_otlp_receiver_empty \
     "$RESULT_DIR/delayed-otlp-receiver-before-request.json" || return $?
@@ -10926,6 +11049,10 @@ run_delayed_otlp_suppression_sequence() {
     "$RESULT_DIR/delayed-otlp-receiver-early.json" \
     "$RESULT_DIR/delayed-otlp-receiver-unexpected.json" \
     "$DELAYED_OTLP_POST_EXPORT_SETTLE_SECONDS" || return $?
+  capture_phase_evidence "$after_phase" || return $?
+  record_obi_metric_pair \
+    delayed-otlp-prime-suppression "$before_phase" "$after_phase" \
+    same_process "$after_phase" >/dev/null || return $?
   assert_selected_transport || return $?
   assert_runtime_contract delayed-otlp-suppression true || return $?
   SCENARIO_VARIANT="delayed-otlp-suppression"
@@ -11246,6 +11373,8 @@ run_helper_attach_failure_control() (
   local -r fault_metrics="$RESULT_DIR/helper-attach-failure-metrics-after.prom"
   local -r quiet_metrics="$RESULT_DIR/helper-attach-failure-metrics-quiet.prom"
   local -r recovery_metrics="$RESULT_DIR/helper-attach-failure-metrics-recovery.prom"
+  local -r before_phase="helper-attach-failure-before"
+  local -r after_phase="helper-attach-failure-after"
   local -r obi_identity_before="$RESULT_DIR/helper-attach-failure-obi-before.txt"
   local -r obi_identity_fault="$RESULT_DIR/helper-attach-failure-obi-fault.txt"
   local -r obi_identity_recovery="$RESULT_DIR/helper-attach-failure-obi-recovery.txt"
@@ -11306,6 +11435,8 @@ run_helper_attach_failure_control() (
     "$original_propagation" \
     "helper attach failure preparation" \
     "$original_transport" || return $?
+  plan_obi_metric_pair_capture helper-attach-rejection || return $?
+  capture_phase_evidence "$before_phase" || return $?
   capture_service_runtime_identity obi "$obi_identity_before" || return $?
   fetch_obi_metrics "$baseline_metrics" || return $?
   attach_baseline="$(java_attach_error_total "$baseline_metrics")" || {
@@ -11362,6 +11493,10 @@ run_helper_attach_failure_control() (
     "$baseline_metrics" \
     "$fault_metrics" \
     "$RESULT_DIR/helper-attach-failure-metrics.delta" || return $?
+  capture_phase_evidence "$after_phase" || return $?
+  record_obi_metric_pair \
+    helper-attach-rejection "$before_phase" "$after_phase" same_process "" \
+    >/dev/null || return $?
 
   capture_service_runtime_identity obi "$obi_identity_fault" || return $?
   cmp -- "$obi_identity_before" "$obi_identity_fault" || return $?
@@ -12571,6 +12706,7 @@ run_primary_w3c_fault_scenario() {
     status_name="passed"
     control_armed=false
 
+    plan_obi_metric_pair_capture "$label" || return $?
     log_info "running $label scenario"
     mkdir -p -- "$RESULT_DIR/phases/$before_phase"
     if ! flush_bridge_metric_boundary "$label" 1 1 "$before_diagnostics"; then
@@ -12649,6 +12785,12 @@ run_primary_w3c_fault_scenario() {
       getsockopt 1 0 0 1 1 false 0; then
       metric_status=1
     fi
+    if ! record_obi_metric_pair \
+      "$label" "$before_phase" "$after_phase" same_process "$after_phase" \
+      >/dev/null; then
+      log_error "could not retain the primary W3C fault metric pair for $label"
+      metric_status=1
+    fi
     if ((scenario_status != 0 || metric_status != 0)); then
       status_name="failed"
     fi
@@ -12665,6 +12807,8 @@ run_primary_w3c_fault_scenario() {
       >"$RESULT_DIR/scenario-$label-status.json"; then
       return 1
     fi
+    crosslink_and_bind_active_obi_metric_boundary_status \
+      "scenario-$label-status.json" || return $?
     log_info "$label status=$status_name evidence=$RESULT_DIR/scenario-$label-status.json"
     if ((scenario_status != 0)); then
       return "$scenario_status"
@@ -13043,6 +13187,7 @@ run_primary_generation_mismatch_control() (
   }
   [[ ! -e "$recovery_marker" && ! -L "$recovery_marker" && \
     ! -e "$control_directory" && ! -L "$control_directory" ]] || return 1
+  plan_obi_metric_pair_capture primary-generation-mismatch-fault || return $?
   (umask 077; printf 'recovery_required\n' >"$recovery_marker") || return $?
   install -d -m 0700 -- "$control_directory" || return $?
   control_owner="$(id -u)" || return $?
@@ -13156,6 +13301,9 @@ run_primary_generation_mismatch_control() (
   assert_primary_security_metric_delta "$metric_delta" take 1 1 || return $?
   assert_bridge_metric_delta \
     "$metric_delta" getsockopt 0 0 3 1 1 false 0 || return $?
+  record_obi_metric_pair \
+    primary-generation-mismatch-fault "$before_phase" "$after_phase" \
+    same_process "$after_phase" >/dev/null || return $?
 
   capture_terminal_java_diagnostics_recovery_boundary || return $?
   recreate_instrumented_stack \
@@ -13172,6 +13320,8 @@ run_primary_generation_mismatch_control() (
   printf '{"status":"passed","scenario":"primary-generation-mismatch","live_owner_mutation":"verified","take_status":"missing","w3c_precedence":"passed","same_fd_execution_guards":"missing","exact_restore":"verified","post_fault_recovery":"passed","before_phase":"phases/%s","after_phase":"phases/%s"}\n' \
     "$before_phase" "$after_phase" \
     >"$RESULT_DIR/scenario-primary-generation-mismatch-status.json"
+  crosslink_and_bind_active_obi_metric_boundary_status \
+    scenario-primary-generation-mismatch-status.json || return $?
 
   commit_terminal_java_diagnostics_recovery_boundary || return $?
   trap - EXIT
@@ -13288,6 +13438,7 @@ run_unix_generation_mismatch_control() (
   }
   [[ ! -e "$recovery_marker" && ! -L "$recovery_marker" && \
     ! -e "$control_directory" && ! -L "$control_directory" ]] || return 1
+  plan_obi_metric_pair_capture unix-generation-mismatch-fault || return $?
   (umask 077; printf 'recovery_required\n' >"$recovery_marker") || return $?
   install -d -m 0700 -- "$control_directory" || return $?
   control_owner="$(id -u)" || return $?
@@ -13391,6 +13542,9 @@ run_unix_generation_mismatch_control() (
     "$metric_delta" take already_consumed unix 1 1 || return $?
   assert_bridge_metric_delta \
     "$metric_delta" unix 0 0 0 1 1 false 0 0 1 || return $?
+  record_obi_metric_pair \
+    unix-generation-mismatch-fault "$before_phase" "$after_phase" \
+    same_process "$after_phase" >/dev/null || return $?
 
   capture_terminal_java_diagnostics_recovery_boundary || return $?
   recreate_instrumented_stack \
@@ -13408,6 +13562,8 @@ run_unix_generation_mismatch_control() (
   printf '%s\n' \
     '{"status":"passed","scenario":"unix-generation-mismatch","transport":"unix","live_owner_mutation":"verified","barrier":"pre-send","bridge_timeout_ms":30000,"take_status":"already_consumed","wrong_parent_count":0,"w3c_precedence":"passed","exact_restore":"verified","post_fault_recovery":"passed","before_phase":"phases/unix-generation-mismatch-before","after_phase":"phases/unix-generation-mismatch-after"}' \
     >"$RESULT_DIR/scenario-unix-generation-mismatch-status.json"
+  crosslink_and_bind_active_obi_metric_boundary_status \
+    scenario-unix-generation-mismatch-status.json || return $?
 
   commit_terminal_java_diagnostics_recovery_boundary || return $?
   trap - EXIT
@@ -13524,6 +13680,8 @@ run_primary_live_fd_security_control() (
     log_error "primary live-descriptor recovery marker already exists: $recovery_marker"
     return 1
   }
+  plan_obi_metric_pair_capture primary-live-fd-probe || return $?
+  plan_obi_metric_pair_capture primary-live-fd-full || return $?
   if ! (umask 077; printf 'recovery_required\n' >"$recovery_marker"); then
     log_error "could not create the primary live-descriptor recovery marker"
     return 1
@@ -13622,6 +13780,8 @@ run_primary_live_fd_security_control() (
     printf '{"status":"unsupported","scenario":"primary-live-fd-security","reason":"pidfd-duplicate-unavailable","probe":"%s","attacker_identity":"root","attacker_cgroup":"pid1-verified-preexec"}\n' \
       "$(basename -- "$probe_output")" \
       >"$RESULT_DIR/scenario-primary-live-fd-security-status.json" || return $?
+    crosslink_and_bind_active_obi_metric_boundary_status \
+      scenario-primary-live-fd-security-status.json || return $?
     if ! run_bounded 10 docker exec --user 0:0 "$java_container" \
       rm -f -- "$PRIMARY_SECURITY_PROBE_PATH"; then
       log_error "could not remove the primary live-descriptor security probe after an unsupported result"
@@ -13680,6 +13840,9 @@ run_primary_live_fd_security_control() (
     log_error "primary live-descriptor security probe produced a valid bridge retrieval"
     return 1
   }
+  record_obi_metric_pair \
+    primary-live-fd-probe "$before_phase" "$probe_phase" same_process "" \
+    >/dev/null || return $?
 
   release_timeout="$(primary_live_fd_remaining_timeout \
     "$pre_release_deadline" "$PRIMARY_LIVE_FD_RELEASE_TIMEOUT_SECONDS" 0)" || {
@@ -13731,6 +13894,9 @@ run_primary_live_fd_security_control() (
     log_error "primary live-descriptor security metrics did not preserve one legitimate retrieval"
     return 1
   }
+  record_obi_metric_pair \
+    primary-live-fd-full "$before_phase" "$after_phase" same_process "" \
+    >/dev/null || return $?
 
   capture_terminal_java_diagnostics_recovery_boundary || return $?
   recreate_instrumented_stack \
@@ -13746,29 +13912,40 @@ run_primary_live_fd_security_control() (
     "$probe_phase" \
     "$after_phase" \
     >"$RESULT_DIR/scenario-primary-live-fd-security-status.json" || return $?
+  crosslink_and_bind_active_obi_metric_boundary_status \
+    scenario-primary-live-fd-security-status.json || return $?
 
   commit_terminal_java_diagnostics_recovery_boundary || return $?
   trap - EXIT
   clear_terminal_java_diagnostics_recovery_boundary || return $?
 )
 
-extract_java_diagnostics_header() {
+validate_java_diagnostics_snapshot_hardlink_payload() {
+  local -r observed_payload="$1"
+  local -r expected_payload="$3"
+
+  [[ "$expected_payload" == __any__ ||
+    "$observed_payload" == "$expected_payload" ]] || return 1
+  assert_sanitized_java_diagnostics_snapshot "$observed_payload"
+}
+
+extract_java_diagnostics_header_unlocked() {
   local -r headers="$1"
   local -r output="$2"
   local reference=""
   local phase=""
   local phase_dir=""
-  local candidate=""
+  local snapshot=""
 
-  [[ -f "$headers" && ! -L "$headers" && \
-    ! -e "$output" && ! -L "$output" ]] || return 1
+  [[ -f "$headers" && ! -L "$headers" &&
+    "${TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER:-false}" == true &&
+    "${TERMINAL_EVIDENCE_LOCK_ENTRY_FROZEN:-}" == false ]] || return 1
   reference="${output#"$RESULT_DIR/"}"
   [[ "$reference" != "$output" ]] || return 1
   phase="$(java_diagnostics_reference_phase "$reference")" || return 1
   phase_dir="$RESULT_DIR/phases/$phase"
   java_diagnostics_phase_directory_is_safe "$phase" || return 1
-  candidate="$(mktemp "$phase_dir/.java-diagnostics-header.XXXXXX")" || return 1
-  if ! awk '
+  snapshot="$(awk '
     {
       line = $0
       sub(/\r$/, "", line)
@@ -13792,52 +13969,47 @@ extract_java_diagnostics_header() {
       }
       print selected
     }
-  ' "$headers" >"$candidate"; then
-    rm -f -- "$candidate"
-    return 1
-  fi
-  if ! assert_sanitized_java_diagnostics "$candidate"; then
-    rm -f -- "$candidate"
-    return 1
-  fi
-  if ! chmod 0644 -- "$candidate" ||
-    ! java_diagnostics_phase_directory_is_safe "$phase" ||
-    [[ -e "$output" || -L "$output" ]]; then
-    rm -f -- "$candidate"
-    return 1
-  fi
-  if ln -T -- "$candidate" "$output"; then
-    rm -f -- "$candidate" || return 1
-  else
-    rm -f -- "$candidate" || true
-    return 1
-  fi
-  record_last_java_diagnostics_reference \
-    "$reference"
+  ' "$headers")" || return 1
+  assert_sanitized_java_diagnostics_snapshot "$snapshot" || return 1
+  java_diagnostics_phase_directory_is_safe "$phase" || return 1
+  publish_terminal_owned_hardlink_payload \
+    "$output" "$phase_dir/.java-diagnostics-header" \
+    '^\.java-diagnostics-header\.[A-Za-z0-9]{6}$' \
+    '^\.(java-diagnostics-header|terminal-diagnostics)\.[A-Za-z0-9]{6}$' \
+    644 "$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES" "$snapshot" \
+    validate_java_diagnostics_snapshot_hardlink_payload true \
+    "$phase_dir/.java-diagnostics-header" \
+    "$phase_dir/.terminal-diagnostics" || return $?
+  record_last_java_diagnostics_reference_unlocked "$reference"
 }
 
-extract_terminal_diagnostics_after() {
+extract_java_diagnostics_header() {
+  with_terminal_java_diagnostics_lock \
+    extract_java_diagnostics_header_unlocked "$@"
+}
+
+extract_terminal_diagnostics_after_unlocked() {
   local -r input="$1"
   local -r output="$2"
   local -r field="$3"
   local reference=""
   local phase=""
   local phase_dir=""
-  local candidate=""
+  local snapshot=""
 
   case "$field" in
     fault_diagnostics_after|java_diagnostics_after) ;;
     *) return 1 ;;
   esac
-  [[ -f "$input" && ! -L "$input" && \
-    ! -e "$output" && ! -L "$output" ]] || return 1
+  [[ -f "$input" && ! -L "$input" &&
+    "${TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER:-false}" == true &&
+    "${TERMINAL_EVIDENCE_LOCK_ENTRY_FROZEN:-}" == false ]] || return 1
   reference="${output#"$RESULT_DIR/"}"
   [[ "$reference" != "$output" ]] || return 1
   phase="$(java_diagnostics_reference_phase "$reference")" || return 1
   phase_dir="$RESULT_DIR/phases/$phase"
   java_diagnostics_phase_directory_is_safe "$phase" || return 1
-  candidate="$(mktemp "$phase_dir/.terminal-diagnostics.XXXXXX")" || return 1
-  if ! awk -v field="$field" '
+  snapshot="$(awk -v field="$field" '
     index($0, "\"" field "\"") {
       matches++
       line = $0
@@ -13857,28 +14029,23 @@ extract_terminal_diagnostics_after() {
       }
       print selected
     }
-  ' "$input" >"$candidate"; then
-    rm -f -- "$candidate"
-    return 1
-  fi
-  if ! assert_sanitized_java_diagnostics "$candidate"; then
-    rm -f -- "$candidate"
-    return 1
-  fi
-  if ! chmod 0644 -- "$candidate" ||
-    ! java_diagnostics_phase_directory_is_safe "$phase" ||
-    [[ -e "$output" || -L "$output" ]]; then
-    rm -f -- "$candidate"
-    return 1
-  fi
-  if ln -T -- "$candidate" "$output"; then
-    rm -f -- "$candidate" || return 1
-  else
-    rm -f -- "$candidate" || true
-    return 1
-  fi
-  record_last_java_diagnostics_reference \
-    "$reference"
+  ' "$input")" || return 1
+  assert_sanitized_java_diagnostics_snapshot "$snapshot" || return 1
+  java_diagnostics_phase_directory_is_safe "$phase" || return 1
+  publish_terminal_owned_hardlink_payload \
+    "$output" "$phase_dir/.terminal-diagnostics" \
+    '^\.terminal-diagnostics\.[A-Za-z0-9]{6}$' \
+    '^\.(java-diagnostics-header|terminal-diagnostics)\.[A-Za-z0-9]{6}$' \
+    644 "$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES" "$snapshot" \
+    validate_java_diagnostics_snapshot_hardlink_payload true \
+    "$phase_dir/.java-diagnostics-header" \
+    "$phase_dir/.terminal-diagnostics" || return $?
+  record_last_java_diagnostics_reference_unlocked "$reference"
+}
+
+extract_terminal_diagnostics_after() {
+  with_terminal_java_diagnostics_lock \
+    extract_terminal_diagnostics_after_unlocked "$@"
 }
 
 extract_fault_diagnostics_after() {
@@ -13943,6 +14110,80 @@ read_bounded_single_line_regular_file() {
     reconstructed_digest="$(printf '%s' "${lines[0]}" | sha256sum)" || return 1
   elif ((size == ${#lines[0]} + 1)); then
     reconstructed_digest="$(printf '%s\n' "${lines[0]}" | sha256sum)" || return 1
+  else
+    return 1
+  fi
+  reconstructed_digest="${reconstructed_digest%% *}"
+  [[ "$reconstructed_digest" == "$digest" ]] || return 1
+  printf '%s\n' "${lines[0]}"
+}
+
+read_bounded_single_line_owned_regular_file() {
+  local -r input="$1"
+  local -r maximum_bytes="$2"
+  local -r expected_mode="$3"
+  local -r expected_links="$4"
+  local descriptor=""
+  local descriptor_path=""
+  local path_identity=""
+  local descriptor_identity=""
+  local size=""
+  local digest=""
+  local reconstructed_digest=""
+  local -a lines=()
+  local LC_ALL=C
+
+  [[ "$maximum_bytes" =~ ^[1-9][0-9]*$ &&
+    "$expected_mode" =~ ^(600|644)$ && "$expected_links" =~ ^[12]$ &&
+    -f "$input" && ! -L "$input" ]] || return 1
+  path_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$input")" || return 1
+  [[ "$path_identity" == *":$(id -u):$expected_mode:$expected_links" ]] ||
+    return 1
+  exec {descriptor}<"$input" || return $?
+  descriptor_path="/proc/self/fd/$descriptor"
+  if [[ ! -f "$descriptor_path" ]] ||
+    ! descriptor_identity="$(
+      stat -Lc '%d:%i:%u:%a:%h' -- "$descriptor_path"
+    )" ||
+    [[ "$descriptor_identity" != "$path_identity" ]] ||
+    [[ -L "$input" ]] ||
+    [[ "$(stat -Lc '%d:%i:%u:%a:%h' -- "$input")" != "$path_identity" ]]; then
+    exec {descriptor}<&-
+    return 1
+  fi
+  size="$(stat -Lc '%s' -- "$descriptor_path")" || {
+    exec {descriptor}<&-
+    return 1
+  }
+  if ((size == 0 || size > maximum_bytes)); then
+    exec {descriptor}<&-
+    return 1
+  fi
+  digest="$(sha256sum "$descriptor_path")" || {
+    exec {descriptor}<&-
+    return 1
+  }
+  digest="${digest%% *}"
+  mapfile -t lines <"$descriptor_path" || {
+    exec {descriptor}<&-
+    return 1
+  }
+  if [[ -L "$input" ||
+    "$(stat -Lc '%d:%i:%u:%a:%h:%s' -- "$input")" != \
+      "$path_identity:$size" ||
+    "$(stat -Lc '%d:%i:%u:%a:%h:%s' -- "$descriptor_path")" != \
+      "$descriptor_identity:$size" ]]; then
+    exec {descriptor}<&-
+    return 1
+  fi
+  exec {descriptor}<&-
+  (( ${#lines[@]} == 1 )) || return 1
+  if ((size == ${#lines[0]})); then
+    reconstructed_digest="$(printf '%s' "${lines[0]}" | sha256sum)" ||
+      return 1
+  elif ((size == ${#lines[0]} + 1)); then
+    reconstructed_digest="$(printf '%s\n' "${lines[0]}" | sha256sum)" ||
+      return 1
   else
     return 1
   fi
@@ -14067,7 +14308,7 @@ obi_metric_phase_reference() {
   esac
 }
 
-validate_obi_process_identity_payload() {
+validate_obi_process_identity_payload_structure() {
   local -r payload="$1"
   local state=""
   local container_id=""
@@ -14075,8 +14316,6 @@ validate_obi_process_identity_payload() {
   local exit_code=""
   local metrics_reference=""
   local metrics_sha256=""
-  local metrics=""
-  local observed_sha256=""
 
   state="$(jq -er '.state' <<<"$payload")" || return 1
   case "$state" in
@@ -14125,6 +14364,24 @@ validate_obi_process_identity_payload() {
     metrics_sha256="$(jq -er '.metrics_sha256' <<<"$payload")" || return 1
     [[ "$metrics_reference" =~ ^phases/[a-z0-9][a-z0-9-]{0,63}/obi-metrics\.prom$ &&
       "$metrics_sha256" =~ ^[0-9a-f]{64}$ ]] || return 1
+  fi
+  printf '%s\n' "$payload"
+}
+
+validate_obi_process_identity_payload() {
+  local -r payload="$1"
+  local state=""
+  local metrics_reference=""
+  local metrics_sha256=""
+  local metrics=""
+  local observed_sha256=""
+
+  validate_obi_process_identity_payload_structure "$payload" >/dev/null ||
+    return 1
+  state="$(jq -er '.state' <<<"$payload")" || return 1
+  if [[ "$state" == running ]]; then
+    metrics_reference="$(jq -er '.metrics_reference' <<<"$payload")" || return 1
+    metrics_sha256="$(jq -er '.metrics_sha256' <<<"$payload")" || return 1
     metrics="$RESULT_DIR/$metrics_reference"
     [[ -f "$metrics" && ! -L "$metrics" ]] || return 1
     obi_metric_output_parent_is_contained "$metrics" || return 1
@@ -14140,12 +14397,27 @@ validate_obi_process_identity_payload() {
 
 obi_process_identity_payload_from_reference() {
   local -r reference="$1"
+  local -r output_name="${2:-}"
   local phase=""
   local input=""
   local payload=""
 
+  (($# == 1 || $# == 2)) || return 1
+  [[ -z "$output_name" || "$output_name" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] ||
+    return 1
   [[ "$reference" =~ ^phases/([a-z0-9][a-z0-9-]{0,63})/obi-identity\.json$ ]] ||
     return 1
+  if [[ "${OBI_METRIC_BOUNDARY_FULL_VALIDATION_CACHE_ACTIVE:-false}" == true ]]; then
+    if [[ -n "${OBI_METRIC_BOUNDARY_IDENTITY_PAYLOAD_CACHE[$reference]+present}" ]]; then
+      if [[ -n "$output_name" ]]; then
+        printf -v "$output_name" '%s' \
+          "${OBI_METRIC_BOUNDARY_IDENTITY_PAYLOAD_CACHE[$reference]}"
+      else
+        printf '%s\n' "${OBI_METRIC_BOUNDARY_IDENTITY_PAYLOAD_CACHE[$reference]}"
+      fi
+      return 0
+    fi
+  fi
   phase="${BASH_REMATCH[1]}"
   java_diagnostics_phase_directory_is_safe "$phase" || return 1
   input="$RESULT_DIR/$reference"
@@ -14156,49 +14428,121 @@ obi_process_identity_payload_from_reference() {
     [[ "$(jq -er '.metrics_reference' <<<"$payload")" == \
       "$(obi_metric_phase_reference "$phase" metrics)" ]] || return 1
   fi
-  printf '%s\n' "$payload"
+  if [[ "${OBI_METRIC_BOUNDARY_FULL_VALIDATION_CACHE_ACTIVE:-false}" == true ]]; then
+    OBI_METRIC_BOUNDARY_IDENTITY_PAYLOAD_CACHE["$reference"]="$payload"
+  fi
+  if [[ -n "$output_name" ]]; then
+    printf -v "$output_name" '%s' "$payload"
+  else
+    printf '%s\n' "$payload"
+  fi
 }
 
 normalize_owned_phase_publication_handle() {
   local -r output="$1"
   local -r handle_prefix="$2"
   local -r expected_digest="$3"
+  local -r preserve_h2="${4:-false}"
   local handle=""
   local handle_name=""
   local output_identity=""
   local handle_identity=""
+  local handle_device=""
+  local handle_inode=""
+  local handle_owner=""
+  local handle_mode=""
+  local handle_links=""
   local observed_digest=""
+  local observed_payload=""
   local path=""
   local -a handles=()
 
-  (($# == 3)) || return 1
-  [[ "$expected_digest" =~ ^[0-9a-f]{64}$ &&
+  (($# == 3 || $# == 4)) || return 1
+  [[ "${TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER:-false}" == true &&
+    "$expected_digest" =~ ^[0-9a-f]{64}$ &&
+    ( "$preserve_h2" == true || "$preserve_h2" == false ) &&
     "${handle_prefix%/*}" == "${output%/*}" &&
     "${handle_prefix##*/}" =~ ^\.obi-(identity|metrics-unavailable)$ ]] ||
     return 1
   obi_metric_output_parent_is_contained "$output" || return 1
-  [[ -f "$output" && ! -L "$output" ]] || return 1
   for path in "$handle_prefix".*; do
     if [[ -e "$path" || -L "$path" ]]; then
       handles+=("$path")
+      ((${#handles[@]} <= 1)) || return 1
     fi
   done
-  ((${#handles[@]} == 1)) || return 1
+  ((${#handles[@]} <= 1)) || return 1
+  if [[ ! -e "$output" && ! -L "$output" ]]; then
+    ((${#handles[@]} == 1)) || return 0
+    handle="${handles[0]}"
+    handle_name="${handle##*/}"
+    [[ "$handle_name" =~ \
+      ^\.obi-(identity|metrics-unavailable)\.[A-Za-z0-9]{6}$ &&
+      -f "$handle" && ! -L "$handle" ]] || return 1
+    handle_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$handle")" || return 1
+    IFS=: read -r handle_device handle_inode handle_owner handle_mode \
+      handle_links <<<"$handle_identity"
+    [[ -n "$handle_device" && -n "$handle_inode" &&
+      "$handle_owner" == "$(id -u)" &&
+      ( "$handle_mode" == 600 || "$handle_mode" == 644 ) &&
+      "$handle_links" == 1 ]] || return 1
+    remove_terminal_owned_private_path "$handle" "$handle_identity"
+    return $?
+  fi
+  [[ -f "$output" && ! -L "$output" ]] || return 1
+  output_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$output")" || return 1
+  if ((${#handles[@]} == 0)); then
+    [[ "$output_identity" == *":$(id -u):644:1" ]] || return 1
+    observed_digest="$(sha256sum "$output")" || return 1
+    observed_digest="${observed_digest%% *}"
+    [[ "$observed_digest" == "$expected_digest" ]]
+    return $?
+  fi
   handle="${handles[0]}"
   handle_name="${handle##*/}"
   [[ "$handle_name" =~ ^\.obi-(identity|metrics-unavailable)\.[A-Za-z0-9]{6}$ &&
-    -f "$handle" && ! -L "$handle" && "$handle" -ef "$output" ]] ||
+    -f "$handle" && ! -L "$handle" ]] ||
     return 1
-  output_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$output")" || return 1
   handle_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$handle")" || return 1
-  [[ "$output_identity" == "$handle_identity" &&
+  IFS=: read -r handle_device handle_inode handle_owner handle_mode \
+    handle_links <<<"$handle_identity"
+  [[ -n "$handle_device" && -n "$handle_inode" &&
+    "$handle_owner" == "$(id -u)" ]] || return 1
+  if [[ "$handle_links" == 1 ]]; then
+    [[ "$handle_mode" =~ ^(600|644)$ &&
+      "$output_identity" == *":$(id -u):644:1" &&
+      ! "$handle" -ef "$output" ]] || return 1
+    remove_terminal_owned_private_path "$handle" "$handle_identity" || return $?
+    observed_digest="$(sha256sum "$output")" || return 1
+    observed_digest="${observed_digest%% *}"
+    [[ "$observed_digest" == "$expected_digest" ]]
+    return $?
+  fi
+  [[ "$handle_links" == 2 && "$handle_mode" == 644 &&
+    "$output_identity" == "$handle_identity" &&
     "$output_identity" == *":$(id -u):644:2" ]] || return 1
   observed_digest="$(sha256sum "$output")" || return 1
   observed_digest="${observed_digest%% *}"
+  case "$handle_name" in
+    .obi-identity.*)
+      observed_payload="$(read_bounded_single_line_owned_regular_file \
+        "$output" "$OBI_PROCESS_IDENTITY_MAX_BYTES" 644 2)" || return 1
+      validate_obi_process_identity_payload "$observed_payload" >/dev/null ||
+        return 1
+      ;;
+    .obi-metrics-unavailable.*)
+      observed_payload="$(read_bounded_single_line_owned_regular_file \
+        "$output" 64 644 2)" || return 1
+      [[ "$observed_payload" == unavailable ]] || return 1
+      ;;
+    *) return 1 ;;
+  esac
   [[ "$observed_digest" == "$expected_digest" ]] || return 1
-  rm -f -- "$handle" || return $?
-  [[ "$(stat -Lc '%d:%i:%u:%a:%h' -- "$output")" == \
-    "${output_identity%:2}:1" ]] || return 1
+  if [[ "$preserve_h2" == true ]]; then
+    return 2
+  fi
+  remove_terminal_owned_hardlink_handle \
+    "$handle" "$output" "$output_identity" || return $?
   observed_digest="$(sha256sum "$output")" || return 1
   observed_digest="${observed_digest%% *}"
   [[ "$observed_digest" == "$expected_digest" ]]
@@ -14222,28 +14566,94 @@ obi_process_identity_publication_matches() {
   [[ "$observed_payload" == "$expected_payload" ]]
 }
 
-publish_obi_process_identity_payload() {
+obi_phase_live_family_is_exclusive() {
+  local -r phase="$1"
+  local -r phase_dir="$RESULT_DIR/phases/$phase"
+  local path=""
+
+  java_diagnostics_phase_directory_is_safe "$phase" || return 1
+  for path in "$phase_dir"/.obi-metrics-unavailable.*; do
+    [[ ! -e "$path" && ! -L "$path" ]] || return 1
+  done
+}
+
+obi_phase_unavailable_family_is_exclusive() {
+  local -r phase="$1"
+  local -r phase_dir="$RESULT_DIR/phases/$phase"
+  local path=""
+
+  java_diagnostics_phase_directory_is_safe "$phase" || return 1
+  [[ ! -e "$phase_dir/obi-identity.json" &&
+    ! -L "$phase_dir/obi-identity.json" ]] || return 1
+  for path in \
+    "$phase_dir"/.obi-identity.* \
+    "$phase_dir"/.obi-metrics.* \
+    "$phase_dir"/.obi-metrics-parsed.*; do
+    [[ ! -e "$path" && ! -L "$path" ]] || return 1
+  done
+}
+
+obi_phase_stopped_family_is_exclusive() {
+  local -r phase="$1"
+  local -r phase_dir="$RESULT_DIR/phases/$phase"
+  local path=""
+
+  java_diagnostics_phase_directory_is_safe "$phase" || return 1
+  [[ ! -e "$phase_dir/obi-metrics.prom" &&
+    ! -L "$phase_dir/obi-metrics.prom" ]] || return 1
+  for path in \
+    "$phase_dir"/.obi-metrics.* \
+    "$phase_dir"/.obi-metrics-unavailable.* \
+    "$phase_dir"/.obi-metrics-parsed.*; do
+    [[ ! -e "$path" && ! -L "$path" ]] || return 1
+  done
+}
+
+publish_obi_process_identity_payload_unlocked() {
   local -r phase="$1"
   local -r payload="$2"
   local reference=""
   local output=""
   local candidate=""
   local candidate_identity=""
+  local candidate_private_identity=""
   local candidate_digest=""
   local expected_digest=""
+  local boundary_index_payload=""
+  local identity_state=""
   local publication_status=0
   local identity_published=false
 
+  [[ "${TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER:-false}" == true &&
+    "${TERMINAL_EVIDENCE_LOCK_ENTRY_FROZEN:-}" == false ]] || return 1
   ensure_java_diagnostics_phase_directory "$phase" || return 1
   reference="$(obi_metric_phase_reference "$phase" identity)" || return 1
   output="$RESULT_DIR/$reference"
   validate_obi_process_identity_payload "$payload" >/dev/null || return 1
-  if [[ "$(jq -er '.state' <<<"$payload")" == running ]]; then
-    [[ "$(jq -er '.metrics_reference' <<<"$payload")" == \
-      "$(obi_metric_phase_reference "$phase" metrics)" ]] || return 1
+  identity_state="$(jq -er '.state' <<<"$payload")" || return 1
+  # Running identities are committed only by the paired metrics+identity
+  # publisher. This direct path is deliberately limited to the stopped family,
+  # where the preplanned pair intent closes the publication-to-attach window.
+  [[ "$identity_state" == obi_stopped ]] || return 1
+  obi_phase_stopped_family_is_exclusive "$phase" || return 1
+  if obi_metric_boundary_index_is_initialized; then
+    boundary_index_payload="$(obi_metric_boundary_index_payload)" || return 1
+    if [[ "$identity_state" == obi_stopped ]]; then
+      jq -e --arg capture_id "$phase" '
+        [.boundaries[] | select(.state == "active")] as $active |
+        ($active | length) == 1 and
+        ([$active[0].captures[] | select(.kind == "pair")] | last) as $latest |
+        $latest.id == $capture_id and $latest.state == "planned"
+      ' <<<"$boundary_index_payload" >/dev/null || return 1
+    fi
+  elif ! obi_metric_boundary_journal_paths_are_cleanly_absent; then
+    return 1
   fi
   expected_digest="$(printf '%s\n' "$payload" | sha256sum)" || return 1
   expected_digest="${expected_digest%% *}"
+  normalize_owned_phase_publication_handle \
+    "$output" "$RESULT_DIR/phases/$phase/.obi-identity" "$expected_digest" ||
+    return $?
   if [[ -e "$output" || -L "$output" ]]; then
     if obi_process_identity_publication_matches "$phase" "$payload"; then
       return 0
@@ -14256,11 +14666,15 @@ publish_obi_process_identity_payload() {
   fi
   candidate="$(mktemp "$RESULT_DIR/phases/$phase/.obi-identity.XXXXXX")" ||
     return $?
+  candidate_private_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$candidate")" ||
+    return 1
+  [[ "$candidate_private_identity" == *":$(id -u):600:1" ]] || return 1
   if printf '%s\n' "$payload" >"$candidate" && chmod 0644 -- "$candidate"; then
     :
   else
     publication_status=$?
-    rm -f -- "$candidate" || true
+    remove_terminal_owned_private_path \
+      "$candidate" "$candidate_private_identity" || return 1
     return "$publication_status"
   fi
   candidate_identity="$(stat -Lc '%d:%i:%u:%a' -- "$candidate")" || return 1
@@ -14277,7 +14691,8 @@ publish_obi_process_identity_payload() {
     fi
   fi
   if [[ "$identity_published" != true ]]; then
-    rm -f -- "$candidate" || true
+    remove_terminal_owned_private_path \
+      "$candidate" "$candidate_identity:1" || return 1
     if obi_process_identity_publication_matches "$phase" "$payload"; then
       return 0
     fi
@@ -14286,23 +14701,23 @@ publish_obi_process_identity_payload() {
   if ! obi_owned_publication_matches \
     "$output" "$candidate_identity" "$candidate_digest" 2; then
     if [[ -f "$output" && ! -L "$output" && "$candidate" -ef "$output" ]]; then
-      rm -f -- "$output" || true
+      remove_terminal_owned_hardlink_handle \
+        "$output" "$candidate" "$candidate_identity:2" || return 1
     fi
-    rm -f -- "$candidate" || true
+    remove_terminal_owned_private_path \
+      "$candidate" "$candidate_identity:1" || return 1
     return 1
   fi
-  if ! rm -f -- "$candidate"; then
-    if [[ ! -e "$candidate" && ! -L "$candidate" ]] &&
-      obi_owned_publication_matches \
-        "$output" "$candidate_identity" "$candidate_digest" 1 &&
-      obi_process_identity_publication_matches "$phase" "$payload"; then
-      return 0
-    fi
-    return 1
-  fi
+  remove_terminal_owned_hardlink_handle \
+    "$candidate" "$output" "$candidate_identity:2" || return $?
   obi_owned_publication_matches \
     "$output" "$candidate_identity" "$candidate_digest" 1 || return 1
   obi_process_identity_publication_matches "$phase" "$payload"
+}
+
+publish_obi_process_identity_payload() {
+  with_terminal_java_diagnostics_lock \
+    publish_obi_process_identity_payload_unlocked "$@"
 }
 
 current_obi_running_observation_payload() {
@@ -14353,8 +14768,50 @@ current_obi_running_observation_payload() {
   printf '%s\n' "$payload"
 }
 
+normalize_owned_obi_h1_scratch_family() {
+  local -r directory="$1"
+  local -r prefix="$2"
+  local -r basename_pattern="$3"
+  local candidate=""
+  local basename=""
+  local identity=""
+  local path=""
+  local -a candidates=()
+
+  [[ "${TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER:-false}" == true &&
+    -d "$directory" && ! -L "$directory" &&
+    "${prefix%/*}" == "$directory" ]] || return 1
+  for path in "$prefix".*; do
+    if [[ -e "$path" || -L "$path" ]]; then
+      candidates+=("$path")
+      ((${#candidates[@]} <= 1)) || return 1
+    fi
+  done
+  ((${#candidates[@]} == 1)) || return 0
+  candidate="${candidates[0]}"
+  basename="${candidate##*/}"
+  [[ "$basename" =~ $basename_pattern &&
+    -f "$candidate" && ! -L "$candidate" ]] || return 1
+  identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$candidate")" || return 1
+  [[ "$identity" == *":$(id -u):600:1" ||
+    "$identity" == *":$(id -u):644:1" ]] || return 1
+  remove_terminal_owned_private_path "$candidate" "$identity"
+}
+
+normalize_owned_obi_metric_phase_scratch_residue() {
+  local -r phase="$1"
+  local -r phase_dir="$RESULT_DIR/phases/$phase"
+
+  [[ "$phase" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] || return 1
+  java_diagnostics_phase_directory_is_safe "$phase" || return 1
+  normalize_owned_obi_h1_scratch_family \
+    "$phase_dir" "$phase_dir/.obi-metrics-parsed" \
+    '^\.obi-metrics-parsed\.[A-Za-z0-9]{6}$'
+}
+
 normalize_owned_obi_metric_phase_capture() {
   local -r phase="$1"
+  local -r preserve_h2="${2:-false}"
   local phase_dir=""
   local metrics_output=""
   local identity_output=""
@@ -14367,16 +14824,23 @@ normalize_owned_obi_metric_phase_capture() {
   local metrics_digest=""
   local identity_payload=""
   local identity_size=""
+  local handle_identity=""
+  local output_present=false
+  local identity_present=false
   local -a handles=()
   local -a identity_lines=()
 
-  [[ "$phase" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] || return 1
+  (($# == 1 || $# == 2)) || return 1
+  [[ "${TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER:-false}" == true &&
+    ( "$preserve_h2" == true || "$preserve_h2" == false ) &&
+    "$phase" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] || return 1
   java_diagnostics_phase_directory_is_safe "$phase" || return 1
   phase_dir="$RESULT_DIR/phases/$phase"
   metrics_output="$phase_dir/obi-metrics.prom"
   identity_output="$phase_dir/obi-identity.json"
-  [[ -f "$metrics_output" && ! -L "$metrics_output" &&
-    -f "$identity_output" && ! -L "$identity_output" ]] || return 1
+  [[ ! -L "$metrics_output" && ! -L "$identity_output" ]] || return 1
+  [[ -f "$metrics_output" ]] && output_present=true
+  [[ -f "$identity_output" ]] && identity_present=true
   for path in "$phase_dir"/.obi-*; do
     if [[ -e "$path" || -L "$path" ]]; then
       handles+=("$path")
@@ -14399,25 +14863,80 @@ normalize_owned_obi_metric_phase_capture() {
       *) return 1 ;;
     esac
   done
+  if [[ "$output_present" != true || "$identity_present" != true ]]; then
+    if [[ "$output_present" == true ]]; then
+      [[ -n "$metrics_handle" && -f "$metrics_handle" &&
+        ! -L "$metrics_handle" && "$metrics_handle" -ef "$metrics_output" ]] ||
+        return 1
+      handle_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$metrics_handle")" ||
+        return 1
+      [[ "$handle_identity" == *":$(id -u):644:2" ]] || return 1
+      remove_terminal_owned_hardlink_handle \
+        "$metrics_output" "$metrics_handle" "$handle_identity" || return $?
+    fi
+    if [[ -n "$metrics_handle" ]]; then
+      handle_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$metrics_handle")" ||
+        return 1
+      remove_terminal_owned_private_path \
+        "$metrics_handle" "$handle_identity" || return $?
+    fi
+    if [[ "$identity_present" == true ]]; then
+      [[ -n "$identity_handle" && -f "$identity_handle" &&
+        ! -L "$identity_handle" && "$identity_handle" -ef "$identity_output" ]] ||
+        return 1
+      handle_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$identity_handle")" ||
+        return 1
+      [[ "$handle_identity" == *":$(id -u):644:2" ]] || return 1
+      remove_terminal_owned_hardlink_handle \
+        "$identity_output" "$identity_handle" "$handle_identity" || return $?
+    fi
+    if [[ -n "$identity_handle" ]]; then
+      handle_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$identity_handle")" ||
+        return 1
+      remove_terminal_owned_private_path \
+        "$identity_handle" "$handle_identity" || return $?
+    fi
+    [[ ! -e "$metrics_output" && ! -L "$metrics_output" &&
+      ! -e "$identity_output" && ! -L "$identity_output" ]]
+    return $?
+  fi
   metrics_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$metrics_output")" ||
     return 1
   identity_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$identity_output")" ||
     return 1
   if [[ -n "$metrics_handle" ]]; then
-    [[ -f "$metrics_handle" && ! -L "$metrics_handle" &&
-      "$metrics_handle" -ef "$metrics_output" &&
-      "$(stat -Lc '%d:%i:%u:%a:%h' -- "$metrics_handle")" == \
-        "$metrics_identity" &&
-      "$metrics_identity" == *":$(id -u):644:2" ]] || return 1
+    handle_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$metrics_handle")" ||
+      return 1
+    if [[ "$handle_identity" == *":$(id -u):644:1" &&
+      "$metrics_identity" == *":$(id -u):644:1" &&
+      ! "$metrics_handle" -ef "$metrics_output" ]]; then
+      remove_terminal_owned_private_path \
+        "$metrics_handle" "$handle_identity" || return $?
+      metrics_handle=""
+    else
+      [[ -f "$metrics_handle" && ! -L "$metrics_handle" &&
+        "$metrics_handle" -ef "$metrics_output" &&
+        "$handle_identity" == "$metrics_identity" &&
+        "$metrics_identity" == *":$(id -u):644:2" ]] || return 1
+    fi
   else
     [[ "$metrics_identity" == *":$(id -u):644:1" ]] || return 1
   fi
   if [[ -n "$identity_handle" ]]; then
-    [[ -f "$identity_handle" && ! -L "$identity_handle" &&
-      "$identity_handle" -ef "$identity_output" &&
-      "$(stat -Lc '%d:%i:%u:%a:%h' -- "$identity_handle")" == \
-        "$identity_identity" &&
-      "$identity_identity" == *":$(id -u):644:2" ]] || return 1
+    handle_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$identity_handle")" ||
+      return 1
+    if [[ "$handle_identity" == *":$(id -u):644:1" &&
+      "$identity_identity" == *":$(id -u):644:1" &&
+      ! "$identity_handle" -ef "$identity_output" ]]; then
+      remove_terminal_owned_private_path \
+        "$identity_handle" "$handle_identity" || return $?
+      identity_handle=""
+    else
+      [[ -f "$identity_handle" && ! -L "$identity_handle" &&
+        "$identity_handle" -ef "$identity_output" &&
+        "$handle_identity" == "$identity_identity" &&
+        "$identity_identity" == *":$(id -u):644:2" ]] || return 1
+    fi
   else
     [[ "$identity_identity" == *":$(id -u):644:1" ]] || return 1
   fi
@@ -14440,11 +14959,18 @@ normalize_owned_obi_metric_phase_capture() {
       "phases/$phase/obi-metrics.prom" &&
     "$(jq -er '.metrics_sha256' <<<"$identity_payload")" == \
       "$metrics_digest" ]] || return 1
+  obi_phase_live_family_is_exclusive "$phase" || return 1
+  if [[ "$preserve_h2" == true &&
+    ( -n "$identity_handle" || -n "$metrics_handle" ) ]]; then
+    return 2
+  fi
   if [[ -n "$identity_handle" ]]; then
-    rm -f -- "$identity_handle" || return 1
+    remove_terminal_owned_hardlink_handle \
+      "$identity_handle" "$identity_output" "$identity_identity" || return $?
   fi
   if [[ -n "$metrics_handle" ]]; then
-    rm -f -- "$metrics_handle" || return 1
+    remove_terminal_owned_hardlink_handle \
+      "$metrics_handle" "$metrics_output" "$metrics_identity" || return $?
   fi
   [[ "$(stat -Lc '%d:%i:%u:%a:%h' -- "$metrics_output")" == \
       "${metrics_identity%:*}:1" &&
@@ -14454,179 +14980,765 @@ normalize_owned_obi_metric_phase_capture() {
     "phases/$phase/obi-identity.json" >/dev/null
 }
 
-capture_bounded_obi_metric_phase() {
+with_obi_metric_capture_stage_lock() (
+  local -r parent="${RESULT_DIR%/*}"
+  local -r lock="$parent/.obi-metric-capture.lock"
+  local lock_fd=""
+  local path_identity=""
+  local descriptor_identity=""
+  local command_status=0
+  local lock_status=0
+  local parent_physical=""
+  local result_physical=""
+  local device=""
+  local inode=""
+  local links=""
+  local owner=""
+  local mode=""
+  local normalization_status=0
+
+  [[ "$RESULT_DIR" == /* && -d "$RESULT_DIR" && ! -L "$RESULT_DIR" &&
+    -d "$parent" && ! -L "$parent" &&
+    ! -L "$lock" && ( ! -e "$lock" || -f "$lock" ) ]] || return 1
+  parent_physical="$(realpath -e -- "$parent")" || return 1
+  result_physical="$(realpath -e -- "$RESULT_DIR")" || return 1
+  [[ "${result_physical%/*}" == "$parent_physical" ]] || return 1
+  umask 077
+  exec {lock_fd}>>"$lock" || return $?
+  path_identity="$(stat -Lc '%d:%i:%h:%u:%a' -- "$lock")" || return 1
+  descriptor_identity="$(stat -Lc '%d:%i:%h:%u:%a' -- \
+    "/proc/self/fd/$lock_fd")" || return 1
+  IFS=: read -r device inode links owner mode <<<"$path_identity"
+  [[ ! -L "$lock" && "$path_identity" == "$descriptor_identity" &&
+    -n "$device" && -n "$inode" && "$links" == 1 &&
+    "$owner" == "$(id -u)" && "$mode" == 600 ]] || return 1
+  flock -x -w "$TERMINAL_JAVA_DIAGNOSTICS_LOCK_TIMEOUT_SECONDS" \
+    "$lock_fd" || return $?
+  path_identity="$(stat -Lc '%d:%i:%h:%u:%a' -- "$lock")" || return 1
+  descriptor_identity="$(stat -Lc '%d:%i:%h:%u:%a' -- \
+    "/proc/self/fd/$lock_fd")" || return 1
+  IFS=: read -r device inode links owner mode <<<"$path_identity"
+  [[ ! -L "$lock" && "$path_identity" == "$descriptor_identity" &&
+    -n "$device" && -n "$inode" && "$links" == 1 &&
+    "$owner" == "$(id -u)" && "$mode" == 600 ]] || return 1
+  local OBI_METRIC_CAPTURE_STAGE_LOCK_HELD_BY_CALLER=true
+  if normalize_obi_metric_capture_stage_residue; then
+    if "$@"; then
+      command_status=0
+    else
+      command_status=$?
+    fi
+  else
+    command_status=$?
+  fi
+  if normalize_obi_metric_capture_stage_residue; then
+    :
+  else
+    normalization_status=$?
+    ((command_status == 0)) && command_status="$normalization_status"
+  fi
+  if flock -u "$lock_fd"; then
+    :
+  else
+    lock_status=$?
+  fi
+  exec {lock_fd}>&-
+  if ((command_status != 0)); then
+    return "$command_status"
+  fi
+  return "$lock_status"
+)
+
+normalize_obi_metric_capture_stage_residue() {
+  local -r parent="${RESULT_DIR%/*}"
+  local stage=""
+  local path=""
+  local name=""
+  local seen_raw=false
+  local seen_parsed=false
+  local seen_unsorted=false
+  local identity=""
+  local device=""
+  local inode=""
+  local owner=""
+  local mode=""
+  local links=""
+  local -a stages=()
+
+  [[ "${OBI_METRIC_CAPTURE_STAGE_LOCK_HELD_BY_CALLER:-false}" == true &&
+    "$RESULT_DIR" == /* && -d "$RESULT_DIR" && ! -L "$RESULT_DIR" &&
+    -d "$parent" && ! -L "$parent" ]] || return 1
+  for path in "$parent"/.obi-metric-capture-stage.*; do
+    [[ -e "$path" || -L "$path" ]] || continue
+    stages+=("$path")
+  done
+  ((${#stages[@]} <= 1)) || return 1
+  ((${#stages[@]} == 1)) || return 0
+  stage="${stages[0]}"
+  [[ "${stage%/*}" == "$parent" &&
+    "${stage##*/}" =~ ^\.obi-metric-capture-stage\.[A-Za-z0-9]{6}$ &&
+    -d "$stage" && ! -L "$stage" ]] || return 1
+  IFS=$'\t' read -r device inode owner mode links <<<"$(
+    stat -Lc $'%d\t%i\t%u\t%a\t%h' -- "$stage"
+  )" || return 1
+  [[ -n "$device" && -n "$inode" && "$owner" == "$(id -u)" &&
+    "$mode" == 700 && "$links" == 2 ]] || return 1
+  for path in "$stage"/* "$stage"/.[!.]* "$stage"/..?*; do
+    [[ -e "$path" || -L "$path" ]] || continue
+    name="${path##*/}"
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+    identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$path")" || return 1
+    IFS=: read -r device inode owner mode links <<<"$identity"
+    [[ -n "$device" && -n "$inode" && "$owner" == "$(id -u)" &&
+      "$mode" == 600 && "$links" == 1 ]] || return 1
+    case "$name" in
+      metrics.raw)
+        [[ "$seen_raw" == false ]] || return 1
+        seen_raw=true
+        ;;
+      metrics.parsed)
+        [[ "$seen_parsed" == false ]] || return 1
+        seen_parsed=true
+        ;;
+      metrics.unsorted)
+        [[ "$seen_unsorted" == false ]] || return 1
+        seen_unsorted=true
+        ;;
+      *) return 1 ;;
+    esac
+  done
+  cleanup_obi_metric_capture_stage \
+    "$stage" "$stage/metrics.raw" "$stage/metrics.parsed" \
+    "$stage/metrics.unsorted"
+}
+
+obi_metric_capture_stage_paths_are_cleanly_absent() {
+  local -r parent="${RESULT_DIR%/*}"
+  local path=""
+
+  [[ "$RESULT_DIR" == /* && -d "$RESULT_DIR" && ! -L "$RESULT_DIR" &&
+    -d "$parent" && ! -L "$parent" ]] || return 1
+  for path in "$parent"/.obi-metric-capture-stage.*; do
+    [[ ! -e "$path" && ! -L "$path" ]] || return 1
+  done
+}
+
+create_obi_metric_capture_stage() {
+  local -r output_name="$1"
+  local -r parent="${RESULT_DIR%/*}"
+  local candidate_stage=""
+  local stage_identity=""
+  local parent_physical=""
+  local result_physical=""
+  local create_status=0
+  local device=""
+  local inode=""
+  local owner=""
+  local mode=""
+  local links=""
+  local attempt=0
+
+  [[ "${OBI_METRIC_CAPTURE_STAGE_LOCK_HELD_BY_CALLER:-false}" == true &&
+    "$output_name" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ &&
+    "$RESULT_DIR" == /* && -d "$RESULT_DIR" && ! -L "$RESULT_DIR" &&
+    -d "$parent" && ! -L "$parent" ]] || return 1
+  parent_physical="$(realpath -e -- "$parent")" || return 1
+  result_physical="$(realpath -e -- "$RESULT_DIR")" || return 1
+  [[ "${result_physical%/*}" == "$parent_physical" ]] || return 1
+  umask 077
+  if candidate_stage="$(mktemp -d \
+    "$parent/.obi-metric-capture-stage.XXXXXX")"; then
+    create_status=0
+  else
+    create_status=$?
+  fi
+  if [[ -n "$candidate_stage" && "${candidate_stage%/*}" == "$parent" &&
+    "${candidate_stage##*/}" =~ \
+      ^\.obi-metric-capture-stage\.[A-Za-z0-9]{6}$ ]]; then
+    printf -v "$output_name" '%s' "$candidate_stage"
+  fi
+  ((create_status == 0)) || return "$create_status"
+  for attempt in 1 2 3; do
+    stage_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+      "$candidate_stage")" && break
+    stage_identity=""
+  done
+  IFS=: read -r device inode owner mode links <<<"$stage_identity"
+  if [[ "${candidate_stage%/*}" != "$parent" ||
+    ! "${candidate_stage##*/}" =~ \
+      ^\.obi-metric-capture-stage\.[A-Za-z0-9]{6}$ ||
+    ! -d "$candidate_stage" || -L "$candidate_stage" ||
+    -z "$device" || -z "$inode" || "$owner" != "$(id -u)" ||
+    "$mode" != 700 || "$links" != 2 ]]; then
+    return 1
+  fi
+  [[ -n "${!output_name}" ]] || printf -v "$output_name" '%s' "$candidate_stage"
+}
+
+cleanup_obi_metric_capture_stage() {
+  local -r stage="$1"
+  local -r parent="${RESULT_DIR%/*}"
+  local stage_identity=""
+  local file=""
+  local identity=""
+  local current_identity=""
+  local device=""
+  local inode=""
+  local owner=""
+  local mode=""
+  local links=""
+  local cleanup_status=0
+  local file_status=0
+  local removal_status=1
+  local attempt=0
+  local -a files=()
+  local -a identities=()
+
+  [[ "${OBI_METRIC_CAPTURE_STAGE_LOCK_HELD_BY_CALLER:-false}" == true &&
+    "${stage%/*}" == "$parent" &&
+    "${stage##*/}" =~ ^\.obi-metric-capture-stage\.[A-Za-z0-9]{6}$ &&
+    -d "$stage" && ! -L "$stage" ]] || return 1
+  stage_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$stage")" || return 1
+  IFS=: read -r device inode owner mode links <<<"$stage_identity"
+  [[ -n "$device" && -n "$inode" && "$owner" == "$(id -u)" &&
+    "$mode" == 700 && "$links" == 2 ]] || return 1
+  for file in "$stage"/* "$stage"/.[!.]* "$stage"/..?*; do
+    [[ -e "$file" || -L "$file" ]] || continue
+    [[ "${file%/*}" == "$stage" ]] || return 1
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    case "${file##*/}" in
+      metrics.raw|metrics.parsed|metrics.unsorted) ;;
+      *) return 1 ;;
+    esac
+    identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$file")" || return 1
+    IFS=: read -r device inode owner mode links <<<"$identity"
+    [[ -n "$device" && -n "$inode" && "$owner" == "$(id -u)" &&
+      "$mode" == 600 && "$links" == 1 ]] || return 1
+    files+=("$file")
+    identities+=("$identity")
+  done
+  for attempt in "${!files[@]}"; do
+    file="${files[$attempt]}"
+    identity="${identities[$attempt]}"
+    if remove_terminal_owned_private_path "$file" "$identity"; then
+      :
+    else
+      file_status=$?
+      ((cleanup_status == 0)) && cleanup_status="$file_status"
+    fi
+  done
+  ((cleanup_status == 0)) || return "$cleanup_status"
+  for attempt in 1 2 3; do
+    [[ -d "$stage" && ! -L "$stage" ]] || return 1
+    current_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$stage")" || return 1
+    [[ "$current_identity" == "$stage_identity" ]] || return 1
+    if rmdir -- "$stage"; then
+      removal_status=0
+    else
+      removal_status=$?
+    fi
+    [[ ! -e "$stage" && ! -L "$stage" ]] && return 0
+  done
+  return "$removal_status"
+}
+
+finalize_obi_metric_phase_publication_unlocked() {
   local -r phase="$1"
-  local -r timeout_seconds="${2:-5}"
-  local phase_dir=""
-  local metrics_reference=""
-  local identity_reference=""
-  local metrics_output=""
-  local identity_output=""
-  local observation_before=""
-  local observation_after=""
+  local -r journal_mode="$2"
+  local -r identity_digest="$3"
+  local -r metrics_handle="$4"
+  local -r metrics_identity="$5"
+  local -r identity_handle="$6"
+  local -r identity_identity="$7"
+  local -r metrics_output="$RESULT_DIR/phases/$phase/obi-metrics.prom"
+  local -r identity_output="$RESULT_DIR/phases/$phase/obi-identity.json"
+  local attachment_state=""
+  local attach_status=0
+
+  (($# == 7)) || return 1
+  [[ "${TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER:-false}" == true &&
+    ( "$journal_mode" == initialized || "$journal_mode" == legacy ) &&
+    "$identity_digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+  [[ -z "$metrics_handle" ||
+    "$metrics_identity" == *":$(id -u):644:2" ]] || return 1
+  [[ -z "$identity_handle" ||
+    "$identity_identity" == *":$(id -u):644:2" ]] || return 1
+  obi_phase_live_family_is_exclusive "$phase" || return 1
+  if [[ "$journal_mode" == initialized ]]; then
+    if attach_obi_metric_phase_capture_unlocked "$phase" "$identity_digest"; then
+      attach_status=0
+    else
+      attach_status=$?
+    fi
+    attachment_state="$(obi_phase_capture_attachment_state_unlocked \
+      "$phase" phase "$identity_digest")" || return 1
+  else
+    attachment_state=legacy
+  fi
+  case "$attachment_state" in
+    captured|no_active|legacy)
+      if [[ -n "$identity_handle" ]]; then
+        remove_terminal_owned_hardlink_handle \
+          "$identity_handle" "$identity_output" "$identity_identity" ||
+          return $?
+      fi
+      if [[ -n "$metrics_handle" ]]; then
+        remove_terminal_owned_hardlink_handle \
+          "$metrics_handle" "$metrics_output" "$metrics_identity" ||
+          return $?
+      fi
+      ;;
+    not_captured)
+      # Roll back only while both h2 handles still prove ownership of the two
+      # canonicals. A partial/ambiguous state is preserved for the next
+      # lock-held retry or the pre-freeze normalizer.
+      [[ -n "$identity_handle" && -n "$metrics_handle" ]] || {
+        ((attach_status != 0)) && return "$attach_status"
+        return 1
+      }
+      remove_terminal_owned_hardlink_handle \
+        "$identity_output" "$identity_handle" "$identity_identity" ||
+        return $?
+      remove_terminal_owned_private_path \
+        "$identity_handle" "${identity_identity%:2}:1" || return $?
+      remove_terminal_owned_hardlink_handle \
+        "$metrics_output" "$metrics_handle" "$metrics_identity" ||
+        return $?
+      remove_terminal_owned_private_path \
+        "$metrics_handle" "${metrics_identity%:2}:1" || return $?
+      ((attach_status != 0)) && return "$attach_status"
+      return 1
+      ;;
+    *) return 1 ;;
+  esac
+  obi_process_identity_payload_from_reference \
+    "phases/$phase/obi-identity.json" >/dev/null || return 1
+  obi_phase_live_family_is_exclusive "$phase" || return 1
+  ((attach_status == 0)) || [[ "$attachment_state" == captured ]]
+}
+
+finalize_obi_unavailable_phase_publication_unlocked() {
+  local -r phase="$1"
+  local -r journal_mode="$2"
+  local -r digest="$3"
+  local -r handle="$4"
+  local -r handle_identity="$5"
+  local -r output="$RESULT_DIR/phases/$phase/obi-metrics.prom"
+  local attachment_state=""
+  local attach_status=0
+
+  (($# == 5)) || return 1
+  [[ "${TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER:-false}" == true &&
+    ( "$journal_mode" == initialized || "$journal_mode" == legacy ) &&
+    "$digest" =~ ^[0-9a-f]{64}$ &&
+    ( -z "$handle" || "$handle_identity" == *":$(id -u):644:2" ) ]] ||
+    return 1
+  obi_phase_unavailable_family_is_exclusive "$phase" || return 1
+  if [[ "$journal_mode" == initialized ]]; then
+    if attach_obi_unavailable_phase_capture_unlocked "$phase" "$digest"; then
+      attach_status=0
+    else
+      attach_status=$?
+    fi
+    attachment_state="$(obi_phase_capture_attachment_state_unlocked \
+      "$phase" unavailable "$digest")" || return 1
+  else
+    attachment_state=legacy
+  fi
+  case "$attachment_state" in
+    captured|no_active|legacy)
+      if [[ -n "$handle" ]]; then
+        remove_terminal_owned_hardlink_handle \
+          "$handle" "$output" "$handle_identity" || return $?
+      fi
+      ;;
+    not_captured)
+      [[ -n "$handle" ]] || {
+        ((attach_status != 0)) && return "$attach_status"
+        return 1
+      }
+      remove_terminal_owned_hardlink_handle \
+        "$output" "$handle" "$handle_identity" || return $?
+      remove_terminal_owned_private_path \
+        "$handle" "${handle_identity%:2}:1" || return $?
+      ((attach_status != 0)) && return "$attach_status"
+      return 1
+      ;;
+    *) return 1 ;;
+  esac
+  obi_metrics_unavailable_phase_is_valid "$phase" || return 1
+  obi_phase_unavailable_family_is_exclusive "$phase" || return 1
+  ((attach_status == 0)) || [[ "$attachment_state" == captured ]]
+}
+
+capture_bounded_obi_metric_phase_publication_unlocked() {
+  local -r phase="$1"
+  local -r staged_metrics="$2"
+  local -r identity_payload="$3"
+  local phase_dir="$RESULT_DIR/phases/$phase"
+  local metrics_reference="phases/$phase/obi-metrics.prom"
+  local identity_reference="phases/$phase/obi-identity.json"
+  local metrics_output="$RESULT_DIR/$metrics_reference"
+  local identity_output="$RESULT_DIR/$identity_reference"
   local metrics_candidate=""
   local identity_candidate=""
-  local parsed_candidate=""
   local metrics_candidate_identity=""
   local identity_candidate_identity=""
   local metrics_digest=""
   local identity_digest=""
-  local identity_payload=""
+  local journal_mode=""
+  local normalization_status=0
+  local path=""
   local publication_status=0
-  local rollback_status=0
-  local metrics_published=false
-  local identity_published=false
+  local metrics_link_status=1
+  local identity_link_status=1
+  local attempt=0
 
-  [[ "$phase" =~ ^[a-z0-9][a-z0-9-]{0,63}$ &&
-    "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ "${OBI_METRIC_CAPTURE_STAGE_LOCK_HELD_BY_CALLER:-false}" == true &&
+    "${TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER:-false}" == true &&
+    "${TERMINAL_EVIDENCE_LOCK_ENTRY_FROZEN:-}" == false &&
+    "$phase" =~ ^[a-z0-9][a-z0-9-]{0,63}$ &&
+    -f "$staged_metrics" && ! -L "$staged_metrics" ]] || return 1
   ensure_java_diagnostics_phase_directory "$phase" || return 1
   java_diagnostics_phase_directory_is_safe "$phase" || return 1
-  phase_dir="$RESULT_DIR/phases/$phase"
-  metrics_reference="$(obi_metric_phase_reference "$phase" metrics)" || return 1
-  identity_reference="$(obi_metric_phase_reference "$phase" identity)" || return 1
-  metrics_output="$RESULT_DIR/$metrics_reference"
-  identity_output="$RESULT_DIR/$identity_reference"
+  bounded_evidence_file "$staged_metrics" "$OBI_METRIC_SNAPSHOT_MAX_BYTES" \
+    "$OBI_METRIC_SNAPSHOT_MAX_LINES" || return 1
+  metrics_digest="$(sha256sum "$staged_metrics")" || return 1
+  metrics_digest="${metrics_digest%% *}"
+  validate_obi_process_identity_payload_structure \
+    "$identity_payload" >/dev/null || return 1
+  [[ "$(jq -er '.state' <<<"$identity_payload")" == running &&
+    "$(jq -er '.metrics_reference' <<<"$identity_payload")" == \
+      "$metrics_reference" &&
+    "$(jq -er '.metrics_sha256' <<<"$identity_payload")" == \
+      "$metrics_digest" ]] || return 1
+  obi_phase_live_family_is_exclusive "$phase" || return 1
+  if obi_metric_boundary_index_is_initialized; then
+    journal_mode=initialized
+  elif obi_metric_boundary_journal_paths_are_cleanly_absent; then
+    journal_mode=legacy
+  else
+    return 1
+  fi
+  normalize_owned_obi_metric_phase_scratch_residue "$phase" || return $?
+  if normalize_owned_obi_metric_phase_capture "$phase" true; then
+    normalization_status=0
+  else
+    normalization_status=$?
+    ((normalization_status == 2)) || return "$normalization_status"
+  fi
+  if ((normalization_status == 2)); then
+    for path in "$phase_dir"/.obi-*; do
+      [[ -e "$path" || -L "$path" ]] || continue
+      case "${path##*/}" in
+        .obi-metrics.??????)
+          [[ -z "$metrics_candidate" ]] || return 1
+          metrics_candidate="$path"
+          metrics_candidate_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+            "$path")" || return 1
+          ;;
+        .obi-identity.??????)
+          [[ -z "$identity_candidate" ]] || return 1
+          identity_candidate="$path"
+          identity_candidate_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+            "$path")" || return 1
+          ;;
+        *) return 1 ;;
+      esac
+    done
+  fi
   if [[ -e "$metrics_output" || -L "$metrics_output" ||
     -e "$identity_output" || -L "$identity_output" ]]; then
-    normalize_owned_obi_metric_phase_capture "$phase"
+    [[ -f "$metrics_output" && ! -L "$metrics_output" &&
+      -f "$identity_output" && ! -L "$identity_output" ]] || return 1
+    obi_process_identity_payload_from_reference "$identity_reference" >/dev/null ||
+      return 1
+    [[ "$(sha256sum "$metrics_output" | awk '{print $1}')" == \
+        "$metrics_digest" &&
+      "$(read_bounded_single_line_regular_file \
+        "$identity_output" "$OBI_PROCESS_IDENTITY_MAX_BYTES")" == \
+        "$identity_payload" ]] || return 1
+    identity_digest="$(sha256sum "$identity_output")" || return 1
+    identity_digest="${identity_digest%% *}"
+    finalize_obi_metric_phase_publication_unlocked \
+      "$phase" "$journal_mode" "$identity_digest" \
+      "$metrics_candidate" "$metrics_candidate_identity" \
+      "$identity_candidate" "$identity_candidate_identity"
     return $?
   fi
-
-  observation_before="$(current_obi_running_observation_payload)" || return $?
   metrics_candidate="$(mktemp "$phase_dir/.obi-metrics.XXXXXX")" || return $?
-  parsed_candidate="$(mktemp "$phase_dir/.obi-metrics-parsed.XXXXXX")" || {
-    rm -f -- "$metrics_candidate" || true
-    return 1
-  }
-  if ! capture_obi_metrics_candidate "$metrics_candidate" "$timeout_seconds" ||
-    ! parse_obi_metric_snapshot "$metrics_candidate" "$parsed_candidate" ||
-    ! chmod 0644 -- "$metrics_candidate"; then
-    publication_status=1
-    rm -f -- "$metrics_candidate" "$parsed_candidate" || true
-    return "$publication_status"
-  fi
-  rm -f -- "$parsed_candidate" || {
-    publication_status=$?
-    rm -f -- "$metrics_candidate" || true
-    return "$publication_status"
-  }
-  observation_after="$(current_obi_running_observation_payload)" || {
-    publication_status=$?
-    rm -f -- "$metrics_candidate" || true
-    return "$publication_status"
-  }
-  if [[ "$observation_after" != "$observation_before" ]]; then
-    rm -f -- "$metrics_candidate" || true
-    return 1
-  fi
-  metrics_digest="$(sha256sum "$metrics_candidate")" || {
-    publication_status=$?
-    rm -f -- "$metrics_candidate" || true
-    return "$publication_status"
-  }
-  metrics_digest="${metrics_digest%% *}"
-  identity_payload="$(jq -cS \
-    --arg metrics_reference "$metrics_reference" \
-    --arg metrics_sha256 "$metrics_digest" '
-      .schema = "obi-process-identity-v1" |
-      . + {
-        metrics_reference: $metrics_reference,
-        metrics_sha256: $metrics_sha256
-      }
-    ' <<<"$observation_before")" || {
-    publication_status=$?
-    rm -f -- "$metrics_candidate" || true
-    return "$publication_status"
-  }
   identity_candidate="$(mktemp "$phase_dir/.obi-identity.XXXXXX")" || {
     publication_status=$?
-    rm -f -- "$metrics_candidate" || true
+    normalize_owned_obi_metric_phase_capture "$phase" || return 1
     return "$publication_status"
   }
-  if ! printf '%s\n' "$identity_payload" >"$identity_candidate" ||
-    ! chmod 0644 -- "$identity_candidate"; then
-    publication_status=1
-    rm -f -- "$metrics_candidate" "$identity_candidate" || true
+  if cp -- "$staged_metrics" "$metrics_candidate" &&
+    chmod 0644 -- "$metrics_candidate" &&
+    printf '%s\n' "$identity_payload" >"$identity_candidate" &&
+    chmod 0644 -- "$identity_candidate"; then
+    :
+  else
+    publication_status=$?
+    normalize_owned_obi_metric_phase_capture "$phase" || return 1
     return "$publication_status"
   fi
-  metrics_candidate_identity="$(stat -Lc '%d:%i:%u:%a' -- "$metrics_candidate")" ||
-    publication_status=$?
-  if ((publication_status == 0)); then
-    identity_candidate_identity="$(stat -Lc '%d:%i:%u:%a' -- "$identity_candidate")" ||
-      publication_status=$?
-  fi
-  if ((publication_status == 0)); then
-    identity_digest="$(sha256sum "$identity_candidate")" || publication_status=$?
-    identity_digest="${identity_digest%% *}"
-  fi
-  if ((publication_status == 0)); then
-    java_diagnostics_phase_directory_is_safe "$phase" || publication_status=$?
-  fi
-  if ((publication_status == 0)); then
+  metrics_candidate_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "$metrics_candidate")" || return 1
+  identity_candidate_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "$identity_candidate")" || return 1
+  identity_digest="$(sha256sum "$identity_candidate")" || return 1
+  identity_digest="${identity_digest%% *}"
+  for attempt in 1 2 3; do
     if ln -T -- "$metrics_candidate" "$metrics_output"; then
-      metrics_published=true
+      metrics_link_status=1
+      break
     else
-      publication_status=$?
-      if [[ -f "$metrics_output" && ! -L "$metrics_output" &&
-        "$metrics_candidate" -ef "$metrics_output" ]] &&
-        obi_owned_publication_matches \
-          "$metrics_output" "$metrics_candidate_identity" "$metrics_digest" 2; then
-        metrics_published=true
-      fi
+      metrics_link_status=$?
     fi
-  fi
-  if ((publication_status == 0)); then
-    validate_obi_process_identity_payload "$identity_payload" >/dev/null ||
-      publication_status=$?
-  fi
-  if ((publication_status == 0)); then
-    if ln -T -- "$identity_candidate" "$identity_output"; then
-      identity_published=true
-    else
-      publication_status=$?
-      if [[ -f "$identity_output" && ! -L "$identity_output" &&
-        "$identity_candidate" -ef "$identity_output" ]] &&
-        obi_owned_publication_matches \
-          "$identity_output" "$identity_candidate_identity" "$identity_digest" 2; then
-        identity_published=true
-      fi
-    fi
-  fi
-  if ((publication_status == 0)); then
-    if [[ "$(stat -Lc '%d:%i:%u:%a:%h' -- "$metrics_output")" == \
-        "$metrics_candidate_identity:2" &&
-      "$(stat -Lc '%d:%i:%u:%a:%h' -- "$identity_output")" == \
-        "$identity_candidate_identity:2" &&
-      "$(sha256sum "$metrics_output" | awk '{print $1}')" == "$metrics_digest" &&
-      "$(sha256sum "$identity_output" | awk '{print $1}')" == "$identity_digest" ]]; then
+    [[ ! -e "$metrics_output" && ! -L "$metrics_output" ]] || break
+  done
+  if ! obi_owned_publication_matches "$metrics_output" \
+    "$metrics_candidate_identity" "$metrics_digest" 2; then
+    if normalize_owned_obi_metric_phase_capture "$phase" true; then
       :
     else
-      publication_status=1
+      normalization_status=$?
+      ((normalization_status == 2)) || return 1
+    fi
+    return "$metrics_link_status"
+  fi
+  for attempt in 1 2 3; do
+    if ln -T -- "$identity_candidate" "$identity_output"; then
+      identity_link_status=1
+      break
+    else
+      identity_link_status=$?
+    fi
+    [[ ! -e "$identity_output" && ! -L "$identity_output" ]] || break
+  done
+  if ! obi_owned_publication_matches "$identity_output" \
+    "$identity_candidate_identity" "$identity_digest" 2; then
+    if normalize_owned_obi_metric_phase_capture "$phase" true; then
+      :
+    else
+      normalization_status=$?
+      ((normalization_status == 2)) || return 1
+    fi
+    return "$identity_link_status"
+  fi
+  metrics_candidate_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "$metrics_candidate")" || return 1
+  identity_candidate_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "$identity_candidate")" || return 1
+  finalize_obi_metric_phase_publication_unlocked \
+    "$phase" "$journal_mode" "$identity_digest" \
+    "$metrics_candidate" "$metrics_candidate_identity" \
+    "$identity_candidate" "$identity_candidate_identity"
+}
+
+recover_obi_metric_phase_capture_unlocked() {
+  local -r phase="$1"
+  local -r phase_dir="$RESULT_DIR/phases/$phase"
+  local -r metrics_output="$phase_dir/obi-metrics.prom"
+  local -r identity_output="$phase_dir/obi-identity.json"
+  local metrics_handle=""
+  local identity_handle=""
+  local metrics_handle_identity=""
+  local identity_handle_identity=""
+  local identity_payload=""
+  local identity_digest=""
+  local identity_owner=""
+  local identity_mode=""
+  local identity_links=""
+  local journal_mode=""
+  local attachment_state=""
+  local normalization_status=0
+  local path=""
+
+  [[ "${OBI_METRIC_CAPTURE_STAGE_LOCK_HELD_BY_CALLER:-false}" == true &&
+    "${TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER:-false}" == true &&
+    "${TERMINAL_EVIDENCE_LOCK_ENTRY_FROZEN:-}" == false &&
+    "$phase" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] || return 1
+  if [[ ! -e "$phase_dir" && ! -L "$phase_dir" ]]; then
+    return 2
+  fi
+  java_diagnostics_phase_directory_is_safe "$phase" || return 1
+  normalize_owned_obi_metric_phase_scratch_residue "$phase" || return $?
+  if normalize_owned_obi_metric_phase_capture "$phase" true; then
+    normalization_status=0
+  else
+    normalization_status=$?
+    ((normalization_status == 2)) || return "$normalization_status"
+  fi
+  if [[ ! -e "$metrics_output" && ! -L "$metrics_output" &&
+    ! -e "$identity_output" && ! -L "$identity_output" ]]; then
+    return 2
+  fi
+  [[ -f "$metrics_output" && ! -L "$metrics_output" &&
+    -f "$identity_output" && ! -L "$identity_output" ]] || return 1
+  if ((normalization_status == 2)); then
+    IFS=: read -r identity_owner identity_mode identity_links <<<"$(
+      stat -Lc '%u:%a:%h' -- "$identity_output"
+    )" || return 1
+    [[ "$identity_owner" == "$(id -u)" && "$identity_mode" == 644 &&
+      ( "$identity_links" == 1 || "$identity_links" == 2 ) ]] || return 1
+    identity_payload="$(read_bounded_single_line_owned_regular_file \
+      "$identity_output" "$OBI_PROCESS_IDENTITY_MAX_BYTES" \
+      644 "$identity_links")" || return 1
+    validate_obi_process_identity_payload "$identity_payload" >/dev/null ||
+      return 1
+  else
+    identity_payload="$(obi_process_identity_payload_from_reference \
+      "phases/$phase/obi-identity.json")" || return 1
+  fi
+  [[ "$(jq -er '.state' <<<"$identity_payload")" == running &&
+    "$(jq -er '.metrics_reference' <<<"$identity_payload")" == \
+      "phases/$phase/obi-metrics.prom" ]] || return 1
+  identity_digest="$(sha256sum "$identity_output")" || return 1
+  identity_digest="${identity_digest%% *}"
+  [[ "$identity_digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+  obi_phase_live_family_is_exclusive "$phase" || return 1
+  if obi_metric_boundary_index_is_initialized; then
+    journal_mode=initialized
+  elif obi_metric_boundary_journal_paths_are_cleanly_absent; then
+    journal_mode=legacy
+  else
+    return 1
+  fi
+  if ((normalization_status == 2)); then
+    for path in "$phase_dir"/.obi-*; do
+      [[ -e "$path" || -L "$path" ]] || continue
+      case "${path##*/}" in
+        .obi-metrics.??????)
+          [[ -z "$metrics_handle" &&
+            "${path##*/}" =~ ^\.obi-metrics\.[A-Za-z0-9]{6}$ ]] || return 1
+          metrics_handle="$path"
+          metrics_handle_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+            "$path")" || return 1
+          ;;
+        .obi-identity.??????)
+          [[ -z "$identity_handle" &&
+            "${path##*/}" =~ ^\.obi-identity\.[A-Za-z0-9]{6}$ ]] || return 1
+          identity_handle="$path"
+          identity_handle_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+            "$path")" || return 1
+          ;;
+        *) return 1 ;;
+      esac
+    done
+    [[ -n "$metrics_handle" || -n "$identity_handle" ]] || return 1
+    finalize_obi_metric_phase_publication_unlocked \
+      "$phase" "$journal_mode" "$identity_digest" \
+      "$metrics_handle" "$metrics_handle_identity" \
+      "$identity_handle" "$identity_handle_identity"
+    return $?
+  fi
+  if [[ "$journal_mode" == initialized ]]; then
+    attachment_state="$(obi_phase_capture_attachment_state_unlocked \
+      "$phase" phase "$identity_digest")" || return 1
+    [[ "$attachment_state" == captured || "$attachment_state" == no_active ]] ||
+      return 1
+  fi
+  normalize_owned_obi_metric_phase_capture "$phase" || return $?
+  obi_phase_live_family_is_exclusive "$phase" || return 1
+  return 0
+}
+
+capture_bounded_obi_metric_phase_unlocked() {
+  local -r phase="$1"
+  local -r timeout_seconds="${2:-5}"
+  local stage=""
+  local staged_metrics=""
+  local staged_parsed=""
+  local staged_unsorted=""
+  local observation_before=""
+  local observation_after=""
+  local metrics_digest=""
+  local identity_payload=""
+  local recovery_status=0
+  local capture_status=0
+  local cleanup_status=0
+
+  [[ "${OBI_METRIC_CAPTURE_STAGE_LOCK_HELD_BY_CALLER:-false}" == true &&
+    "$phase" =~ ^[a-z0-9][a-z0-9-]{0,63}$ &&
+    "$timeout_seconds" =~ ^[1-9][0-9]*$ ]] || return 1
+  normalize_obi_metric_capture_stage_residue || return $?
+  obi_metric_boundary_publication_is_frozen && return 1
+  if with_terminal_java_diagnostics_lock \
+    recover_obi_metric_phase_capture_unlocked "$phase"; then
+    return 0
+  else
+    recovery_status=$?
+  fi
+  ((recovery_status == 2)) || return "$recovery_status"
+  if create_obi_metric_capture_stage stage; then
+    staged_metrics="$stage/metrics.raw"
+    staged_parsed="$stage/metrics.parsed"
+    staged_unsorted="$stage/metrics.unsorted"
+  else
+    capture_status=$?
+  fi
+  if ((capture_status == 0)); then
+    if (umask 077 && : >"$staged_metrics" && : >"$staged_parsed" &&
+      : >"$staged_unsorted"); then
+      :
+    else
+      capture_status=$?
+      ((capture_status != 0)) || capture_status=1
     fi
   fi
-  if ((publication_status != 0)); then
-    if [[ "$identity_published" == true && -f "$identity_output" &&
-      ! -L "$identity_output" && "$identity_candidate" -ef "$identity_output" ]]; then
-      rm -f -- "$identity_output" || rollback_status=1
-    fi
-    if [[ "$metrics_published" == true && -f "$metrics_output" &&
-      ! -L "$metrics_output" && "$metrics_candidate" -ef "$metrics_output" ]]; then
-      rm -f -- "$metrics_output" || rollback_status=1
-    fi
-    rm -f -- "$metrics_candidate" "$identity_candidate" || rollback_status=1
-    if [[ -e "$metrics_output" || -L "$metrics_output" ||
-      -e "$identity_output" || -L "$identity_output" ]]; then
-      rollback_status=1
-    fi
-    ((rollback_status == 0)) || return 1
-    return "$publication_status"
+  if ((capture_status == 0)); then
+    observation_before="$(current_obi_running_observation_payload)" ||
+      capture_status=$?
   fi
-  rm -f -- "$metrics_candidate" "$identity_candidate" || return 1
-  [[ "$(stat -Lc '%d:%i:%u:%a:%h' -- "$metrics_output")" == \
-      "$metrics_candidate_identity:1" &&
-    "$(stat -Lc '%d:%i:%u:%a:%h' -- "$identity_output")" == \
-      "$identity_candidate_identity:1" ]] || return 1
-  obi_process_identity_payload_from_reference "$identity_reference" >/dev/null
+  if ((capture_status == 0)); then
+    capture_obi_metrics_candidate "$staged_metrics" "$timeout_seconds" ||
+      capture_status=$?
+  fi
+  if ((capture_status == 0)); then
+    parse_obi_metric_snapshot \
+      "$staged_metrics" "$staged_parsed" "$staged_unsorted" ||
+      capture_status=$?
+  fi
+  if ((capture_status == 0)); then
+    observation_after="$(current_obi_running_observation_payload)" ||
+      capture_status=$?
+  fi
+  if ((capture_status == 0)) && [[ "$observation_after" != "$observation_before" ]]; then
+    capture_status=1
+  fi
+  if ((capture_status == 0)); then
+    metrics_digest="$(sha256sum "$staged_metrics")" || capture_status=$?
+    metrics_digest="${metrics_digest%% *}"
+  fi
+  if ((capture_status == 0)); then
+    identity_payload="$(jq -cS \
+      --arg metrics_reference "phases/$phase/obi-metrics.prom" \
+      --arg metrics_sha256 "$metrics_digest" '
+        .schema = "obi-process-identity-v1" |
+        . + {
+          metrics_reference: $metrics_reference,
+          metrics_sha256: $metrics_sha256
+        }
+      ' <<<"$observation_before")" || capture_status=$?
+  fi
+  if ((capture_status == 0)); then
+    with_terminal_java_diagnostics_lock \
+      capture_bounded_obi_metric_phase_publication_unlocked \
+      "$phase" "$staged_metrics" "$identity_payload" || capture_status=$?
+  fi
+  if [[ -n "$stage" && ( -e "$stage" || -L "$stage" ) ]]; then
+    cleanup_obi_metric_capture_stage \
+      "$stage" "$stage/metrics.raw" "$stage/metrics.parsed" \
+      "$stage/metrics.unsorted" || cleanup_status=$?
+  fi
+  ((cleanup_status == 0)) || return "$cleanup_status"
+  return "$capture_status"
+}
+
+capture_bounded_obi_metric_phase() {
+  with_obi_metric_capture_stage_lock \
+    capture_bounded_obi_metric_phase_unlocked "$@"
 }
 
 obi_metrics_unavailable_phase_is_valid() {
@@ -14644,18 +15756,23 @@ obi_metrics_unavailable_phase_is_valid() {
   [[ "$payload" == unavailable ]]
 }
 
-publish_obi_metrics_unavailable_phase() {
+publish_obi_metrics_unavailable_phase_unlocked() {
   local -r phase="$1"
   local phase_dir=""
   local reference=""
   local output=""
   local candidate=""
   local candidate_identity=""
+  local candidate_private_identity=""
   local candidate_digest=""
   local expected_digest=""
-  local publication_status=0
-  local metrics_published=false
+  local journal_mode=""
+  local normalization_status=0
+  local publication_status=1
+  local attempt=0
 
+  [[ "${TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER:-false}" == true &&
+    "${TERMINAL_EVIDENCE_LOCK_ENTRY_FROZEN:-}" == false ]] || return 1
   ensure_java_diagnostics_phase_directory "$phase" || return 1
   java_diagnostics_phase_directory_is_safe "$phase" || return 1
   phase_dir="$RESULT_DIR/phases/$phase"
@@ -14663,73 +15780,102 @@ publish_obi_metrics_unavailable_phase() {
   output="$RESULT_DIR/$reference"
   expected_digest="$(printf 'unavailable\n' | sha256sum)" || return 1
   expected_digest="${expected_digest%% *}"
+  obi_phase_unavailable_family_is_exclusive "$phase" || return 1
+  if obi_metric_boundary_index_is_initialized; then
+    journal_mode=initialized
+  elif obi_metric_boundary_journal_paths_are_cleanly_absent; then
+    journal_mode=legacy
+  else
+    return 1
+  fi
+  if normalize_owned_phase_publication_handle \
+    "$output" "$phase_dir/.obi-metrics-unavailable" "$expected_digest" \
+    true; then
+    normalization_status=0
+  else
+    normalization_status=$?
+    ((normalization_status == 2)) || return "$normalization_status"
+  fi
+  if ((normalization_status == 2)); then
+    for candidate in "$phase_dir"/.obi-metrics-unavailable.*; do
+      [[ -e "$candidate" || -L "$candidate" ]] || continue
+      [[ "${candidate##*/}" =~ \
+        ^\.obi-metrics-unavailable\.[A-Za-z0-9]{6}$ ]] || return 1
+      candidate_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$candidate")" ||
+        return 1
+    done
+    [[ -n "$candidate" && "$candidate_identity" == \
+      *":$(id -u):644:2" ]] || return 1
+  fi
   if [[ -e "$output" || -L "$output" ]]; then
     if obi_metrics_unavailable_phase_is_valid "$phase"; then
-      return 0
+      finalize_obi_unavailable_phase_publication_unlocked \
+        "$phase" "$journal_mode" "$expected_digest" \
+        "$candidate" "$candidate_identity"
+      return $?
     fi
     normalize_owned_phase_publication_handle \
       "$output" "$phase_dir/.obi-metrics-unavailable" "$expected_digest" ||
       return 1
-    obi_metrics_unavailable_phase_is_valid "$phase"
+    obi_metrics_unavailable_phase_is_valid "$phase" || return 1
+    finalize_obi_unavailable_phase_publication_unlocked \
+      "$phase" "$journal_mode" "$expected_digest" "" ""
     return $?
   fi
   candidate="$(mktemp "$phase_dir/.obi-metrics-unavailable.XXXXXX")" || return $?
+  candidate_private_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$candidate")" ||
+    return 1
+  [[ "$candidate_private_identity" == *":$(id -u):600:1" ]] || return 1
   if ! printf 'unavailable\n' >"$candidate" || ! chmod 0644 -- "$candidate"; then
-    rm -f -- "$candidate" || true
+    remove_terminal_owned_private_path \
+      "$candidate" "$candidate_private_identity" || return 1
     return 1
   fi
   candidate_identity="$(stat -Lc '%d:%i:%u:%a' -- "$candidate")" || {
     publication_status=$?
-    rm -f -- "$candidate" || true
+    if [[ -n "$candidate_identity" ]]; then
+      remove_terminal_owned_private_path \
+        "$candidate" "$candidate_identity:1" || return 1
+    fi
     return "$publication_status"
   }
   candidate_digest="$(sha256sum "$candidate")" || {
     publication_status=$?
-    rm -f -- "$candidate" || true
+    remove_terminal_owned_private_path \
+      "$candidate" "$candidate_identity:1" || return 1
     return "$publication_status"
   }
   candidate_digest="${candidate_digest%% *}"
-  if ! java_diagnostics_phase_directory_is_safe "$phase"; then
-    rm -f -- "$candidate" || true
-    return 1
-  fi
-  if ln -T -- "$candidate" "$output"; then
-    metrics_published=true
-  else
-    publication_status=$?
-    if [[ -f "$output" && ! -L "$output" && "$candidate" -ef "$output" ]] &&
-      obi_owned_publication_matches \
-        "$output" "$candidate_identity" "$candidate_digest" 2; then
-      metrics_published=true
+  java_diagnostics_phase_directory_is_safe "$phase" || return 1
+  for attempt in 1 2 3; do
+    if ln -T -- "$candidate" "$output"; then
+      publication_status=1
+      break
+    else
+      publication_status=$?
     fi
-  fi
-  if [[ "$metrics_published" != true ]]; then
-    rm -f -- "$candidate" || true
-    if obi_metrics_unavailable_phase_is_valid "$phase"; then
-      return 0
-    fi
-    return "$publication_status"
-  fi
+    [[ ! -e "$output" && ! -L "$output" ]] || break
+  done
   if ! obi_owned_publication_matches \
     "$output" "$candidate_identity" "$candidate_digest" 2; then
     if [[ -f "$output" && ! -L "$output" && "$candidate" -ef "$output" ]]; then
-      rm -f -- "$output" || true
+      remove_terminal_owned_hardlink_handle \
+        "$output" "$candidate" "$candidate_identity:2" || return 1
     fi
-    rm -f -- "$candidate" || true
-    return 1
+    remove_terminal_owned_private_path \
+      "$candidate" "$candidate_identity:1" || return 1
+    return "$publication_status"
   fi
-  if ! rm -f -- "$candidate"; then
-    if [[ ! -e "$candidate" && ! -L "$candidate" ]] &&
-      obi_owned_publication_matches \
-        "$output" "$candidate_identity" "$candidate_digest" 1 &&
-      obi_metrics_unavailable_phase_is_valid "$phase"; then
-      return 0
-    fi
+  candidate_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$candidate")" ||
     return 1
-  fi
-  obi_owned_publication_matches \
-    "$output" "$candidate_identity" "$candidate_digest" 1 || return 1
-  obi_metrics_unavailable_phase_is_valid "$phase"
+  finalize_obi_unavailable_phase_publication_unlocked \
+    "$phase" "$journal_mode" "$candidate_digest" \
+    "$candidate" "$candidate_identity"
+}
+
+publish_obi_metrics_unavailable_phase() {
+  with_terminal_java_diagnostics_lock \
+    publish_obi_metrics_unavailable_phase_unlocked "$@"
 }
 
 capture_obi_stopped_attestation() {
@@ -14808,6 +15954,7 @@ obi_metric_label_value_is_allowed() {
 parse_obi_metric_snapshot() {
   local -r input="$1"
   local -r output="$2"
+  local -r supplied_unsorted="${3:-}"
   local line=""
   local metric=""
   local raw_value=""
@@ -14830,8 +15977,16 @@ parse_obi_metric_snapshot() {
   declare -A seen_series=()
   declare -A seen_labels=()
 
-  [[ -f "$input" && ! -L "$input" && ! -L "$output" ]] || return 1
-  unsorted="$(mktemp "$RESULT_DIR/.obi-metric-snapshot.XXXXXX")" || return $?
+  [[ $# -le 3 && -f "$input" && ! -L "$input" && ! -L "$output" ]] ||
+    return 1
+  if [[ -n "$supplied_unsorted" ]]; then
+    [[ "${supplied_unsorted%/*}" == "${output%/*}" &&
+      -f "$supplied_unsorted" && ! -L "$supplied_unsorted" ]] || return 1
+    unsorted="$supplied_unsorted"
+    : >"$unsorted" || return $?
+  else
+    unsorted="$(mktemp "$RESULT_DIR/.obi-metric-snapshot.XXXXXX")" || return $?
+  fi
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ "$line" != *$'\r'* ]] || {
       rm -f -- "$unsorted"
@@ -14963,6 +16118,40 @@ parse_obi_metric_snapshot() {
   return 1
 }
 
+obi_parsed_metric_snapshot() {
+  local -r input="$1"
+  local -r output_name="$2"
+  local reference=""
+  local parsed_output=""
+  local parsed_payload=""
+
+  (($# == 2)) || return 1
+  [[ "$output_name" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ &&
+    "$input" == "$RESULT_DIR"/phases/*/obi-metrics.prom ]] || return 1
+  reference="${input#"$RESULT_DIR/"}"
+  [[ "$reference" =~ ^phases/[a-z0-9][a-z0-9-]{0,63}/obi-metrics\.prom$ ]] ||
+    return 1
+  if [[ "${OBI_METRIC_BOUNDARY_FULL_VALIDATION_CACHE_ACTIVE:-false}" == true &&
+    -n "${OBI_METRIC_BOUNDARY_PARSED_METRICS_CACHE[$reference]+present}" ]]; then
+    printf -v "$output_name" '%s' \
+      "${OBI_METRIC_BOUNDARY_PARSED_METRICS_CACHE[$reference]}"
+    return 0
+  fi
+  parsed_output="$(mktemp "$RESULT_DIR/.obi-metric-parsed.XXXXXX")" || return $?
+  if parse_obi_metric_snapshot "$input" "$parsed_output" &&
+    parsed_payload="$(<"$parsed_output")" && rm -f -- "$parsed_output"; then
+    :
+  else
+    rm -f -- "$parsed_output" || true
+    return 1
+  fi
+  [[ -n "$parsed_payload" ]] || return 1
+  if [[ "${OBI_METRIC_BOUNDARY_FULL_VALIDATION_CACHE_ACTIVE:-false}" == true ]]; then
+    OBI_METRIC_BOUNDARY_PARSED_METRICS_CACHE["$reference"]="$parsed_payload"
+  fi
+  printf -v "$output_name" '%s' "$parsed_payload"
+}
+
 validate_obi_metric_pair_payload_structure() {
   local -r payload="$1"
   local boundary=""
@@ -15028,12 +16217,10 @@ validate_obi_metric_pair_payload_structure() {
     return 1
   [[ "$boundary" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] || return 1
   [[ "$before_reference" != "$after_reference" ]] || return 1
-  before_identity="$(
-    obi_process_identity_payload_from_reference "$before_reference"
-  )" || return 1
-  after_identity="$(
-    obi_process_identity_payload_from_reference "$after_reference"
-  )" || return 1
+  obi_process_identity_payload_from_reference \
+    "$before_reference" before_identity || return 1
+  obi_process_identity_payload_from_reference \
+    "$after_reference" after_identity || return 1
   [[ "$(jq -er '.state' <<<"$before_identity")" == "$before_state" &&
     "$(jq -er '.state' <<<"$after_identity")" == "$after_state" ]] || return 1
   before_identity_key="$(jq -r '[.container_id, .started_at] | join(":")' \
@@ -15131,8 +16318,9 @@ validate_obi_metric_pair_payload() {
   [[ "$after_reference" =~ ^phases/([a-z0-9][a-z0-9-]{0,63})/obi-identity\.json$ ]] ||
     return 1
   after_phase="${BASH_REMATCH[1]}"
-  expected_payload="$(derive_obi_metric_pair_payload \
-    "$boundary" "$before_phase" "$after_phase" "$continuity")" || return 1
+  derive_obi_metric_pair_payload \
+    "$boundary" "$before_phase" "$after_phase" "$continuity" \
+    expected_payload || return 1
   [[ "$payload" == "$expected_payload" ]] || return 1
   printf '%s\n' "$payload"
 }
@@ -15142,6 +16330,7 @@ derive_obi_metric_pair_payload() {
   local -r before_phase="$2"
   local -r after_phase="$3"
   local -r continuity="$4"
+  local -r output_name="${5:-}"
   local before_identity_reference=""
   local after_identity_reference=""
   local before_identity=""
@@ -15175,6 +16364,9 @@ derive_obi_metric_pair_payload() {
   declare -A after_values=()
   declare -A union=()
 
+  (($# == 4 || $# == 5)) || return 1
+  [[ -z "$output_name" || "$output_name" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] ||
+    return 1
   [[ "$boundary" =~ ^[a-z0-9][a-z0-9-]{0,63}$ &&
     ( "$continuity" == same_process || "$continuity" == process_replaced ) ]] ||
     return 1
@@ -15185,31 +16377,18 @@ derive_obi_metric_pair_payload() {
     obi_metric_phase_reference "$after_phase" identity
   )" || return 1
   [[ "$before_identity_reference" != "$after_identity_reference" ]] || return 1
-  before_identity="$(
-    obi_process_identity_payload_from_reference "$before_identity_reference"
-  )" || return 1
-  after_identity="$(
-    obi_process_identity_payload_from_reference "$after_identity_reference"
-  )" || return 1
+  obi_process_identity_payload_from_reference \
+    "$before_identity_reference" before_identity || return 1
+  obi_process_identity_payload_from_reference \
+    "$after_identity_reference" after_identity || return 1
   [[ "$(jq -er '.state' <<<"$before_identity")" == running ]] || return 1
   after_state="$(jq -er '.state' <<<"$after_identity")" || return 1
   before_metrics="$RESULT_DIR/$(obi_metric_phase_reference "$before_phase" metrics)" ||
     return 1
   after_metrics="$RESULT_DIR/$(obi_metric_phase_reference "$after_phase" metrics)" ||
     return 1
-  before_parsed="$(mktemp "$RESULT_DIR/.obi-metric-before.XXXXXX")" || return $?
-  after_parsed="$(mktemp "$RESULT_DIR/.obi-metric-after.XXXXXX")" || {
-    rm -f -- "$before_parsed" || true
-    return 1
-  }
-  series_tsv="$(mktemp "$RESULT_DIR/.obi-metric-series.XXXXXX")" || {
-    rm -f -- "$before_parsed" "$after_parsed" || true
-    return 1
-  }
-  if ! parse_obi_metric_snapshot "$before_metrics" "$before_parsed"; then
-    rm -f -- "$before_parsed" "$after_parsed" "$series_tsv"
-    return 1
-  fi
+  obi_parsed_metric_snapshot "$before_metrics" before_parsed || return 1
+  series_tsv="$(mktemp "$RESULT_DIR/.obi-metric-series.XXXXXX")" || return $?
   while IFS=$'\t' read -r record_type transport operation status value; do
     if [[ "$record_type" == series ]]; then
       key="$transport|$operation|$status"
@@ -15219,13 +16398,13 @@ derive_obi_metric_pair_payload() {
       attach_before_present="$transport"
       attach_before="$operation"
     else
-      rm -f -- "$before_parsed" "$after_parsed" "$series_tsv"
+      rm -f -- "$series_tsv"
       return 1
     fi
-  done <"$before_parsed"
+  done <<<"$before_parsed"
   if [[ "$after_state" == running ]]; then
-    if ! parse_obi_metric_snapshot "$after_metrics" "$after_parsed"; then
-      rm -f -- "$before_parsed" "$after_parsed" "$series_tsv"
+    if ! obi_parsed_metric_snapshot "$after_metrics" after_parsed; then
+      rm -f -- "$series_tsv"
       return 1
     fi
     while IFS=$'\t' read -r record_type transport operation status value; do
@@ -15237,25 +16416,24 @@ derive_obi_metric_pair_payload() {
         attach_after_present="$transport"
         attach_after="$operation"
       else
-        rm -f -- "$before_parsed" "$after_parsed" "$series_tsv"
+        rm -f -- "$series_tsv"
         return 1
       fi
-    done <"$after_parsed"
+    done <<<"$after_parsed"
   else
     [[ "$after_state" == obi_stopped && "$continuity" == same_process &&
       ! -e "$after_metrics" && ! -L "$after_metrics" ]] || {
-      rm -f -- "$before_parsed" "$after_parsed" "$series_tsv"
+      rm -f -- "$series_tsv"
       return 1
     }
   fi
   if (( ${#union[@]} > 0 )); then
     union_unsorted="$(mktemp "$RESULT_DIR/.obi-metric-union-unsorted.XXXXXX")" || {
-      rm -f -- "$before_parsed" "$after_parsed" "$series_tsv"
+      rm -f -- "$series_tsv"
       return 1
     }
     union_sorted="$(mktemp "$RESULT_DIR/.obi-metric-union-sorted.XXXXXX")" || {
-      rm -f -- \
-        "$before_parsed" "$after_parsed" "$series_tsv" "$union_unsorted"
+      rm -f -- "$series_tsv" "$union_unsorted"
       return 1
     }
     if printf '%s\n' "${!union[@]}" >"$union_unsorted" &&
@@ -15264,18 +16442,16 @@ derive_obi_metric_pair_payload() {
       :
     else
       build_status=$?
-      rm -f -- \
-        "$before_parsed" "$after_parsed" "$series_tsv" \
-        "$union_unsorted" "$union_sorted" || true
+      rm -f -- "$series_tsv" "$union_unsorted" "$union_sorted" || true
       return "$build_status"
     fi
     rm -f -- "$union_unsorted" "$union_sorted" || {
-      rm -f -- "$before_parsed" "$after_parsed" "$series_tsv" || true
+      rm -f -- "$series_tsv" || true
       return 1
     }
   fi
   (( ${#keys[@]} <= OBI_METRIC_PAIR_MAX_SERIES )) || {
-    rm -f -- "$before_parsed" "$after_parsed" "$series_tsv"
+    rm -f -- "$series_tsv"
     return 1
   }
   for key in "${keys[@]}"; do
@@ -15283,28 +16459,36 @@ derive_obi_metric_pair_payload() {
     before="${before_values[$key]:-0}"
     if [[ "$after_state" == obi_stopped ]]; then
       printf '%s\t%s\t%s\t%s\tnull\tnull\n' \
-        "$transport" "$operation" "$status" "$before" >>"$series_tsv" ||
+        "$transport" "$operation" "$status" "$before" >>"$series_tsv" || {
+        rm -f -- "$series_tsv" || true
         return 1
+      }
       continue
     fi
     after="${after_values[$key]:-0}"
     if [[ "$continuity" == same_process ]]; then
       if [[ -n "${before_values[$key]+present}" &&
         -z "${after_values[$key]+present}" ]]; then
-        rm -f -- "$before_parsed" "$after_parsed" "$series_tsv"
+        rm -f -- "$series_tsv"
         return 1
       fi
       uint64_string_subtract "$after" "$before" delta || {
-        rm -f -- "$before_parsed" "$after_parsed" "$series_tsv"
+        rm -f -- "$series_tsv"
         return 1
       }
       printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$transport" "$operation" "$status" "$before" "$after" "$delta" \
-        >>"$series_tsv" || return 1
+        >>"$series_tsv" || {
+        rm -f -- "$series_tsv" || true
+        return 1
+      }
     else
       printf '%s\t%s\t%s\t%s\t%s\tnull\n' \
         "$transport" "$operation" "$status" "$before" "$after" \
-        >>"$series_tsv" || return 1
+        >>"$series_tsv" || {
+        rm -f -- "$series_tsv" || true
+        return 1
+      }
     fi
   done
   if [[ "$after_state" == obi_stopped ]]; then
@@ -15314,11 +16498,11 @@ derive_obi_metric_pair_payload() {
     attach_delta=null
   else
     if [[ "$attach_before_present" == true && "$attach_after_present" != true ]]; then
-      rm -f -- "$before_parsed" "$after_parsed" "$series_tsv"
+      rm -f -- "$series_tsv"
       return 1
     fi
     uint64_string_subtract "$attach_after" "$attach_before" attach_delta || {
-      rm -f -- "$before_parsed" "$after_parsed" "$series_tsv"
+      rm -f -- "$series_tsv"
       return 1
     }
   fi
@@ -15357,11 +16541,15 @@ derive_obi_metric_pair_payload() {
     :
   else
     build_status=$?
-    rm -f -- "$before_parsed" "$after_parsed" "$series_tsv" || true
+    rm -f -- "$series_tsv" || true
     return "$build_status"
   fi
-  rm -f -- "$before_parsed" "$after_parsed" "$series_tsv" || return 1
-  printf '%s\n' "$payload"
+  rm -f -- "$series_tsv" || return 1
+  if [[ -n "$output_name" ]]; then
+    printf -v "$output_name" '%s' "$payload"
+  else
+    printf '%s\n' "$payload"
+  fi
 }
 
 build_obi_metric_pair_payload() {
@@ -15391,14 +16579,211 @@ ensure_obi_metric_pair_directory() {
   [[ "$(realpath -e -- "$directory")" == "$result_physical/obi-metric-pairs" ]]
 }
 
+remove_obi_owned_pair_publication_handle() {
+  local -r handle="$1"
+  local -r canonical="$2"
+  local shared_identity=""
+  local removal_status=0
+  local attempt=0
+
+  [[ -f "$handle" && ! -L "$handle" &&
+    -f "$canonical" && ! -L "$canonical" && "$handle" -ef "$canonical" ]] ||
+    return 1
+  shared_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$handle")" || return 1
+  [[ "$shared_identity" == *":$(id -u):644:2" &&
+    "$(stat -Lc '%d:%i:%u:%a:%h' -- "$canonical")" == "$shared_identity" ]] ||
+    return 1
+  for attempt in 1 2 3; do
+    if rm -f -- "$handle"; then
+      removal_status=0
+      break
+    else
+      removal_status=$?
+    fi
+    [[ ! -e "$handle" && ! -L "$handle" ]] && break
+    [[ -f "$handle" && ! -L "$handle" && "$handle" -ef "$canonical" &&
+      "$(stat -Lc '%d:%i:%u:%a:%h' -- "$handle")" == "$shared_identity" &&
+      "$(stat -Lc '%d:%i:%u:%a:%h' -- "$canonical")" == "$shared_identity" ]] ||
+      return 1
+  done
+  [[ ! -e "$handle" && ! -L "$handle" ]] || return "$removal_status"
+  [[ "$(stat -Lc '%d:%i:%u:%a:%h' -- "$canonical")" == \
+    "${shared_identity%:2}:1" ]]
+}
+
+remove_obi_owned_pair_orphan_publication() {
+  local -r handle="$1"
+  local -r canonical="$2"
+  local shared_identity=""
+  local device=""
+  local inode=""
+  local owner=""
+  local removal_status=0
+  local attempt=0
+
+  [[ -f "$handle" && ! -L "$handle" &&
+    -f "$canonical" && ! -L "$canonical" && "$handle" -ef "$canonical" ]] ||
+    return 1
+  shared_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$handle")" || return 1
+  [[ "$shared_identity" == *":$(id -u):644:2" &&
+    "$(stat -Lc '%d:%i:%u:%a:%h' -- "$canonical")" == "$shared_identity" ]] ||
+    return 1
+  for attempt in 1 2 3; do
+    if rm -f -- "$canonical"; then
+      removal_status=0
+      break
+    else
+      removal_status=$?
+    fi
+    [[ ! -e "$canonical" && ! -L "$canonical" ]] && break
+    [[ -f "$handle" && ! -L "$handle" && "$handle" -ef "$canonical" &&
+      "$(stat -Lc '%d:%i:%u:%a:%h' -- "$handle")" == "$shared_identity" &&
+      "$(stat -Lc '%d:%i:%u:%a:%h' -- "$canonical")" == "$shared_identity" ]] ||
+      return 1
+  done
+  [[ ! -e "$canonical" && ! -L "$canonical" ]] || return "$removal_status"
+  IFS=: read -r device inode owner _ <<<"${shared_identity%:2}"
+  [[ -n "$device" && -n "$inode" && -n "$owner" &&
+    "$(stat -Lc '%d:%i:%u:%a:%h' -- "$handle")" == \
+      "$device:$inode:$owner:644:1" ]] || return 1
+  remove_obi_owned_private_path_by_inode "$handle" "$device:$inode:$owner"
+}
+
+normalize_obi_metric_pair_candidate_residue() {
+  local -r expected_canonical="${1:-}"
+  local -r directory="$RESULT_DIR/obi-metric-pairs"
+  local candidate=""
+  local candidate_name=""
+  local canonical=""
+  local canonical_reference=""
+  local journal_payload=""
+  local journal_state=""
+  local device=""
+  local inode=""
+  local owner=""
+  local mode=""
+  local links=""
+  local -a candidates=()
+  local -a matching_canonicals=()
+
+  if [[ ! -e "$directory" && ! -L "$directory" ]]; then
+    return 0
+  fi
+  ensure_obi_metric_pair_directory || return 1
+  for candidate in "$directory"/.pair.*; do
+    [[ -e "$candidate" || -L "$candidate" ]] && candidates+=("$candidate")
+  done
+  ((${#candidates[@]} <= 1)) || return 1
+  ((${#candidates[@]} == 1)) || return 0
+  candidate="${candidates[0]}"
+  candidate_name="${candidate##*/}"
+  [[ "$candidate_name" =~ ^\.pair\.[A-Za-z0-9]{6}$ &&
+    -f "$candidate" && ! -L "$candidate" ]] || return 1
+  IFS=$'\t' read -r device inode owner mode links <<<"$(
+    stat -Lc $'%d\t%i\t%u\t%a\t%h' -- "$candidate"
+  )" || return 1
+  [[ -n "$device" && -n "$inode" && "$owner" == "$(id -u)" &&
+    ( "$mode" == 600 || "$mode" == 644 ) ]] || return 1
+  if [[ "$links" == 1 ]]; then
+    remove_obi_owned_private_path_by_inode \
+      "$candidate" "$device:$inode:$owner"
+    return $?
+  fi
+  [[ "$links" == 2 && "$mode" == 644 ]] || return 1
+  if [[ -n "$expected_canonical" ]]; then
+    [[ "$expected_canonical" == "$directory"/*.json &&
+      -f "$expected_canonical" && ! -L "$expected_canonical" &&
+      "$candidate" -ef "$expected_canonical" ]] || return 1
+    canonical="$expected_canonical"
+  else
+    for canonical in "$directory"/*.json; do
+      if [[ -f "$canonical" && ! -L "$canonical" &&
+        "$candidate" -ef "$canonical" ]]; then
+        matching_canonicals+=("$canonical")
+      fi
+    done
+    ((${#matching_canonicals[@]} == 1)) || return 1
+    canonical="${matching_canonicals[0]}"
+  fi
+  [[ "${canonical##*/}" =~ ^[a-z0-9][a-z0-9-]{0,63}\.json$ ]] || return 1
+  if obi_metric_boundary_index_is_initialized; then
+    journal_payload="$(obi_metric_boundary_index_payload)" || return 1
+    canonical_reference="${canonical#"$RESULT_DIR/"}"
+    journal_state="$(jq -r --arg reference "$canonical_reference" \
+      --arg capture_id "${canonical##*/}" '
+        ($capture_id | sub("\\.json$"; "")) as $id |
+        [.boundaries[].captures[] | select(.kind == "pair") |
+          if .state == "captured" and .pair_reference == $reference then
+            "captured"
+          elif .state == "planned" and .id == $id then "planned"
+          else empty end] |
+        if length == 1 then .[0] else "unknown" end
+      ' <<<"$journal_payload")" || return 1
+  else
+    journal_state=captured
+  fi
+  case "$journal_state" in
+    captured)
+      remove_obi_owned_pair_publication_handle "$candidate" "$canonical"
+      ;;
+    planned)
+      remove_obi_owned_pair_orphan_publication "$candidate" "$canonical"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_obi_metric_pair_directory_closure() {
+  local -r index_payload="$1"
+  local -r directory="$RESULT_DIR/obi-metric-pairs"
+  local expected_manifest=""
+  local observed_manifest=""
+  local entry=""
+
+  expected_manifest="$(jq -r '
+    [.boundaries[].captures[] |
+      select(.kind == "pair" and .state == "captured") |
+      .pair_reference] | unique | .[]
+  ' <<<"$index_payload")" || return 1
+  if [[ ! -e "$directory" && ! -L "$directory" ]]; then
+    [[ -z "$expected_manifest" ]]
+    return $?
+  fi
+  ensure_obi_metric_pair_directory || return 1
+  for entry in "$directory"/* "$directory"/.[!.]* "$directory"/..?*; do
+    [[ -e "$entry" || -L "$entry" ]] || continue
+    [[ -f "$entry" && ! -L "$entry" &&
+      "${entry##*/}" =~ ^[a-z0-9][a-z0-9-]{0,63}\.json$ ]] || return 1
+  done
+  observed_manifest="$(find "$directory" -mindepth 1 -maxdepth 1 \
+    -type f -printf 'obi-metric-pairs/%f\n' | LC_ALL=C sort -u)" || return 1
+  expected_manifest="$(LC_ALL=C sort -u <<<"$expected_manifest")" || return 1
+  [[ "$observed_manifest" == "$expected_manifest" ]]
+}
+
 obi_metric_pair_payload_from_reference() {
   local -r reference="$1"
+  local -r output_name="${2:-}"
   local input=""
   local payload=""
   local boundary=""
 
+  (($# == 1 || $# == 2)) || return 1
+  [[ -z "$output_name" || "$output_name" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] ||
+    return 1
   [[ "$reference" =~ ^obi-metric-pairs/([a-z0-9][a-z0-9-]{0,63})\.json$ ]] ||
     return 1
+  if [[ "${OBI_METRIC_BOUNDARY_FULL_VALIDATION_CACHE_ACTIVE:-false}" == true ]]; then
+    if [[ -n "${OBI_METRIC_BOUNDARY_PAIR_PAYLOAD_CACHE[$reference]+present}" ]]; then
+      if [[ -n "$output_name" ]]; then
+        printf -v "$output_name" '%s' \
+          "${OBI_METRIC_BOUNDARY_PAIR_PAYLOAD_CACHE[$reference]}"
+      else
+        printf '%s\n' "${OBI_METRIC_BOUNDARY_PAIR_PAYLOAD_CACHE[$reference]}"
+      fi
+      return 0
+    fi
+  fi
   boundary="${BASH_REMATCH[1]}"
   ensure_obi_metric_pair_directory || return 1
   input="$RESULT_DIR/$reference"
@@ -15406,7 +16791,15 @@ obi_metric_pair_payload_from_reference() {
     "$input" "$OBI_METRIC_PAIR_MAX_BYTES")" || return 1
   [[ "$(jq -er '.boundary' <<<"$payload")" == "$boundary" ]] ||
     return 1
-  validate_obi_metric_pair_payload "$payload"
+  validate_obi_metric_pair_payload "$payload" >/dev/null || return 1
+  if [[ "${OBI_METRIC_BOUNDARY_FULL_VALIDATION_CACHE_ACTIVE:-false}" == true ]]; then
+    OBI_METRIC_BOUNDARY_PAIR_PAYLOAD_CACHE["$reference"]="$payload"
+  fi
+  if [[ -n "$output_name" ]]; then
+    printf -v "$output_name" '%s' "$payload"
+  else
+    printf '%s\n' "$payload"
+  fi
 }
 
 obi_metric_pair_evidence_json_from_reference() {
@@ -15448,94 +16841,6 @@ java_diagnostics_payload_for_terminal_boundary_phase() {
   validate_last_java_diagnostics_payload "$payload"
 }
 
-validate_last_terminal_boundary_payload() {
-  local -r payload="$1"
-  local metric_reference=""
-  local metric_payload=""
-  local expected_metric_payload=""
-
-  metric_reference="$(jq -er '.obi_metric_pair.reference' <<<"$payload")" ||
-    return 1
-  metric_payload="$(jq -c '.obi_metric_pair.pair' <<<"$payload")" || return 1
-  expected_metric_payload="$(
-    obi_metric_pair_payload_from_reference "$metric_reference"
-  )" || return 1
-  [[ "$metric_payload" == "$expected_metric_payload" ]] || return 1
-  validate_last_terminal_boundary_payload_against_metric_pair \
-    "$payload" "$metric_reference" "$metric_payload"
-}
-
-validate_last_terminal_boundary_payload_against_metric_pair() {
-  local -r payload="$1"
-  local -r expected_metric_reference="$2"
-  local -r expected_metric_payload="$3"
-  local java_payload=""
-  local metric_reference=""
-  local metric_payload=""
-
-  jq -e '
-    keys == ["java_payload", "obi_metric_pair", "schema"] and
-    .schema == "obi-terminal-boundary-v1" and
-    (.java_payload == null or (.java_payload | type == "object")) and
-    (.obi_metric_pair | keys == ["pair", "reference"]) and
-    (.obi_metric_pair.reference | type == "string") and
-    (.obi_metric_pair.pair | type == "object")
-  ' <<<"$payload" >/dev/null || return 1
-  java_payload="$(jq -c '.java_payload' <<<"$payload")" || return 1
-  if [[ "$java_payload" != null ]]; then
-    validate_last_java_diagnostics_payload "$java_payload" >/dev/null || return 1
-  fi
-  metric_reference="$(jq -er '.obi_metric_pair.reference' <<<"$payload")" ||
-    return 1
-  metric_payload="$(jq -c '.obi_metric_pair.pair' <<<"$payload")" || return 1
-  [[ "$metric_reference" == "$expected_metric_reference" &&
-    "$metric_payload" == "$expected_metric_payload" ]] || return 1
-  validate_obi_metric_pair_payload_structure "$metric_payload" >/dev/null ||
-    return 1
-  [[ "$metric_reference" == \
-    "obi-metric-pairs/$(jq -er '.boundary' <<<"$metric_payload").json" ]] ||
-    return 1
-  printf '%s\n' "$payload"
-}
-
-validate_last_terminal_boundary_json() {
-  local -r input="$1"
-  local payload=""
-
-  payload="$(read_bounded_single_line_regular_file \
-    "$input" "$OBI_TERMINAL_BOUNDARY_MAX_BYTES")" || return 1
-  validate_last_terminal_boundary_payload "$payload"
-}
-
-build_last_terminal_boundary_payload() {
-  local -r metric_reference="$1"
-  local -r metric_payload="$2"
-  local -r java_phase="$3"
-  local java_payload=""
-  local payload=""
-
-  validate_obi_metric_pair_payload_structure "$metric_payload" >/dev/null ||
-    return 1
-  [[ "$metric_reference" == \
-    "obi-metric-pairs/$(jq -er '.boundary' <<<"$metric_payload").json" ]] ||
-    return 1
-  java_payload="$(
-    java_diagnostics_payload_for_terminal_boundary_phase "$java_phase"
-  )" || return 1
-  payload="$(jq -cn \
-    --arg reference "$metric_reference" \
-    --argjson java_payload "$java_payload" \
-    --argjson metric_payload "$metric_payload" '
-      {
-        schema: "obi-terminal-boundary-v1",
-        java_payload: $java_payload,
-        obi_metric_pair: {reference: $reference, pair: $metric_payload}
-      }
-    ')" || return 1
-  validate_last_terminal_boundary_payload_against_metric_pair \
-    "$payload" "$metric_reference" "$metric_payload"
-}
-
 obi_owned_publication_matches() {
   local -r path="$1"
   local -r expected_identity="$2"
@@ -15551,88 +16856,2014 @@ obi_owned_publication_matches() {
   [[ "$observed_digest" == "$expected_digest" ]]
 }
 
-install_last_terminal_boundary_payload_unlocked() {
-  local -r publication="$1"
-  local -r output="$2"
+remove_obi_owned_private_file() {
+  local -r path="$1"
+  local -r expected_identity="$2"
+  local -r expected_digest="$3"
+  local removal_status=0
+  local attempt=0
 
-  mv -fT -- "$publication" "$output"
+  for attempt in 1 2 3; do
+    if [[ ! -e "$path" && ! -L "$path" ]]; then
+      return 0
+    fi
+    obi_owned_publication_matches \
+      "$path" "$expected_identity" "$expected_digest" 1 || return 1
+    if rm -f -- "$path"; then
+      [[ ! -e "$path" && ! -L "$path" ]] && return 0
+      removal_status=1
+    else
+      removal_status=$?
+      [[ ! -e "$path" && ! -L "$path" ]] && return 0
+    fi
+  done
+  return "$removal_status"
 }
 
-rollback_obi_metric_pair_transaction() {
-  local -r pair_output="$1"
-  local -r pair_candidate="$2"
-  local -r pair_identity="$3"
-  local -r pair_digest="$4"
-  local -r tracker_output="$5"
-  local -r tracker_candidate="$6"
-  local -r tracker_publication="$7"
-  local -r tracker_identity="$8"
-  local -r tracker_digest="$9"
-  local -r old_tracker_handle="${10}"
-  local -r old_tracker_identity="${11}"
-  local -r old_tracker_digest="${12}"
-  local -r old_tracker_existed="${13}"
-  local restoration=""
-  local rollback_status=0
+remove_obi_owned_private_path_by_inode() {
+  local -r path="$1"
+  local -r expected_inode="$2"
+  local removal_status=0
+  local attempt=0
 
-  if [[ -e "$pair_output" || -L "$pair_output" ]]; then
-    if obi_owned_publication_matches \
-      "$pair_output" "$pair_identity" "$pair_digest" \
-      "$(stat -Lc '%h' -- "$pair_output" 2>/dev/null || printf 'invalid')"; then
-      rm -f -- "$pair_output" || rollback_status=1
+  for attempt in 1 2 3; do
+    [[ -e "$path" || -L "$path" ]] || return 0
+    [[ -f "$path" && ! -L "$path" &&
+      "$(stat -Lc '%d:%i:%u:%h' -- "$path")" == "$expected_inode:1" ]] ||
+      return 1
+    if rm -f -- "$path"; then
+      [[ ! -e "$path" && ! -L "$path" ]] && return 0
+      removal_status=1
     else
-      rollback_status=1
+      removal_status=$?
+      [[ ! -e "$path" && ! -L "$path" ]] && return 0
+    fi
+  done
+  return "$removal_status"
+}
+
+normalize_obi_owned_private_candidate_residue() {
+  local -r prefix="$1"
+  local -r basename_pattern="$2"
+  local -r allowed_mode_pattern="$3"
+  local -r excluded_canonical="${4:-}"
+  local path=""
+  local basename=""
+  local device=""
+  local inode=""
+  local owner=""
+  local mode=""
+  local links=""
+  local -a candidates=()
+
+  [[ "${TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER:-false}" == true &&
+    "${prefix%/*}" == "$RESULT_DIR" &&
+    ( -z "$excluded_canonical" ||
+      "$excluded_canonical" == "$prefix.freeze" ) ]] || return 1
+  for path in "$prefix".*; do
+    [[ -n "$excluded_canonical" && "$path" == "$excluded_canonical" ]] &&
+      continue
+    [[ -e "$path" || -L "$path" ]] && candidates+=("$path")
+  done
+  ((${#candidates[@]} <= 1)) || return 1
+  ((${#candidates[@]} == 1)) || return 0
+  path="${candidates[0]}"
+  basename="${path##*/}"
+  [[ "$basename" =~ $basename_pattern && -f "$path" && ! -L "$path" ]] ||
+    return 1
+  IFS=$'\t' read -r device inode owner mode links <<<"$(
+    stat -Lc $'%d\t%i\t%u\t%a\t%h' -- "$path"
+  )" || return 1
+  [[ -n "$device" && -n "$inode" && "$owner" == "$(id -u)" &&
+    "$mode" =~ $allowed_mode_pattern && "$links" == 1 ]] || return 1
+  remove_obi_owned_private_path_by_inode \
+    "$path" "$device:$inode:$owner"
+}
+
+remove_terminal_owned_hardlink_handle() {
+  local -r handle="$1"
+  local -r canonical="$2"
+  local -r expected_identity="$3"
+  local removal_status=1
+  local attempt=0
+  local expected_device=""
+  local expected_inode=""
+  local expected_owner=""
+  local expected_mode=""
+  local expected_links=""
+
+  IFS=: read -r expected_device expected_inode expected_owner \
+    expected_mode expected_links <<<"$expected_identity"
+  [[ -n "$expected_device" && -n "$expected_inode" &&
+    "$expected_owner" == "$(id -u)" &&
+    ( "$expected_mode" == 600 || "$expected_mode" == 644 ) &&
+    "$expected_links" == 2 ]] || return 1
+  for attempt in 1 2 3; do
+    [[ -f "$handle" && ! -L "$handle" &&
+      -f "$canonical" && ! -L "$canonical" &&
+      "$handle" -ef "$canonical" &&
+      "$(stat -Lc '%d:%i:%u:%a:%h' -- "$handle")" == \
+        "$expected_identity" &&
+      "$(stat -Lc '%d:%i:%u:%a:%h' -- "$canonical")" == \
+        "$expected_identity" ]] || return 1
+    if rm -f -- "$handle"; then
+      removal_status=0
+    else
+      removal_status=$?
+    fi
+    if [[ ! -e "$handle" && ! -L "$handle" ]]; then
+      [[ "$(stat -Lc '%d:%i:%u:%a:%h' -- "$canonical")" == \
+        "${expected_identity%:2}:1" ]] || return 1
+      return 0
+    fi
+  done
+  return "$removal_status"
+}
+
+remove_terminal_owned_private_path() {
+  local -r path="$1"
+  local -r expected_identity="$2"
+  local removal_status=1
+  local attempt=0
+  local expected_device=""
+  local expected_inode=""
+  local expected_owner=""
+  local expected_mode=""
+  local expected_links=""
+
+  IFS=: read -r expected_device expected_inode expected_owner \
+    expected_mode expected_links <<<"$expected_identity"
+  [[ -n "$expected_device" && -n "$expected_inode" &&
+    "$expected_owner" == "$(id -u)" &&
+    ( "$expected_mode" == 600 || "$expected_mode" == 644 ) &&
+    "$expected_links" == 1 ]] || return 1
+  for attempt in 1 2 3; do
+    [[ -f "$path" && ! -L "$path" &&
+      "$(stat -Lc '%d:%i:%u:%a:%h' -- "$path")" == \
+        "$expected_identity" ]] || return 1
+    if rm -f -- "$path"; then
+      removal_status=0
+    else
+      removal_status=$?
+    fi
+    [[ ! -e "$path" && ! -L "$path" ]] && return 0
+  done
+  return "$removal_status"
+}
+
+remove_terminal_owned_private_candidate() {
+  local -r path="$1"
+  local -r expected_inode="$2"
+  local -r allowed_mode_pattern="$3"
+  local identity=""
+  local device=""
+  local inode=""
+  local owner=""
+  local mode=""
+  local links=""
+
+  identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$path")" || return 1
+  IFS=: read -r device inode owner mode links <<<"$identity"
+  [[ "$device:$inode:$owner" == "$expected_inode" &&
+    "$owner" == "$(id -u)" && "$mode" =~ $allowed_mode_pattern &&
+    "$links" == 1 ]] || return 1
+  remove_terminal_owned_private_path "$path" "$identity"
+}
+
+normalize_terminal_owned_hardlink_family() {
+  local -r canonical="$1"
+  local -r canonical_mode="$2"
+  local -r maximum_bytes="$3"
+  local -r allow_h1_cleanup="$4"
+  local -r expected_payload="$5"
+  local -r payload_validator="$6"
+  local -r candidate_basename_pattern="$7"
+  shift 7
+  local canonical_directory="${canonical%/*}"
+  local result_physical=""
+  local canonical_directory_physical=""
+  local canonical_identity=""
+  local canonical_device=""
+  local canonical_inode=""
+  local canonical_owner=""
+  local canonical_observed_mode=""
+  local canonical_links=""
+  local canonical_payload=""
+  local candidate=""
+  local candidate_basename=""
+  local candidate_identity=""
+  local candidate_device=""
+  local candidate_inode=""
+  local candidate_owner=""
+  local candidate_mode=""
+  local candidate_links=""
+  local candidate_prefix=""
+  local path=""
+  local -a candidates=()
+
+  [[ -d "$RESULT_DIR" && ! -L "$RESULT_DIR" &&
+    -d "$canonical_directory" && ! -L "$canonical_directory" &&
+    "$canonical_mode" =~ ^(600|644)$ &&
+    "$maximum_bytes" =~ ^[1-9][0-9]*$ &&
+    ( "$allow_h1_cleanup" == true || "$allow_h1_cleanup" == false ) &&
+    "$payload_validator" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ &&
+    $# -ge 1 ]] || return 1
+  if [[ "$allow_h1_cleanup" == true ]]; then
+    [[ "${TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER:-false}" == true ||
+      "${TERMINAL_TRANSITION_PUBLICATION_LOCK_HELD_BY_CALLER:-false}" == \
+        true ]] || return 1
+  fi
+  result_physical="$(realpath -e -- "$RESULT_DIR")" || return 1
+  canonical_directory_physical="$(
+    realpath -e -- "$canonical_directory"
+  )" || return 1
+  [[ "$canonical_directory_physical" == "$result_physical" ||
+    "$canonical_directory_physical" == "$result_physical"/* ]] || return 1
+  for candidate_prefix in "$@"; do
+    [[ "${candidate_prefix%/*}" == "${canonical%/*}" ]] || return 1
+    for path in "$candidate_prefix".*; do
+      if [[ ( -e "$path" || -L "$path" ) && "$path" != "$canonical" ]]; then
+        candidates+=("$path")
+        ((${#candidates[@]} <= 1)) || return 1
+      fi
+    done
+  done
+  ((${#candidates[@]} <= 1)) || return 1
+  if ((${#candidates[@]} == 1)); then
+    candidate="${candidates[0]}"
+    candidate_basename="${candidate##*/}"
+    [[ "$candidate_basename" =~ $candidate_basename_pattern &&
+      -f "$candidate" && ! -L "$candidate" ]] || return 1
+    candidate_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$candidate")" ||
+      return 1
+    IFS=: read -r \
+      candidate_device candidate_inode candidate_owner candidate_mode \
+      candidate_links <<<"$candidate_identity"
+    [[ -n "$candidate_device" && -n "$candidate_inode" &&
+      "$candidate_owner" == "$(id -u)" &&
+      "$candidate_links" =~ ^[12]$ ]] || return 1
+    if [[ "$candidate_links" == 1 ]]; then
+      if [[ "$canonical_mode" == 644 ]]; then
+        [[ "$candidate_mode" == 600 || "$candidate_mode" == 644 ]] ||
+          return 1
+      else
+        [[ "$candidate_mode" == 600 ]] || return 1
+      fi
+    else
+      [[ "$candidate_mode" == "$canonical_mode" ]] || return 1
     fi
   fi
-  if [[ -e "$tracker_output" || -L "$tracker_output" ]]; then
-    if obi_owned_publication_matches \
-      "$tracker_output" "$tracker_identity" "$tracker_digest" \
-      "$(stat -Lc '%h' -- "$tracker_output" 2>/dev/null || printf 'invalid')"; then
-      rm -f -- "$tracker_output" || rollback_status=1
-    elif [[ "$old_tracker_existed" == true ]] &&
-      obi_owned_publication_matches \
-        "$tracker_output" "$old_tracker_identity" "$old_tracker_digest" \
-        "$(stat -Lc '%h' -- "$tracker_output" 2>/dev/null || printf 'invalid')"; then
+  if [[ ! -e "$canonical" && ! -L "$canonical" ]]; then
+    if [[ -z "$candidate" ]]; then
+      return 0
+    fi
+    [[ "$allow_h1_cleanup" == true && "$candidate_links" == 1 ]] ||
+      return 1
+    remove_terminal_owned_private_path "$candidate" "$candidate_identity"
+    return $?
+  fi
+  [[ -f "$canonical" && ! -L "$canonical" ]] || return 1
+  canonical_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$canonical")" ||
+    return 1
+  IFS=: read -r \
+    canonical_device canonical_inode canonical_owner canonical_observed_mode \
+    canonical_links <<<"$canonical_identity"
+  [[ -n "$canonical_device" && -n "$canonical_inode" &&
+    "$canonical_owner" == "$(id -u)" &&
+    "$canonical_observed_mode" == "$canonical_mode" ]] || return 1
+  case "$canonical_links" in
+    1|2) ;;
+    *) return 1 ;;
+  esac
+  canonical_payload="$(read_bounded_single_line_owned_regular_file \
+    "$canonical" "$maximum_bytes" "$canonical_mode" \
+    "$canonical_links")" || return 1
+  "$payload_validator" \
+    "$canonical_payload" "$candidate_basename" __any__ \
+    "$candidate_links" || return 1
+  if [[ -z "$candidate" ]]; then
+    [[ "$canonical_links" == 1 ]] || return 1
+    "$payload_validator" "$canonical_payload" "" "$expected_payload" ""
+    return $?
+  fi
+  if [[ "$candidate_links" == 2 ]]; then
+    [[ "$canonical_links" == 2 &&
+      "$candidate" -ef "$canonical" &&
+      "$candidate_identity" == "$canonical_identity" ]] || return 1
+    remove_terminal_owned_hardlink_handle \
+      "$candidate" "$canonical" "$canonical_identity" || return $?
+  else
+    [[ "$canonical_links" == 1 &&
+      "$allow_h1_cleanup" == true && ! "$candidate" -ef "$canonical" ]] ||
+      return 1
+    remove_terminal_owned_private_path \
+      "$candidate" "$candidate_identity" || return $?
+  fi
+  canonical_payload="$(read_bounded_single_line_owned_regular_file \
+    "$canonical" "$maximum_bytes" "$canonical_mode" 1)" || return 1
+  "$payload_validator" "$canonical_payload" "" "$expected_payload" ""
+}
+
+publish_terminal_owned_hardlink_payload() {
+  local -r canonical="$1"
+  local -r candidate_prefix="$2"
+  local -r own_basename_pattern="$3"
+  local -r family_basename_pattern="$4"
+  local -r canonical_mode="$5"
+  local -r maximum_bytes="$6"
+  local -r payload="$7"
+  local -r payload_validator="$8"
+  local -r allow_h1_cleanup="$9"
+  shift 9
+  local candidate=""
+  local candidate_basename=""
+  local candidate_cleanup_mode_pattern='^600$'
+  local candidate_inode=""
+  local candidate_device=""
+  local candidate_inode_number=""
+  local candidate_owner=""
+  local candidate_payload=""
+  local publication_status=1
+  local normalization_status=1
+  local cleanup_status=0
+  local attempt=0
+
+  if [[ "$canonical_mode" == 644 ]]; then
+    candidate_cleanup_mode_pattern='^(600|644)$'
+  fi
+
+  normalize_terminal_owned_hardlink_family \
+    "$canonical" "$canonical_mode" "$maximum_bytes" "$allow_h1_cleanup" \
+    "$payload" "$payload_validator" "$family_basename_pattern" "$@" ||
+    return $?
+  if [[ -e "$canonical" || -L "$canonical" ]]; then
+    return 0
+  fi
+  if candidate="$(mktemp "$candidate_prefix.XXXXXX")"; then
+    :
+  else
+    publication_status=$?
+    normalize_terminal_owned_hardlink_family \
+      "$canonical" "$canonical_mode" "$maximum_bytes" "$allow_h1_cleanup" \
+      "$payload" "$payload_validator" "$family_basename_pattern" "$@" ||
+      return 1
+    return "$publication_status"
+  fi
+  candidate_basename="${candidate##*/}"
+  [[ "${candidate%/*}" == "${canonical%/*}" &&
+    "$candidate_basename" =~ $own_basename_pattern &&
+    -f "$candidate" && ! -L "$candidate" ]] || return 1
+  for attempt in 1 2 3; do
+    candidate_inode="$(stat -Lc '%d:%i:%u' -- "$candidate")" && break
+    candidate_inode=""
+  done
+  IFS=: read -r candidate_device candidate_inode_number candidate_owner \
+    <<<"$candidate_inode"
+  [[ -n "$candidate_device" && -n "$candidate_inode_number" &&
+    "$candidate_owner" == "$(id -u)" &&
+    "$(stat -Lc '%d:%i:%u:%a:%h' -- "$candidate")" == \
+      "$candidate_inode:600:1" ]] || return 1
+  if printf '%s\n' "$payload" >"$candidate" &&
+    chmod "0$canonical_mode" -- "$candidate"; then
+    :
+  else
+    publication_status=$?
+    remove_terminal_owned_private_candidate \
+      "$candidate" "$candidate_inode" "$candidate_cleanup_mode_pattern" ||
+      return 1
+    return "$publication_status"
+  fi
+  candidate_payload="$(read_bounded_single_line_owned_regular_file \
+    "$candidate" "$maximum_bytes" "$canonical_mode" 1)" || {
+      remove_terminal_owned_private_candidate \
+        "$candidate" "$candidate_inode" "^$canonical_mode$" || return 1
+      return 1
+    }
+  "$payload_validator" \
+    "$candidate_payload" "$candidate_basename" "$payload" 1 || {
+    remove_terminal_owned_private_candidate \
+      "$candidate" "$candidate_inode" "^$canonical_mode$" || return 1
+    return 1
+  }
+  for attempt in 1 2 3; do
+    if ln -T -- "$candidate" "$canonical"; then
+      publication_status=1
+      break
+    else
+      publication_status=$?
+    fi
+    [[ ! -e "$canonical" && ! -L "$canonical" ]] || break
+    [[ -f "$candidate" && ! -L "$candidate" &&
+      "$(stat -Lc '%d:%i:%u:%a:%h' -- "$candidate")" == \
+        "$candidate_inode:$canonical_mode:1" ]] || return 1
+  done
+  if normalize_terminal_owned_hardlink_family \
+    "$canonical" "$canonical_mode" "$maximum_bytes" "$allow_h1_cleanup" \
+    "$payload" "$payload_validator" "$family_basename_pattern" "$@"; then
+    normalization_status=0
+    [[ -e "$canonical" && ! -L "$canonical" ]] && return 0
+  else
+    normalization_status=$?
+  fi
+  if [[ -f "$candidate" && ! -L "$candidate" &&
+    "$(stat -Lc '%d:%i:%u:%h' -- "$candidate")" == "$candidate_inode:1" ]]; then
+    if remove_terminal_owned_private_candidate \
+      "$candidate" "$candidate_inode" "$candidate_cleanup_mode_pattern"; then
       :
     else
-      rollback_status=1
+      cleanup_status=$?
+      return "$cleanup_status"
     fi
   fi
-  if [[ "$old_tracker_existed" == true ]]; then
-    if ! obi_owned_publication_matches \
-      "$old_tracker_handle" "$old_tracker_identity" "$old_tracker_digest" \
-      "$(stat -Lc '%h' -- "$old_tracker_handle" 2>/dev/null || printf 'invalid')"; then
-      rollback_status=1
-    elif [[ ! -e "$tracker_output" && ! -L "$tracker_output" ]]; then
-      restoration="$(mktemp "$RESULT_DIR/.last-valid-terminal-boundary-restore.XXXXXX")" ||
-        rollback_status=1
-      if ((rollback_status == 0)); then
-        rm -f -- "$restoration" || rollback_status=1
-      fi
-      if ((rollback_status == 0)); then
-        ln -T -- "$old_tracker_handle" "$restoration" || rollback_status=1
-      fi
-      if ((rollback_status == 0)); then
-        mv -fT -- "$restoration" "$tracker_output" || rollback_status=1
-      fi
+  if ((normalization_status != 0)); then
+    return "$normalization_status"
+  fi
+  return "$publication_status"
+}
+
+obi_metric_boundary_publication_is_frozen() {
+  local -r index_freeze="$RESULT_DIR/.obi-metric-boundary-index.freeze"
+  local -r java_transition="$RESULT_DIR/.terminal-java-diagnostics.freeze"
+  local -r java_terminal="$RESULT_DIR/terminal-java-diagnostics.json"
+  local -r metric_terminal="$RESULT_DIR/terminal-obi-metrics.json"
+
+  [[ -e "$index_freeze" || -L "$index_freeze" ||
+    -e "$java_transition" || -L "$java_transition" ||
+    -e "$java_terminal" || -L "$java_terminal" ||
+    -e "$metric_terminal" || -L "$metric_terminal" ]]
+}
+
+obi_metric_boundary_index_path() {
+  printf '%s/obi-metric-boundary-index.json\n' "$RESULT_DIR"
+}
+
+obi_metric_boundary_index_is_initialized() {
+  local index=""
+
+  [[ -n "${RESULT_DIR:-}" ]] || return 1
+  index="$(obi_metric_boundary_index_path)" || return 1
+  [[ -f "$index" && ! -L "$index" ]]
+}
+
+obi_metric_boundary_journal_paths_are_cleanly_absent() {
+  local -r index="$RESULT_DIR/obi-metric-boundary-index.json"
+  local -r freeze="$RESULT_DIR/.obi-metric-boundary-index.freeze"
+  local path=""
+
+  [[ ! -e "$index" && ! -L "$index" &&
+    ! -e "$freeze" && ! -L "$freeze" ]] || return 1
+  for path in \
+    "$RESULT_DIR"/.obi-metric-boundary-plan.* \
+    "$RESULT_DIR"/.obi-metric-boundary-index.* \
+    "$RESULT_DIR"/.obi-metric-boundary-index-backup.* \
+    "$RESULT_DIR"/.obi-metric-boundary-index-restore.* \
+    "$RESULT_DIR"/.obi-metric-boundary-index-freeze.*; do
+    [[ ! -e "$path" && ! -L "$path" ]] || return 1
+  done
+}
+
+read_bounded_single_line_regular_file_without_hashing() {
+  local -r input="$1"
+  local -r maximum_bytes="$2"
+  local descriptor=""
+  local descriptor_path=""
+  local path_identity=""
+  local descriptor_identity=""
+  local links=""
+  local size=""
+  local -a lines=()
+  local LC_ALL=C
+
+  [[ "$maximum_bytes" =~ ^[1-9][0-9]*$ &&
+    -f "$input" && ! -L "$input" ]] || return 1
+  path_identity="$(stat -Lc '%d:%i' -- "$input")" || return 1
+  exec {descriptor}<"$input" || return $?
+  descriptor_path="/proc/self/fd/$descriptor"
+  if [[ ! -f "$descriptor_path" ]] ||
+    ! descriptor_identity="$(stat -Lc '%d:%i' -- "$descriptor_path")" ||
+    [[ "$descriptor_identity" != "$path_identity" ]] ||
+    [[ -L "$input" ]] ||
+    [[ "$(stat -Lc '%d:%i' -- "$input")" != "$path_identity" ]]; then
+    exec {descriptor}<&-
+    return 1
+  fi
+  links="$(stat -Lc '%h' -- "$descriptor_path")" || {
+    exec {descriptor}<&-
+    return 1
+  }
+  size="$(stat -Lc '%s' -- "$descriptor_path")" || {
+    exec {descriptor}<&-
+    return 1
+  }
+  if [[ "$links" != 1 ]] || ((size == 0 || size > maximum_bytes)); then
+    exec {descriptor}<&-
+    return 1
+  fi
+  mapfile -t lines <"$descriptor_path" || {
+    exec {descriptor}<&-
+    return 1
+  }
+  if [[ -L "$input" ||
+    "$(stat -Lc '%d:%i:%s:%h' -- "$input")" != \
+      "$path_identity:$size:1" ]]; then
+    exec {descriptor}<&-
+    return 1
+  fi
+  exec {descriptor}<&-
+  (( ${#lines[@]} == 1 )) || return 1
+  if ((size != ${#lines[0]} && size != ${#lines[0]} + 1)); then
+    return 1
+  fi
+  printf '%s\n' "${lines[0]}"
+}
+
+add_obi_metric_boundary_budget_reference() {
+  local -r reference="$1"
+  local -r reference_kind="$2"
+  local -n seen_map_ref="$3"
+  local -n bytes_total_ref="$4"
+  local maximum_bytes=""
+  local path=""
+  local descriptor=""
+  local descriptor_path=""
+  local path_identity=""
+  local descriptor_identity=""
+  local links=""
+  local size=""
+
+  case "$reference_kind" in
+    identity)
+      [[ "$reference" =~ ^phases/[a-z0-9][a-z0-9-]{0,63}/obi-identity\.json$ ]] ||
+        return 1
+      maximum_bytes="$OBI_PROCESS_IDENTITY_MAX_BYTES"
+      ;;
+    metrics)
+      [[ "$reference" =~ ^phases/[a-z0-9][a-z0-9-]{0,63}/obi-metrics\.prom$ ]] ||
+        return 1
+      maximum_bytes="$OBI_METRIC_SNAPSHOT_MAX_BYTES"
+      ;;
+    java)
+      [[ "$reference" =~ ^phases/[a-z0-9][a-z0-9-]{0,63}/java-diagnostics\.txt$ ]] ||
+        return 1
+      maximum_bytes="$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES"
+      ;;
+    pair)
+      [[ "$reference" =~ ^obi-metric-pairs/[a-z0-9][a-z0-9-]{0,63}\.json$ ]] ||
+        return 1
+      maximum_bytes="$OBI_METRIC_PAIR_MAX_BYTES"
+      ;;
+    status)
+      [[ "$reference" =~ ^scenario-[a-z0-9][a-z0-9-]{0,95}-status\.json$ ]] ||
+        return 1
+      maximum_bytes="$OBI_METRIC_BOUNDARY_STATUS_MAX_BYTES"
+      ;;
+    artifact)
+      [[ "$reference" =~ ^[a-z0-9][a-z0-9._-]{0,127}$ ]] || return 1
+      maximum_bytes="$OBI_METRIC_BOUNDARY_REFERENCED_MAX_BYTES"
+      ;;
+    *) return 1 ;;
+  esac
+  if [[ -n "${seen_map_ref[$reference]+present}" ]]; then
+    [[ "${seen_map_ref[$reference]}" == "$reference_kind" ]] || return 1
+    return 0
+  fi
+  path="$RESULT_DIR/$reference"
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  path_identity="$(stat -Lc '%d:%i' -- "$path")" || return 1
+  exec {descriptor}<"$path" || return $?
+  descriptor_path="/proc/self/fd/$descriptor"
+  if [[ ! -f "$descriptor_path" ]] ||
+    ! descriptor_identity="$(stat -Lc '%d:%i' -- "$descriptor_path")" ||
+    [[ "$descriptor_identity" != "$path_identity" ]] ||
+    [[ -L "$path" ]] ||
+    [[ "$(stat -Lc '%d:%i' -- "$path")" != "$path_identity" ]]; then
+    exec {descriptor}<&-
+    return 1
+  fi
+  links="$(stat -Lc '%h' -- "$descriptor_path")" || {
+    exec {descriptor}<&-
+    return 1
+  }
+  size="$(stat -Lc '%s' -- "$descriptor_path")" || {
+    exec {descriptor}<&-
+    return 1
+  }
+  if [[ "$reference_kind" == artifact ]]; then
+    size="$(bounded_decimal "$size" "$maximum_bytes" true)" || {
+      exec {descriptor}<&-
+      return 1
+    }
+  else
+    size="$(bounded_decimal "$size" "$maximum_bytes" false)" || {
+      exec {descriptor}<&-
+      return 1
+    }
+  fi
+  if [[ "$links" != 1 || -L "$path" ||
+    "$(stat -Lc '%d:%i:%s:%h' -- "$path")" != \
+      "$path_identity:$size:1" ]]; then
+    exec {descriptor}<&-
+    return 1
+  fi
+  exec {descriptor}<&-
+  if ((size > OBI_METRIC_BOUNDARY_REFERENCED_MAX_BYTES - bytes_total_ref)); then
+    log_error "retained boundary evidence exceeds the 536870912-byte safety ceiling; unrelated Prometheus cardinality may trigger this limit"
+    return 1
+  fi
+  bytes_total_ref=$((bytes_total_ref + size))
+  seen_map_ref["$reference"]="$reference_kind"
+}
+
+validate_obi_metric_boundary_referenced_byte_budget() {
+  local -r payload="$1"
+  local boundary_id=""
+  local capture_id=""
+  local kind=""
+  local capture_state=""
+  local reference=""
+  local java_reference=""
+  local pair_payload=""
+  local pair_identity_manifest=""
+  local identity_payload=""
+  local identity_state=""
+  local metrics_reference=""
+  local capture_budget_manifest=""
+  local status_budget_manifest=""
+  local expected_budget_capture_count=""
+  local expected_budget_status_count=""
+  local -i budget_capture_count=0
+  local -i budget_status_count=0
+  local -i pair_identity_count=0
+  # Updated by add_obi_metric_boundary_budget_reference through its nameref.
+  # shellcheck disable=SC2034
+  local -i referenced_bytes=0
+  # Updated by add_obi_metric_boundary_budget_reference through its nameref.
+  # shellcheck disable=SC2034
+  local -A seen_references=()
+  local -a pair_references=()
+  local -a identity_references=()
+
+  capture_budget_manifest="$(jq -r '
+    .boundaries[] as $boundary |
+    $boundary.captures[] |
+    [
+      $boundary.id, .id, .kind, .state,
+      (if .kind == "phase" then .identity_reference
+       elif .kind == "pair" then (.pair_reference // "__null__")
+       else .reference end),
+      (.java_reference // "__null__")
+    ] | @tsv
+  ' <<<"$payload")" || return 1
+  expected_budget_capture_count="$(jq -er \
+    '[.boundaries[].captures[]] | length' <<<"$payload")" || return 1
+  while IFS=$'\t' read -r \
+    boundary_id capture_id kind capture_state reference java_reference; do
+    [[ -n "$boundary_id" ]] || continue
+    ((budget_capture_count += 1))
+    case "$kind:$capture_state" in
+      phase:captured)
+        add_obi_metric_boundary_budget_reference \
+          "$reference" identity seen_references referenced_bytes || return 1
+        identity_references+=("$reference")
+        ;;
+      java:captured)
+        add_obi_metric_boundary_budget_reference \
+          "$reference" java seen_references referenced_bytes || return 1
+        ;;
+      artifact:captured)
+        add_obi_metric_boundary_budget_reference \
+          "$reference" artifact seen_references referenced_bytes || return 1
+        ;;
+      unavailable:captured)
+        add_obi_metric_boundary_budget_reference \
+          "$reference" metrics seen_references referenced_bytes || return 1
+        ;;
+      pair:captured)
+        add_obi_metric_boundary_budget_reference \
+          "$reference" pair seen_references referenced_bytes || return 1
+        pair_references+=("$reference")
+        if [[ "$java_reference" != __null__ ]]; then
+          add_obi_metric_boundary_budget_reference \
+            "$java_reference" java seen_references referenced_bytes || return 1
+        fi
+        ;;
+      pair:planned) ;;
+      *) return 1 ;;
+    esac
+  done <<<"$capture_budget_manifest"
+  ((budget_capture_count == expected_budget_capture_count)) || return 1
+  status_budget_manifest="$(jq -r '
+    .boundaries[] as $boundary |
+    $boundary.status_references[] |
+    [$boundary.id, .reference] | @tsv
+  ' <<<"$payload")" || return 1
+  expected_budget_status_count="$(jq -er \
+    '[.boundaries[].status_references[]] | length' <<<"$payload")" || return 1
+  while IFS=$'\t' read -r boundary_id reference; do
+    [[ -n "$boundary_id" ]] || continue
+    ((budget_status_count += 1))
+    add_obi_metric_boundary_budget_reference \
+      "$reference" status seen_references referenced_bytes || return 1
+  done <<<"$status_budget_manifest"
+  ((budget_status_count == expected_budget_status_count)) || return 1
+
+  for reference in "${pair_references[@]}"; do
+    pair_payload="$(read_bounded_single_line_regular_file_without_hashing \
+      "$RESULT_DIR/$reference" "$OBI_METRIC_PAIR_MAX_BYTES")" || return 1
+    pair_identity_manifest="$(jq -er '
+      if (.before.identity_reference | type) == "string" and
+        (.after.identity_reference | type) == "string"
+      then .before.identity_reference, .after.identity_reference
+      else error("invalid pair identity references") end
+    ' <<<"$pair_payload")" || return 1
+    pair_identity_count=0
+    while IFS= read -r metrics_reference; do
+      [[ -n "$metrics_reference" ]] || return 1
+      ((pair_identity_count += 1))
+      add_obi_metric_boundary_budget_reference \
+        "$metrics_reference" identity seen_references referenced_bytes || return 1
+      identity_references+=("$metrics_reference")
+    done <<<"$pair_identity_manifest"
+    ((pair_identity_count == 2)) || return 1
+  done
+  for reference in "${identity_references[@]}"; do
+    identity_payload="$(read_bounded_single_line_regular_file_without_hashing \
+      "$RESULT_DIR/$reference" "$OBI_PROCESS_IDENTITY_MAX_BYTES")" || return 1
+    identity_state="$(jq -er '.state' <<<"$identity_payload")" || return 1
+    case "$identity_state" in
+      running)
+        metrics_reference="$(jq -er '.metrics_reference' \
+          <<<"$identity_payload")" || return 1
+        add_obi_metric_boundary_budget_reference \
+          "$metrics_reference" metrics seen_references referenced_bytes || return 1
+        ;;
+      obi_stopped) ;;
+      *) return 1 ;;
+    esac
+  done
+}
+
+validate_obi_metric_boundary_index_payload() {
+  local -r payload="$1"
+  local -r validation_scope="${2:-full}"
+  local canonical=""
+  local kind=""
+  local boundary_id=""
+  local capture_id=""
+  local reference=""
+  local expected_digest=""
+  local observed_digest=""
+  local capture_state=""
+  local java_reference=""
+  local java_digest=""
+  local unavailable_phase=""
+  local capture_phase=""
+  # Populated by the semantic loader helpers through their output-variable name.
+  # shellcheck disable=SC2034
+  local semantic_payload=""
+  local capture_manifest=""
+  local status_manifest=""
+  local expected_capture_count=""
+  local expected_status_count=""
+  local -i capture_count=0
+  local -i status_count=0
+  local OBI_METRIC_BOUNDARY_FULL_VALIDATION_CACHE_ACTIVE=true
+  local -A observed_reference_digests=()
+  local -A OBI_METRIC_BOUNDARY_IDENTITY_PAYLOAD_CACHE=()
+  local -A OBI_METRIC_BOUNDARY_PAIR_PAYLOAD_CACHE=()
+  local -A OBI_METRIC_BOUNDARY_JAVA_EVIDENCE_CACHE=()
+  local -A OBI_METRIC_BOUNDARY_PARSED_METRICS_CACHE=()
+
+  canonical="$(
+    jq -ceS \
+      --argjson maximum_boundaries "$OBI_METRIC_BOUNDARY_INDEX_MAX_BOUNDARIES" \
+      --argjson maximum_captures "$OBI_METRIC_BOUNDARY_INDEX_MAX_CAPTURES" \
+      --argjson maximum_statuses "$OBI_METRIC_BOUNDARY_INDEX_MAX_STATUS_REFERENCES" '
+      def valid_shape:
+        keys == ["boundaries", "schema", "selection"] and
+      .schema == "obi-metric-boundary-index-v1" and
+      (.selection | keys == [
+        "repeat_count", "requested_transport", "scenario", "selected_transport"
+      ]) and
+      (.selection.scenario | type == "string") and
+      (.selection.requested_transport == "auto" or
+        .selection.requested_transport == "getsockopt" or
+        .selection.requested_transport == "unix" or
+        .selection.requested_transport == "disabled") and
+      (.selection.selected_transport == null or
+        .selection.selected_transport == "getsockopt" or
+        .selection.selected_transport == "unix") and
+      (if .selection.requested_transport == "getsockopt" then
+        (.selection.selected_transport == null or
+          .selection.selected_transport == "getsockopt")
+       elif .selection.requested_transport == "unix" then
+        (.selection.selected_transport == null or
+          .selection.selected_transport == "unix")
+       elif .selection.requested_transport == "disabled" then
+        .selection.selected_transport == null
+       else true end) and
+      (.selection.repeat_count | type == "number" and
+        floor == . and . >= 1 and . <= 10) and
+      (.boundaries | type == "array" and length >= 1 and
+        length <= $maximum_boundaries) and
+      ([.boundaries[].id] | length == (unique | length)) and
+      ([.boundaries[].ordinal] | length == (unique | length)) and
+      ([.boundaries[].captures[] |
+        select(.kind == "pair" and .state == "captured") |
+        .pair_reference] | length == (unique | length)) and
+      ([.boundaries[] | select(.state == "active")] | length <= 1) and
+      ([.boundaries[].captures[]] | length <= $maximum_captures) and
+      ([.boundaries[].status_references[]] | length <= $maximum_statuses) and
+      (.boundaries | to_entries | all(.[];
+        .value.ordinal == (.key + 1))) and
+      all(.boundaries[];
+        keys == [
+          "captures", "id", "not_applicable_reason", "ordinal", "state",
+          "status_references"
+        ] and
+        (.id | type == "string" and test("^[a-z0-9][a-z0-9-]{0,63}$")) and
+        (.ordinal | type == "number" and floor == . and . >= 1) and
+        (.state == "planned" or .state == "active" or
+          .state == "complete" or .state == "not_applicable") and
+        (.captures | type == "array") and
+        (.status_references | type == "array") and
+        ([.captures[].id] | length == (unique | length)) and
+        ([.status_references[].reference] | length == (unique | length)) and
+        (if .state == "planned" then
+          .captures == [] and .status_references == [] and
+          .not_applicable_reason == null
+        elif .state == "active" then
+          .not_applicable_reason == null
+        elif .state == "complete" then
+          (.captures | length) > 0 and
+          all(.captures[]; .state == "captured") and
+          (any(.captures[]; .kind == "pair") or
+            all(.captures[]; .kind == "unavailable")) and
+          (.status_references | length) > 0 and
+          .not_applicable_reason == null
+        else
+          .captures == [] and (.status_references | length) == 1 and
+          (.not_applicable_reason | type == "string" and length >= 1 and
+            length <= 160)
+        end) and
+        all(.status_references[];
+          keys == ["reference", "sha256"] and
+          (.reference | type == "string" and
+            test("^scenario-[a-z0-9][a-z0-9-]{0,95}-status\\.json$")) and
+          (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))) and
+        all(.captures[];
+          (.kind == "phase" and .state == "captured" and
+            keys == ["id", "identity_reference", "identity_sha256", "kind", "state"] and
+            (.identity_reference | type == "string") and
+            (.identity_sha256 | type == "string" and test("^[0-9a-f]{64}$"))) or
+          (.kind == "java" and .state == "captured" and
+            keys == ["id", "kind", "reference", "sha256", "state"] and
+            (.reference | type == "string") and
+            (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))) or
+          (.kind == "artifact" and .state == "captured" and
+            keys == ["id", "kind", "reference", "sha256", "state"] and
+            (.reference | type == "string") and
+            (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))) or
+          (.kind == "unavailable" and .state == "captured" and
+            keys == ["id", "kind", "reason", "reference", "sha256", "state"] and
+            .reason == "obi_process_not_running" and
+            (.reference | type == "string") and
+            (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))) or
+          (.kind == "pair" and
+            keys == [
+              "id", "java_reference", "java_sha256", "kind", "pair_reference",
+              "pair_sha256", "state"
+            ] and
+            (.state == "planned" or .state == "captured") and
+            (.id | type == "string" and
+              test("^[a-z0-9][a-z0-9-]{0,63}$")) and
+            (if .state == "planned" then
+              .pair_reference == null and .pair_sha256 == null and
+              .java_reference == null and .java_sha256 == null
+            else
+              (.pair_reference | type == "string") and
+              (.pair_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+              ((.java_reference == null and .java_sha256 == null) or
+                ((.java_reference | type == "string") and
+                  (.java_sha256 | type == "string" and test("^[0-9a-f]{64}$"))))
+            end)) and
+          (.id | type == "string" and test("^[a-z0-9][a-z0-9-]{0,95}$"))
+        )
+      );
+      def valid_order:
+        [.boundaries[].state] as $states |
+        ($states | length) as $count |
+        all(range(0; $count); . as $index |
+          if ($states[$index] == "complete" or
+            $states[$index] == "not_applicable") then
+            all(range(0; $index); . as $prior |
+              $states[$prior] == "complete" or
+              $states[$prior] == "not_applicable")
+          elif $states[$index] == "active" then
+            all(range(0; $index); . as $prior |
+              $states[$prior] == "complete" or
+              $states[$prior] == "not_applicable") and
+            all(range($index + 1; $count); . as $later |
+              $states[$later] == "planned")
+          else
+            all(range($index + 1; $count); . as $later |
+              $states[$later] == "planned")
+          end) and
+        all(.boundaries[];
+          ([.captures[] | select(.kind == "pair") | .state]) as $pair_states |
+          all(range(0; ($pair_states | length)); . as $index |
+            if $pair_states[$index] == "planned" then
+              all(range($index + 1; ($pair_states | length)); . as $later |
+                $pair_states[$later] == "planned")
+            else true end));
+      if valid_shape and valid_order then
+        .
+      else
+        error("invalid OBI metric boundary index structure")
+      end
+    ' <<<"$payload"
+  )" || return 1
+  [[ "$payload" == "$canonical" ]] || return 1
+
+  [[ "$validation_scope" == full || "$validation_scope" == structure ]] ||
+    return 1
+  if [[ "$validation_scope" == structure ]]; then
+    return 0
+  fi
+
+  validate_obi_metric_boundary_referenced_byte_budget "$payload" || return 1
+
+  capture_manifest="$(jq -r '
+    .boundaries[] as $boundary |
+    $boundary.captures[] |
+    [
+      $boundary.id, .id, .kind, .state,
+      (if .kind == "phase" then .identity_reference
+       elif .kind == "pair" then (.pair_reference // "__null__")
+       else .reference end),
+      (if .kind == "phase" then .identity_sha256
+       elif .kind == "pair" then (.pair_sha256 // "__null__")
+       else .sha256 end),
+      (.java_reference // "__null__"), (.java_sha256 // "__null__")
+    ] | @tsv
+  ' <<<"$payload")" || return 1
+  expected_capture_count="$(jq -er '[.boundaries[].captures[]] | length' \
+    <<<"$payload")" || return 1
+
+  while IFS=$'\t' read -r \
+    boundary_id capture_id kind capture_state reference expected_digest \
+    java_reference java_digest; do
+    [[ -n "$boundary_id" ]] || continue
+    ((capture_count += 1))
+    case "$kind:$capture_state" in
+      pair:planned)
+        continue
+        ;;
+      phase:captured)
+        [[ "$reference" =~ ^phases/([a-z0-9][a-z0-9-]{0,63})/obi-identity\.json$ ]] ||
+          return 1
+        capture_phase="${BASH_REMATCH[1]}"
+        [[ "$capture_id" == "$capture_phase" ]] || return 1
+        obi_process_identity_payload_from_reference \
+          "$reference" semantic_payload || return 1
+        ;;
+      java:captured)
+        [[ "$reference" =~ ^phases/([a-z0-9][a-z0-9-]{0,63})/java-diagnostics\.txt$ ]] ||
+          return 1
+        capture_phase="${BASH_REMATCH[1]}"
+        [[ "$capture_id" == "java-$capture_phase" ]] || return 1
+        java_diagnostics_reference_evidence_json \
+          "$reference" semantic_payload || return 1
+        ;;
+      artifact:captured)
+        [[ "$reference" =~ ^[a-z0-9][a-z0-9._-]{0,127}$ &&
+          -f "$RESULT_DIR/$reference" && ! -L "$RESULT_DIR/$reference" ]] || return 1
+        ;;
+      unavailable:captured)
+        [[ "$reference" =~ ^phases/([a-z0-9][a-z0-9-]{0,63})/obi-metrics\.prom$ ]] ||
+          return 1
+        unavailable_phase="${BASH_REMATCH[1]}"
+        [[ "$capture_id" == "$unavailable_phase" ]] || return 1
+        [[ ! -e "$RESULT_DIR/phases/$unavailable_phase/obi-identity.json" &&
+          ! -L "$RESULT_DIR/phases/$unavailable_phase/obi-identity.json" ]] ||
+          return 1
+        obi_metrics_unavailable_phase_is_valid "$unavailable_phase" || return 1
+        ;;
+      pair:captured)
+        [[ "$reference" == "obi-metric-pairs/$capture_id.json" ]] || return 1
+        obi_metric_pair_payload_from_reference \
+          "$reference" semantic_payload || return 1
+        if [[ "$java_reference" != __null__ ]]; then
+          java_diagnostics_reference_evidence_json \
+            "$java_reference" semantic_payload || return 1
+          observed_digest="$(sha256sum "$RESULT_DIR/$java_reference")" || return 1
+          observed_digest="${observed_digest%% *}"
+          [[ "$observed_digest" == "$java_digest" ]] || return 1
+        fi
+        ;;
+      *) return 1 ;;
+    esac
+    if [[ -n "${observed_reference_digests[$reference]+present}" ]]; then
+      [[ "${observed_reference_digests[$reference]}" == "$expected_digest" ]] ||
+        return 1
+    else
+      observed_digest="$(sha256sum "$RESULT_DIR/$reference")" || return 1
+      observed_digest="${observed_digest%% *}"
+      [[ "$observed_digest" == "$expected_digest" ]] || return 1
+      observed_reference_digests["$reference"]="$observed_digest"
     fi
-  elif [[ -e "$tracker_output" || -L "$tracker_output" ]]; then
-    rollback_status=1
+  done <<<"$capture_manifest"
+  ((capture_count == expected_capture_count)) || return 1
+  status_manifest="$(jq -r '
+    .boundaries[] as $boundary |
+    $boundary.status_references[] |
+    [$boundary.id, .reference, .sha256] | @tsv
+  ' <<<"$payload")" || return 1
+  expected_status_count="$(jq -er \
+    '[.boundaries[].status_references[]] | length' <<<"$payload")" || return 1
+  while IFS=$'\t' read -r boundary_id reference expected_digest; do
+    [[ -n "$boundary_id" ]] || continue
+    ((status_count += 1))
+    [[ -f "$RESULT_DIR/$reference" && ! -L "$RESULT_DIR/$reference" &&
+      "$(stat -Lc '%s' -- "$RESULT_DIR/$reference")" -le \
+        "$OBI_METRIC_BOUNDARY_STATUS_MAX_BYTES" ]] || return 1
+    if [[ -n "${observed_reference_digests[$reference]+present}" ]]; then
+      [[ "${observed_reference_digests[$reference]}" == "$expected_digest" ]] ||
+        return 1
+    else
+      observed_digest="$(sha256sum "$RESULT_DIR/$reference")" || return 1
+      observed_digest="${observed_digest%% *}"
+      [[ "$observed_digest" == "$expected_digest" ]] || return 1
+      observed_reference_digests["$reference"]="$observed_digest"
+    fi
+    jq -e --arg boundary_id "$boundary_id" '
+      (.obi_metric_boundary_ids | type == "array" and length >= 1) and
+      ([.obi_metric_boundary_ids[]] | length == (unique | length)) and
+      all(.obi_metric_boundary_ids[];
+        type == "string" and test("^[a-z0-9][a-z0-9-]{0,63}$")) and
+      (.obi_metric_boundary_ids | index($boundary_id)) != null
+    ' "$RESULT_DIR/$reference" >/dev/null || return 1
+  done <<<"$status_manifest"
+  validate_obi_metric_pair_directory_closure "$payload" || return 1
+  ((capture_count == expected_capture_count &&
+    status_count == expected_status_count &&
+    capture_count <= OBI_METRIC_BOUNDARY_INDEX_MAX_CAPTURES &&
+    status_count <= OBI_METRIC_BOUNDARY_INDEX_MAX_STATUS_REFERENCES))
+}
+
+obi_metric_boundary_index_payload() {
+  local -r validation_scope="${1:-structure}"
+  local index=""
+  local authority=""
+  local authority_device=""
+  local authority_inode=""
+  local authority_owner=""
+  local authority_mode=""
+  local authority_links=""
+  local payload=""
+
+  index="$(obi_metric_boundary_index_path)" || return 1
+  [[ -f "$index" && ! -L "$index" ]] || return 1
+  authority="$(stat -Lc '%d:%i:%u:%a:%h' -- "$index")" || return 1
+  IFS=: read -r authority_device authority_inode authority_owner \
+    authority_mode authority_links <<<"$authority"
+  [[ -n "$authority_device" && -n "$authority_inode" &&
+    "$authority_owner" == "$(id -u)" && "$authority_mode" == 644 &&
+    "$authority_links" == 1 ]] || return 1
+  payload="$(read_bounded_single_line_regular_file \
+    "$index" "$OBI_METRIC_BOUNDARY_INDEX_MAX_BYTES")" || return 1
+  [[ ! -L "$index" &&
+    "$(stat -Lc '%d:%i:%u:%a:%h' -- "$index")" == "$authority" ]] ||
+    return 1
+  validate_obi_metric_boundary_index_payload \
+    "$payload" "$validation_scope" >/dev/null || return 1
+  printf '%s\n' "$payload"
+}
+
+publish_obi_metric_boundary_index_payload_unlocked() {
+  local -r payload="$1"
+  local -r expected_old_payload="${2:-}"
+  local -r index="$(obi_metric_boundary_index_path)"
+  local candidate=""
+  local candidate_name=""
+  local candidate_inode=""
+  local candidate_identity=""
+  local candidate_digest=""
+  local old_identity=""
+  local old_digest=""
+  local observed_payload=""
+  local publication_status=0
+  local old_index_existed=false
+  local installed=false
+  local attempt=0
+
+  (($# == 1 || $# == 2)) || return 1
+  [[ "${TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER:-false}" == true &&
+    "$TERMINAL_EVIDENCE_LOCK_ENTRY_FROZEN" == false &&
+    -d "$RESULT_DIR" && ! -L "$RESULT_DIR" &&
+    ! -L "$index" && ( ! -e "$index" || -f "$index" ) ]] || return 1
+  normalize_obi_owned_private_candidate_residue \
+    "$RESULT_DIR/.obi-metric-boundary-index" \
+    '^\.obi-metric-boundary-index\.[A-Za-z0-9]{6}$' '^(600|644)$' || return 1
+  validate_obi_metric_boundary_index_payload "$payload" structure >/dev/null ||
+    return 1
+  if [[ -e "$index" ]]; then
+    observed_payload="$(read_bounded_single_line_regular_file_without_hashing \
+      "$index" "$OBI_METRIC_BOUNDARY_INDEX_MAX_BYTES")" || return 1
+    old_identity="$(stat -Lc '%d:%i:%u:%a' -- "$index")" || return 1
+    [[ "$old_identity" == *":$(id -u):644" ]] || return 1
+    old_digest="$(sha256sum "$index")" || return 1
+    old_digest="${old_digest%% *}"
+    obi_owned_publication_matches \
+      "$index" "$old_identity" "$old_digest" 1 || return 1
+    # A previous call can install the requested payload and then lose a
+    # transient post-install stat/read. Treat that exact, fully validated
+    # canonical state as the committed transition so a cooperative retry is
+    # idempotent rather than requiring the no-longer-current predecessor.
+    [[ "$observed_payload" != "$payload" ]] || return 0
+    (($# == 2)) || return 1
+    [[ "$observed_payload" == "$expected_old_payload" ]] || return 1
+    old_index_existed=true
+  elif (($# == 2)); then
+    return 1
   fi
-  rm -f -- \
-    "$pair_candidate" "$tracker_candidate" "$tracker_publication" ||
-    rollback_status=1
-  if [[ "$old_tracker_existed" == true && -n "$old_tracker_handle" ]]; then
-    rm -f -- "$old_tracker_handle" || rollback_status=1
+  if candidate="$(mktemp "$RESULT_DIR/.obi-metric-boundary-index.XXXXXX")"; then
+    :
+  else
+    publication_status=$?
+    candidate_name="${candidate##*/}"
+    if [[ "${candidate%/*}" != "$RESULT_DIR" ||
+      ! "$candidate_name" =~ ^\.obi-metric-boundary-index\.[A-Za-z0-9]{6}$ ||
+      ! -f "$candidate" || -L "$candidate" ]]; then
+      return "$publication_status"
+    fi
   fi
-  if ((rollback_status == 0)) && [[ "$old_tracker_existed" == true ]]; then
-    validate_last_terminal_boundary_json "$tracker_output" >/dev/null ||
-      rollback_status=1
+  for attempt in 1 2 3; do
+    candidate_inode="$(stat -Lc '%d:%i:%u' -- "$candidate")" && break
+  done
+  [[ -n "$candidate_inode" && "$candidate_inode" == *":$(id -u)" &&
+    "$(stat -Lc '%d:%i:%u:%h' -- "$candidate")" == "$candidate_inode:1" ]] ||
+    return 1
+  if printf '%s\n' "$payload" >"$candidate" && chmod 0644 -- "$candidate"; then
+    :
+  else
+    publication_status=$?
+    remove_obi_owned_private_path_by_inode \
+      "$candidate" "$candidate_inode" || return 1
+    return "$publication_status"
   fi
-  if ((rollback_status == 0)); then
-    [[ ! -e "$pair_output" && ! -L "$pair_output" ]] || rollback_status=1
+  candidate_identity="$(stat -Lc '%d:%i:%u:%a' -- "$candidate")" || {
+    remove_obi_owned_private_path_by_inode \
+      "$candidate" "$candidate_inode" || true
+    return 1
+  }
+  [[ "$candidate_identity" == "$candidate_inode:644" ]] || {
+    remove_obi_owned_private_path_by_inode \
+      "$candidate" "$candidate_inode" || true
+    return 1
+  }
+  candidate_digest="$(sha256sum "$candidate")" || {
+    remove_obi_owned_private_path_by_inode \
+      "$candidate" "$candidate_inode" || true
+    return 1
+  }
+  candidate_digest="${candidate_digest%% *}"
+  observed_payload="$(read_bounded_single_line_regular_file_without_hashing \
+    "$candidate" "$OBI_METRIC_BOUNDARY_INDEX_MAX_BYTES")" || {
+    remove_obi_owned_private_file \
+      "$candidate" "$candidate_identity" "$candidate_digest" || true
+    return 1
+  }
+  [[ "$observed_payload" == "$payload" ]] || {
+    remove_obi_owned_private_file \
+      "$candidate" "$candidate_identity" "$candidate_digest" || true
+    return 1
+  }
+  if [[ "$old_index_existed" == true ]]; then
+    obi_owned_publication_matches \
+      "$index" "$old_identity" "$old_digest" 1 || {
+      remove_obi_owned_private_file \
+        "$candidate" "$candidate_identity" "$candidate_digest" || return 1
+      return 1
+    }
+  elif [[ -e "$index" || -L "$index" ]]; then
+    remove_obi_owned_private_file \
+      "$candidate" "$candidate_identity" "$candidate_digest" || return 1
+    return 1
   fi
-  return "$rollback_status"
+  if mv -fT -- "$candidate" "$index"; then
+    publication_status=0
+  else
+    publication_status=$?
+  fi
+  if obi_owned_publication_matches \
+    "$index" "$candidate_identity" "$candidate_digest" 1; then
+    installed=true
+  fi
+  if [[ "$installed" == true ]]; then
+    return 0
+  fi
+  if [[ "$old_index_existed" == true ]]; then
+    obi_owned_publication_matches \
+      "$index" "$old_identity" "$old_digest" 1 || return 1
+  else
+    [[ ! -e "$index" && ! -L "$index" ]] || return 1
+  fi
+  remove_obi_owned_private_file \
+    "$candidate" "$candidate_identity" "$candidate_digest" || return 1
+  ((publication_status != 0)) || publication_status=1
+  return "$publication_status"
+}
+
+emit_repeated_obi_metric_boundary_ids() {
+  local -r base="$1"
+  local run_number=0
+
+  for ((run_number = 1; run_number <= REPEAT_COUNT; run_number++)); do
+    if ((REPEAT_COUNT == 1)); then
+      printf '%s\n' "$base"
+    else
+      printf '%s-run-%02d\n' "$base" "$run_number"
+    fi
+  done
+}
+
+planned_obi_metric_boundary_ids() {
+  local name=""
+  local -a direct_after_controls=(
+    keepalive pipelining concurrency connection-churn fd-port-reuse
+    slow-body tls-boundary coalesced-bridge timeout-retry pressure handoff
+    virtual-thread netty netty-server dispatch w3c
+  )
+
+  if [[ "$SCENARIO" == all ]]; then
+    emit_repeated_obi_metric_boundary_ids basic
+    printf '%s\n' delayed-otlp-suppression security
+    for name in "${direct_after_controls[@]}"; do
+      emit_repeated_obi_metric_boundary_ids "$name"
+    done
+    printf 'w3c-match\n'
+    emit_repeated_obi_metric_boundary_ids obi-flags
+    printf '%s\n' \
+      primary-w3c-stale primary-generation-mismatch primary-w3c-fault \
+      unix-w3c-stale unix-generation-mismatch w3c-fault \
+      permanent-absence auto-unavailable late-attach restart-during-traffic \
+      helper-attach-failure disabled extension-controls uninstrumented
+    return 0
+  fi
+  case "$SCENARIO" in
+    assertion-failure) emit_repeated_obi_metric_boundary_ids basic ;;
+    restart-fault) printf 'restart-during-traffic\n' ;;
+    benchmark-disabled|benchmark-uninstrumented|pid-reuse|restart)
+      printf '%s\n' "$SCENARIO"
+      ;;
+    fail-open|w3c-only|w3c-match|w3c-fault|primary-w3c-stale|unix-w3c-stale|\
+    primary-w3c-fault|primary-generation-mismatch|unix-generation-mismatch|\
+    permanent-absence|auto-unavailable|security|delayed-otlp-suppression|\
+    helper-attach-failure)
+      printf '%s\n' "$SCENARIO"
+      ;;
+    *) emit_repeated_obi_metric_boundary_ids "$SCENARIO" ;;
+  esac
+}
+
+initialize_obi_metric_boundary_index_unlocked() {
+  local -r index="$(obi_metric_boundary_index_path)"
+  local plan=""
+  local plan_inode=""
+  local payload=""
+  local initialize_status=0
+
+  [[ -d "$RESULT_DIR" && ! -L "$RESULT_DIR" && ! -L "$index" &&
+    ( ! -e "$index" || -f "$index" ) ]] || return 1
+  normalize_owned_obi_h1_scratch_family \
+    "$RESULT_DIR" "$RESULT_DIR/.obi-metric-boundary-plan" \
+    '^\.obi-metric-boundary-plan\.[A-Za-z0-9]{6}$' || return $?
+  plan="$(mktemp "$RESULT_DIR/.obi-metric-boundary-plan.XXXXXX")" || return $?
+  plan_inode="$(stat -Lc '%d:%i:%u' -- "$plan")" || return 1
+  [[ "$plan_inode" == *":$(id -u)" &&
+    "$(stat -Lc '%d:%i:%u:%a:%h' -- "$plan")" == \
+      "$plan_inode:600:1" ]] || return 1
+  if planned_obi_metric_boundary_ids >"$plan"; then
+    :
+  else
+    initialize_status=$?
+    remove_obi_owned_private_path_by_inode \
+      "$plan" "$plan_inode" || return $?
+    return "$initialize_status"
+  fi
+  payload="$(jq -Rcn \
+    --arg scenario "$SCENARIO" \
+    --arg requested_transport "$TRANSPORT" \
+    --argjson repeat_count "$REPEAT_COUNT" '
+      [inputs | select(length > 0)] as $ids |
+      {
+        schema: "obi-metric-boundary-index-v1",
+        selection: {
+          scenario: $scenario,
+          requested_transport: $requested_transport,
+          selected_transport: null,
+          repeat_count: $repeat_count
+        },
+        boundaries: ($ids | to_entries | map({
+          id: .value,
+          ordinal: (.key + 1),
+          state: "planned",
+          captures: [],
+          status_references: [],
+          not_applicable_reason: null
+        }))
+      }
+    ' <"$plan")" || initialize_status=$?
+  remove_obi_owned_private_path_by_inode \
+    "$plan" "$plan_inode" || return $?
+  ((initialize_status == 0)) || return "$initialize_status"
+  payload="$(jq -cS . <<<"$payload")" || return 1
+  publish_obi_metric_boundary_index_payload_unlocked "$payload"
+}
+
+initialize_obi_metric_boundary_index() {
+  with_terminal_java_diagnostics_lock initialize_obi_metric_boundary_index_unlocked
+}
+
+bind_selected_transport_to_obi_metric_boundary_index_unlocked() {
+  local -r selected_transport="$1"
+  local payload=""
+  local updated=""
+
+  [[ "$selected_transport" == getsockopt || "$selected_transport" == unix ]] ||
+    return 1
+  payload="$(obi_metric_boundary_index_payload)" || return 1
+  if [[ "$(jq -r '.selection.selected_transport // empty' <<<"$payload")" != "" ]]; then
+    return 0
+  fi
+  updated="$(jq -cS --arg selected_transport "$selected_transport" '
+    if .selection.selected_transport == null then
+      .selection.selected_transport = $selected_transport
+    else .
+    end
+  ' <<<"$payload")" || return 1
+  publish_obi_metric_boundary_index_payload_unlocked "$updated" "$payload"
+}
+
+bind_selected_transport_to_obi_metric_boundary_index() {
+  local -r selected_transport="$1"
+
+  obi_metric_boundary_index_is_initialized || return 0
+  with_terminal_java_diagnostics_lock \
+    bind_selected_transport_to_obi_metric_boundary_index_unlocked \
+      "$selected_transport"
+}
+
+active_obi_metric_boundary_id() {
+  local payload=""
+
+  obi_metric_boundary_index_is_initialized || return 1
+  payload="$(obi_metric_boundary_index_payload)" || return 1
+  jq -er '
+    [.boundaries[] | select(.state == "active") | .id] |
+    if length == 1 then .[0] else error("no unique active boundary") end
+  ' <<<"$payload"
+}
+
+begin_obi_metric_boundary_unlocked() {
+  local -r boundary_id="$1"
+  local payload=""
+  local updated=""
+
+  [[ "$boundary_id" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] || return 1
+  payload="$(obi_metric_boundary_index_payload)" || return 1
+  updated="$(jq -cS --arg boundary_id "$boundary_id" '
+    ([.boundaries[] | select(.state == "active") | .id]) as $active |
+    if $active == [$boundary_id] then .
+    elif ($active | length) != 0 then error("another boundary is active")
+    elif ([.boundaries[] | select(.state == "planned")][0].id // null) !=
+      $boundary_id then error("boundary is not the earliest planned entry")
+    else .boundaries |= map(
+      if .id == $boundary_id then .state = "active" else . end)
+    end
+  ' <<<"$payload")" || return 1
+  publish_obi_metric_boundary_index_payload_unlocked "$updated" "$payload"
+}
+
+begin_obi_metric_boundary() {
+  local -r boundary_id="$1"
+
+  obi_metric_boundary_index_is_initialized || return 0
+  with_terminal_java_diagnostics_lock \
+    begin_obi_metric_boundary_unlocked "$boundary_id" || return $?
+  OBI_METRIC_BOUNDARY_ACTIVE_ID="$boundary_id"
+}
+
+plan_obi_metric_pair_capture_unlocked() {
+  local -r capture_id="$1"
+  local payload=""
+  local updated=""
+
+  payload="$(obi_metric_boundary_index_payload)" || return 1
+  updated="$(jq -cS --arg capture_id "$capture_id" '
+    ([.boundaries[] | select(.state == "active")]) as $active |
+    if ($active | length) != 1 then error("no unique active boundary")
+    elif any($active[0].captures[]; .id == $capture_id) then
+      if any($active[0].captures[];
+        .id == $capture_id and .kind == "pair") then .
+      else error("capture id collision") end
+    else
+      .boundaries |= map(
+        if .state == "active" then
+          .captures += [{
+            id: $capture_id,
+            kind: "pair",
+            state: "planned",
+            pair_reference: null,
+            pair_sha256: null,
+            java_reference: null,
+            java_sha256: null
+          }]
+        else . end)
+    end
+  ' <<<"$payload")" || return 1
+  publish_obi_metric_boundary_index_payload_unlocked "$updated" "$payload"
+}
+
+plan_obi_metric_pair_capture() {
+  local -r capture_id="$1"
+
+  obi_metric_boundary_index_is_initialized || return 0
+  with_terminal_java_diagnostics_lock \
+    plan_obi_metric_pair_capture_unlocked "$capture_id"
+}
+
+attach_obi_metric_phase_capture_unlocked() {
+  local -r phase="$1"
+  local -r reference="phases/$phase/obi-identity.json"
+  local digest="${2:-}"
+  local payload=""
+  local updated=""
+
+  payload="$(obi_metric_boundary_index_payload)" || return 1
+  case "$(jq -r '[.boundaries[] | select(.state == "active")] | length' \
+    <<<"$payload")" in
+    0) return 0 ;;
+    1) ;;
+    *) return 1 ;;
+  esac
+  if [[ -n "$digest" ]]; then
+    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+  else
+    obi_process_identity_payload_from_reference "$reference" >/dev/null || return 1
+    digest="$(sha256sum "$RESULT_DIR/$reference")" || return 1
+    digest="${digest%% *}"
+  fi
+  updated="$(jq -cS \
+    --arg capture_id "$phase" --arg reference "$reference" --arg digest "$digest" '
+      ([.boundaries[] | select(.state == "active")]) as $active |
+      if ($active | length) == 0 then .
+      elif ($active | length) != 1 then error("no unique active boundary")
+      elif any($active[0].captures[]; .id == $capture_id) then
+        if any($active[0].captures[];
+          .id == $capture_id and .kind == "phase" and
+          .identity_reference == $reference and .identity_sha256 == $digest)
+        then . else error("phase capture collision") end
+      else
+        .boundaries |= map(
+          if .state == "active" then
+            .captures += [{
+              id: $capture_id,
+              kind: "phase",
+              state: "captured",
+              identity_reference: $reference,
+              identity_sha256: $digest
+            }]
+          else . end)
+      end
+    ' <<<"$payload")" || return 1
+  publish_obi_metric_boundary_index_payload_unlocked "$updated" "$payload"
+}
+
+attach_obi_metric_phase_capture() {
+  local -r phase="$1"
+
+  obi_metric_boundary_index_is_initialized || return 0
+  with_terminal_java_diagnostics_lock \
+    attach_obi_metric_phase_capture_unlocked "$phase"
+}
+
+attach_obi_unavailable_phase_capture_unlocked() {
+  local -r phase="$1"
+  local -r reference="phases/$phase/obi-metrics.prom"
+  local digest="${2:-}"
+  local payload=""
+  local updated=""
+
+  payload="$(obi_metric_boundary_index_payload)" || return 1
+  case "$(jq -r '[.boundaries[] | select(.state == "active")] | length' \
+    <<<"$payload")" in
+    0) return 0 ;;
+    1) ;;
+    *) return 1 ;;
+  esac
+  obi_metrics_unavailable_phase_is_valid "$phase" || return 1
+  [[ ! -e "$RESULT_DIR/phases/$phase/obi-identity.json" &&
+    ! -L "$RESULT_DIR/phases/$phase/obi-identity.json" ]] || return 1
+  if [[ -n "$digest" ]]; then
+    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+  else
+    digest="$(sha256sum "$RESULT_DIR/$reference")" || return 1
+    digest="${digest%% *}"
+  fi
+  updated="$(jq -cS \
+    --arg capture_id "$phase" --arg reference "$reference" \
+    --arg digest "$digest" '
+      ([.boundaries[] | select(.state == "active")]) as $active |
+      if ($active | length) == 0 then .
+      elif ($active | length) != 1 then error("no unique active boundary")
+      elif any($active[0].captures[]; .id == $capture_id) then
+        if any($active[0].captures[];
+          .id == $capture_id and .kind == "unavailable" and
+          .reason == "obi_process_not_running" and
+          .reference == $reference and .sha256 == $digest)
+        then . else error("unavailable capture collision") end
+      else
+        .boundaries |= map(
+          if .state == "active" then
+            .captures += [{
+              id: $capture_id,
+              kind: "unavailable",
+              state: "captured",
+              reason: "obi_process_not_running",
+              reference: $reference,
+              sha256: $digest
+            }]
+          else . end)
+      end
+    ' <<<"$payload")" || return 1
+  publish_obi_metric_boundary_index_payload_unlocked "$updated" "$payload"
+}
+
+obi_phase_capture_attachment_state_unlocked() {
+  local -r phase="$1"
+  local -r kind="$2"
+  local -r digest="$3"
+  local payload=""
+  local active_count=""
+  local matches=""
+
+  [[ "${TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER:-false}" == true &&
+    "$phase" =~ ^[a-z0-9][a-z0-9-]{0,63}$ &&
+    ( "$kind" == phase || "$kind" == unavailable ) &&
+    "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+  payload="$(obi_metric_boundary_index_payload)" || return 1
+  active_count="$(jq -r \
+    '[.boundaries[] | select(.state == "active")] | length' \
+    <<<"$payload")" || return 1
+  case "$active_count" in
+    0)
+      printf 'no_active\n'
+      return 0
+      ;;
+    1) ;;
+    *) return 1 ;;
+  esac
+  if [[ "$kind" == phase ]]; then
+    matches="$(jq -r --arg capture_id "$phase" \
+      --arg reference "phases/$phase/obi-identity.json" \
+      --arg digest "$digest" '
+        [.boundaries[] | select(.state == "active") | .captures[] |
+          select(.id == $capture_id and .kind == "phase" and
+            .state == "captured" and .identity_reference == $reference and
+            .identity_sha256 == $digest)] | length
+      ' <<<"$payload")" || return 1
+  else
+    matches="$(jq -r --arg capture_id "$phase" \
+      --arg reference "phases/$phase/obi-metrics.prom" \
+      --arg digest "$digest" '
+        [.boundaries[] | select(.state == "active") | .captures[] |
+          select(.id == $capture_id and .kind == "unavailable" and
+            .state == "captured" and .reason == "obi_process_not_running" and
+            .reference == $reference and .sha256 == $digest)] | length
+      ' <<<"$payload")" || return 1
+  fi
+  case "$matches" in
+    1) printf 'captured\n' ;;
+    0) printf 'not_captured\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+attach_obi_unavailable_phase_capture() {
+  local -r phase="$1"
+
+  obi_metric_boundary_index_is_initialized || return 0
+  with_terminal_java_diagnostics_lock \
+    attach_obi_unavailable_phase_capture_unlocked "$phase"
+}
+
+attach_obi_java_capture_unlocked() {
+  local -r phase="$1"
+  local -r reference="phases/$phase/java-diagnostics.txt"
+  local digest=""
+  local payload=""
+  local updated=""
+
+  payload="$(obi_metric_boundary_index_payload)" || return 1
+  case "$(jq -r '[.boundaries[] | select(.state == "active")] | length' \
+    <<<"$payload")" in
+    0) return 0 ;;
+    1) ;;
+    *) return 1 ;;
+  esac
+  java_diagnostics_reference_evidence_json "$reference" >/dev/null || return 1
+  digest="$(sha256sum "$RESULT_DIR/$reference")" || return 1
+  digest="${digest%% *}"
+  updated="$(jq -cS \
+    --arg capture_id "java-$phase" --arg reference "$reference" \
+    --arg digest "$digest" '
+      ([.boundaries[] | select(.state == "active")]) as $active |
+      if ($active | length) == 0 then .
+      elif ($active | length) != 1 then error("no unique active boundary")
+      elif any($active[0].captures[]; .id == $capture_id) then
+        if any($active[0].captures[];
+          .id == $capture_id and .kind == "java" and
+          .reference == $reference and .sha256 == $digest)
+        then . else error("Java capture collision") end
+      else
+        .boundaries |= map(
+          if .state == "active" then
+            .captures += [{
+              id: $capture_id,
+              kind: "java",
+              state: "captured",
+              reference: $reference,
+              sha256: $digest
+            }]
+          else . end)
+      end
+    ' <<<"$payload")" || return 1
+  publish_obi_metric_boundary_index_payload_unlocked "$updated" "$payload"
+}
+
+attach_obi_java_capture() {
+  local -r phase="$1"
+
+  obi_metric_boundary_index_is_initialized || return 0
+  with_terminal_java_diagnostics_lock attach_obi_java_capture_unlocked "$phase"
+}
+
+attach_obi_artifact_capture_unlocked() {
+  local -r capture_id="$1"
+  local -r reference="$2"
+  local digest=""
+  local payload=""
+  local updated=""
+
+  [[ "$capture_id" =~ ^[a-z0-9][a-z0-9-]{0,63}$ &&
+    "$reference" =~ ^[a-z0-9][a-z0-9._-]{0,127}$ &&
+    -f "$RESULT_DIR/$reference" && ! -L "$RESULT_DIR/$reference" ]] || return 1
+  digest="$(sha256sum "$RESULT_DIR/$reference")" || return 1
+  digest="${digest%% *}"
+  payload="$(obi_metric_boundary_index_payload)" || return 1
+  updated="$(jq -cS \
+    --arg capture_id "$capture_id" --arg reference "$reference" \
+    --arg digest "$digest" '
+      ([.boundaries[] | select(.state == "active")]) as $active |
+      if ($active | length) != 1 then error("no unique active boundary")
+      elif any($active[0].captures[]; .id == $capture_id) then
+        if any($active[0].captures[];
+          .id == $capture_id and .kind == "artifact" and
+          .reference == $reference and .sha256 == $digest)
+        then . else error("artifact capture collision") end
+      else
+        .boundaries |= map(
+          if .state == "active" then
+            .captures += [{
+              id: $capture_id,
+              kind: "artifact",
+              state: "captured",
+              reference: $reference,
+              sha256: $digest
+            }]
+          else . end)
+      end
+    ' <<<"$payload")" || return 1
+  publish_obi_metric_boundary_index_payload_unlocked "$updated" "$payload"
+}
+
+attach_obi_artifact_capture() {
+  local -r capture_id="$1"
+  local -r reference="$2"
+
+  obi_metric_boundary_index_is_initialized || return 0
+  with_terminal_java_diagnostics_lock \
+    attach_obi_artifact_capture_unlocked "$capture_id" "$reference"
+}
+
+attach_obi_metric_pair_capture_unlocked() {
+  local -r capture_id="$1"
+  local -r pair_reference="$2"
+  local -r java_phase="$3"
+  local -r admitted_pair_payload="${4:-}"
+  local -r admitted_pair_digest="${5:-}"
+  local pair_digest=""
+  local java_reference="null"
+  local java_digest="null"
+  local payload=""
+  local updated=""
+
+  (($# == 3 || $# == 5)) || return 1
+  if (($# == 5)); then
+    [[ "$TERMINAL_EVIDENCE_LOCK_ENTRY_FROZEN" == false &&
+      "$admitted_pair_digest" =~ ^[0-9a-f]{64}$ &&
+      "$(jq -er '.boundary' <<<"$admitted_pair_payload")" == "$capture_id" ]] ||
+      return 1
+    validate_obi_metric_pair_payload "$admitted_pair_payload" >/dev/null ||
+      return 1
+    pair_digest="$admitted_pair_digest"
+  else
+    obi_metric_pair_payload_from_reference "$pair_reference" >/dev/null || return 1
+    pair_digest="$(sha256sum "$RESULT_DIR/$pair_reference")" || return 1
+    pair_digest="${pair_digest%% *}"
+  fi
+  if [[ -n "$java_phase" &&
+    -e "$RESULT_DIR/phases/$java_phase/java-diagnostics.txt" ]]; then
+    java_reference="phases/$java_phase/java-diagnostics.txt"
+    java_diagnostics_reference_evidence_json "$java_reference" >/dev/null || return 1
+    java_digest="$(sha256sum "$RESULT_DIR/$java_reference")" || return 1
+    java_digest="${java_digest%% *}"
+  fi
+  payload="$(obi_metric_boundary_index_payload)" || return 1
+  updated="$(jq -cS \
+    --arg capture_id "$capture_id" \
+    --arg pair_reference "$pair_reference" --arg pair_digest "$pair_digest" \
+    --arg java_reference "$java_reference" --arg java_digest "$java_digest" '
+      def nullable($value): if $value == "null" then null else $value end;
+      ([.boundaries[] | select(.state == "active")]) as $active |
+      if ($active | length) != 1 then error("no unique active boundary")
+      elif any($active[0].captures[];
+        .id == $capture_id and .kind == "pair" and .state == "captured") then
+        if any($active[0].captures[];
+          .id == $capture_id and .kind == "pair" and .state == "captured" and
+          .pair_reference == $pair_reference and .pair_sha256 == $pair_digest and
+          .java_reference == nullable($java_reference) and
+          .java_sha256 == nullable($java_digest))
+        then . else error("captured pair collision") end
+      elif ([ $active[0].captures[] |
+        select(.kind == "pair" and .state == "planned") ][0].id // null) !=
+        $capture_id then error("pair capture is not the earliest planned pair")
+      else
+        .boundaries |= map(
+          if .state == "active" then
+            .captures |= map(
+              if .id == $capture_id and .kind == "pair" then
+                .state = "captured" |
+                .pair_reference = $pair_reference |
+                .pair_sha256 = $pair_digest |
+                .java_reference = nullable($java_reference) |
+                .java_sha256 = nullable($java_digest)
+              else . end)
+          else . end)
+      end
+    ' <<<"$payload")" || return 1
+  publish_obi_metric_boundary_index_payload_unlocked "$updated" "$payload"
+}
+
+obi_metric_pair_capture_commit_state() {
+  local -r capture_id="$1"
+  local -r pair_reference="$2"
+  local -r pair_digest="$3"
+  local -r java_reference="$4"
+  local -r java_digest="$5"
+  local payload=""
+
+  payload="$(obi_metric_boundary_index_payload)" || return 1
+  jq -er \
+    --arg capture_id "$capture_id" \
+    --arg pair_reference "$pair_reference" --arg pair_digest "$pair_digest" \
+    --arg java_reference "$java_reference" --arg java_digest "$java_digest" '
+      def nullable($value): if $value == "null" then null else $value end;
+      [.boundaries[] | select(.state == "active") | .captures[] |
+        select(.id == $capture_id and .kind == "pair")] as $matches |
+      if ($matches | length) != 1 then error("ambiguous pair capture")
+      elif $matches[0].state == "planned" and
+        $matches[0].pair_reference == null and
+        $matches[0].pair_sha256 == null and
+        $matches[0].java_reference == null and
+        $matches[0].java_sha256 == null then "planned"
+      elif $matches[0].state == "captured" and
+        $matches[0].pair_reference == $pair_reference and
+        $matches[0].pair_sha256 == $pair_digest and
+        $matches[0].java_reference == nullable($java_reference) and
+        $matches[0].java_sha256 == nullable($java_digest) then "captured"
+      else error("pair capture collision") end
+    ' <<<"$payload"
+}
+
+obi_metric_boundary_ids_json() {
+  local boundary_id=""
+
+  if boundary_id="$(active_obi_metric_boundary_id 2>/dev/null)"; then
+    jq -cn --arg boundary_id "$boundary_id" '[$boundary_id]'
+  else
+    printf '[]\n'
+  fi
+}
+
+completed_obi_metric_boundary_ids_json() {
+  local payload=""
+
+  obi_metric_boundary_index_is_initialized || {
+    printf '[]\n'
+    return 0
+  }
+  payload="$(obi_metric_boundary_index_payload)" || return 1
+  jq -ce '
+    [.boundaries[] | select(.state == "complete") | .id] as $completed |
+    if ($completed | length) >= 1 and
+      all(.boundaries[]; .state == "complete")
+    then $completed else error("journal is not wholly complete") end
+  ' <<<"$payload"
+}
+
+bind_status_to_active_obi_metric_boundary_unlocked() {
+  local -r reference="$1"
+  local boundary_id=""
+  local digest=""
+  local payload=""
+  local updated=""
+
+  [[ "$reference" =~ ^scenario-[a-z0-9][a-z0-9-]{0,95}-status\.json$ &&
+    -f "$RESULT_DIR/$reference" && ! -L "$RESULT_DIR/$reference" ]] || return 1
+  digest="$(sha256sum "$RESULT_DIR/$reference")" || return 1
+  digest="${digest%% *}"
+  payload="$(obi_metric_boundary_index_payload)" || return 1
+  boundary_id="$(jq -er '
+    [.boundaries[] | select(.state == "active") | .id] |
+    if length == 1 then .[0] else error("no unique active boundary") end
+  ' <<<"$payload")" || return 1
+  jq -e --arg boundary_id "$boundary_id" '
+    .obi_metric_boundary_ids == [$boundary_id]
+  ' "$RESULT_DIR/$reference" >/dev/null || return 1
+  updated="$(jq -cS \
+    --arg boundary_id "$boundary_id" --arg reference "$reference" \
+    --arg digest "$digest" '
+      .boundaries |= map(
+        if .id == $boundary_id and .state == "active" then
+          if any(.status_references[]; .reference == $reference) then
+            if any(.status_references[];
+              .reference == $reference and .sha256 == $digest)
+            then . else error("status reference collision") end
+          else .status_references += [{reference: $reference, sha256: $digest}] end
+        else . end)
+    ' <<<"$payload")" || return 1
+  publish_obi_metric_boundary_index_payload_unlocked "$updated" "$payload"
+}
+
+bind_status_to_active_obi_metric_boundary() {
+  local -r reference="$1"
+
+  obi_metric_boundary_index_is_initialized || return 0
+  with_terminal_java_diagnostics_lock \
+    bind_status_to_active_obi_metric_boundary_unlocked "$reference"
+}
+
+crosslink_and_bind_active_obi_metric_boundary_status() {
+  local -r reference="$1"
+  local boundary_id=""
+  local candidate=""
+  local update_status=0
+
+  obi_metric_boundary_index_is_initialized || return 0
+  boundary_id="$(active_obi_metric_boundary_id)" || return 1
+  [[ "$reference" =~ ^scenario-[a-z0-9][a-z0-9-]{0,95}-status\.json$ &&
+    -f "$RESULT_DIR/$reference" && ! -L "$RESULT_DIR/$reference" ]] || return 1
+  candidate="$(mktemp "$RESULT_DIR/.scenario-status-crosslink.XXXXXX")" || return $?
+  if jq -c --arg boundary_id "$boundary_id" '
+    . + {obi_metric_boundary_ids: [$boundary_id]}
+  ' "$RESULT_DIR/$reference" >"$candidate" &&
+    chmod 0644 -- "$candidate" && mv -fT -- "$candidate" "$RESULT_DIR/$reference";
+  then
+    :
+  else
+    update_status=$?
+    rm -f -- "$candidate" || true
+    return "$update_status"
+  fi
+  bind_status_to_active_obi_metric_boundary "$reference"
+}
+
+complete_obi_metric_boundary_unlocked() {
+  local -r boundary_id="$1"
+  local payload=""
+  local updated=""
+
+  payload="$(obi_metric_boundary_index_payload)" || return 1
+  updated="$(jq -cS --arg boundary_id "$boundary_id" '
+    if ([.boundaries[] | select(
+      .id == $boundary_id and .state == "active" and
+      (.captures | length) > 0 and all(.captures[]; .state == "captured") and
+      (any(.captures[]; .kind == "pair") or
+        all(.captures[]; .kind == "unavailable")) and
+      (.status_references | length) > 0)] | length) != 1
+    then error("active boundary is incomplete")
+    else .boundaries |= map(
+      if .id == $boundary_id then .state = "complete" else . end)
+    end
+  ' <<<"$payload")" || return 1
+  publish_obi_metric_boundary_index_payload_unlocked "$updated" "$payload"
+}
+
+complete_obi_metric_boundary() {
+  local -r boundary_id="$1"
+
+  obi_metric_boundary_index_is_initialized || return 0
+  with_terminal_java_diagnostics_lock \
+    complete_obi_metric_boundary_unlocked "$boundary_id" || return $?
+  if [[ "$OBI_METRIC_BOUNDARY_ACTIVE_ID" == "$boundary_id" ]]; then
+    OBI_METRIC_BOUNDARY_ACTIVE_ID=""
+  fi
+}
+
+mark_obi_metric_boundary_not_applicable_unlocked() {
+  local -r boundary_id="$1"
+  local -r reason="$2"
+  local -r reference="$3"
+  local digest=""
+  local payload=""
+  local updated=""
+
+  [[ ${#reason} -ge 1 && ${#reason} -le 160 &&
+    "$reference" == "scenario-$boundary_id-status.json" &&
+    -f "$RESULT_DIR/$reference" && ! -L "$RESULT_DIR/$reference" ]] || return 1
+  jq -e --arg boundary_id "$boundary_id" '
+    .obi_metric_boundary_ids == [$boundary_id] and .status == "not_applicable"
+  ' "$RESULT_DIR/$reference" >/dev/null || return 1
+  digest="$(sha256sum "$RESULT_DIR/$reference")" || return 1
+  digest="${digest%% *}"
+  payload="$(obi_metric_boundary_index_payload)" || return 1
+  updated="$(jq -cS \
+    --arg boundary_id "$boundary_id" --arg reason "$reason" \
+    --arg reference "$reference" --arg digest "$digest" '
+      if ([.boundaries[] | select(
+        .id == $boundary_id and .state == "planned")] | length) != 1
+      then error("boundary is not uniquely planned")
+      else .boundaries |= map(
+        if .id == $boundary_id then
+          .state = "not_applicable" |
+          .not_applicable_reason = $reason |
+          .status_references = [{reference: $reference, sha256: $digest}]
+        else . end)
+      end
+    ' <<<"$payload")" || return 1
+  publish_obi_metric_boundary_index_payload_unlocked "$updated" "$payload"
+}
+
+mark_obi_metric_boundary_not_applicable() {
+  local -r boundary_id="$1"
+  local -r reason="$2"
+  local -r reference="$3"
+
+  obi_metric_boundary_index_is_initialized || return 0
+  with_terminal_java_diagnostics_lock \
+    mark_obi_metric_boundary_not_applicable_unlocked \
+      "$boundary_id" "$reason" "$reference" || return $?
+  if [[ "$OBI_METRIC_BOUNDARY_ACTIVE_ID" == "$boundary_id" ]]; then
+    OBI_METRIC_BOUNDARY_ACTIVE_ID=""
+  fi
+}
+
+active_stopped_obi_metric_pair_reference() {
+  local payload=""
+  local pair_state=""
+  local reference=""
+  local expected_digest=""
+  local observed_digest=""
+
+  obi_metric_boundary_index_is_initialized || return 1
+  payload="$(obi_metric_boundary_index_payload)" || return 1
+  pair_state="$(jq -r '
+    .boundaries[] | select(.state == "active") | .captures[] |
+    select(.kind == "pair") | .state
+  ' <<<"$payload" | tail -n 1)" || return 1
+  if [[ -z "$pair_state" || "$pair_state" == planned ]]; then
+    printf '\n'
+    return 0
+  fi
+  [[ "$pair_state" == captured ]] || return 1
+  IFS=$'\t' read -r reference expected_digest <<<"$(jq -er '
+    [.boundaries[] | select(.state == "active") | .captures[] |
+      select(.kind == "pair")][-1] |
+    [.pair_reference, .pair_sha256] | @tsv
+  ' <<<"$payload")" || return 1
+  observed_digest="$(sha256sum "$RESULT_DIR/$reference")" || return 1
+  observed_digest="${observed_digest%% *}"
+  [[ "$observed_digest" == "$expected_digest" ]] || return 1
+  if [[ "$(jq -er '.after.state' \
+    <<<"$(obi_metric_pair_payload_from_reference "$reference")")" == \
+    obi_stopped ]]; then
+    printf '%s\n' "$reference"
+  else
+    printf '\n'
+  fi
 }
 
 record_obi_metric_pair_unlocked() {
@@ -15641,233 +18872,184 @@ record_obi_metric_pair_unlocked() {
   local -r java_phase="$3"
   local -r metric_reference="obi-metric-pairs/$boundary.json"
   local -r pair_output="$RESULT_DIR/$metric_reference"
-  local -r tracker_output="$RESULT_DIR/.last-valid-terminal-boundary.json"
   local -r java_terminal="$RESULT_DIR/terminal-java-diagnostics.json"
   local -r metric_terminal="$RESULT_DIR/terminal-obi-metrics.json"
-  local -r freeze="$RESULT_DIR/.terminal-java-diagnostics.freeze"
-  local tracker_payload=""
   local existing_pair=""
-  local existing_tracker=""
   local pair_candidate=""
+  local pair_candidate_name=""
+  local pair_inode=""
   local pair_identity=""
   local pair_digest=""
-  local tracker_candidate=""
-  local tracker_publication=""
-  local tracker_identity=""
-  local tracker_digest=""
-  local old_tracker_handle=""
-  local old_tracker_identity=""
-  local old_tracker_digest=""
-  local old_tracker_existed=false
+  local expected_java_reference="null"
+  local expected_java_digest="null"
+  local durable_capture_state=""
   local size=""
-  local transaction_status=0
+  local publication_status=0
+  local attach_status=0
+  local pair_created=false
+  local pair_published=false
+  local attempt=0
 
   [[ "$boundary" =~ ^[a-z0-9][a-z0-9-]{0,63}$ &&
+    "$TERMINAL_EVIDENCE_LOCK_ENTRY_FROZEN" == false &&
     -d "$RESULT_DIR" && ! -L "$RESULT_DIR" &&
     ! -e "$java_terminal" && ! -L "$java_terminal" &&
-    ! -e "$metric_terminal" && ! -L "$metric_terminal" &&
-    ! -L "$tracker_output" &&
-    ( ! -e "$tracker_output" || -f "$tracker_output" ) ]] || return 1
+    ! -e "$metric_terminal" && ! -L "$metric_terminal" ]] || return 1
   ensure_obi_metric_pair_directory || return 1
-  # This is the transaction trust boundary: rederive the canonical pair once
-  # from its immutable referenced phase snapshots while holding the shared lock.
+  normalize_obi_metric_pair_candidate_residue "$pair_output" || return 1
   validate_obi_metric_pair_payload "$metric_payload" >/dev/null || return 1
   [[ "$(jq -er '.boundary' <<<"$metric_payload")" == "$boundary" ]] || return 1
-  tracker_payload="$(build_last_terminal_boundary_payload \
-    "$metric_reference" "$metric_payload" "$java_phase")" || return 1
   if [[ -e "$pair_output" || -L "$pair_output" ]]; then
     existing_pair="$(obi_metric_pair_payload_from_reference "$metric_reference")" ||
       return 1
-    existing_tracker="$(
-      validate_last_terminal_boundary_json "$tracker_output"
-    )" || return 1
-    [[ "$existing_pair" == "$metric_payload" &&
-      "$existing_tracker" == "$tracker_payload" ]] || return 1
-    printf '%s\n' "$metric_reference"
-    return 0
-  fi
-  [[ ! -e "$freeze" && ! -L "$freeze" ]] || return 1
-
-  if [[ -e "$tracker_output" ]]; then
-    existing_tracker="$(
-      validate_last_terminal_boundary_json "$tracker_output"
-    )" || return 1
-    old_tracker_identity="$(stat -Lc '%d:%i:%u:%a' -- "$tracker_output")" ||
-      return 1
-    old_tracker_digest="$(sha256sum "$tracker_output")" || return 1
-    old_tracker_digest="${old_tracker_digest%% *}"
-    old_tracker_handle="$(mktemp \
-      "$RESULT_DIR/.last-valid-terminal-boundary-rollback.XXXXXX")" || return 1
-    rm -f -- "$old_tracker_handle" || return 1
-    if ! ln -T -- "$tracker_output" "$old_tracker_handle"; then
-      rm -f -- "$old_tracker_handle" || true
-      return 1
+    [[ "$existing_pair" == "$metric_payload" ]] || return 1
+    pair_digest="$(sha256sum "$pair_output")" || return 1
+    pair_digest="${pair_digest%% *}"
+  else
+    if pair_candidate="$(mktemp \
+      "$RESULT_DIR/obi-metric-pairs/.pair.XXXXXX")"; then
+      :
+    else
+      publication_status=$?
+      pair_candidate_name="${pair_candidate##*/}"
+      if [[ "${pair_candidate%/*}" != "$RESULT_DIR/obi-metric-pairs" ||
+        ! "$pair_candidate_name" =~ ^\.pair\.[A-Za-z0-9]{6}$ ||
+        ! -f "$pair_candidate" || -L "$pair_candidate" ]]; then
+        return "$publication_status"
+      fi
+      for attempt in 1 2 3; do
+        pair_inode="$(stat -Lc '%d:%i:%u' -- "$pair_candidate")" && break
+      done
+      [[ -n "$pair_inode" ]] || return "$publication_status"
+      remove_obi_owned_private_path_by_inode \
+        "$pair_candidate" "$pair_inode" || return 1
+      return "$publication_status"
     fi
-    if ! obi_owned_publication_matches \
-      "$old_tracker_handle" "$old_tracker_identity" "$old_tracker_digest" 2; then
-      rm -f -- "$old_tracker_handle" || true
+    pair_candidate_name="${pair_candidate##*/}"
+    [[ "${pair_candidate%/*}" == "$RESULT_DIR/obi-metric-pairs" &&
+      "$pair_candidate_name" =~ ^\.pair\.[A-Za-z0-9]{6}$ &&
+      -f "$pair_candidate" && ! -L "$pair_candidate" ]] || return 1
+    for attempt in 1 2 3; do
+      pair_inode="$(stat -Lc '%d:%i:%u' -- "$pair_candidate")" && break
+    done
+    [[ -n "$pair_inode" &&
+      "$(stat -Lc '%d:%i:%u:%h' -- "$pair_candidate")" == "$pair_inode:1" ]] ||
       return 1
-    fi
-    old_tracker_existed=true
-  fi
-
-  pair_candidate="$(mktemp "$RESULT_DIR/obi-metric-pairs/.pair-transaction.XXXXXX")" ||
-    transaction_status=$?
-  if ((transaction_status == 0)); then
     if printf '%s\n' "$metric_payload" >"$pair_candidate" &&
       chmod 0644 -- "$pair_candidate"; then
       :
     else
-      transaction_status=$?
+      publication_status=$?
+      remove_obi_owned_private_path_by_inode \
+        "$pair_candidate" "$pair_inode" || return 1
+      return "$publication_status"
     fi
-  fi
-  if ((transaction_status == 0)); then
-    size="$(stat -Lc '%s' -- "$pair_candidate")" || transaction_status=$?
-  fi
-  if ((transaction_status == 0)) &&
-    ! ((size > 0 && size <= OBI_METRIC_PAIR_MAX_BYTES)); then
-    transaction_status=1
-  fi
-  if ((transaction_status == 0)); then
-    pair_identity="$(stat -Lc '%d:%i:%u:%a' -- "$pair_candidate")" ||
-      transaction_status=$?
-  fi
-  if ((transaction_status == 0)); then
-    pair_digest="$(sha256sum "$pair_candidate")" || transaction_status=$?
+    size=""
+    for attempt in 1 2 3; do
+      size="$(stat -Lc '%s' -- "$pair_candidate")" && break
+    done
+    if ! size="$(bounded_decimal "$size" "$OBI_METRIC_PAIR_MAX_BYTES" false)";
+    then
+      remove_obi_owned_private_path_by_inode \
+        "$pair_candidate" "$pair_inode" || return 1
+      return 1
+    fi
+    pair_identity=""
+    for attempt in 1 2 3; do
+      pair_identity="$(stat -Lc '%d:%i:%u:%a' -- "$pair_candidate")" && break
+    done
+    if [[ "$pair_identity" != "$pair_inode:644" ]]; then
+      remove_obi_owned_private_path_by_inode \
+        "$pair_candidate" "$pair_inode" || return 1
+      return 1
+    fi
+    pair_digest=""
+    for attempt in 1 2 3; do
+      if pair_digest="$(sha256sum "$pair_candidate")"; then
+        break
+      fi
+      pair_digest=""
+    done
+    if [[ -z "$pair_digest" ]]; then
+      remove_obi_owned_private_path_by_inode \
+        "$pair_candidate" "$pair_inode" || return 1
+      return 1
+    fi
     pair_digest="${pair_digest%% *}"
-  fi
-
-  if ((transaction_status == 0)); then
-    tracker_candidate="$(mktemp \
-      "$RESULT_DIR/.last-valid-terminal-boundary-transaction.XXXXXX")" ||
-      transaction_status=$?
-  fi
-  if ((transaction_status == 0)); then
-    if printf '%s\n' "$tracker_payload" >"$tracker_candidate" &&
-      chmod 0644 -- "$tracker_candidate"; then
-      :
+    if ln -T -- "$pair_candidate" "$pair_output"; then
+      pair_published=true
     else
-      transaction_status=$?
+      publication_status=$?
+      for attempt in 1 2 3; do
+        if obi_owned_publication_matches \
+          "$pair_output" "$pair_identity" "$pair_digest" 2; then
+          pair_published=true
+          break
+        fi
+      done
+      if [[ "$pair_published" != true ]]; then
+        remove_obi_owned_private_file \
+          "$pair_candidate" "$pair_identity" "$pair_digest" || return 1
+        return "$publication_status"
+      fi
     fi
-  fi
-  if ((transaction_status == 0)); then
-    size="$(stat -Lc '%s' -- "$tracker_candidate")" || transaction_status=$?
-  fi
-  if ((transaction_status == 0)) &&
-    ! ((size > 0 && size <= OBI_TERMINAL_BOUNDARY_MAX_BYTES)); then
-    transaction_status=1
-  fi
-  if ((transaction_status == 0)); then
-    tracker_identity="$(stat -Lc '%d:%i:%u:%a' -- "$tracker_candidate")" ||
-      transaction_status=$?
-  fi
-  if ((transaction_status == 0)); then
-    tracker_digest="$(sha256sum "$tracker_candidate")" || transaction_status=$?
-    tracker_digest="${tracker_digest%% *}"
-  fi
-  if ((transaction_status == 0)); then
-    tracker_publication="$(mktemp \
-      "$RESULT_DIR/.last-valid-terminal-boundary-publication.XXXXXX")" ||
-      transaction_status=$?
-  fi
-  if ((transaction_status == 0)); then
-    rm -f -- "$tracker_publication" || transaction_status=$?
-  fi
-  if ((transaction_status == 0)); then
-    ln -T -- "$tracker_candidate" "$tracker_publication" ||
-      transaction_status=$?
-  fi
-  if ((transaction_status != 0)); then
-    rm -f -- \
-      "$pair_candidate" "$tracker_candidate" "$tracker_publication" \
-      "$old_tracker_handle" || true
-    return "$transaction_status"
-  fi
-
-  if [[ -e "$freeze" || -L "$freeze" ||
-    -e "$java_terminal" || -L "$java_terminal" ||
-    -e "$metric_terminal" || -L "$metric_terminal" ]]; then
-    transaction_status=1
-  elif ln -T -- "$pair_candidate" "$pair_output"; then
-    :
-  else
-    transaction_status=$?
-    if obi_owned_publication_matches \
-      "$pair_output" "$pair_identity" "$pair_digest" 2; then
-      transaction_status=0
-    fi
-  fi
-  if ((transaction_status == 0)); then
+    for attempt in 1 2 3; do
+      obi_owned_publication_matches \
+        "$pair_output" "$pair_identity" "$pair_digest" 2 && break
+    done
     obi_owned_publication_matches \
-      "$pair_output" "$pair_identity" "$pair_digest" 2 || transaction_status=$?
+      "$pair_output" "$pair_identity" "$pair_digest" 2 || return 1
+    pair_created=true
   fi
-  if ((transaction_status == 0)) &&
-    [[ -e "$freeze" || -L "$freeze" ||
-      -e "$java_terminal" || -L "$java_terminal" ||
-      -e "$metric_terminal" || -L "$metric_terminal" ]]; then
-    transaction_status=1
+  if [[ -n "$java_phase" &&
+    -e "$RESULT_DIR/phases/$java_phase/java-diagnostics.txt" ]]; then
+    expected_java_reference="phases/$java_phase/java-diagnostics.txt"
+    java_diagnostics_reference_evidence_json \
+      "$expected_java_reference" >/dev/null || return 1
+    expected_java_digest="$(sha256sum \
+      "$RESULT_DIR/$expected_java_reference")" || return 1
+    expected_java_digest="${expected_java_digest%% *}"
   fi
-  if ((transaction_status == 0)); then
-    if install_last_terminal_boundary_payload_unlocked \
-      "$tracker_publication" "$tracker_output"; then
-      :
+  if obi_metric_boundary_index_is_initialized; then
+    if [[ "$pair_created" == true ]]; then
+      if attach_obi_metric_pair_capture_unlocked \
+        "$boundary" "$metric_reference" "$java_phase" \
+        "$metric_payload" "$pair_digest"; then
+        attach_status=0
+      else
+        attach_status=$?
+      fi
+    elif attach_obi_metric_pair_capture_unlocked \
+      "$boundary" "$metric_reference" "$java_phase"; then
+      attach_status=0
     else
-      transaction_status=$?
+      attach_status=$?
     fi
-  fi
-  if obi_owned_publication_matches \
-      "$pair_output" "$pair_identity" "$pair_digest" 2 &&
-    obi_owned_publication_matches \
-      "$tracker_output" "$tracker_identity" "$tracker_digest" 2 &&
-    validate_last_terminal_boundary_payload_against_metric_pair \
-      "$tracker_payload" "$metric_reference" "$metric_payload" >/dev/null; then
-    transaction_status=0
-  elif ((transaction_status == 0)); then
-    transaction_status=1
-  fi
-  if ((transaction_status != 0)); then
-    if rollback_obi_metric_pair_transaction \
-      "$pair_output" "$pair_candidate" "$pair_identity" "$pair_digest" \
-      "$tracker_output" "$tracker_candidate" "$tracker_publication" \
-      "$tracker_identity" "$tracker_digest" "$old_tracker_handle" \
-      "$old_tracker_identity" "$old_tracker_digest" "$old_tracker_existed"; then
-      return "$transaction_status"
+    durable_capture_state="$(obi_metric_pair_capture_commit_state \
+      "$boundary" "$metric_reference" "$pair_digest" \
+      "$expected_java_reference" "$expected_java_digest")" ||
+      durable_capture_state=ambiguous
+    if [[ "$durable_capture_state" == captured ]]; then
+      if [[ "$pair_created" == true ]]; then
+        remove_obi_owned_pair_publication_handle \
+          "$pair_candidate" "$pair_output" || return 1
+      fi
+      attach_status=0
+    elif [[ "$durable_capture_state" == planned ]]; then
+      if [[ "$pair_created" == true ]]; then
+        remove_obi_owned_pair_orphan_publication \
+          "$pair_candidate" "$pair_output" || return 1
+      fi
+      ((attach_status != 0)) || attach_status=1
+      return "$attach_status"
+    else
+      # Preserve the exact h2 ownership proof when the durable index cannot be
+      # classified. A retry or terminal freeze can resolve it from disk.
+      return 1
     fi
-    return 1
-  fi
-
-  if rm -f -- "$pair_candidate" "$tracker_candidate"; then
-    :
-  else
-    transaction_status=$?
-  fi
-  if ((transaction_status == 0)); then
-    obi_owned_publication_matches \
-      "$pair_output" "$pair_identity" "$pair_digest" 1 ||
-      transaction_status=$?
-  fi
-  if ((transaction_status == 0)); then
-    obi_owned_publication_matches \
-      "$tracker_output" "$tracker_identity" "$tracker_digest" 1 ||
-      transaction_status=$?
-  fi
-  if ((transaction_status == 0)); then
-    validate_last_terminal_boundary_payload_against_metric_pair \
-      "$tracker_payload" "$metric_reference" "$metric_payload" >/dev/null ||
-      transaction_status=$?
-  fi
-  if ((transaction_status != 0)); then
-    if rollback_obi_metric_pair_transaction \
-      "$pair_output" "$pair_candidate" "$pair_identity" "$pair_digest" \
-      "$tracker_output" "$tracker_candidate" "$tracker_publication" \
-      "$tracker_identity" "$tracker_digest" "$old_tracker_handle" \
-      "$old_tracker_identity" "$old_tracker_digest" "$old_tracker_existed"; then
-      return "$transaction_status"
-    fi
-    return 1
-  fi
-  if [[ "$old_tracker_existed" == true ]]; then
-    rm -f -- "$old_tracker_handle" || return 1
+  elif [[ "$pair_created" == true ]]; then
+    remove_obi_owned_pair_publication_handle \
+      "$pair_candidate" "$pair_output" || return 1
   fi
   printf '%s\n' "$metric_reference"
 }
@@ -15882,6 +19064,7 @@ record_obi_metric_pair() {
   local record_status=0
 
   (($# >= 4 && $# <= 5)) || return 1
+  plan_obi_metric_pair_capture "$boundary" || return $?
   if payload="$(build_obi_metric_pair_payload \
     "$boundary" "$before_phase" "$after_phase" "$continuity")"; then
     :
@@ -15999,17 +19182,33 @@ java_diagnostics_reference_phase() {
 
 java_diagnostics_reference_evidence_json() {
   local -r reference="$1"
+  local -r output_name="${2:-}"
   local phase=""
   local input=""
   local snapshot=""
+  local evidence=""
 
+  (($# == 1 || $# == 2)) || return 1
+  [[ -z "$output_name" || "$output_name" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] ||
+    return 1
   phase="$(java_diagnostics_reference_phase "$reference")" || return 1
+  if [[ "${OBI_METRIC_BOUNDARY_FULL_VALIDATION_CACHE_ACTIVE:-false}" == true ]]; then
+    if [[ -n "${OBI_METRIC_BOUNDARY_JAVA_EVIDENCE_CACHE[$reference]+present}" ]]; then
+      if [[ -n "$output_name" ]]; then
+        printf -v "$output_name" '%s' \
+          "${OBI_METRIC_BOUNDARY_JAVA_EVIDENCE_CACHE[$reference]}"
+      else
+        printf '%s\n' "${OBI_METRIC_BOUNDARY_JAVA_EVIDENCE_CACHE[$reference]}"
+      fi
+      return 0
+    fi
+  fi
   input="$RESULT_DIR/$reference"
   java_diagnostics_phase_directory_is_safe "$phase" || return 1
   snapshot="$(read_bounded_single_line_regular_file \
     "$input" "$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES")" || return 1
   assert_sanitized_java_diagnostics_snapshot "$snapshot" || return $?
-  jq -cn \
+  evidence="$(jq -cn \
     --arg reference "$reference" \
     --arg snapshot "$snapshot" '
       {
@@ -16022,7 +19221,15 @@ java_diagnostics_reference_evidence_json() {
           | add
         )
       }
-    '
+    ')" || return 1
+  if [[ "${OBI_METRIC_BOUNDARY_FULL_VALIDATION_CACHE_ACTIVE:-false}" == true ]]; then
+    OBI_METRIC_BOUNDARY_JAVA_EVIDENCE_CACHE["$reference"]="$evidence"
+  fi
+  if [[ -n "$output_name" ]]; then
+    printf -v "$output_name" '%s' "$evidence"
+  else
+    printf '%s\n' "$evidence"
+  fi
 }
 
 java_diagnostics_phase_evidence_json() {
@@ -16037,25 +19244,44 @@ java_diagnostics_phase_evidence_json() {
   java_diagnostics_reference_evidence_json "$reference"
 }
 
-with_terminal_java_diagnostics_lock() (
-  local -r lock="$RESULT_DIR/.terminal-java-diagnostics.lock"
+with_terminal_java_diagnostics_transition_publication_lock() (
+  local -r lock="$RESULT_DIR/.terminal-java-diagnostics-transition.lock"
   local lock_fd=""
   local path_identity=""
   local descriptor_identity=""
   local lock_status=0
   local command_status=0
+  local lock_device=""
+  local lock_inode=""
+  local lock_links=""
+  local lock_owner=""
+  local lock_mode=""
 
   [[ -d "$RESULT_DIR" && ! -L "$RESULT_DIR" &&
     ! -L "$lock" && ( ! -e "$lock" || -f "$lock" ) ]] || return 1
   umask 077
   exec {lock_fd}>>"$lock" || return $?
   path_identity="$(stat -Lc '%d:%i:%h:%u:%a' -- "$lock")" || return 1
-  descriptor_identity="$(stat -Lc '%d:%i:%h:%u:%a' -- "/proc/self/fd/$lock_fd")" ||
-    return 1
+  descriptor_identity="$(
+    stat -Lc '%d:%i:%h:%u:%a' -- "/proc/self/fd/$lock_fd"
+  )" || return 1
+  IFS=: read -r lock_device lock_inode lock_links lock_owner lock_mode \
+    <<<"$path_identity"
   [[ ! -L "$lock" && "$path_identity" == "$descriptor_identity" &&
-    "$path_identity" == *":1:$(id -u):600" ]] || return 1
+    -n "$lock_device" && -n "$lock_inode" && "$lock_links" == 1 &&
+    "$lock_owner" == "$(id -u)" && "$lock_mode" == 600 ]] || return 1
   flock -x -w "$TERMINAL_JAVA_DIAGNOSTICS_LOCK_TIMEOUT_SECONDS" \
     "$lock_fd" || return $?
+  path_identity="$(stat -Lc '%d:%i:%h:%u:%a' -- "$lock")" || return 1
+  descriptor_identity="$(
+    stat -Lc '%d:%i:%h:%u:%a' -- "/proc/self/fd/$lock_fd"
+  )" || return 1
+  IFS=: read -r lock_device lock_inode lock_links lock_owner lock_mode \
+    <<<"$path_identity"
+  [[ ! -L "$lock" && "$path_identity" == "$descriptor_identity" &&
+    -n "$lock_device" && -n "$lock_inode" && "$lock_links" == 1 &&
+    "$lock_owner" == "$(id -u)" && "$lock_mode" == 600 ]] || return 1
+  local TERMINAL_TRANSITION_PUBLICATION_LOCK_HELD_BY_CALLER=true
   if "$@"; then
     command_status=0
   else
@@ -16073,25 +19299,426 @@ with_terminal_java_diagnostics_lock() (
   return "$lock_status"
 )
 
+with_terminal_java_diagnostics_lock() (
+  local -r lock="$RESULT_DIR/.terminal-java-diagnostics.lock"
+  local lock_fd=""
+  local path_identity=""
+  local descriptor_identity=""
+  local lock_status=0
+  local command_status=0
+  local TERMINAL_EVIDENCE_LOCK_ENTRY_FROZEN=""
+  local lock_device=""
+  local lock_inode=""
+  local lock_links=""
+  local lock_owner=""
+  local lock_mode=""
+
+  [[ -d "$RESULT_DIR" && ! -L "$RESULT_DIR" &&
+    ! -L "$lock" && ( ! -e "$lock" || -f "$lock" ) ]] || return 1
+  umask 077
+  exec {lock_fd}>>"$lock" || return $?
+  path_identity="$(stat -Lc '%d:%i:%h:%u:%a' -- "$lock")" || return 1
+  descriptor_identity="$(stat -Lc '%d:%i:%h:%u:%a' -- "/proc/self/fd/$lock_fd")" ||
+    return 1
+  IFS=: read -r lock_device lock_inode lock_links lock_owner lock_mode \
+    <<<"$path_identity"
+  [[ ! -L "$lock" && "$path_identity" == "$descriptor_identity" &&
+    -n "$lock_device" && -n "$lock_inode" && "$lock_links" == 1 &&
+    "$lock_owner" == "$(id -u)" && "$lock_mode" == 600 ]] || return 1
+  flock -x -w "$TERMINAL_JAVA_DIAGNOSTICS_LOCK_TIMEOUT_SECONDS" \
+    "$lock_fd" || return $?
+  path_identity="$(stat -Lc '%d:%i:%h:%u:%a' -- "$lock")" || return 1
+  descriptor_identity="$(
+    stat -Lc '%d:%i:%h:%u:%a' -- "/proc/self/fd/$lock_fd"
+  )" || return 1
+  IFS=: read -r lock_device lock_inode lock_links lock_owner lock_mode \
+    <<<"$path_identity"
+  [[ ! -L "$lock" && "$path_identity" == "$descriptor_identity" &&
+    -n "$lock_device" && -n "$lock_inode" && "$lock_links" == 1 &&
+    "$lock_owner" == "$(id -u)" && "$lock_mode" == 600 ]] || return 1
+  local TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER=true
+  if obi_metric_boundary_publication_is_frozen; then
+    TERMINAL_EVIDENCE_LOCK_ENTRY_FROZEN=true
+  else
+    TERMINAL_EVIDENCE_LOCK_ENTRY_FROZEN=false
+  fi
+  if "$@"; then
+    command_status=0
+  else
+    command_status=$?
+  fi
+  if flock -u "$lock_fd"; then
+    :
+  else
+    lock_status=$?
+  fi
+  exec {lock_fd}>&-
+  if ((command_status != 0)); then
+    return "$command_status"
+  fi
+  return "$lock_status"
+)
+
+last_java_diagnostics_payload_is_exact() {
+  local -r last="$RESULT_DIR/.last-valid-java-diagnostics.json"
+  local -r expected_payload="$1"
+  local observed_payload=""
+
+  observed_payload="$(read_bounded_single_line_owned_regular_file \
+    "$last" "$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES" 644 1)" || return 1
+  validate_last_java_diagnostics_payload_structure \
+    "$observed_payload" >/dev/null ||
+    return 1
+  [[ "$expected_payload" == __any__ ||
+    "$observed_payload" == "$expected_payload" ]]
+}
+
+normalize_last_java_diagnostics_candidate_residue() {
+  local -r expected_payload="$1"
+  local -r last="$RESULT_DIR/.last-valid-java-diagnostics.json"
+  local candidate=""
+  local candidate_identity=""
+  local candidate_device=""
+  local candidate_inode=""
+  local candidate_owner=""
+  local candidate_mode=""
+  local candidate_links=""
+  local path=""
+  local -a candidates=()
+
+  [[ "${TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER:-false}" == true ]] || return 1
+  for path in "$RESULT_DIR"/.last-valid-java-diagnostics.*; do
+    if [[ ( -e "$path" || -L "$path" ) && "$path" != "$last" ]]; then
+      candidates+=("$path")
+      ((${#candidates[@]} <= 1)) || return 1
+    fi
+  done
+  ((${#candidates[@]} <= 1)) || return 1
+  if [[ -e "$last" || -L "$last" ]]; then
+    last_java_diagnostics_payload_is_exact __any__ || return 1
+  fi
+  if ((${#candidates[@]} == 0)); then
+    return 0
+  fi
+  candidate="${candidates[0]}"
+  [[ "${candidate##*/}" =~ \
+      ^\.last-valid-java-diagnostics\.[A-Za-z0-9]{6}$ &&
+    -f "$candidate" && ! -L "$candidate" ]] || return 1
+  candidate_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$candidate")" ||
+    return 1
+  IFS=: read -r \
+    candidate_device candidate_inode candidate_owner candidate_mode \
+    candidate_links <<<"$candidate_identity"
+  [[ -n "$candidate_device" && -n "$candidate_inode" &&
+    "$candidate_owner" == "$(id -u)" &&
+    ( "$candidate_mode" == 600 || "$candidate_mode" == 644 ) &&
+    "$candidate_links" == 1 ]] || return 1
+  remove_terminal_owned_private_path \
+    "$candidate" "$candidate_identity" || return $?
+  if [[ -e "$last" || -L "$last" ]]; then
+    last_java_diagnostics_payload_is_exact "$expected_payload"
+    return $?
+  fi
+  return 0
+}
+
+normalize_terminal_java_phase_and_last_candidates_before_freeze() {
+  local -r phases_root="$RESULT_DIR/phases"
+  local phase_dir=""
+  local phase=""
+  local path=""
+  local has_candidate=false
+
+  [[ "${TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER:-false}" == true ]] || return 1
+  normalize_legacy_terminal_java_diagnostics_candidate_residue || return $?
+  normalize_last_java_diagnostics_candidate_residue __any__ || return $?
+  if [[ ! -e "$phases_root" && ! -L "$phases_root" ]]; then
+    return 0
+  fi
+  [[ -d "$phases_root" && ! -L "$phases_root" ]] || return 1
+  for phase_dir in "$phases_root"/*; do
+    [[ -e "$phase_dir" || -L "$phase_dir" ]] || continue
+    phase="${phase_dir##*/}"
+    [[ "$phase" =~ ^[a-z0-9][a-z0-9-]{0,63}$ &&
+      -d "$phase_dir" && ! -L "$phase_dir" ]] || return 1
+    has_candidate=false
+    for path in \
+      "$phase_dir"/.java-diagnostics-header.* \
+      "$phase_dir"/.terminal-diagnostics.*; do
+      if [[ -e "$path" || -L "$path" ]]; then
+        has_candidate=true
+        break
+      fi
+    done
+    [[ "$has_candidate" == true ]] || continue
+    java_diagnostics_phase_directory_is_safe "$phase" || return 1
+    normalize_terminal_owned_hardlink_family \
+      "$phase_dir/java-diagnostics.txt" 644 \
+      "$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES" true __any__ \
+      validate_java_diagnostics_snapshot_hardlink_payload \
+      '^\.(java-diagnostics-header|terminal-diagnostics)\.[A-Za-z0-9]{6}$' \
+      "$phase_dir/.java-diagnostics-header" \
+      "$phase_dir/.terminal-diagnostics" || return $?
+  done
+}
+
+normalize_obi_phase_publication_candidates_before_freeze() {
+  local -r phases_root="$RESULT_DIR/phases"
+  local phase_dir=""
+  local phase=""
+  local path=""
+  local identity_output=""
+  local metrics_output=""
+  local identity_payload=""
+  local identity_digest=""
+  local identity_links=""
+  local unavailable_digest=""
+  local journal_mode=""
+  local normalization_status=0
+  local metrics_handle=""
+  local identity_handle=""
+  local unavailable_handle=""
+  local metrics_handle_identity=""
+  local identity_handle_identity=""
+  local unavailable_handle_identity=""
+  local has_identity_candidate=false
+  local has_metrics_candidate=false
+  local has_unavailable_candidate=false
+
+  [[ "${TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER:-false}" == true ]] || return 1
+  normalize_owned_obi_h1_scratch_family \
+    "$RESULT_DIR" "$RESULT_DIR/.obi-metric-boundary-plan" \
+    '^\.obi-metric-boundary-plan\.[A-Za-z0-9]{6}$' || return $?
+  normalize_obi_owned_private_candidate_residue \
+    "$RESULT_DIR/.obi-metric-boundary-index" \
+    '^\.obi-metric-boundary-index\.[A-Za-z0-9]{6}$' '^(600|644)$' \
+    "$RESULT_DIR/.obi-metric-boundary-index.freeze" ||
+    return $?
+  if obi_metric_boundary_index_is_initialized; then
+    journal_mode=initialized
+  elif obi_metric_boundary_journal_paths_are_cleanly_absent; then
+    journal_mode=legacy
+  else
+    return 1
+  fi
+  normalize_owned_obi_h1_scratch_family \
+    "$RESULT_DIR" "$RESULT_DIR/.obi-metric-snapshot" \
+    '^\.obi-metric-snapshot\.[A-Za-z0-9]{6}$' || return $?
+  normalize_owned_obi_h1_scratch_family \
+    "$RESULT_DIR" "$RESULT_DIR/.obi-metric-parsed" \
+    '^\.obi-metric-parsed\.[A-Za-z0-9]{6}$' || return $?
+  if [[ ! -e "$phases_root" && ! -L "$phases_root" ]]; then
+    return 0
+  fi
+  [[ -d "$phases_root" && ! -L "$phases_root" ]] || return 1
+  unavailable_digest="$(printf 'unavailable\n' | sha256sum)" || return 1
+  unavailable_digest="${unavailable_digest%% *}"
+  for phase_dir in "$phases_root"/*; do
+    [[ -e "$phase_dir" || -L "$phase_dir" ]] || continue
+    phase="${phase_dir##*/}"
+    [[ "$phase" =~ ^[a-z0-9][a-z0-9-]{0,63}$ &&
+      -d "$phase_dir" && ! -L "$phase_dir" ]] || return 1
+    java_diagnostics_phase_directory_is_safe "$phase" || return 1
+    normalize_owned_obi_metric_phase_scratch_residue "$phase" || return $?
+    has_identity_candidate=false
+    has_metrics_candidate=false
+    has_unavailable_candidate=false
+    metrics_handle=""
+    identity_handle=""
+    unavailable_handle=""
+    metrics_handle_identity=""
+    identity_handle_identity=""
+    unavailable_handle_identity=""
+    for path in "$phase_dir"/.obi-*; do
+      [[ -e "$path" || -L "$path" ]] || continue
+      case "${path##*/}" in
+        .obi-identity.*)
+          [[ "${path##*/}" =~ ^\.obi-identity\.[A-Za-z0-9]{6}$ ]] ||
+            return 1
+          has_identity_candidate=true
+          identity_handle="$path"
+          ;;
+        .obi-metrics.*)
+          [[ "${path##*/}" =~ ^\.obi-metrics\.[A-Za-z0-9]{6}$ ]] ||
+            return 1
+          has_metrics_candidate=true
+          metrics_handle="$path"
+          ;;
+        .obi-metrics-unavailable.*)
+          [[ "${path##*/}" =~ \
+            ^\.obi-metrics-unavailable\.[A-Za-z0-9]{6}$ ]] || return 1
+          has_unavailable_candidate=true
+          unavailable_handle="$path"
+          ;;
+        *) return 1 ;;
+      esac
+    done
+    if [[ "$has_unavailable_candidate" == true ]]; then
+      if normalize_owned_phase_publication_handle \
+        "$phase_dir/obi-metrics.prom" \
+        "$phase_dir/.obi-metrics-unavailable" "$unavailable_digest" true;
+      then
+        normalization_status=0
+      else
+        normalization_status=$?
+      fi
+      case "$normalization_status" in
+        0) ;;
+        2)
+          unavailable_handle_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+            "$unavailable_handle")" || return 1
+          finalize_obi_unavailable_phase_publication_unlocked \
+            "$phase" "$journal_mode" "$unavailable_digest" \
+            "$unavailable_handle" "$unavailable_handle_identity" || return $?
+          ;;
+        *) return "$normalization_status" ;;
+      esac
+    fi
+    [[ "$has_identity_candidate" == true ||
+      "$has_metrics_candidate" == true ]] || continue
+    identity_output="$phase_dir/obi-identity.json"
+    metrics_output="$phase_dir/obi-metrics.prom"
+    if [[ -f "$identity_output" && ! -L "$identity_output" &&
+      ! -e "$metrics_output" && ! -L "$metrics_output" ]]; then
+      identity_links="$(stat -Lc '%h' -- "$identity_output")" || return 1
+      [[ "$identity_links" =~ ^[12]$ ]] || return 1
+      identity_payload="$(read_bounded_single_line_owned_regular_file \
+        "$identity_output" "$OBI_PROCESS_IDENTITY_MAX_BYTES" 644 \
+        "$identity_links")" || return 1
+      validate_obi_process_identity_payload "$identity_payload" >/dev/null ||
+        return 1
+      if [[ "$(jq -er '.state' <<<"$identity_payload")" == obi_stopped ]]; then
+        identity_digest="$(sha256sum "$identity_output")" || return 1
+        identity_digest="${identity_digest%% *}"
+        normalize_owned_phase_publication_handle \
+          "$identity_output" "$phase_dir/.obi-identity" "$identity_digest" ||
+          return $?
+        continue
+      fi
+    fi
+    if normalize_owned_obi_metric_phase_capture "$phase" true; then
+      normalization_status=0
+    else
+      normalization_status=$?
+    fi
+    case "$normalization_status" in
+      0) ;;
+      2)
+        identity_digest="$(sha256sum "$identity_output")" || return 1
+        identity_digest="${identity_digest%% *}"
+        metrics_handle=""
+        identity_handle=""
+        for path in "$phase_dir"/.obi-*; do
+          [[ -e "$path" || -L "$path" ]] || continue
+          case "${path##*/}" in
+            .obi-metrics.??????) metrics_handle="$path" ;;
+            .obi-identity.??????) identity_handle="$path" ;;
+            *) return 1 ;;
+          esac
+        done
+        if [[ -n "$metrics_handle" ]]; then
+          metrics_handle_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+            "$metrics_handle")" || return 1
+        fi
+        if [[ -n "$identity_handle" ]]; then
+          identity_handle_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+            "$identity_handle")" || return 1
+        fi
+        finalize_obi_metric_phase_publication_unlocked \
+          "$phase" "$journal_mode" "$identity_digest" \
+          "$metrics_handle" "$metrics_handle_identity" \
+          "$identity_handle" "$identity_handle_identity" || return $?
+        ;;
+      *) return "$normalization_status" ;;
+    esac
+  done
+}
+
+publish_last_java_diagnostics_payload_unlocked() {
+  local -r payload="$1"
+  local -r last="$RESULT_DIR/.last-valid-java-diagnostics.json"
+  local candidate=""
+  local candidate_inode=""
+  local candidate_device=""
+  local candidate_inode_number=""
+  local candidate_owner=""
+  local publication_status=1
+  local attempt=0
+
+  normalize_last_java_diagnostics_candidate_residue __any__ || return $?
+  if [[ -e "$last" || -L "$last" ]] &&
+    last_java_diagnostics_payload_is_exact "$payload"; then
+    return 0
+  fi
+  if candidate="$(mktemp "$RESULT_DIR/.last-valid-java-diagnostics.XXXXXX")"; then
+    :
+  else
+    publication_status=$?
+    normalize_last_java_diagnostics_candidate_residue __any__ || return 1
+    return "$publication_status"
+  fi
+  [[ "${candidate%/*}" == "$RESULT_DIR" &&
+    "${candidate##*/}" =~ \
+      ^\.last-valid-java-diagnostics\.[A-Za-z0-9]{6}$ &&
+    -f "$candidate" && ! -L "$candidate" ]] || return 1
+  for attempt in 1 2 3; do
+    candidate_inode="$(stat -Lc '%d:%i:%u' -- "$candidate")" && break
+    candidate_inode=""
+  done
+  IFS=: read -r candidate_device candidate_inode_number candidate_owner \
+    <<<"$candidate_inode"
+  [[ -n "$candidate_device" && -n "$candidate_inode_number" &&
+    "$candidate_owner" == "$(id -u)" &&
+    "$(stat -Lc '%d:%i:%u:%a:%h' -- "$candidate")" == \
+      "$candidate_inode:600:1" ]] || return 1
+  if printf '%s\n' "$payload" >"$candidate" &&
+    chmod 0644 -- "$candidate"; then
+    :
+  else
+    publication_status=$?
+    remove_terminal_owned_private_candidate \
+      "$candidate" "$candidate_inode" '^(600|644)$' || return 1
+    return "$publication_status"
+  fi
+  [[ "$(read_bounded_single_line_owned_regular_file \
+      "$candidate" "$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES" 644 1)" == \
+      "$payload" ]] &&
+    validate_last_java_diagnostics_payload_structure "$payload" >/dev/null || {
+      remove_terminal_owned_private_candidate \
+        "$candidate" "$candidate_inode" '^644$' || return 1
+      return 1
+    }
+  if mv -fT -- "$candidate" "$last"; then
+    # A successful rename is provisional until the exact canonical path is
+    # re-read with its expected ownership, mode, link count, and payload.
+    publication_status=1
+  else
+    publication_status=$?
+  fi
+  if [[ -e "$candidate" || -L "$candidate" ]]; then
+    remove_terminal_owned_private_candidate \
+      "$candidate" "$candidate_inode" '^(600|644)$' || return 1
+  fi
+  if last_java_diagnostics_payload_is_exact "$payload"; then
+    return 0
+  fi
+  return "$publication_status"
+}
+
 record_last_java_diagnostics_reference_unlocked() {
   local -r reference="$1"
   local -r last="$RESULT_DIR/.last-valid-java-diagnostics.json"
   local -r terminal="$RESULT_DIR/terminal-java-diagnostics.json"
-  local -r freeze="$RESULT_DIR/.terminal-java-diagnostics.freeze"
   local phase=""
   local evidence=""
   local payload=""
-  local candidate=""
-  local publication_status=0
 
-  [[ -d "$RESULT_DIR" && ! -L "$RESULT_DIR" ]] || return 1
+  [[ "${TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER:-false}" == true &&
+    "$TERMINAL_EVIDENCE_LOCK_ENTRY_FROZEN" == false &&
+    -d "$RESULT_DIR" && ! -L "$RESULT_DIR" ]] || return 1
   if [[ -e "$terminal" || -L "$terminal" ]]; then
     terminal_java_diagnostics_json >/dev/null
     return $?
-  fi
-  if [[ -e "$freeze" || -L "$freeze" ]]; then
-    terminal_java_diagnostics_freeze_is_valid
-    return 1
   fi
   [[ ! -L "$last" && ( ! -e "$last" || -f "$last" ) ]] || return 1
   phase="$(java_diagnostics_reference_phase "$reference")" || return 1
@@ -16107,30 +19734,7 @@ record_last_java_diagnostics_reference_unlocked() {
         phase: $phase
       }
     ')" || return 1
-  candidate="$(mktemp "$RESULT_DIR/.last-valid-java-diagnostics.XXXXXX")" || return $?
-  if printf '%s\n' "$payload" >"$candidate" &&
-    chmod 0644 -- "$candidate"; then
-    :
-  else
-    rm -f -- "$candidate" || true
-    return 1
-  fi
-  if [[ -e "$terminal" || -L "$terminal" ]]; then
-    rm -f -- "$candidate" || true
-    terminal_java_diagnostics_json >/dev/null
-    return $?
-  fi
-  if [[ -e "$freeze" || -L "$freeze" ]]; then
-    rm -f -- "$candidate" || true
-    terminal_java_diagnostics_freeze_is_valid >/dev/null || return 1
-    return 1
-  fi
-  if mv -fT -- "$candidate" "$last"; then
-    return 0
-  fi
-  publication_status=$?
-  rm -f -- "$candidate" || true
-  return "$publication_status"
+  publish_last_java_diagnostics_payload_unlocked "$payload"
 }
 
 record_last_java_diagnostics_reference() {
@@ -16146,11 +19750,11 @@ record_last_java_diagnostics_phase() {
     "phases/$phase/java-diagnostics.txt"
 }
 
-validate_last_java_diagnostics_payload() {
+validate_last_java_diagnostics_payload_structure() {
   local -r payload="$1"
   local reference=""
   local phase=""
-  local expected=""
+  local snapshot=""
 
   jq -e '
     keys == [
@@ -16167,6 +19771,24 @@ validate_last_java_diagnostics_payload() {
   reference="$(jq -er '.reference' <<<"$payload")" || return 1
   phase="$(java_diagnostics_reference_phase "$reference")" || return 1
   [[ "$(jq -er '.phase' <<<"$payload")" == "$phase" ]] || return 1
+  snapshot="$(jq -er '.snapshot' <<<"$payload")" || return 1
+  assert_sanitized_java_diagnostics_snapshot "$snapshot" || return $?
+  jq -e --arg snapshot "$snapshot" '
+    .counters == (
+      $snapshot | split(",") |
+      map(split("=") | {(.[0]): .[1]}) | add)
+  ' <<<"$payload" >/dev/null || return 1
+  printf '%s\n' "$payload"
+}
+
+validate_last_java_diagnostics_payload() {
+  local -r payload="$1"
+  local reference=""
+  local expected=""
+
+  validate_last_java_diagnostics_payload_structure "$payload" >/dev/null ||
+    return 1
+  reference="$(jq -er '.reference' <<<"$payload")" || return 1
   expected="$(java_diagnostics_reference_evidence_json "$reference")" || return 1
   jq -e --argjson expected "$expected" '
     .reference == $expected.reference and
@@ -16185,39 +19807,68 @@ validate_last_java_diagnostics_json() {
   validate_last_java_diagnostics_payload "$payload"
 }
 
-terminal_java_diagnostics_recovery_boundary_payload() {
-  local -r boundary="$RESULT_DIR/.terminal-java-diagnostics-recovery-boundary.json"
-  local envelope=""
+validate_terminal_java_diagnostics_recovery_envelope() {
+  local -r envelope="$1"
   local payload=""
   local metric_pair=""
 
-  envelope="$(read_bounded_single_line_regular_file \
-    "$boundary" "$OBI_TERMINAL_BOUNDARY_MAX_BYTES")" || return 1
   jq -e '
     keys == ["obi_metric_pair", "payload", "schema", "state"] and
     .schema == "obi-terminal-evidence-recovery-v2" and
     .state == "pending" and
     (.payload == null or (.payload | type == "object")) and
-    (.obi_metric_pair == null or
-      (.obi_metric_pair | keys == ["pair", "reference"]))
+    .obi_metric_pair == null
   ' <<<"$envelope" >/dev/null || return 1
   payload="$(jq -c '.payload' <<<"$envelope")" || return 1
   metric_pair="$(jq -c '.obi_metric_pair' <<<"$envelope")" || return 1
-  if [[ "$metric_pair" != null ]]; then
-    validate_last_terminal_boundary_payload "$(jq -cn \
-      --argjson metric_pair "$metric_pair" '
-        {
-          schema: "obi-terminal-boundary-v1",
-          java_payload: null,
-          obi_metric_pair: $metric_pair
-        }
-      ')" >/dev/null || return 1
-  fi
+  [[ "$metric_pair" == null ]] || return 1
   if [[ "$payload" == "null" ]]; then
-    printf 'null\n'
+    :
   else
-    validate_last_java_diagnostics_payload "$payload"
+    validate_last_java_diagnostics_payload_structure \
+      "$payload" >/dev/null || return 1
   fi
+  printf '%s\n' "$envelope"
+}
+
+validate_terminal_java_diagnostics_recovery_hardlink_payload() {
+  local -r observed_payload="$1"
+  local -r expected_payload="$3"
+
+  validate_terminal_java_diagnostics_recovery_envelope \
+    "$observed_payload" >/dev/null || return 1
+  [[ "$expected_payload" == __any__ ||
+    "$observed_payload" == "$expected_payload" ]]
+}
+
+normalize_terminal_java_diagnostics_recovery_boundary_residue() {
+  local -r expected_payload="${1:-__any__}"
+  local allow_h1_cleanup=false
+
+  if [[ "${TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER:-false}" == true ]]; then
+    allow_h1_cleanup=true
+  fi
+  normalize_terminal_owned_hardlink_family \
+    "$RESULT_DIR/.terminal-java-diagnostics-recovery-boundary.json" 600 \
+    "$OBI_TERMINAL_BOUNDARY_MAX_BYTES" "$allow_h1_cleanup" \
+    "$expected_payload" \
+    validate_terminal_java_diagnostics_recovery_hardlink_payload \
+    '^\.terminal-java-diagnostics-recovery-boundary\.[A-Za-z0-9]{6}$' \
+    "$RESULT_DIR/.terminal-java-diagnostics-recovery-boundary"
+}
+
+terminal_java_diagnostics_recovery_boundary_payload() {
+  local -r boundary="$RESULT_DIR/.terminal-java-diagnostics-recovery-boundary.json"
+  local envelope=""
+  local payload=""
+
+  normalize_terminal_java_diagnostics_recovery_boundary_residue || return $?
+  envelope="$(read_bounded_single_line_regular_file \
+    "$boundary" "$OBI_TERMINAL_BOUNDARY_MAX_BYTES")" || return 1
+  validate_terminal_java_diagnostics_recovery_envelope \
+    "$envelope" >/dev/null || return 1
+  payload="$(jq -c '.payload' <<<"$envelope")" || return 1
+  printf '%s\n' "$payload"
 }
 
 terminal_obi_metric_recovery_boundary_payload() {
@@ -16233,13 +19884,20 @@ terminal_obi_metric_recovery_boundary_payload() {
 }
 
 terminal_java_diagnostics_recovery_commit_is_valid() {
-  local -r transition="$RESULT_DIR/.terminal-java-diagnostics.freeze"
+  with_terminal_java_diagnostics_transition_publication_lock \
+    terminal_java_diagnostics_recovery_commit_is_valid_unlocked
+}
+
+validate_terminal_java_diagnostics_transition_payload() {
+  local -r payload="$1"
   local -r boundary="$RESULT_DIR/.terminal-java-diagnostics-recovery-boundary.json"
-  local payload=""
   local boundary_digest=""
   local expected_boundary_digest=""
 
-  payload="$(read_bounded_single_line_regular_file "$transition" 160)" || return 1
+  if [[ "$payload" == terminal-java-diagnostics-frozen-v1 ]]; then
+    printf 'frozen\n'
+    return 0
+  fi
   [[ "$payload" =~ ^terminal-java-diagnostics-recovery-committed-v1:([0-9a-f]{64})$ ]] ||
     return 1
   expected_boundary_digest="${BASH_REMATCH[1]}"
@@ -16249,20 +19907,64 @@ terminal_java_diagnostics_recovery_commit_is_valid() {
     boundary_digest="${boundary_digest%% *}"
     [[ "$boundary_digest" == "$expected_boundary_digest" ]] || return 1
   fi
+  printf 'committed\n'
 }
 
-terminal_java_diagnostics_transition_state() {
+validate_terminal_java_diagnostics_transition_hardlink_payload() {
+  local -r observed_payload="$1"
+  local -r candidate_basename="$2"
+  local -r expected_payload="$3"
+  local -r candidate_links="$4"
+  local state=""
+
+  state="$(
+    validate_terminal_java_diagnostics_transition_payload "$observed_payload"
+  )" || return 1
+  if [[ "$candidate_links" == 2 ]]; then
+    if [[ "$state" == frozen ]]; then
+      [[ "$candidate_basename" =~ \
+        ^\.terminal-java-diagnostics-freeze\.[A-Za-z0-9]{6}$ ]] || return 1
+    else
+      [[ "$candidate_basename" =~ \
+        ^\.terminal-java-diagnostics-recovery-commit\.[A-Za-z0-9]{6}$ ]] ||
+        return 1
+    fi
+  fi
+  [[ "$expected_payload" == __any__ ||
+    "$observed_payload" == "$expected_payload" ]]
+}
+
+# shellcheck disable=SC2120 # Tests also exercise exact-payload normalization.
+normalize_terminal_java_diagnostics_transition_residue_unlocked() {
+  local -r expected_payload="${1:-__any__}"
+
+  [[ "${TERMINAL_TRANSITION_PUBLICATION_LOCK_HELD_BY_CALLER:-false}" == true ]] ||
+    return 1
+  normalize_terminal_owned_hardlink_family \
+    "$RESULT_DIR/.terminal-java-diagnostics.freeze" 600 160 true \
+    "$expected_payload" \
+    validate_terminal_java_diagnostics_transition_hardlink_payload \
+    '^\.terminal-java-diagnostics-(freeze|recovery-commit)\.[A-Za-z0-9]{6}$' \
+    "$RESULT_DIR/.terminal-java-diagnostics-freeze" \
+    "$RESULT_DIR/.terminal-java-diagnostics-recovery-commit"
+}
+
+terminal_java_diagnostics_transition_state_unlocked() {
   local -r transition="$RESULT_DIR/.terminal-java-diagnostics.freeze"
   local payload=""
 
+  normalize_terminal_java_diagnostics_transition_residue_unlocked || return $?
   payload="$(read_bounded_single_line_regular_file "$transition" 160)" || return 1
-  if [[ "$payload" == "terminal-java-diagnostics-frozen-v1" ]]; then
-    printf 'frozen\n'
-  elif [[ "$payload" =~ ^terminal-java-diagnostics-recovery-committed-v1:[0-9a-f]{64}$ ]]; then
-    printf 'committed\n'
-  else
-    return 1
-  fi
+  validate_terminal_java_diagnostics_transition_payload "$payload"
+}
+
+terminal_java_diagnostics_transition_state() {
+  with_terminal_java_diagnostics_transition_publication_lock \
+    terminal_java_diagnostics_transition_state_unlocked
+}
+
+terminal_java_diagnostics_recovery_commit_is_valid_unlocked() {
+  [[ "$(terminal_java_diagnostics_transition_state_unlocked)" == committed ]]
 }
 
 terminal_java_diagnostics_transition_is_valid() {
@@ -16274,28 +19976,18 @@ capture_terminal_java_diagnostics_recovery_boundary_unlocked() {
   local -r metric_terminal="$RESULT_DIR/terminal-obi-metrics.json"
   local -r freeze="$RESULT_DIR/.terminal-java-diagnostics.freeze"
   local -r last="$RESULT_DIR/.last-valid-java-diagnostics.json"
-  local -r last_boundary="$RESULT_DIR/.last-valid-terminal-boundary.json"
   local -r boundary="$RESULT_DIR/.terminal-java-diagnostics-recovery-boundary.json"
   local payload="null"
   local metric_pair="null"
-  local last_boundary_payload=""
   local envelope=""
-  local candidate=""
-  local publication_status=0
 
   [[ -d "$RESULT_DIR" && ! -L "$RESULT_DIR" &&
     ! -e "$terminal" && ! -L "$terminal" &&
     ! -e "$metric_terminal" && ! -L "$metric_terminal" &&
     ! -e "$freeze" && ! -L "$freeze" &&
-    ! -e "$boundary" && ! -L "$boundary" ]] || return 1
-  if [[ -e "$last_boundary" || -L "$last_boundary" ]]; then
-    last_boundary_payload="$(
-      validate_last_terminal_boundary_json "$last_boundary"
-    )" || return 1
-    payload="$(jq -c '.java_payload' <<<"$last_boundary_payload")" || return 1
-    metric_pair="$(jq -c '.obi_metric_pair' <<<"$last_boundary_payload")" ||
-      return 1
-  elif [[ -e "$last" || -L "$last" ]]; then
+    "${TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER:-false}" == true &&
+    "${TERMINAL_EVIDENCE_LOCK_ENTRY_FROZEN:-}" == false ]] || return 1
+  if [[ -e "$last" || -L "$last" ]]; then
     payload="$(validate_last_java_diagnostics_json "$last")" || return 1
   fi
   envelope="$(jq -cn \
@@ -16308,29 +20000,23 @@ capture_terminal_java_diagnostics_recovery_boundary_unlocked() {
       obi_metric_pair: $metric_pair
     }
   ')" || return 1
-  candidate="$(mktemp \
-    "$RESULT_DIR/.terminal-java-diagnostics-recovery-boundary.XXXXXX")" ||
+  normalize_terminal_java_diagnostics_recovery_boundary_residue __any__ ||
     return $?
-  if printf '%s\n' "$envelope" >"$candidate" &&
-    chmod 0600 -- "$candidate"; then
-    :
-  else
-    publication_status=$?
-    rm -f -- "$candidate" || true
-    return "$publication_status"
+  if [[ -e "$boundary" || -L "$boundary" ]]; then
+    terminal_java_diagnostics_recovery_boundary_payload >/dev/null || return 1
+    terminal_obi_metric_recovery_boundary_payload >/dev/null
+    return $?
   fi
-  if ln -T -- "$candidate" "$boundary"; then
-    :
-  else
-    publication_status=$?
-    rm -f -- "$candidate" || true
-    return "$publication_status"
-  fi
-  if ! rm -f -- "$candidate"; then
-    return 1
-  fi
-  [[ "$(terminal_java_diagnostics_recovery_boundary_payload)" == "$payload" &&
-    "$(terminal_obi_metric_recovery_boundary_payload)" == "$metric_pair" ]]
+  publish_terminal_owned_hardlink_payload \
+    "$boundary" \
+    "$RESULT_DIR/.terminal-java-diagnostics-recovery-boundary" \
+    '^\.terminal-java-diagnostics-recovery-boundary\.[A-Za-z0-9]{6}$' \
+    '^\.terminal-java-diagnostics-recovery-boundary\.[A-Za-z0-9]{6}$' \
+    600 "$OBI_TERMINAL_BOUNDARY_MAX_BYTES" "$envelope" \
+    validate_terminal_java_diagnostics_recovery_hardlink_payload true \
+    "$RESULT_DIR/.terminal-java-diagnostics-recovery-boundary" || return $?
+  terminal_java_diagnostics_recovery_boundary_payload >/dev/null || return 1
+  terminal_obi_metric_recovery_boundary_payload >/dev/null
 }
 
 capture_terminal_java_diagnostics_recovery_boundary() {
@@ -16338,50 +20024,42 @@ capture_terminal_java_diagnostics_recovery_boundary() {
     capture_terminal_java_diagnostics_recovery_boundary_unlocked
 }
 
-commit_terminal_java_diagnostics_recovery_boundary_unlocked() {
+commit_terminal_java_diagnostics_recovery_boundary_publication_unlocked() {
   local -r terminal="$RESULT_DIR/terminal-java-diagnostics.json"
   local -r metric_terminal="$RESULT_DIR/terminal-obi-metrics.json"
   local -r freeze="$RESULT_DIR/.terminal-java-diagnostics.freeze"
   local -r boundary="$RESULT_DIR/.terminal-java-diagnostics-recovery-boundary.json"
-  local candidate=""
   local boundary_digest=""
-  local publication_status=0
+  local payload=""
 
   [[ -d "$RESULT_DIR" && ! -L "$RESULT_DIR" &&
     ! -e "$terminal" && ! -L "$terminal" &&
     ! -e "$metric_terminal" && ! -L "$metric_terminal" &&
-    ! -e "$freeze" && ! -L "$freeze" &&
-    -e "$boundary" && ! -L "$boundary" ]] || return 1
+    -e "$boundary" && ! -L "$boundary" &&
+    "${TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER:-false}" == true &&
+    ( "${TERMINAL_EVIDENCE_LOCK_ENTRY_FROZEN:-}" == false ||
+      ( "${TERMINAL_EVIDENCE_LOCK_ENTRY_FROZEN:-}" == true &&
+        -e "$freeze" && ! -L "$freeze" ) ) &&
+    "${TERMINAL_TRANSITION_PUBLICATION_LOCK_HELD_BY_CALLER:-false}" == true ]] ||
+    return 1
   terminal_java_diagnostics_recovery_boundary_payload >/dev/null || return $?
   boundary_digest="$(sha256sum "$boundary")" || return $?
   boundary_digest="${boundary_digest%% *}"
-  candidate="$(mktemp \
-    "$RESULT_DIR/.terminal-java-diagnostics-recovery-commit.XXXXXX")" ||
-    return $?
-  if printf 'terminal-java-diagnostics-recovery-committed-v1:%s\n' \
-    "$boundary_digest" >"$candidate" &&
-    chmod 0600 -- "$candidate"; then
-    :
-  else
-    publication_status=$?
-    rm -f -- "$candidate" || true
-    return "$publication_status"
-  fi
-  if ln -T -- "$candidate" "$freeze"; then
-    :
-  else
-    publication_status=$?
-    rm -f -- "$candidate" || true
-    if [[ -e "$freeze" || -L "$freeze" ]] &&
-      terminal_java_diagnostics_recovery_commit_is_valid; then
-      return 0
-    fi
-    return "$publication_status"
-  fi
-  if ! rm -f -- "$candidate"; then
-    return 1
-  fi
-  terminal_java_diagnostics_recovery_commit_is_valid
+  payload="terminal-java-diagnostics-recovery-committed-v1:$boundary_digest"
+  publish_terminal_owned_hardlink_payload \
+    "$freeze" "$RESULT_DIR/.terminal-java-diagnostics-recovery-commit" \
+    '^\.terminal-java-diagnostics-recovery-commit\.[A-Za-z0-9]{6}$' \
+    '^\.terminal-java-diagnostics-(freeze|recovery-commit)\.[A-Za-z0-9]{6}$' \
+    600 160 "$payload" \
+    validate_terminal_java_diagnostics_transition_hardlink_payload true \
+    "$RESULT_DIR/.terminal-java-diagnostics-freeze" \
+    "$RESULT_DIR/.terminal-java-diagnostics-recovery-commit" || return $?
+  terminal_java_diagnostics_recovery_commit_is_valid_unlocked
+}
+
+commit_terminal_java_diagnostics_recovery_boundary_unlocked() {
+  with_terminal_java_diagnostics_transition_publication_lock \
+    commit_terminal_java_diagnostics_recovery_boundary_publication_unlocked
 }
 
 commit_terminal_java_diagnostics_recovery_boundary() {
@@ -16389,20 +20067,44 @@ commit_terminal_java_diagnostics_recovery_boundary() {
     commit_terminal_java_diagnostics_recovery_boundary_unlocked
 }
 
-clear_terminal_java_diagnostics_recovery_boundary_unlocked() {
+clear_terminal_java_diagnostics_recovery_boundary_publication_unlocked() {
   local -r boundary="$RESULT_DIR/.terminal-java-diagnostics-recovery-boundary.json"
   local -r transition="$RESULT_DIR/.terminal-java-diagnostics.freeze"
 
+  local boundary_identity=""
+  local transition_identity=""
+
   [[ -d "$RESULT_DIR" && ! -L "$RESULT_DIR" &&
-    -e "$transition" && ! -L "$transition" ]] || return 1
-  terminal_java_diagnostics_recovery_commit_is_valid || return $?
+    "${TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER:-false}" == true &&
+    "${TERMINAL_TRANSITION_PUBLICATION_LOCK_HELD_BY_CALLER:-false}" == true ]] ||
+    return 1
+  normalize_terminal_java_diagnostics_recovery_boundary_residue __any__ ||
+    return $?
+  normalize_terminal_java_diagnostics_transition_residue_unlocked || return $?
+  if [[ ! -e "$boundary" && ! -L "$boundary" &&
+    ! -e "$transition" && ! -L "$transition" ]]; then
+    return 0
+  fi
+  [[ -e "$transition" && ! -L "$transition" ]] || return 1
+  terminal_java_diagnostics_recovery_commit_is_valid_unlocked || return $?
   if [[ -e "$boundary" || -L "$boundary" ]]; then
     terminal_java_diagnostics_recovery_boundary_payload >/dev/null || return $?
-    rm -f -- "$boundary" || return $?
+    boundary_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$boundary")" ||
+      return 1
+    remove_terminal_owned_private_path \
+      "$boundary" "$boundary_identity" || return $?
   fi
-  rm -f -- "$transition" || return $?
+  transition_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$transition")" ||
+    return 1
+  remove_terminal_owned_private_path \
+    "$transition" "$transition_identity" || return $?
   [[ ! -e "$boundary" && ! -L "$boundary" &&
     ! -e "$transition" && ! -L "$transition" ]]
+}
+
+clear_terminal_java_diagnostics_recovery_boundary_unlocked() {
+  with_terminal_java_diagnostics_transition_publication_lock \
+    clear_terminal_java_diagnostics_recovery_boundary_publication_unlocked
 }
 
 clear_terminal_java_diagnostics_recovery_boundary() {
@@ -16410,15 +20112,12 @@ clear_terminal_java_diagnostics_recovery_boundary() {
     clear_terminal_java_diagnostics_recovery_boundary_unlocked
 }
 
-terminal_java_diagnostics_json() {
-  local -r terminal="$RESULT_DIR/terminal-java-diagnostics.json"
-  local payload=""
+validate_terminal_java_diagnostics_payload() {
+  local -r payload="$1"
   local reference=""
   local phase=""
   local expected=""
 
-  payload="$(read_bounded_single_line_regular_file \
-    "$terminal" "$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES")" || return 1
   if jq -e '
     keys == ["available", "reason", "schema", "sealed"] and
     .schema == "obi-java-bridge-terminal-diagnostics-v1" and
@@ -16453,15 +20152,338 @@ terminal_java_diagnostics_json() {
   printf '%s\n' "$payload"
 }
 
-terminal_obi_metrics_json() {
-  local -r terminal="$RESULT_DIR/terminal-obi-metrics.json"
+validate_terminal_java_diagnostics_hardlink_payload() {
+  local -r observed_payload="$1"
+  local -r expected_payload="$3"
+
+  validate_terminal_java_diagnostics_payload "$observed_payload" >/dev/null ||
+    return 1
+  [[ "$expected_payload" == __any__ ||
+    "$observed_payload" == "$expected_payload" ]]
+}
+
+normalize_legacy_terminal_java_diagnostics_candidate_residue() {
+  local -r terminal="$RESULT_DIR/terminal-java-diagnostics.json"
+  local candidate=""
+  local name=""
+  local path=""
+  local candidate_identity=""
+  local terminal_identity=""
   local payload=""
-  local pair_reference=""
-  local pair=""
-  local expected_pair=""
+  local candidate_device=""
+  local candidate_inode=""
+  local candidate_owner=""
+  local candidate_mode=""
+  local candidate_links=""
+  local -a candidates=()
+
+  [[ "${TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER:-false}" == true &&
+    -d "$RESULT_DIR" && ! -L "$RESULT_DIR" ]] || return 1
+  for path in "$RESULT_DIR"/.terminal-java-diagnostics.*; do
+    [[ -e "$path" || -L "$path" ]] || continue
+    name="${path##*/}"
+    case "$name" in
+      .terminal-java-diagnostics.lock|\
+      .terminal-java-diagnostics-transition.lock|\
+      .terminal-java-diagnostics.freeze|\
+      .terminal-java-diagnostics-recovery-boundary.json)
+        ;;
+      .terminal-java-diagnostics.[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9])
+        [[ "$name" =~ ^\.terminal-java-diagnostics\.[A-Za-z0-9]{6}$ ]] ||
+          return 1
+        candidates+=("$path")
+        ;;
+      .terminal-java-diagnostics-output.*)
+        [[ "$name" =~ \
+          ^\.terminal-java-diagnostics-output\.[A-Za-z0-9]{6}$ ]] ||
+          return 1
+        ;;
+      .terminal-java-diagnostics-freeze.*)
+        [[ "$name" =~ \
+          ^\.terminal-java-diagnostics-freeze\.[A-Za-z0-9]{6}$ ]] ||
+          return 1
+        ;;
+      .terminal-java-diagnostics-recovery-commit.*)
+        [[ "$name" =~ \
+          ^\.terminal-java-diagnostics-recovery-commit\.[A-Za-z0-9]{6}$ ]] ||
+          return 1
+        ;;
+      .terminal-java-diagnostics-recovery-boundary.*)
+        [[ "$name" =~ \
+          ^\.terminal-java-diagnostics-recovery-boundary\.[A-Za-z0-9]{6}$ ]] ||
+          return 1
+        ;;
+      *) return 1 ;;
+    esac
+  done
+  ((${#candidates[@]} <= 1)) || return 1
+  ((${#candidates[@]} == 1)) || return 0
+  candidate="${candidates[0]}"
+  [[ -f "$candidate" && ! -L "$candidate" ]] || return 1
+  candidate_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$candidate")" ||
+    return 1
+  IFS=: read -r candidate_device candidate_inode candidate_owner \
+    candidate_mode candidate_links <<<"$candidate_identity"
+  [[ -n "$candidate_device" && -n "$candidate_inode" &&
+    "$candidate_owner" == "$(id -u)" ]] || return 1
+  if [[ ( "$candidate_mode" == 600 || "$candidate_mode" == 644 ) &&
+    "$candidate_links" == 1 ]]; then
+    remove_terminal_owned_private_path \
+      "$candidate" "$candidate_identity"
+    return $?
+  fi
+  [[ "$candidate_mode" == 644 && "$candidate_links" == 2 &&
+    -f "$terminal" && ! -L "$terminal" && "$candidate" -ef "$terminal" ]] ||
+    return 1
+  terminal_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$terminal")" ||
+    return 1
+  [[ "$terminal_identity" == "$candidate_identity" ]] || return 1
+  payload="$(read_bounded_single_line_owned_regular_file \
+    "$terminal" "$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES" 644 2)" || return 1
+  validate_terminal_java_diagnostics_payload "$payload" >/dev/null ||
+    return 1
+  remove_terminal_owned_hardlink_handle \
+    "$candidate" "$terminal" "$terminal_identity"
+}
+
+normalize_terminal_java_diagnostics_residue() {
+  local -r expected_payload="$1"
+  local allow_h1_cleanup=false
+
+  if [[ "${TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER:-false}" == true &&
+    "${TERMINAL_EVIDENCE_LOCK_ENTRY_FROZEN:-}" == true ]]; then
+    allow_h1_cleanup=true
+  fi
+  normalize_legacy_terminal_java_diagnostics_candidate_residue || return $?
+  normalize_terminal_owned_hardlink_family \
+    "$RESULT_DIR/terminal-java-diagnostics.json" 644 \
+    "$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES" "$allow_h1_cleanup" \
+    "$expected_payload" validate_terminal_java_diagnostics_hardlink_payload \
+    '^\.terminal-java-diagnostics-output\.[A-Za-z0-9]{6}$' \
+    "$RESULT_DIR/.terminal-java-diagnostics-output"
+}
+
+terminal_java_diagnostics_json() {
+  local -r terminal="$RESULT_DIR/terminal-java-diagnostics.json"
+  local payload=""
 
   payload="$(read_bounded_single_line_regular_file \
-    "$terminal" "$OBI_METRIC_PAIR_MAX_BYTES")" || return 1
+    "$terminal" "$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES")" || return 1
+  validate_terminal_java_diagnostics_payload "$payload"
+}
+
+terminal_java_diagnostics_payload_from_frozen_index() {
+  local index_payload=""
+  local active_boundary_id=""
+  local reference=""
+  local phase=""
+  local evidence=""
+
+  if obi_metric_boundary_journal_paths_are_cleanly_absent; then
+    printf 'null\n'
+    return 0
+  fi
+  obi_metric_boundary_index_freeze_payload >/dev/null || return 1
+  if [[ -n "$OBI_METRIC_BOUNDARY_FROZEN_PAYLOAD" ]]; then
+    index_payload="$OBI_METRIC_BOUNDARY_FROZEN_PAYLOAD"
+  else
+    index_payload="$(obi_metric_boundary_index_payload full)" || return 1
+  fi
+  active_boundary_id="$(jq -r '
+    [.boundaries[] | select(.state == "active") | .id] |
+    if length == 0 then "" elif length == 1 then .[0]
+    else error("multiple active boundaries") end
+  ' <<<"$index_payload")" || return 1
+  if [[ -z "$active_boundary_id" ]]; then
+    # Java-only recovery remains independent of metric attribution. Returning
+    # null permits the existing last-valid Java checkpoint, but the v2 metric
+    # terminal below still records no-active-boundary and can never reuse a
+    # completed boundary's pair.
+    printf 'null\n'
+    return 0
+  fi
+  reference="$(jq -r --arg boundary_id "$active_boundary_id" '
+    [.boundaries[] | select(.id == $boundary_id) | .captures][0] as $captures |
+    [$captures | to_entries[] | select(.value.kind == "pair")] as $pairs |
+    if ($pairs | length) == 0 then
+      [$captures[] | select(.kind == "java" and .state == "captured") |
+        .reference] | if length == 0 then "" else .[-1] end
+    elif $pairs[-1].value.state == "captured" then
+      ($pairs[-1].value.java_reference // "")
+    else
+      [$captures | to_entries[] |
+        select(.key > $pairs[-1].key and .value.kind == "java" and
+          .value.state == "captured") | .value.reference] |
+      if length == 0 then "" else .[-1] end
+    end
+  ' <<<"$index_payload")" || return 1
+  if [[ -z "$reference" ]]; then
+    jq -cnS '
+      {
+        schema: "obi-java-bridge-terminal-diagnostics-v1",
+        sealed: true,
+        available: false,
+        reason: "no-valid-snapshot-before-terminal-boundary"
+      }
+    '
+    return $?
+  fi
+  phase="$(java_diagnostics_reference_phase "$reference")" || return 1
+  evidence="$(java_diagnostics_reference_evidence_json "$reference")" || return 1
+  jq -cnS --arg phase "$phase" --argjson evidence "$evidence" '
+    $evidence + {
+      schema: "obi-java-bridge-terminal-diagnostics-v1",
+      sealed: true,
+      available: true,
+      phase: $phase
+    }
+  '
+}
+
+terminal_obi_metrics_payload_from_frozen_index() {
+  local freeze_payload=""
+  local index_payload=""
+  local index_digest=""
+  local active_boundary_id=""
+  local pair_state=""
+  local pair_reference=""
+  local pair=""
+
+  if obi_metric_boundary_journal_paths_are_cleanly_absent; then
+    jq -cnS '
+      {
+        schema: "obi-java-remote-parent-terminal-metrics-v1",
+        sealed: true,
+        available: false,
+        reason: "no-valid-pair-before-terminal-boundary"
+      }
+    '
+    return $?
+  fi
+  freeze_payload="$(obi_metric_boundary_index_freeze_payload)" || return 1
+  index_digest="${freeze_payload##*:}"
+  if [[ -n "$OBI_METRIC_BOUNDARY_FROZEN_PAYLOAD" ]]; then
+    index_payload="$OBI_METRIC_BOUNDARY_FROZEN_PAYLOAD"
+  else
+    index_payload="$(obi_metric_boundary_index_payload full)" || return 1
+  fi
+  active_boundary_id="$(jq -r '
+    [.boundaries[] | select(.state == "active") | .id] |
+    if length == 0 then "" elif length == 1 then .[0]
+    else error("multiple active boundaries") end
+  ' <<<"$index_payload")" || return 1
+  if [[ -z "$active_boundary_id" ]]; then
+    jq -cnS \
+      --arg index_reference 'obi-metric-boundary-index.json' \
+      --arg index_digest "$index_digest" '
+        {
+          schema: "obi-java-remote-parent-terminal-metrics-v2",
+          sealed: true,
+          available: false,
+          reason: "no-active-boundary",
+          active_boundary_id: null,
+          boundary_index_reference: $index_reference,
+          boundary_index_sha256: $index_digest
+        }
+      '
+    return $?
+  fi
+  pair_state="$(jq -r --arg boundary_id "$active_boundary_id" '
+    [.boundaries[] | select(.id == $boundary_id) | .captures[] |
+      select(.kind == "pair") | .state] |
+    if length == 0 then "none" else .[-1] end
+  ' <<<"$index_payload")" || return 1
+  if [[ "$pair_state" != captured ]]; then
+    jq -cnS \
+      --arg active_boundary_id "$active_boundary_id" \
+      --arg index_reference 'obi-metric-boundary-index.json' \
+      --arg index_digest "$index_digest" '
+        {
+          schema: "obi-java-remote-parent-terminal-metrics-v2",
+          sealed: true,
+          available: false,
+          reason: "active-boundary-incomplete",
+          active_boundary_id: $active_boundary_id,
+          boundary_index_reference: $index_reference,
+          boundary_index_sha256: $index_digest
+        }
+      '
+    return $?
+  fi
+  pair_reference="$(jq -er --arg boundary_id "$active_boundary_id" '
+    [.boundaries[] | select(.id == $boundary_id) | .captures[] |
+      select(.kind == "pair")][-1].pair_reference
+  ' <<<"$index_payload")" || return 1
+  pair="$(obi_metric_pair_payload_from_reference "$pair_reference")" || return 1
+  jq -cnS \
+    --arg active_boundary_id "$active_boundary_id" \
+    --arg index_reference 'obi-metric-boundary-index.json' \
+    --arg index_digest "$index_digest" \
+    --arg pair_reference "$pair_reference" \
+    --argjson pair "$pair" '
+      {
+        schema: "obi-java-remote-parent-terminal-metrics-v2",
+        sealed: true,
+        available: true,
+        active_boundary_id: $active_boundary_id,
+        boundary_index_reference: $index_reference,
+        boundary_index_sha256: $index_digest,
+        pair_reference: $pair_reference,
+        pair: $pair
+      }
+    '
+}
+
+validate_terminal_obi_metrics_payload() {
+  local -r payload="$1"
+  local pair_reference=""
+  local expected_pair=""
+
+  if jq -e '
+    .schema == "obi-java-remote-parent-terminal-metrics-v2"
+  ' <<<"$payload" >/dev/null; then
+    if jq -e '
+      keys == [
+        "active_boundary_id", "available", "boundary_index_reference",
+        "boundary_index_sha256", "reason", "schema", "sealed"
+      ] and
+      .schema == "obi-java-remote-parent-terminal-metrics-v2" and
+      .sealed == true and .available == false and
+      (.active_boundary_id == null or
+        (.active_boundary_id | type == "string" and
+          test("^[a-z0-9][a-z0-9-]{0,63}$"))) and
+      ((.reason == "no-active-boundary" and .active_boundary_id == null) or
+        (.reason == "active-boundary-incomplete" and
+          (.active_boundary_id | type == "string"))) and
+      .boundary_index_reference == "obi-metric-boundary-index.json" and
+      (.boundary_index_sha256 | type == "string" and test("^[0-9a-f]{64}$"))
+    ' <<<"$payload" >/dev/null; then
+      [[ "$payload" == "$(terminal_obi_metrics_payload_from_frozen_index)" ]] ||
+        return 1
+      printf '%s\n' "$payload"
+      return 0
+    fi
+    jq -e '
+      keys == [
+        "active_boundary_id", "available", "boundary_index_reference",
+        "boundary_index_sha256", "pair", "pair_reference", "schema", "sealed"
+      ] and
+      .schema == "obi-java-remote-parent-terminal-metrics-v2" and
+      .sealed == true and .available == true and
+      (.active_boundary_id | type == "string" and
+        test("^[a-z0-9][a-z0-9-]{0,63}$")) and
+      .boundary_index_reference == "obi-metric-boundary-index.json" and
+      (.boundary_index_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+      (.pair_reference | type == "string") and (.pair | type == "object")
+    ' <<<"$payload" >/dev/null || return 1
+    [[ "$payload" == "$(terminal_obi_metrics_payload_from_frozen_index)" ]] ||
+      return 1
+    printf '%s\n' "$payload"
+    return 0
+  fi
+  # Legacy v1 terminals are readable only for pre-journal evidence. A current
+  # run with an initialized journal must bind the frozen index through v2.
+  obi_metric_boundary_journal_paths_are_cleanly_absent || return 1
   if jq -e '
     keys == ["available", "reason", "schema", "sealed"] and
     .schema == "obi-java-remote-parent-terminal-metrics-v1" and
@@ -16481,233 +20503,359 @@ terminal_obi_metrics_json() {
     (.pair | type == "object")
   ' <<<"$payload" >/dev/null || return 1
   pair_reference="$(jq -er '.pair_reference' <<<"$payload")" || return 1
-  pair="$(jq -c '.pair' <<<"$payload")" || return 1
   expected_pair="$(obi_metric_pair_payload_from_reference "$pair_reference")" ||
     return 1
-  [[ "$pair" == "$expected_pair" ]] || return 1
-  validate_obi_metric_pair_payload "$pair" >/dev/null || return 1
+  jq -e --argjson expected_pair "$expected_pair" \
+    '.pair == $expected_pair' <<<"$payload" >/dev/null || return 1
+  validate_obi_metric_pair_payload "$expected_pair" >/dev/null || return 1
   printf '%s\n' "$payload"
 }
 
-normalize_terminal_obi_metrics_owned_handle() {
-  local -r terminal="$RESULT_DIR/terminal-obi-metrics.json"
-  local handle=""
-  local path=""
-  local terminal_identity=""
-  local handle_identity=""
-  local -a handles=()
+validate_terminal_obi_metrics_hardlink_payload() {
+  local -r observed_payload="$1"
+  local -r expected_payload="$3"
 
-  [[ -d "$RESULT_DIR" && ! -L "$RESULT_DIR" &&
-    -f "$terminal" && ! -L "$terminal" ]] || return 1
-  for path in "$RESULT_DIR"/.terminal-obi-metrics.*; do
-    if [[ -e "$path" || -L "$path" ]]; then
-      handles+=("$path")
-    fi
-  done
-  ((${#handles[@]} == 1)) || return 1
-  handle="${handles[0]}"
-  [[ -f "$handle" && ! -L "$handle" && "$handle" -ef "$terminal" ]] ||
+  validate_terminal_obi_metrics_payload "$observed_payload" >/dev/null ||
     return 1
-  terminal_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$terminal")" ||
-    return 1
-  handle_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$handle")" || return 1
-  [[ "$terminal_identity" == "$handle_identity" &&
-    "$terminal_identity" == *":$(id -u):644:2" ]] || return 1
-  rm -f -- "$handle" || return $?
-  [[ "$(stat -Lc '%d:%i:%u:%a:%h' -- "$terminal")" == \
-    "${terminal_identity%:2}:1" ]] || return 1
-  terminal_obi_metrics_json >/dev/null
+  [[ "$expected_payload" == __any__ ||
+    "$observed_payload" == "$expected_payload" ]]
+}
+
+normalize_terminal_obi_metrics_residue() {
+  local -r expected_payload="$1"
+  local allow_h1_cleanup=false
+
+  if [[ "${TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER:-false}" == true &&
+    "${TERMINAL_EVIDENCE_LOCK_ENTRY_FROZEN:-}" == true ]]; then
+    allow_h1_cleanup=true
+  fi
+  normalize_terminal_owned_hardlink_family \
+    "$RESULT_DIR/terminal-obi-metrics.json" 644 "$OBI_METRIC_PAIR_MAX_BYTES" \
+    "$allow_h1_cleanup" "$expected_payload" \
+    validate_terminal_obi_metrics_hardlink_payload \
+    '^\.terminal-obi-metrics\.[A-Za-z0-9]{6}$' \
+    "$RESULT_DIR/.terminal-obi-metrics"
+}
+
+terminal_obi_metrics_json() {
+  local -r terminal="$RESULT_DIR/terminal-obi-metrics.json"
+  local payload=""
+
+  payload="$(read_bounded_single_line_regular_file \
+    "$terminal" "$OBI_METRIC_PAIR_MAX_BYTES")" || return 1
+  validate_terminal_obi_metrics_payload "$payload"
 }
 
 seal_terminal_obi_metrics_unlocked() {
   local -r terminal="$RESULT_DIR/terminal-obi-metrics.json"
-  local -r last_boundary="$RESULT_DIR/.last-valid-terminal-boundary.json"
-  local metric_pair="${1:-}"
-  local last_payload=""
-  local pair_reference=""
-  local pair=""
   local payload=""
+
+  [[ -d "$RESULT_DIR" && ! -L "$RESULT_DIR" &&
+    "${TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER:-false}" == true &&
+    "${TERMINAL_EVIDENCE_LOCK_ENTRY_FROZEN:-}" == true ]] || return 1
+  payload="$(terminal_obi_metrics_payload_from_frozen_index)" || return 1
+  publish_terminal_owned_hardlink_payload \
+    "$terminal" "$RESULT_DIR/.terminal-obi-metrics" \
+    '^\.terminal-obi-metrics\.[A-Za-z0-9]{6}$' \
+    '^\.terminal-obi-metrics\.[A-Za-z0-9]{6}$' \
+    644 "$OBI_METRIC_PAIR_MAX_BYTES" "$payload" \
+    validate_terminal_obi_metrics_hardlink_payload true \
+    "$RESULT_DIR/.terminal-obi-metrics" || return $?
+  [[ "$(terminal_obi_metrics_json)" == "$payload" ]]
+}
+
+obi_metric_boundary_index_freeze_payload() {
+  local -r freeze="$RESULT_DIR/.obi-metric-boundary-index.freeze"
+  local -r index="$RESULT_DIR/obi-metric-boundary-index.json"
+  local payload=""
+  local expected_digest=""
+  local observed_digest=""
+  local path=""
+
+  for path in "$RESULT_DIR"/.obi-metric-boundary-index-freeze.*; do
+    [[ ! -e "$path" && ! -L "$path" ]] || return 1
+  done
+  [[ -f "$freeze" && ! -L "$freeze" &&
+    "$(stat -Lc '%u:%a:%h' -- "$freeze")" == "$(id -u):600:1" ]] ||
+    return 1
+  [[ -f "$index" && ! -L "$index" &&
+    "$(stat -Lc '%u:%a:%h' -- "$index")" == "$(id -u):644:1" ]] ||
+    return 1
+  payload="$(read_bounded_single_line_regular_file "$freeze" 160)" || return 1
+  [[ "$payload" =~ ^obi-metric-boundary-index-frozen-v1:([0-9a-f]{64})$ ]] ||
+    return 1
+  expected_digest="${BASH_REMATCH[1]}"
+  observed_digest="$(sha256sum "$(obi_metric_boundary_index_path)")" || return 1
+  observed_digest="${observed_digest%% *}"
+  [[ "$observed_digest" == "$expected_digest" ]] || return 1
+  if [[ -z "$OBI_METRIC_BOUNDARY_FROZEN_PAYLOAD" ||
+    "$OBI_METRIC_BOUNDARY_FROZEN_SHA256" != "$expected_digest" ]]; then
+    OBI_METRIC_BOUNDARY_FROZEN_PAYLOAD="$(
+      obi_metric_boundary_index_payload full
+    )" || return 1
+    OBI_METRIC_BOUNDARY_FROZEN_SHA256="$expected_digest"
+  fi
+  printf '%s\n' "$payload"
+}
+
+normalize_obi_metric_boundary_index_freeze_owned_handle() {
+  local -r freeze="$RESULT_DIR/.obi-metric-boundary-index.freeze"
+  local handle=""
+  local path=""
+  local freeze_identity=""
+  local handle_identity=""
+  local removal_status=0
+  local attempt=0
+  local -a handles=()
+
+  [[ -f "$freeze" && ! -L "$freeze" ]] || return 1
+  for path in "$RESULT_DIR"/.obi-metric-boundary-index-freeze.*; do
+    [[ -e "$path" || -L "$path" ]] && handles+=("$path")
+  done
+  ((${#handles[@]} == 1)) || return 1
+  handle="${handles[0]}"
+  [[ -f "$handle" && ! -L "$handle" && "$handle" -ef "$freeze" ]] ||
+    return 1
+  freeze_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$freeze")" || return 1
+  handle_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$handle")" || return 1
+  [[ "$freeze_identity" == "$handle_identity" &&
+    "$freeze_identity" == *":$(id -u):600:2" ]] || return 1
+  for attempt in 1 2 3; do
+    if rm -f -- "$handle"; then
+      removal_status=0
+      break
+    else
+      removal_status=$?
+    fi
+    [[ ! -e "$handle" && ! -L "$handle" ]] && break
+    [[ -f "$handle" && ! -L "$handle" && "$handle" -ef "$freeze" &&
+      "$(stat -Lc '%d:%i:%u:%a:%h' -- "$handle")" == "$freeze_identity" ]] ||
+      return 1
+  done
+  [[ ! -e "$handle" && ! -L "$handle" ]] || return "$removal_status"
+  [[ "$(stat -Lc '%d:%i:%u:%a:%h' -- "$freeze")" == \
+    "${freeze_identity%:2}:1" ]] || return 1
+  obi_metric_boundary_index_freeze_payload >/dev/null
+}
+
+freeze_obi_metric_boundary_index_unlocked() {
+  local -r freeze="$RESULT_DIR/.obi-metric-boundary-index.freeze"
+  local index=""
+  local index_payload=""
+  local digest=""
   local candidate=""
+  local candidate_name=""
+  local candidate_inode=""
   local candidate_identity=""
   local candidate_digest=""
-  local size=""
+  local freeze_published=false
   local publication_status=0
-  local cleanup_status=0
-  local terminal_published=false
+  local path=""
+  local attempt=0
 
-  (($# <= 1)) || return 1
-  [[ -d "$RESULT_DIR" && ! -L "$RESULT_DIR" ]] || return 1
-  if [[ -e "$terminal" || -L "$terminal" ]]; then
-    if terminal_obi_metrics_json >/dev/null; then
-      return 0
-    fi
-    normalize_terminal_obi_metrics_owned_handle
+  index="$(obi_metric_boundary_index_path)" || return 1
+  [[ -d "$RESULT_DIR" && ! -L "$RESULT_DIR" &&
+    "${TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER:-false}" == true ]] || return 1
+  obi_metric_capture_stage_paths_are_cleanly_absent || return 1
+  normalize_obi_phase_publication_candidates_before_freeze || return $?
+  normalize_terminal_java_phase_and_last_candidates_before_freeze || return $?
+  # Initialization owns this scratch family under the same journal lock.  It
+  # must be normalized before deciding whether the journal is cleanly absent;
+  # otherwise an interrupted first plan write can permanently block the
+  # deterministic pre-index failure seal.
+  normalize_obi_owned_private_candidate_residue \
+    "$RESULT_DIR/.obi-metric-boundary-plan" \
+    '^\.obi-metric-boundary-plan\.[A-Za-z0-9]{6}$' '^600$' || return $?
+  if [[ ! -e "$index" && ! -L "$index" &&
+    ! -e "$freeze" && ! -L "$freeze" ]]; then
+    # A clean pre-index failure still needs deterministic Java/metric terminal
+    # evidence and run-status-v2. Normalize the sole publisher candidate that
+    # an interrupted initialization may own, then refuse every other partial
+    # journal shape instead of downgrading it to legacy evidence.
+    normalize_obi_owned_private_candidate_residue \
+      "$RESULT_DIR/.obi-metric-boundary-index" \
+      '^\.obi-metric-boundary-index\.[A-Za-z0-9]{6}$' '^(600|644)$' ||
+      return 1
+    obi_metric_boundary_journal_paths_are_cleanly_absent
     return $?
   fi
-  if (($# == 0)); then
-    metric_pair=null
-    if [[ -e "$last_boundary" || -L "$last_boundary" ]]; then
-      last_payload="$(
-        validate_last_terminal_boundary_json "$last_boundary"
-      )" || return 1
-      metric_pair="$(jq -c '.obi_metric_pair' <<<"$last_payload")" || return 1
+  if [[ -e "$freeze" || -L "$freeze" ]]; then
+    if obi_metric_boundary_index_freeze_payload >/dev/null; then
+      return 0
     fi
+    if normalize_obi_metric_boundary_index_freeze_owned_handle; then
+      return 0
+    fi
+    normalize_obi_owned_private_candidate_residue \
+      "$RESULT_DIR/.obi-metric-boundary-index-freeze" \
+      '^\.obi-metric-boundary-index-freeze\.[A-Za-z0-9]{6}$' '^600$' ||
+      return 1
+    obi_metric_boundary_index_freeze_payload >/dev/null
+    return $?
   fi
-  if [[ "$metric_pair" == null ]]; then
-    payload="$(jq -cn '
-      {
-        schema: "obi-java-remote-parent-terminal-metrics-v1",
-        sealed: true,
-        available: false,
-        reason: "no-valid-pair-before-terminal-boundary"
-      }
-    ')" || return 1
-  else
-    validate_last_terminal_boundary_payload "$(jq -cn \
-      --argjson metric_pair "$metric_pair" '
-        {
-          schema: "obi-terminal-boundary-v1",
-          java_payload: null,
-          obi_metric_pair: $metric_pair
-        }
-      ')" >/dev/null || return 1
-    pair_reference="$(jq -er '.reference' <<<"$metric_pair")" || return 1
-    pair="$(jq -c '.pair' <<<"$metric_pair")" || return 1
-    payload="$(jq -cn \
-      --arg pair_reference "$pair_reference" \
-      --argjson pair "$pair" '
-        {
-          schema: "obi-java-remote-parent-terminal-metrics-v1",
-          sealed: true,
-          available: true,
-          pair_reference: $pair_reference,
-          pair: $pair
-        }
-      ')" || return 1
-  fi
-  candidate="$(mktemp "$RESULT_DIR/.terminal-obi-metrics.XXXXXX")" || return $?
-  if printf '%s\n' "$payload" >"$candidate" && chmod 0644 -- "$candidate"; then
+  normalize_obi_owned_private_candidate_residue \
+    "$RESULT_DIR/.obi-metric-boundary-index-freeze" \
+    '^\.obi-metric-boundary-index-freeze\.[A-Za-z0-9]{6}$' '^600$' ||
+    return 1
+  terminal_java_diagnostics_transition_is_valid || return 1
+  # A mutation admitted before the freeze intent can fail before installation
+  # and leave its exact private candidate behind. The stable canonical index is
+  # still the pre-mutation version, so normalize that owned h1 residue before
+  # taking the frozen snapshot.
+  normalize_obi_owned_private_candidate_residue \
+    "$RESULT_DIR/.obi-metric-boundary-index" \
+    '^\.obi-metric-boundary-index\.[A-Za-z0-9]{6}$' '^(600|644)$' || return 1
+  normalize_obi_metric_pair_candidate_residue || return 1
+  for path in \
+    "$RESULT_DIR"/.obi-metric-boundary-index.* \
+    "$RESULT_DIR"/.obi-metric-boundary-index-backup.* \
+    "$RESULT_DIR"/.obi-metric-boundary-index-restore.* \
+    "$RESULT_DIR"/.obi-metric-boundary-index-freeze.*; do
+    if [[ ( -e "$path" || -L "$path" ) && "$path" != "$freeze" ]]; then
+      return 1
+    fi
+  done
+  [[ -f "$index" && ! -L "$index" &&
+    "$(stat -Lc '%u:%a:%h' -- "$index")" == "$(id -u):644:1" ]] ||
+    return 1
+  index_payload="$(obi_metric_boundary_index_payload full)" || return 1
+  digest="$(sha256sum "$index")" || return 1
+  digest="${digest%% *}"
+  OBI_METRIC_BOUNDARY_FROZEN_PAYLOAD="$index_payload"
+  OBI_METRIC_BOUNDARY_FROZEN_SHA256="$digest"
+  if candidate="$(mktemp \
+    "$RESULT_DIR/.obi-metric-boundary-index-freeze.XXXXXX")"; then
     :
   else
     publication_status=$?
-    rm -f -- "$candidate" || true
+    candidate_name="${candidate##*/}"
+    if [[ "${candidate%/*}" != "$RESULT_DIR" ||
+      ! "$candidate_name" =~ ^\.obi-metric-boundary-index-freeze\.[A-Za-z0-9]{6}$ ||
+      ! -f "$candidate" || -L "$candidate" ]]; then
+      return "$publication_status"
+    fi
+    for attempt in 1 2 3; do
+      candidate_inode="$(stat -Lc '%d:%i:%u' -- "$candidate")" && break
+    done
+    [[ -n "$candidate_inode" ]] || return "$publication_status"
+    remove_obi_owned_private_path_by_inode \
+      "$candidate" "$candidate_inode" || return 1
     return "$publication_status"
   fi
-  size="$(stat -Lc '%s' -- "$candidate")" || return 1
-  ((size > 0 && size <= OBI_METRIC_PAIR_MAX_BYTES)) || {
-    rm -f -- "$candidate"
+  candidate_name="${candidate##*/}"
+  [[ "${candidate%/*}" == "$RESULT_DIR" &&
+    "$candidate_name" =~ ^\.obi-metric-boundary-index-freeze\.[A-Za-z0-9]{6}$ &&
+    -f "$candidate" && ! -L "$candidate" ]] || return 1
+  for attempt in 1 2 3; do
+    candidate_inode="$(stat -Lc '%d:%i:%u' -- "$candidate")" && break
+  done
+  [[ -n "$candidate_inode" &&
+    "$(stat -Lc '%d:%i:%u:%h' -- "$candidate")" == "$candidate_inode:1" ]] ||
     return 1
-  }
-  candidate_identity="$(stat -Lc '%d:%i:%u:%a' -- "$candidate")" || return 1
-  candidate_digest="$(sha256sum "$candidate")" || return 1
-  candidate_digest="${candidate_digest%% *}"
-  if ln -T -- "$candidate" "$terminal"; then
-    terminal_published=true
-  else
-    publication_status=$?
-    if [[ -f "$terminal" && ! -L "$terminal" &&
-      "$candidate" -ef "$terminal" ]] &&
-      obi_owned_publication_matches \
-        "$terminal" "$candidate_identity" "$candidate_digest" 2; then
-      terminal_published=true
-    fi
-  fi
-  if [[ "$terminal_published" == true ]]; then
-    if ! obi_owned_publication_matches \
-      "$terminal" "$candidate_identity" "$candidate_digest" 2; then
-      if [[ -f "$terminal" && ! -L "$terminal" &&
-        "$candidate" -ef "$terminal" ]]; then
-        rm -f -- "$terminal" || true
-      fi
-      rm -f -- "$candidate" || true
-      return 1
-    fi
-    if rm -f -- "$candidate"; then
-      if obi_owned_publication_matches \
-          "$terminal" "$candidate_identity" "$candidate_digest" 1 &&
-        terminal_obi_metrics_json >/dev/null; then
-        return 0
-      fi
-      if obi_owned_publication_matches \
-        "$terminal" "$candidate_identity" "$candidate_digest" 1; then
-        rm -f -- "$terminal" || true
-      fi
-      return 1
-    else
-      cleanup_status=$?
-    fi
-    if [[ ! -e "$candidate" && ! -L "$candidate" ]] &&
-      obi_owned_publication_matches \
-        "$terminal" "$candidate_identity" "$candidate_digest" 1 &&
-      terminal_obi_metrics_json >/dev/null; then
-      return 0
-    fi
-    if [[ -f "$candidate" && ! -L "$candidate" &&
-      "$candidate" -ef "$terminal" ]] &&
-      obi_owned_publication_matches \
-        "$terminal" "$candidate_identity" "$candidate_digest" 2; then
-      return 1
-    fi
-    return "$cleanup_status"
-  fi
-  rm -f -- "$candidate" || true
-  if [[ -e "$terminal" || -L "$terminal" ]] &&
-    terminal_obi_metrics_json >/dev/null; then
-    return 0
-  fi
-  return "$publication_status"
-}
-
-terminal_java_diagnostics_freeze_is_valid() {
-  local -r freeze="$RESULT_DIR/.terminal-java-diagnostics.freeze"
-  local payload=""
-
-  payload="$(read_bounded_single_line_regular_file "$freeze" 64)" || return 1
-  [[ "$payload" == "terminal-java-diagnostics-frozen-v1" ]]
-}
-
-freeze_terminal_java_diagnostics_unlocked() {
-  local -r freeze="$RESULT_DIR/.terminal-java-diagnostics.freeze"
-  local candidate=""
-  local publication_status=0
-  local attempt=0
-
-  [[ -d "$RESULT_DIR" && ! -L "$RESULT_DIR" ]] || return 1
-  if [[ -e "$freeze" || -L "$freeze" ]]; then
-    terminal_java_diagnostics_transition_state >/dev/null
-    return $?
-  fi
-  candidate="$(mktemp "$RESULT_DIR/.terminal-java-diagnostics-freeze.XXXXXX")" ||
-    return $?
-  if printf '%s\n' 'terminal-java-diagnostics-frozen-v1' >"$candidate" &&
+  if printf 'obi-metric-boundary-index-frozen-v1:%s\n' "$digest" >"$candidate" &&
     chmod 0600 -- "$candidate"; then
     :
   else
     publication_status=$?
-    rm -f -- "$candidate" || true
+    remove_obi_owned_private_path_by_inode \
+      "$candidate" "$candidate_inode" || return 1
+    return "$publication_status"
+  fi
+  candidate_identity=""
+  for attempt in 1 2 3; do
+    candidate_identity="$(stat -Lc '%d:%i:%u:%a' -- "$candidate")" && break
+  done
+  if [[ "$candidate_identity" != "$candidate_inode:600" ]]; then
+    remove_obi_owned_private_path_by_inode \
+      "$candidate" "$candidate_inode" || return 1
+    return 1
+  fi
+  candidate_digest=""
+  for attempt in 1 2 3; do
+    if candidate_digest="$(sha256sum "$candidate")"; then
+      break
+    fi
+    candidate_digest=""
+  done
+  if [[ -z "$candidate_digest" ]]; then
+    remove_obi_owned_private_path_by_inode \
+      "$candidate" "$candidate_inode" || return 1
+    return 1
+  fi
+  candidate_digest="${candidate_digest%% *}"
+  if ln -T -- "$candidate" "$freeze"; then
+    freeze_published=true
+  else
+    publication_status=$?
+    if [[ -f "$freeze" && ! -L "$freeze" && "$candidate" -ef "$freeze" ]] &&
+      obi_owned_publication_matches \
+        "$freeze" "$candidate_identity" "$candidate_digest" 2; then
+      freeze_published=true
+    fi
+  fi
+  if [[ "$freeze_published" == false ]]; then
+    remove_obi_owned_private_file \
+      "$candidate" "$candidate_identity" "$candidate_digest" || return 1
     return "$publication_status"
   fi
   for attempt in 1 2 3; do
-    if ln -T -- "$candidate" "$freeze"; then
-      if rm -f -- "$candidate"; then
-        terminal_java_diagnostics_freeze_is_valid
-        return $?
-      fi
-      return 1
-    fi
-    publication_status=$?
-    if [[ -e "$freeze" || -L "$freeze" ]] &&
-      terminal_java_diagnostics_transition_state >/dev/null; then
-      rm -f -- "$candidate" || true
-      return 0
-    fi
-    if [[ -e "$freeze" || -L "$freeze" ]]; then
-      rm -f -- "$candidate" || true
-      return "$publication_status"
-    fi
+    obi_owned_publication_matches \
+      "$freeze" "$candidate_identity" "$candidate_digest" 2 && break
   done
-  rm -f -- "$candidate" || true
-  return "$publication_status"
+  obi_owned_publication_matches \
+    "$freeze" "$candidate_identity" "$candidate_digest" 2 || return 1
+  for attempt in 1 2 3; do
+    if rm -f -- "$candidate"; then
+      publication_status=0
+      break
+    else
+      publication_status=$?
+    fi
+    [[ ! -e "$candidate" && ! -L "$candidate" ]] && break
+    obi_owned_publication_matches \
+      "$freeze" "$candidate_identity" "$candidate_digest" 2 || return 1
+  done
+  if [[ -e "$candidate" || -L "$candidate" ]]; then
+    return "$publication_status"
+  fi
+  obi_owned_publication_matches \
+    "$freeze" "$candidate_identity" "$candidate_digest" 1 || return 1
+  obi_metric_boundary_index_freeze_payload >/dev/null
+}
+
+terminal_java_diagnostics_freeze_is_valid_unlocked() {
+  [[ "$(terminal_java_diagnostics_transition_state_unlocked)" == frozen ]]
+}
+
+terminal_java_diagnostics_freeze_is_valid() {
+  with_terminal_java_diagnostics_transition_publication_lock \
+    terminal_java_diagnostics_freeze_is_valid_unlocked
+}
+
+freeze_terminal_java_diagnostics_publication_unlocked() {
+  local -r freeze="$RESULT_DIR/.terminal-java-diagnostics.freeze"
+  local -r payload="terminal-java-diagnostics-frozen-v1"
+
+  [[ -d "$RESULT_DIR" && ! -L "$RESULT_DIR" &&
+    "${TERMINAL_TRANSITION_PUBLICATION_LOCK_HELD_BY_CALLER:-false}" == true ]] ||
+    return 1
+  normalize_terminal_java_diagnostics_transition_residue_unlocked || return $?
+  if [[ -e "$freeze" || -L "$freeze" ]]; then
+    return 0
+  fi
+  publish_terminal_owned_hardlink_payload \
+    "$freeze" "$RESULT_DIR/.terminal-java-diagnostics-freeze" \
+    '^\.terminal-java-diagnostics-freeze\.[A-Za-z0-9]{6}$' \
+    '^\.terminal-java-diagnostics-(freeze|recovery-commit)\.[A-Za-z0-9]{6}$' \
+    600 160 "$payload" \
+    validate_terminal_java_diagnostics_transition_hardlink_payload true \
+    "$RESULT_DIR/.terminal-java-diagnostics-freeze" \
+    "$RESULT_DIR/.terminal-java-diagnostics-recovery-commit"
+}
+
+freeze_terminal_java_diagnostics_unlocked() {
+  with_terminal_java_diagnostics_transition_publication_lock \
+    freeze_terminal_java_diagnostics_publication_unlocked
 }
 
 freeze_terminal_java_diagnostics() {
@@ -16716,58 +20864,45 @@ freeze_terminal_java_diagnostics() {
   # the lock wait drains it. If the bounded wait fails, the durable freeze still
   # prevents recovery from publishing a later snapshot as the failed boundary.
   freeze_terminal_java_diagnostics_unlocked || return $?
+  with_obi_metric_capture_stage_lock \
+    normalize_obi_metric_capture_stage_residue || return $?
   with_terminal_java_diagnostics_lock \
-    terminal_java_diagnostics_transition_is_valid
+    freeze_terminal_evidence_indexes_unlocked
+}
+
+freeze_terminal_evidence_indexes_unlocked() {
+  freeze_terminal_java_diagnostics_unlocked || return $?
+  freeze_obi_metric_boundary_index_unlocked
 }
 
 seal_terminal_java_diagnostics_unlocked() {
   local -r terminal="$RESULT_DIR/terminal-java-diagnostics.json"
   local -r last="$RESULT_DIR/.last-valid-java-diagnostics.json"
-  local -r last_boundary="$RESULT_DIR/.last-valid-terminal-boundary.json"
   local recovery_boundary="${1:-}"
-  local metric_recovery_boundary="${2:-}"
   local boundary_is_explicit=false
-  local metric_boundary_is_resolved=false
-  local last_boundary_payload=""
+  local journal_boundary_payload=""
   local payload=""
-  local candidate=""
-  local publication_status=0
 
   (($# <= 2)) || return 1
-  [[ -d "$RESULT_DIR" && ! -L "$RESULT_DIR" ]] || return 1
-  if (($# == 2)); then
-    metric_boundary_is_resolved=true
-  fi
-  if (($# >= 1)); then
+  [[ -d "$RESULT_DIR" && ! -L "$RESULT_DIR" &&
+    "${TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER:-false}" == true &&
+    "${TERMINAL_EVIDENCE_LOCK_ENTRY_FROZEN:-}" == true ]] || return 1
+  journal_boundary_payload="$(
+    terminal_java_diagnostics_payload_from_frozen_index
+  )" || return 1
+  if [[ "$journal_boundary_payload" != null ]]; then
+    recovery_boundary="$journal_boundary_payload"
     boundary_is_explicit=true
-  elif [[ -e "$last_boundary" || -L "$last_boundary" ]]; then
-    last_boundary_payload="$(
-      validate_last_terminal_boundary_json "$last_boundary"
-    )" || return 1
-    recovery_boundary="$(jq -c '.java_payload' <<<"$last_boundary_payload")" ||
-      return 1
-    metric_recovery_boundary="$(
-      jq -c '.obi_metric_pair' <<<"$last_boundary_payload"
-    )" || return 1
+  elif (($# >= 1)); then
     boundary_is_explicit=true
-    metric_boundary_is_resolved=true
-  fi
-  if (($# == 1)); then
-    metric_recovery_boundary=null
-    metric_boundary_is_resolved=true
-  fi
-  if [[ -e "$terminal" || -L "$terminal" ]]; then
-    terminal_java_diagnostics_json >/dev/null || return 1
-    if [[ "$metric_boundary_is_resolved" == true ]]; then
-      seal_terminal_obi_metrics_unlocked "$metric_recovery_boundary"
-    else
-      seal_terminal_obi_metrics_unlocked
-    fi
-    return $?
   fi
   freeze_terminal_java_diagnostics_unlocked || return $?
-  if [[ "$boundary_is_explicit" == true && "$recovery_boundary" != null ]]; then
-    payload="$(validate_last_java_diagnostics_payload "$recovery_boundary")" ||
+  if [[ "$boundary_is_explicit" == true &&
+    "$journal_boundary_payload" != null ]]; then
+    payload="$journal_boundary_payload"
+  elif [[ "$boundary_is_explicit" == true && "$recovery_boundary" != null ]]; then
+    payload="$(validate_last_java_diagnostics_payload_structure \
+      "$recovery_boundary")" ||
       return 1
     payload="$(jq -c '.sealed = true' <<<"$payload")" || return 1
   elif [[ "$boundary_is_explicit" == true ]]; then
@@ -16792,35 +20927,15 @@ seal_terminal_java_diagnostics_unlocked() {
       }
     ')" || return 1
   fi
-  candidate="$(mktemp "$RESULT_DIR/.terminal-java-diagnostics.XXXXXX")" || return $?
-  if printf '%s\n' "$payload" >"$candidate" &&
-    chmod 0644 -- "$candidate"; then
-    :
-  else
-    publication_status=$?
-    rm -f -- "$candidate" || true
-    return "$publication_status"
-  fi
-  if ln -T -- "$candidate" "$terminal"; then
-    if ! rm -f -- "$candidate"; then
-      return 1
-    fi
-    terminal_java_diagnostics_json >/dev/null || return 1
-  else
-    publication_status=$?
-    rm -f -- "$candidate" || true
-    if [[ -e "$terminal" || -L "$terminal" ]] &&
-      terminal_java_diagnostics_json >/dev/null; then
-      :
-    else
-      return "$publication_status"
-    fi
-  fi
-  if [[ "$metric_boundary_is_resolved" == true ]]; then
-    seal_terminal_obi_metrics_unlocked "$metric_recovery_boundary"
-  else
-    seal_terminal_obi_metrics_unlocked
-  fi
+  publish_terminal_owned_hardlink_payload \
+    "$terminal" "$RESULT_DIR/.terminal-java-diagnostics-output" \
+    '^\.terminal-java-diagnostics-output\.[A-Za-z0-9]{6}$' \
+    '^\.terminal-java-diagnostics-output\.[A-Za-z0-9]{6}$' \
+    644 "$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES" "$payload" \
+    validate_terminal_java_diagnostics_hardlink_payload true \
+    "$RESULT_DIR/.terminal-java-diagnostics-output" || return $?
+  [[ "$(terminal_java_diagnostics_json)" == "$payload" ]] || return 1
+  seal_terminal_obi_metrics_unlocked
 }
 
 seal_terminal_java_diagnostics_from_recovery_state_unlocked() {
@@ -16829,6 +20944,8 @@ seal_terminal_java_diagnostics_from_recovery_state_unlocked() {
   local recovery_boundary=""
   local metric_recovery_boundary=""
 
+  normalize_terminal_java_diagnostics_recovery_boundary_residue __any__ ||
+    return $?
   transition_state="$(terminal_java_diagnostics_transition_state)" || return $?
   if [[ "$transition_state" == "committed" ]]; then
     terminal_java_diagnostics_recovery_commit_is_valid || return $?
@@ -16849,13 +20966,21 @@ seal_terminal_java_diagnostics_from_recovery_state_unlocked() {
   seal_terminal_java_diagnostics_unlocked
 }
 
+seal_terminal_evidence_from_recovery_state_unlocked() {
+  freeze_terminal_java_diagnostics_unlocked || return $?
+  freeze_obi_metric_boundary_index_unlocked || return $?
+  seal_terminal_java_diagnostics_from_recovery_state_unlocked
+}
+
 seal_terminal_java_diagnostics() {
   # The freeze must survive a bounded lock-acquisition failure. Records check
   # it both before validation and immediately before publication, while the
   # lock orders any record that was already in flight ahead of this seal.
   freeze_terminal_java_diagnostics_unlocked || return $?
+  with_obi_metric_capture_stage_lock \
+    normalize_obi_metric_capture_stage_residue || return $?
   with_terminal_java_diagnostics_lock \
-    seal_terminal_java_diagnostics_from_recovery_state_unlocked
+    seal_terminal_evidence_from_recovery_state_unlocked
 }
 
 background_process_is_running() {
@@ -17351,6 +21476,8 @@ run_primary_security_control() {
     log_error "the primary security control requires the selected getsockopt transport"
     return 1
   }
+  plan_obi_metric_pair_capture security-primary-sibling || return $?
+  plan_obi_metric_pair_capture security-primary-same-cgroup || return $?
 
   capture_java_diagnostics "security-primary-diagnostics-before"
   assert_sanitized_java_diagnostics \
@@ -17423,6 +21550,9 @@ run_primary_security_control() {
     "$sibling_delta"
   assert_primary_security_metric_delta "$sibling_delta" negotiate 1 1
   assert_primary_security_metric_delta "$sibling_delta" take 5
+  record_obi_metric_pair \
+    security-primary-sibling security-primary-before \
+    security-primary-sibling-ready same_process "" >/dev/null || return $?
 
   host_probe="$(mktemp "$RESULT_DIR/.security-primary-probe.XXXXXX")"
   PRIMARY_SECURITY_HOST_PROBE="$host_probe"
@@ -17517,6 +21647,9 @@ run_primary_security_control() {
     "$same_cgroup_delta"
   assert_primary_security_metric_delta "$same_cgroup_delta" negotiate 1 1
   assert_primary_security_metric_delta "$same_cgroup_delta" take 5
+  record_obi_metric_pair \
+    security-primary-same-cgroup security-primary-sibling-complete \
+    security-primary-probe-ready same_process "" >/dev/null || return $?
 
   (
     SCENARIO_VARIANT="security-primary-victim"
@@ -17587,6 +21720,8 @@ run_primary_security_control() {
     "$(basename -- "$same_cgroup_output")" \
     "$(basename -- "$sibling_output")" \
     >"$RESULT_DIR/scenario-security-status.json"
+  crosslink_and_bind_active_obi_metric_boundary_status \
+    scenario-security-status.json || return $?
 }
 
 run_unix_permissive_directory_control() {
@@ -17598,12 +21733,16 @@ run_unix_permissive_directory_control() {
   local recovery_since=""
   local socket_status=0
 
+  plan_obi_metric_pair_capture security-unix-permissive-refusal || return $?
+  plan_obi_metric_pair_capture security-unix-permissive-recovery || return $?
+  capture_phase_evidence security-unix-permissive-before || return $?
   log_info "proving the Unix bridge refuses a world-accessible socket directory"
   invalidate_selected_transport || return $?
   BRIDGE_RUNNING=false
   run_bounded "$OBI_COMPOSE_COMMAND_TIMEOUT_SECONDS" \
     "${COMPOSE[@]}" stop --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" obi || \
     return $?
+  OBI_RUNNING=false
   run_bounded 10 "${COMPOSE[@]}" exec --no-TTY java-backend \
     chmod 0777 /var/run/obi || return $?
   UNIX_SECURITY_DIRECTORY_RELAXED=true
@@ -17619,6 +21758,7 @@ run_unix_permissive_directory_control() {
     "${COMPOSE[@]}" up --detach \
       --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" \
       --no-deps --force-recreate obi || return $?
+  OBI_RUNNING=true
   wait_for_log \
     obi \
     "$UNIX_PERMISSION_REFUSAL_PATTERN" \
@@ -17649,11 +21789,16 @@ run_unix_permissive_directory_control() {
   fi
   run_bounded 15 "${COMPOSE[@]}" logs --no-color --since "$failure_since" \
     obi >"$obi_log" || return $?
+  capture_phase_evidence security-unix-permissive-fault || return $?
+  record_obi_metric_pair \
+    security-unix-permissive-refusal security-unix-permissive-before \
+    security-unix-permissive-fault process_replaced "" >/dev/null || return $?
 
   capture_terminal_java_diagnostics_recovery_boundary || return $?
   run_bounded "$OBI_COMPOSE_COMMAND_TIMEOUT_SECONDS" \
     "${COMPOSE[@]}" stop --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" obi || \
     return $?
+  OBI_RUNNING=false
   run_bounded 10 "${COMPOSE[@]}" exec --no-TTY java-backend \
     chmod 0750 /var/run/obi || return $?
   run_bounded 10 "${COMPOSE[@]}" exec --no-TTY java-backend \
@@ -17668,6 +21813,7 @@ run_unix_permissive_directory_control() {
     "${COMPOSE[@]}" up --detach \
       --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" \
       --no-deps --force-recreate obi || return $?
+  OBI_RUNNING=true
   wait_for_log \
     obi \
     "Java remote parent bridge ready" \
@@ -17692,6 +21838,10 @@ run_unix_permissive_directory_control() {
     return 1
   }
   BRIDGE_RUNNING=true
+  capture_phase_evidence security-unix-permissive-after || return $?
+  record_obi_metric_pair \
+    security-unix-permissive-recovery security-unix-permissive-fault \
+    security-unix-permissive-after process_replaced "" >/dev/null || return $?
 }
 
 run_unix_sibling_security_control() {
@@ -18121,6 +22271,9 @@ run_unix_security_control() {
 
   run_unix_peer_security_controls || return $?
 
+  plan_obi_metric_pair_capture security-unix-endpoint-refusal || return $?
+  plan_obi_metric_pair_capture security-unix-endpoint-recovery || return $?
+  capture_phase_evidence security-unix-endpoint-before || return $?
   SECURITY_PROBE_MODE="endpoint"
   export SECURITY_PROBE_MODE
   log_info "installing a bounded replacement endpoint around an OBI restart"
@@ -18143,11 +22296,16 @@ run_unix_security_control() {
   run_bounded "$OBI_COMPOSE_COMMAND_TIMEOUT_SECONDS" \
     "${COMPOSE[@]}" restart --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" obi || \
     return $?
+  OBI_RUNNING=true
   wait_for_log \
     obi \
     "refusing to replace non-socket Java bridge path" \
     "replacement endpoint fail-closed restart" \
     "$restart_since" || return $?
+  capture_phase_evidence security-unix-endpoint-fault || return $?
+  record_obi_metric_pair \
+    security-unix-endpoint-refusal security-unix-endpoint-before \
+    security-unix-endpoint-fault process_replaced "" >/dev/null || return $?
   run_bounded 15 \
     "${COMPOSE[@]}" kill --signal SIGUSR1 security-probe || return $?
   probe_exit="$(run_bounded 60 docker wait "$UNIX_SECURITY_ENDPOINT_CONTAINER")"
@@ -18183,6 +22341,10 @@ run_unix_security_control() {
     "post-replacement Java bridge provider" \
     "$restart_since" || return $?
   assert_selected_transport unix || return $?
+  capture_phase_evidence security-unix-endpoint-after || return $?
+  record_obi_metric_pair \
+    security-unix-endpoint-recovery security-unix-endpoint-fault \
+    security-unix-endpoint-after same_process "" >/dev/null || return $?
 
   capture_java_diagnostics "security-after"
   assert_sanitized_java_diagnostics \
@@ -18221,6 +22383,8 @@ run_unix_security_control() {
     "$(basename -- "$RESULT_DIR/security-unix-same-cgroup-identity.txt")" \
     "$(basename -- "$endpoint_output")" \
     >"$RESULT_DIR/scenario-security-status.json"
+  crosslink_and_bind_active_obi_metric_boundary_status \
+    scenario-security-status.json || return $?
   commit_terminal_java_diagnostics_recovery_boundary || return $?
   clear_terminal_java_diagnostics_recovery_boundary || return $?
 }
@@ -18228,13 +22392,27 @@ run_unix_security_control() {
 record_unsupported_scenario() {
   local -r name="$1"
   local -r reason="$2"
+  local -r reference="scenario-$name-status.json"
 
   [[ -n "$RESULT_DIR" && -d "$RESULT_DIR" ]] || {
     log_error "cannot record unsupported scenario without a result directory"
     return 1
   }
-  printf '{"status":"unsupported","reason":"%s"}\n' "$reason" \
-    >"$RESULT_DIR/scenario-$name-status.json"
+  if obi_metric_boundary_index_is_initialized; then
+    jq -cn --arg name "$name" --arg reason "$reason" '
+      {
+        status: "not_applicable",
+        scenario: $name,
+        reason: $reason,
+        obi_metric_boundary_ids: [$name]
+      }
+    ' >"$RESULT_DIR/$reference" || return $?
+    mark_obi_metric_boundary_not_applicable \
+      "$name" "$reason" "$reference"
+  else
+    printf '{"status":"unsupported","reason":"%s"}\n' "$reason" \
+      >"$RESULT_DIR/$reference"
+  fi
 }
 
 run_security_control() {
@@ -18270,6 +22448,7 @@ run_disabled_control() {
     "${COMPOSE[@]}" up --detach \
       --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" --force-recreate \
       java-backend apache-proxy obi || return $?
+  OBI_RUNNING=true
   wait_for_log \
     java-backend \
     "OBI remote-parent propagator enabled" \
@@ -18301,6 +22480,7 @@ run_uninstrumented_control() {
   run_bounded "$OBI_COMPOSE_COMMAND_TIMEOUT_SECONDS" \
     "${COMPOSE[@]}" stop --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" obi || \
     return $?
+  OBI_RUNNING=false
   run_bounded 30 \
     "${COMPOSE[@]}" config >"$RESULT_DIR/compose-uninstrumented-control.yaml" || return $?
   run_bounded 120 \
@@ -18352,14 +22532,38 @@ normalize_control_response() {
     "$input" >"$output"
 }
 
+run_obi_metric_control_boundary() {
+  local -r boundary_id="$1"
+  local control_status=0
+  shift
+
+  if ! obi_metric_boundary_index_is_initialized; then
+    "$@"
+    return $?
+  fi
+  if ! active_obi_metric_boundary_id >/dev/null 2>&1; then
+    begin_obi_metric_boundary "$boundary_id" || return $?
+  else
+    [[ "$(active_obi_metric_boundary_id)" == "$boundary_id" ]] || return 1
+  fi
+  if "$@"; then
+    :
+  else
+    control_status=$?
+    return "$control_status"
+  fi
+  complete_obi_metric_boundary "$boundary_id"
+}
+
 execute_requested_scenarios() {
   local restart_since=""
 
   case "$SCENARIO" in
     all)
       run_scenario basic
-      run_delayed_otlp_suppression_control
-      run_security_control
+      run_obi_metric_control_boundary \
+        delayed-otlp-suppression run_delayed_otlp_suppression_control
+      run_obi_metric_control_boundary security run_security_control
       run_scenario keepalive
       run_scenario pipelining
       run_scenario concurrency
@@ -18376,12 +22580,15 @@ execute_requested_scenarios() {
       run_scenario netty-server
       run_scenario dispatch
       run_scenario w3c
-      run_w3c_match_control
+      run_obi_metric_control_boundary w3c-match run_w3c_match_control
       run_scenario obi-flags
       if [[ "$TRANSPORT" == "getsockopt" && "$SELECTED_TRANSPORT" == "getsockopt" ]]; then
-        run_primary_w3c_stale_control
-        run_primary_generation_mismatch_control
-        run_primary_w3c_fault_control
+        run_obi_metric_control_boundary \
+          primary-w3c-stale run_primary_w3c_stale_control
+        run_obi_metric_control_boundary \
+          primary-generation-mismatch run_primary_generation_mismatch_control
+        run_obi_metric_control_boundary \
+          primary-w3c-fault run_primary_w3c_fault_control
       else
         record_unsupported_scenario \
           primary-w3c-stale "requires forced getsockopt transport"
@@ -18391,9 +22598,11 @@ execute_requested_scenarios() {
           primary-w3c-fault "requires forced getsockopt transport"
       fi
       if [[ "$TRANSPORT" == "unix" && "$SELECTED_TRANSPORT" == "unix" ]]; then
-        run_unix_w3c_stale_control
-        run_unix_generation_mismatch_control
-        run_w3c_fault_control
+        run_obi_metric_control_boundary \
+          unix-w3c-stale run_unix_w3c_stale_control
+        run_obi_metric_control_boundary \
+          unix-generation-mismatch run_unix_generation_mismatch_control
+        run_obi_metric_control_boundary w3c-fault run_w3c_fault_control
       else
         record_unsupported_scenario \
           unix-w3c-stale "requires forced Unix transport"
@@ -18402,33 +22611,41 @@ execute_requested_scenarios() {
         record_unsupported_scenario \
           w3c-fault "requires forced Unix transport"
       fi
-      run_permanent_absence_control
+      run_obi_metric_control_boundary \
+        permanent-absence run_permanent_absence_control
       if [[ "$TRANSPORT" == "auto" ]]; then
-        run_auto_unavailable_control
+        run_obi_metric_control_boundary \
+          auto-unavailable run_auto_unavailable_control
       else
         record_unsupported_scenario \
           auto-unavailable "requires auto transport selection"
       fi
-      run_late_attach_control
-      run_restart_during_traffic_control
-      run_helper_attach_failure_control
-      run_disabled_control
-      run_extension_controls
-      run_uninstrumented_control
+      run_obi_metric_control_boundary late-attach run_late_attach_control
+      run_obi_metric_control_boundary \
+        restart-during-traffic run_restart_during_traffic_control
+      run_obi_metric_control_boundary \
+        helper-attach-failure run_helper_attach_failure_control
+      run_obi_metric_control_boundary disabled run_disabled_control
+      run_obi_metric_control_boundary extension-controls run_extension_controls
+      run_obi_metric_control_boundary uninstrumented run_uninstrumented_control
       ;;
     fail-open)
-      run_fail_open_control
+      run_obi_metric_control_boundary fail-open run_fail_open_control
       ;;
     w3c-only)
-      run_w3c_only_control
+      run_obi_metric_control_boundary w3c-only run_w3c_only_control
       ;;
     restart)
+      begin_obi_metric_boundary restart || return $?
+      plan_obi_metric_pair_capture restart-process-replaced || return $?
+      capture_phase_evidence restart-obi-before || return $?
       restart_since="$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')" || return $?
       invalidate_selected_transport || return $?
       BRIDGE_RUNNING=false
       run_bounded "$OBI_COMPOSE_COMMAND_TIMEOUT_SECONDS" \
         "${COMPOSE[@]}" restart \
           --timeout "$OBI_COMPOSE_STOP_GRACE_SECONDS" obi || return $?
+      OBI_RUNNING=true
       wait_for_log \
         obi \
         "Java remote parent bridge ready" \
@@ -18448,60 +22665,81 @@ execute_requested_scenarios() {
         "restarted Java bridge provider" \
         "$restart_since" || return $?
       assert_selected_transport || return $?
+      capture_phase_evidence restart-obi-after || return $?
+      record_obi_metric_pair \
+        restart-process-replaced restart-obi-before restart-obi-after \
+        process_replaced restart-obi-after >/dev/null || return $?
       run_scenario restart
+      complete_obi_metric_boundary restart
       ;;
     restart-fault)
-      run_restart_during_traffic_control
+      run_obi_metric_control_boundary \
+        restart-during-traffic run_restart_during_traffic_control
       ;;
     helper-attach-failure)
-      run_helper_attach_failure_control
+      run_obi_metric_control_boundary \
+        helper-attach-failure run_helper_attach_failure_control
       ;;
     delayed-otlp-suppression)
-      run_delayed_otlp_suppression_control
+      run_obi_metric_control_boundary \
+        delayed-otlp-suppression run_delayed_otlp_suppression_control
       ;;
     assertion-failure)
       run_deliberate_assertion_failure_control
       ;;
     w3c-match)
-      run_w3c_match_control
+      run_obi_metric_control_boundary w3c-match run_w3c_match_control
       ;;
     w3c-fault)
-      run_w3c_fault_control
+      run_obi_metric_control_boundary w3c-fault run_w3c_fault_control
       ;;
     primary-w3c-stale)
-      run_primary_w3c_stale_control
+      run_obi_metric_control_boundary \
+        primary-w3c-stale run_primary_w3c_stale_control
       ;;
     unix-w3c-stale)
-      run_unix_w3c_stale_control
+      run_obi_metric_control_boundary unix-w3c-stale run_unix_w3c_stale_control
       ;;
     unix-generation-mismatch)
-      run_unix_generation_mismatch_control
+      run_obi_metric_control_boundary \
+        unix-generation-mismatch run_unix_generation_mismatch_control
       ;;
     pid-reuse)
+      attach_obi_artifact_capture \
+        pid-reuse-controller pid-reuse-controller.json || return $?
       SCENARIO_VARIANT="pid-reuse-recovery"
       run_scenario basic
       SCENARIO_VARIANT=""
+      complete_obi_metric_boundary pid-reuse
       ;;
     primary-w3c-fault)
-      run_primary_w3c_fault_control
+      run_obi_metric_control_boundary \
+        primary-w3c-fault run_primary_w3c_fault_control
       ;;
     primary-generation-mismatch)
-      run_primary_generation_mismatch_control
+      run_obi_metric_control_boundary \
+        primary-generation-mismatch run_primary_generation_mismatch_control
       ;;
     permanent-absence)
-      run_permanent_absence_control
+      run_obi_metric_control_boundary \
+        permanent-absence run_permanent_absence_control
       ;;
     auto-unavailable)
-      run_auto_unavailable_control
+      run_obi_metric_control_boundary \
+        auto-unavailable run_auto_unavailable_control
       ;;
     security)
-      run_security_control
+      run_obi_metric_control_boundary security run_security_control
       ;;
     benchmark-disabled)
+      begin_obi_metric_boundary benchmark-disabled || return $?
       run_scenario concurrency true full none normal disabled
+      complete_obi_metric_boundary benchmark-disabled
       ;;
     benchmark-uninstrumented)
+      begin_obi_metric_boundary benchmark-uninstrumented || return $?
       run_scenario concurrency true full none normal uninstrumented
+      complete_obi_metric_boundary benchmark-uninstrumented
       ;;
     uninstrumented)
       run_scenario uninstrumented
@@ -18782,6 +23020,8 @@ capture_phase_evidence() {
   local fd_count=""
   local metric_capture_status=0
   local stopped_attestation_status=0
+  local live_metric_capture=false
+  local unavailable_metric_capture=false
   local -a phase_container_ids=()
 
   [[ "$phase" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] || {
@@ -18791,8 +23031,11 @@ capture_phase_evidence() {
   phase_dir="$RESULT_DIR/phases/$phase"
   ensure_java_diagnostics_phase_directory "$phase" || return $?
 
-  if capture_bounded_obi_metric_phase "$phase" 5; then
-    :
+  if [[ "$OBI_RUNNING" == true ||
+    ( ! -e "$RESULT_DIR/obi-metric-boundary-index.json" &&
+      "$BRIDGE_RUNNING" == true ) ]] &&
+    capture_bounded_obi_metric_phase "$phase" 5; then
+    live_metric_capture=true
   else
     metric_capture_status=$?
     if assert_compose_service_stopped obi "$phase metric-evidence boundary"; then
@@ -18800,6 +23043,7 @@ capture_phase_evidence() {
         log_warn "could not publish the attested unavailable $phase OBI metrics"
         return 1
       fi
+      unavailable_metric_capture=true
     else
       stopped_attestation_status=$?
       log_warn "could not capture bounded process-fenced $phase OBI metrics"
@@ -18809,6 +23053,8 @@ capture_phase_evidence() {
       return "$stopped_attestation_status"
     fi
   fi
+  [[ "$live_metric_capture" == true ||
+    "$unavailable_metric_capture" == true ]] || return 1
   mapfile -t phase_container_ids < <(
     run_bounded 10 "${COMPOSE[@]}" ps --quiet 2>/dev/null | awk 'NF > 0'
   )
@@ -18928,7 +23174,8 @@ capture_java_diagnostics() {
   if ((validation_status != 0)); then
     return "$validation_status"
   fi
-  record_last_java_diagnostics_phase "$phase"
+  record_last_java_diagnostics_phase "$phase" || return $?
+  attach_obi_java_capture "$phase"
 }
 
 write_metrics_delta() {
@@ -20299,135 +24546,256 @@ capture_evidence() {
     "http://127.0.0.1:14318/snapshot" >"$RESULT_DIR/final-receiver-snapshot.json" 2>/dev/null || true
 }
 
-remove_published_run_status() {
+clear_published_run_status_ownership() {
+  RUN_STATUS_CREATED_IDENTITY=""
+  RUN_STATUS_PUBLISHED_IDENTITY=""
+  RUN_STATUS_PUBLISHED_DIGEST=""
+  RUN_STATUS_PUBLICATION_HANDLE=""
+  RUN_STATUS_PUBLICATION_OUTPUT=""
+  RUN_STATUS_PUBLICATION_STATE=""
+}
+
+acquire_run_status_created_identity() {
   local -r output="$RESULT_DIR/run-status.json"
-  local handle_identity=""
-  local handle_links=""
+  local identity=""
+  local device=""
+  local inode=""
+  local owner=""
+  local mode=""
+  local links=""
   local output_identity=""
-  local output_links=""
+  local attempt=0
+
+  [[ -z "$RUN_STATUS_CREATED_IDENTITY" &&
+    "$RUN_STATUS_PUBLICATION_STATE" == created &&
+    "$RUN_STATUS_PUBLICATION_OUTPUT" == "$output" &&
+    "${RUN_STATUS_PUBLICATION_HANDLE%/*}" == "$RESULT_DIR" &&
+    "${RUN_STATUS_PUBLICATION_HANDLE##*/}" =~ \
+      ^\.run-status\.[A-Za-z0-9]{6}$ ]] || return 1
+  for attempt in 1 2 3; do
+    identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+      "$RUN_STATUS_PUBLICATION_HANDLE")" && break
+    identity=""
+  done
+  IFS=: read -r device inode owner mode links <<<"$identity"
+  [[ -n "$device" && -n "$inode" && "$owner" == "$(id -u)" &&
+    ( "$mode" == 600 || "$mode" == 644 ) &&
+    ( "$links" == 1 || "$links" == 2 ) &&
+    -f "$RUN_STATUS_PUBLICATION_HANDLE" &&
+    ! -L "$RUN_STATUS_PUBLICATION_HANDLE" ]] || return 1
+  if [[ "$links" == 1 ]]; then
+    [[ ! -e "$output" && ! -L "$output" ]] || return 1
+  else
+    [[ "$mode" == 644 && -f "$output" && ! -L "$output" &&
+      "$RUN_STATUS_PUBLICATION_HANDLE" -ef "$output" ]] || return 1
+    output_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$output")" || return 1
+    [[ "$output_identity" == "$identity" ]] || return 1
+  fi
+  RUN_STATUS_CREATED_IDENTITY="$device:$inode:$owner"
+}
+
+classify_owned_run_status_publication() {
+  local -r output_name="$1"
+  local -r output="$RESULT_DIR/run-status.json"
   local handle_present=false
   local output_present=false
+  local handle_identity=""
+  local output_identity=""
+  local handle_digest=""
+  local output_digest=""
+  local created_device=""
+  local created_inode=""
+  local created_owner=""
+  local handle_device=""
+  local handle_inode=""
+  local handle_owner=""
+  local handle_mode=""
+  local handle_links=""
+  local output_device=""
+  local output_inode=""
+  local output_owner=""
+  local output_mode=""
+  local output_links=""
+  local classified_topology=""
 
-  [[ -n "$RUN_STATUS_PUBLISHED_IDENTITY" &&
-    -n "$RUN_STATUS_PUBLISHED_DIGEST" &&
+  [[ "$output_name" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ &&
     "$RUN_STATUS_PUBLICATION_OUTPUT" == "$output" &&
-    "$RUN_STATUS_PUBLICATION_HANDLE" == "$RESULT_DIR"/.run-status.* &&
-    "$RUN_STATUS_PUBLICATION_STATE" =~ ^(prepared|published|validated)$ ]] ||
-    return 1
+    "${RUN_STATUS_PUBLICATION_HANDLE%/*}" == "$RESULT_DIR" &&
+    "${RUN_STATUS_PUBLICATION_HANDLE##*/}" =~ \
+      ^\.run-status\.[A-Za-z0-9]{6}$ &&
+    "$RUN_STATUS_PUBLICATION_STATE" =~ \
+      ^(created|prepared|validated|committed)$ ]] || return 1
+  if [[ -z "$RUN_STATUS_CREATED_IDENTITY" ]]; then
+    acquire_run_status_created_identity || return $?
+  fi
+  IFS=: read -r created_device created_inode created_owner \
+    <<<"$RUN_STATUS_CREATED_IDENTITY"
+  [[ -n "$created_device" && -n "$created_inode" &&
+    "$created_owner" == "$(id -u)" ]] || return 1
   if [[ -e "$RUN_STATUS_PUBLICATION_HANDLE" ||
     -L "$RUN_STATUS_PUBLICATION_HANDLE" ]]; then
     [[ -f "$RUN_STATUS_PUBLICATION_HANDLE" &&
       ! -L "$RUN_STATUS_PUBLICATION_HANDLE" ]] || return 1
     handle_present=true
-    handle_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    handle_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
       "$RUN_STATUS_PUBLICATION_HANDLE")" || return 1
-    handle_links="$(stat -Lc '%h' -- "$RUN_STATUS_PUBLICATION_HANDLE")" || return 1
-    [[ "$handle_identity" == "$RUN_STATUS_PUBLISHED_IDENTITY" ]] || return 1
+    IFS=: read -r handle_device handle_inode handle_owner handle_mode \
+      handle_links <<<"$handle_identity"
+    [[ "$handle_device:$handle_inode:$handle_owner" == \
+      "$RUN_STATUS_CREATED_IDENTITY" ]] || return 1
   fi
   if [[ -e "$output" || -L "$output" ]]; then
     [[ -f "$output" && ! -L "$output" ]] || return 1
     output_present=true
-    output_identity="$(stat -Lc '%d:%i:%u:%a' -- "$output")" || return 1
-    output_links="$(stat -Lc '%h' -- "$output")" || return 1
-    [[ "$output_identity" == "$RUN_STATUS_PUBLISHED_IDENTITY" ]] || return 1
+    output_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$output")" || return 1
+    IFS=: read -r output_device output_inode output_owner output_mode \
+      output_links <<<"$output_identity"
+    [[ "$output_device:$output_inode:$output_owner" == \
+      "$RUN_STATUS_CREATED_IDENTITY" ]] || return 1
   fi
-  if [[ "$handle_present" == true && "$output_present" == true ]]; then
-    [[ "$handle_links" == 2 && "$output_links" == 2 ]] || return 1
-  elif [[ "$handle_present" == true ]]; then
-    [[ "$handle_links" == 1 ]] || return 1
+  if [[ "$handle_present" == false && "$output_present" == false ]]; then
+    classified_topology=absent
+  elif [[ "$handle_present" == true && "$output_present" == false ]]; then
+    [[ "$handle_owner" == "$(id -u)" && "$handle_links" == 1 &&
+      ( "$handle_mode" == 600 || "$handle_mode" == 644 ) ]] || return 1
+    if [[ -n "$RUN_STATUS_PUBLISHED_IDENTITY" ||
+      -n "$RUN_STATUS_PUBLISHED_DIGEST" ]]; then
+      [[ "$RUN_STATUS_PUBLISHED_IDENTITY" == \
+          "$handle_device:$handle_inode:$handle_owner:644" &&
+        "$handle_mode" == 644 &&
+        "$RUN_STATUS_PUBLISHED_DIGEST" =~ ^[0-9a-f]{64}$ ]] || return 1
+      handle_digest="$(sha256sum "$RUN_STATUS_PUBLICATION_HANDLE")" ||
+        return 1
+      handle_digest="${handle_digest%% *}"
+      [[ "$handle_digest" == "$RUN_STATUS_PUBLISHED_DIGEST" ]] || return 1
+    fi
+    classified_topology=private_h1
+  elif [[ "$handle_present" == true && "$output_present" == true ]]; then
+    [[ -n "$RUN_STATUS_PUBLISHED_IDENTITY" &&
+      "$RUN_STATUS_PUBLISHED_DIGEST" =~ ^[0-9a-f]{64}$ &&
+      "$RUN_STATUS_PUBLICATION_HANDLE" -ef "$output" &&
+      "$handle_identity" == "$output_identity" &&
+      "$handle_identity" == "$RUN_STATUS_PUBLISHED_IDENTITY:2" &&
+      "$handle_owner" == "$(id -u)" && "$handle_mode" == 644 &&
+      "$handle_links" == 2 && "$output_links" == 2 ]] || return 1
+    handle_digest="$(sha256sum "$RUN_STATUS_PUBLICATION_HANDLE")" || return 1
+    handle_digest="${handle_digest%% *}"
+    output_digest="$(sha256sum "$output")" || return 1
+    output_digest="${output_digest%% *}"
+    [[ "$handle_digest" == "$RUN_STATUS_PUBLISHED_DIGEST" &&
+      "$output_digest" == "$RUN_STATUS_PUBLISHED_DIGEST" ]] || return 1
+    classified_topology=published_h2
   else
-    return 1
+    [[ -n "$RUN_STATUS_PUBLISHED_IDENTITY" &&
+      "$RUN_STATUS_PUBLISHED_DIGEST" =~ ^[0-9a-f]{64}$ &&
+      "$output_identity" == "$RUN_STATUS_PUBLISHED_IDENTITY:1" &&
+      "$output_owner" == "$(id -u)" && "$output_mode" == 644 &&
+      "$output_links" == 1 ]] || return 1
+    output_digest="$(sha256sum "$output")" || return 1
+    output_digest="${output_digest%% *}"
+    [[ "$output_digest" == "$RUN_STATUS_PUBLISHED_DIGEST" ]] || return 1
+    classified_topology=committed_h1
   fi
-  if [[ "$output_present" == true ]]; then
-    rm -f -- "$output" || return $?
-  fi
-  [[ ! -e "$output" && ! -L "$output" ]] || return 1
-  if [[ "$handle_present" == true ]]; then
-    [[ "$(stat -Lc '%h' -- "$RUN_STATUS_PUBLICATION_HANDLE")" == 1 ]] || return 1
-    rm -f -- "$RUN_STATUS_PUBLICATION_HANDLE" || return $?
-  fi
-  [[ ! -e "$RUN_STATUS_PUBLICATION_HANDLE" &&
-    ! -L "$RUN_STATUS_PUBLICATION_HANDLE" ]] || return 1
-  RUN_STATUS_PUBLISHED_IDENTITY=""
-  RUN_STATUS_PUBLISHED_DIGEST=""
-  RUN_STATUS_PUBLICATION_HANDLE=""
-  RUN_STATUS_PUBLICATION_OUTPUT=""
-  RUN_STATUS_PUBLICATION_STATE=""
+  printf -v "$output_name" '%s' "$classified_topology"
 }
 
-commit_published_run_status() {
-  local -r output="$RESULT_DIR/run-status.json"
-  local handle_identity=""
-  local output_identity=""
-  local handle_digest=""
-  local output_digest=""
+reconcile_owned_run_status_publication() {
+  local -r output_name="$1"
+  local observed_topology=""
+  local attempt=0
 
-  [[ -n "$RUN_STATUS_PUBLISHED_IDENTITY" &&
-    -n "$RUN_STATUS_PUBLISHED_DIGEST" &&
-    "$RUN_STATUS_PUBLICATION_STATE" == validated &&
-    "$RUN_STATUS_PUBLICATION_OUTPUT" == "$output" &&
-    "$RUN_STATUS_PUBLICATION_HANDLE" == "$RESULT_DIR"/.run-status.* &&
-    -f "$RUN_STATUS_PUBLICATION_HANDLE" &&
-    ! -L "$RUN_STATUS_PUBLICATION_HANDLE" &&
-    -f "$output" && ! -L "$output" ]] || return 1
-  handle_identity="$(stat -Lc '%d:%i:%u:%a' -- \
-    "$RUN_STATUS_PUBLICATION_HANDLE")" || return 1
-  output_identity="$(stat -Lc '%d:%i:%u:%a' -- "$output")" || return 1
-  handle_digest="$(sha256sum "$RUN_STATUS_PUBLICATION_HANDLE")" || return 1
-  handle_digest="${handle_digest%% *}"
-  output_digest="$(sha256sum "$output")" || return 1
-  output_digest="${output_digest%% *}"
-  [[ "$handle_identity" == "$RUN_STATUS_PUBLISHED_IDENTITY" &&
-    "$output_identity" == "$RUN_STATUS_PUBLISHED_IDENTITY" &&
-    "$(stat -Lc '%h' -- "$RUN_STATUS_PUBLICATION_HANDLE")" == 2 &&
-    "$(stat -Lc '%h' -- "$output")" == 2 &&
-    "$handle_digest" == "$RUN_STATUS_PUBLISHED_DIGEST" &&
-    "$output_digest" == "$RUN_STATUS_PUBLISHED_DIGEST" ]] || return 1
-  rm -f -- "$RUN_STATUS_PUBLICATION_HANDLE" || return $?
-  clear_published_run_status_ownership
-}
-
-clear_published_run_status_ownership() {
-  RUN_STATUS_PUBLISHED_IDENTITY=""
-  RUN_STATUS_PUBLISHED_DIGEST=""
-  RUN_STATUS_PUBLICATION_HANDLE=""
-  RUN_STATUS_PUBLICATION_OUTPUT=""
-  RUN_STATUS_PUBLICATION_STATE=""
+  [[ "$output_name" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || return 1
+  for attempt in 1 2 3; do
+    if classify_owned_run_status_publication observed_topology; then
+      printf -v "$output_name" '%s' "$observed_topology"
+      return 0
+    fi
+  done
+  return 1
 }
 
 remove_terminal_owned_run_status_for_rewrite() {
   local -r output="$RESULT_DIR/run-status.json"
+  local topology=""
+  local handle_identity=""
 
-  [[ -n "$RUN_STATUS_PUBLISHED_IDENTITY" &&
-    -n "$RUN_STATUS_PUBLISHED_DIGEST" &&
-    "$RUN_STATUS_PUBLICATION_OUTPUT" == "$output" &&
-    "$RUN_STATUS_PUBLICATION_HANDLE" == "$RESULT_DIR"/.run-status.* &&
-    "$RUN_STATUS_PUBLICATION_STATE" =~ ^(published|validated)$ ]] || return 1
-  # A successful hardlink publication binds both paths to the private handle.
-  # Terminal rewrites are serialized cooperative harness operations, so a
-  # later verifier fault must not strand a stale canonical status.
-  rm -f -- "$output" || return $?
-  rm -f -- "$RUN_STATUS_PUBLICATION_HANDLE" || return $?
+  reconcile_owned_run_status_publication topology || return 1
+  case "$topology" in
+    absent)
+      clear_published_run_status_ownership
+      return 0
+      ;;
+    published_h2)
+      remove_terminal_owned_hardlink_handle \
+        "$output" "$RUN_STATUS_PUBLICATION_HANDLE" \
+        "$RUN_STATUS_PUBLISHED_IDENTITY:2" || return $?
+      ;;
+    committed_h1)
+      remove_terminal_owned_private_path \
+        "$output" "$RUN_STATUS_PUBLISHED_IDENTITY:1" || return $?
+      ;;
+    private_h1) ;;
+    *) return 1 ;;
+  esac
+  reconcile_owned_run_status_publication topology || return 1
+  if [[ "$topology" == private_h1 ]]; then
+    handle_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+      "$RUN_STATUS_PUBLICATION_HANDLE")" || return 1
+    remove_terminal_owned_private_path \
+      "$RUN_STATUS_PUBLICATION_HANDLE" "$handle_identity" || return $?
+    reconcile_owned_run_status_publication topology || return 1
+  fi
+  [[ "$topology" == absent ]] || return 1
   clear_published_run_status_ownership
+}
+
+remove_published_run_status() {
+  remove_terminal_owned_run_status_for_rewrite
+}
+
+commit_published_run_status() {
+  local topology=""
+
+  [[ "$RUN_STATUS_PUBLICATION_STATE" =~ ^(validated|committed)$ ]] ||
+    return 1
+  reconcile_owned_run_status_publication topology || return 1
+  case "$topology" in
+    published_h2)
+      remove_terminal_owned_hardlink_handle \
+        "$RUN_STATUS_PUBLICATION_HANDLE" "$RUN_STATUS_PUBLICATION_OUTPUT" \
+        "$RUN_STATUS_PUBLISHED_IDENTITY:2" || return $?
+      reconcile_owned_run_status_publication topology || return 1
+      ;;
+    committed_h1) ;;
+    *) return 1 ;;
+  esac
+  [[ "$topology" == committed_h1 ]] || return 1
+  RUN_STATUS_PUBLICATION_STATE=committed
 }
 
 publish_owned_run_status() {
   local -r exit_status="$1"
   local publication_status=0
+  local cleanup_status=0
 
+  if [[ -n "$RUN_STATUS_PUBLICATION_STATE" ||
+    -n "$RUN_STATUS_CREATED_IDENTITY" ||
+    -n "$RUN_STATUS_PUBLICATION_HANDLE" ]]; then
+    remove_terminal_owned_run_status_for_rewrite || return $?
+  fi
   if write_run_status "$exit_status"; then
-    return 0
+    :
   else
     publication_status=$?
+    if [[ -n "$RUN_STATUS_PUBLICATION_STATE" ||
+      -n "$RUN_STATUS_CREATED_IDENTITY" ||
+      -n "$RUN_STATUS_PUBLICATION_HANDLE" ]]; then
+      remove_terminal_owned_run_status_for_rewrite || cleanup_status=$?
+      ((cleanup_status == 0)) || return "$cleanup_status"
+    fi
+    return "$publication_status"
   fi
-  if [[ "$RUN_STATUS_PUBLICATION_STATE" =~ ^(published|validated)$ ]]; then
-    remove_terminal_owned_run_status_for_rewrite || return "$publication_status"
-  elif [[ -n "$RUN_STATUS_PUBLISHED_IDENTITY" ||
-    -n "$RUN_STATUS_PUBLISHED_DIGEST" ||
-    -n "$RUN_STATUS_PUBLICATION_STATE" ]]; then
-    remove_published_run_status || return "$publication_status"
-  fi
-  return "$publication_status"
+  commit_published_run_status
 }
 
 write_run_status() {
@@ -20439,28 +24807,101 @@ write_run_status() {
   local status="failed"
   local java_bridge_diagnostics=""
   local obi_metric_evidence=""
+  local boundary_index_payload=""
+  local boundary_index_digest=""
+  local boundary_index_freeze=""
+  local run_status_schema="obi-apache-java-https-run-status-v3"
   local candidate=""
+  local candidate_created_identity=""
   local candidate_identity=""
   local candidate_digest=""
-  local output_identity=""
-  local output_digest=""
+  local candidate_device=""
+  local candidate_inode=""
+  local candidate_owner=""
+  local candidate_mode=""
+  local candidate_links=""
+  local topology=""
+  local create_status=0
+  local cleanup_status=0
   local publication_status=0
+  local attempt=0
 
   if ((exit_status == 0)) && [[ "$RUN_STATUS" == "passed" ]]; then
     status="passed"
   fi
   seal_terminal_java_diagnostics || return $?
+  if obi_metric_boundary_journal_paths_are_cleanly_absent; then
+    # This branch is only for failures before journal initialization. A passed
+    # current run must always prove closed v3 journal coverage.
+    [[ "$status" != passed ]] || return 1
+    run_status_schema="obi-apache-java-https-run-status-v2"
+  else
+    boundary_index_freeze="$(read_bounded_single_line_regular_file \
+      "$RESULT_DIR/.obi-metric-boundary-index.freeze" 160)" || return 1
+    [[ "$boundary_index_freeze" =~ \
+      ^obi-metric-boundary-index-frozen-v1:([0-9a-f]{64})$ ]] || return 1
+    boundary_index_digest="${BASH_REMATCH[1]}"
+    [[ "$(sha256sum "$(obi_metric_boundary_index_path)" | awk '{print $1}')" == \
+      "$boundary_index_digest" ]] || return 1
+    boundary_index_payload="$(obi_metric_boundary_index_payload full)" || return 1
+    OBI_METRIC_BOUNDARY_FROZEN_PAYLOAD="$boundary_index_payload"
+    OBI_METRIC_BOUNDARY_FROZEN_SHA256="$boundary_index_digest"
+  fi
   java_bridge_diagnostics="$(terminal_java_diagnostics_json)" || return $?
   obi_metric_evidence="$(terminal_obi_metrics_json)" || return $?
+  if [[ "$status" == passed ]]; then
+    jq -e '
+      all(.boundaries[];
+        .state == "complete" or .state == "not_applicable")
+    ' <<<"$boundary_index_payload" >/dev/null || return 1
+  fi
   [[ -d "$RESULT_DIR" && ! -L "$RESULT_DIR" &&
     ! -e "$output" && ! -L "$output" &&
+    -z "$RUN_STATUS_CREATED_IDENTITY" &&
     -z "$RUN_STATUS_PUBLISHED_IDENTITY" &&
     -z "$RUN_STATUS_PUBLISHED_DIGEST" &&
     -z "$RUN_STATUS_PUBLICATION_HANDLE" &&
     -z "$RUN_STATUS_PUBLICATION_OUTPUT" &&
     -z "$RUN_STATUS_PUBLICATION_STATE" ]] || return 1
-  candidate="$(mktemp "$RESULT_DIR/.run-status.XXXXXX")" || return $?
+  if candidate="$(mktemp "$RESULT_DIR/.run-status.XXXXXX")"; then
+    create_status=0
+  else
+    create_status=$?
+  fi
+  if [[ "${candidate%/*}" != "$RESULT_DIR" ||
+    ! "${candidate##*/}" =~ ^\.run-status\.[A-Za-z0-9]{6}$ ||
+    ! -f "$candidate" || -L "$candidate" ]]; then
+    ((create_status != 0)) && return "$create_status"
+    return 1
+  fi
+  # Register the exact private pathname before the first fallible metadata
+  # read.  If that read is transiently unavailable, the next cooperative
+  # reconciliation can acquire its inode token without losing the candidate.
+  RUN_STATUS_PUBLICATION_HANDLE="$candidate"
+  RUN_STATUS_PUBLICATION_OUTPUT="$output"
+  RUN_STATUS_PUBLICATION_STATE=created
+  for attempt in 1 2 3; do
+    candidate_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$candidate")" &&
+      break
+    candidate_identity=""
+  done
+  IFS=: read -r candidate_device candidate_inode candidate_owner \
+    candidate_mode candidate_links <<<"$candidate_identity"
+  if [[ -z "$candidate_device" || -z "$candidate_inode" ||
+    "$candidate_owner" != "$(id -u)" || "$candidate_mode" != 600 ||
+    "$candidate_links" != 1 ]]; then
+    ((create_status != 0)) && return "$create_status"
+    return 1
+  fi
+  candidate_created_identity="$candidate_device:$candidate_inode:$candidate_owner"
+  RUN_STATUS_CREATED_IDENTITY="$candidate_created_identity"
+  if ((create_status != 0)); then
+    remove_terminal_owned_run_status_for_rewrite || cleanup_status=$?
+    ((cleanup_status == 0)) || return "$cleanup_status"
+    return "$create_status"
+  fi
   if jq -n \
+    --arg schema "$run_status_schema" \
     --arg status "$status" \
     --argjson exit_status "$exit_status" \
     --argjson acceptance_evidence "$ACCEPTANCE_EVIDENCE" \
@@ -20472,8 +24913,10 @@ write_run_status() {
     --argjson java_bridge_diagnostics "$java_bridge_diagnostics" \
     --arg obi_metric_evidence_reference 'terminal-obi-metrics.json' \
     --argjson obi_metric_evidence "$obi_metric_evidence" \
-    '{
-      schema: "obi-apache-java-https-run-status-v2",
+    --arg obi_metric_boundary_index_reference 'obi-metric-boundary-index.json' \
+    --arg obi_metric_boundary_index_sha256 "$boundary_index_digest" \
+    '({
+      schema: $schema,
       status: $status,
       exit_status: $exit_status,
       acceptance_evidence: $acceptance_evidence,
@@ -20485,59 +24928,62 @@ write_run_status() {
       java_bridge_diagnostics: $java_bridge_diagnostics,
       obi_metric_evidence_reference: $obi_metric_evidence_reference,
       obi_metric_evidence: $obi_metric_evidence
-    }' >"$candidate" && chmod 0644 -- "$candidate"; then
+    } + if $schema == "obi-apache-java-https-run-status-v3" then {
+      obi_metric_boundary_index_reference: $obi_metric_boundary_index_reference,
+      obi_metric_boundary_index_sha256: $obi_metric_boundary_index_sha256
+    } else {} end)' >"$candidate" && chmod 0644 -- "$candidate"; then
     :
   else
     publication_status=$?
-    rm -f -- "$candidate" || true
+    remove_terminal_owned_run_status_for_rewrite || cleanup_status=$?
+    ((cleanup_status == 0)) || return "$cleanup_status"
     return "$publication_status"
   fi
-  candidate_identity="$(stat -Lc '%d:%i:%u:%a' -- "$candidate")" || {
-    publication_status=$?
-    rm -f -- "$candidate" || true
-    return "$publication_status"
-  }
-  candidate_digest="$(sha256sum "$candidate")" || {
-    publication_status=$?
-    rm -f -- "$candidate" || true
-    return "$publication_status"
-  }
-  candidate_digest="${candidate_digest%% *}"
-  RUN_STATUS_PUBLISHED_IDENTITY="$candidate_identity"
-  RUN_STATUS_PUBLISHED_DIGEST="$candidate_digest"
-  RUN_STATUS_PUBLICATION_HANDLE="$candidate"
-  RUN_STATUS_PUBLICATION_OUTPUT="$output"
-  RUN_STATUS_PUBLICATION_STATE=prepared
-  if ln -T -- "$candidate" "$output"; then
-    RUN_STATUS_PUBLICATION_STATE=published
+  for attempt in 1 2 3; do
+    candidate_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$candidate")" &&
+      break
+    candidate_identity=""
+  done
+  IFS=: read -r candidate_device candidate_inode candidate_owner \
+    candidate_mode candidate_links <<<"$candidate_identity"
+  if [[ "$candidate_device:$candidate_inode:$candidate_owner" != \
+      "$candidate_created_identity" || "$candidate_mode" != 644 ||
+    "$candidate_links" != 1 ]]; then
+    remove_terminal_owned_run_status_for_rewrite || cleanup_status=$?
+    ((cleanup_status == 0)) || return "$cleanup_status"
+    return 1
+  fi
+  if candidate_digest="$(sha256sum "$candidate")"; then
+    :
   else
     publication_status=$?
-    if [[ -f "$candidate" && ! -L "$candidate" &&
-      -f "$output" && ! -L "$output" && "$candidate" -ef "$output" ]]; then
-      # The atomic link succeeded even though its wrapper reported an error.
-      # Preserve ownership so the terminal fast remover can safely prevent a
-      # stale status even when a later external verifier is unavailable.
-      RUN_STATUS_PUBLICATION_STATE=published
-    elif remove_published_run_status; then
-      :
-    elif [[ -f "$candidate" && ! -L "$candidate" &&
-      "$(stat -Lc '%d:%i:%u:%a:%h' -- "$candidate")" == "$candidate_identity:1" &&
-      "$(sha256sum "$candidate" | awk '{ print $1 }')" == "$candidate_digest" ]]; then
-      rm -f -- "$candidate" || true
-      clear_published_run_status_ownership
-    fi
+    remove_terminal_owned_run_status_for_rewrite || cleanup_status=$?
+    ((cleanup_status == 0)) || return "$cleanup_status"
     return "$publication_status"
   fi
-  output_identity="$(stat -Lc '%d:%i:%u:%a' -- "$output")" || return 1
-  output_digest="$(sha256sum "$output")" || return 1
-  output_digest="${output_digest%% *}"
-  [[ -f "$candidate" && ! -L "$candidate" &&
-    -f "$output" && ! -L "$output" &&
-    "$output_identity" == "$candidate_identity" &&
-    "$output_identity" == *":$(id -u):644" &&
-    "$(stat -Lc '%h' -- "$candidate")" == 2 &&
-    "$(stat -Lc '%h' -- "$output")" == 2 &&
-    "$output_digest" == "$candidate_digest" ]] || return 1
+  candidate_digest="${candidate_digest%% *}"
+  if [[ ! "$candidate_digest" =~ ^[0-9a-f]{64}$ ]]; then
+    remove_terminal_owned_run_status_for_rewrite || cleanup_status=$?
+    ((cleanup_status == 0)) || return "$cleanup_status"
+    return 1
+  fi
+  RUN_STATUS_PUBLISHED_IDENTITY="${candidate_identity%:1}"
+  RUN_STATUS_PUBLISHED_DIGEST="$candidate_digest"
+  RUN_STATUS_PUBLICATION_STATE=prepared
+  publication_status=1
+  for attempt in 1 2 3; do
+    if ln -T -- "$candidate" "$output"; then
+      publication_status=1
+      break
+    else
+      publication_status=$?
+    fi
+    [[ ! -e "$output" && ! -L "$output" ]] || break
+  done
+  if ! reconcile_owned_run_status_publication topology; then
+    return "$publication_status"
+  fi
+  [[ "$topology" == published_h2 ]] || return "$publication_status"
   RUN_STATUS_PUBLICATION_STATE=validated
 }
 
@@ -20551,6 +24997,7 @@ cleanup_only() {
   BRIDGE_RUNNING=false
   log_info "stopping scoped Compose project $PROJECT_NAME"
   safe_compose_down || return $?
+  OBI_RUNNING=false
   clear_pending_permanent_absence_recovery
 }
 
@@ -20585,6 +25032,7 @@ run_demo() {
 
   RUN_STAGE="runtime-preparation"
   prepare_directories
+  initialize_obi_metric_boundary_index || return $?
   RUN_STAGE="source-state"
   capture_source_state
   RUN_STAGE="source-snapshot"
@@ -20602,6 +25050,9 @@ run_demo() {
   RUN_STAGE="environment-evidence"
   capture_environment
   assert_clean_source_checkout_is_stable
+  if [[ "$SCENARIO" == "pid-reuse" ]]; then
+    begin_obi_metric_boundary pid-reuse || return $?
+  fi
   start_stack
   RUN_STAGE="scenarios"
   if [[ "$SCENARIO" == "delayed-otlp-suppression" ]]; then

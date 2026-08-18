@@ -1030,7 +1030,6 @@ validate_terminal_evidence() {
     (.snapshot | type == "string") and (.counters | type == "object"))
     then .[0] else error("invalid terminal Java diagnostics") end
   ' "$directory/terminal-java-diagnostics.json")" || return 1
-  [[ "$(<"$directory/terminal-java-diagnostics.json")" == "$canonical" ]] || return 1
   reference="$(jq -er '.reference' "$directory/terminal-java-diagnostics.json")" || return 1
   [[ -f "$directory/$reference" && ! -L "$directory/$reference" ]] || return 1
   assert_java_diagnostics "$directory/$reference" || return 1

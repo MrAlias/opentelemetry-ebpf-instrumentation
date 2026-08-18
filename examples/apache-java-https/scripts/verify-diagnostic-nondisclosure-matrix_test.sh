@@ -261,8 +261,10 @@ write_cell() {
   printf '%s\n' "$after_identity" >"$directory/phases/w3c-after/obi-identity.json"
   pair="$(jq -cn --arg transport "$transport" '{schema:"obi-java-remote-parent-metric-pair-v1",boundary:"w3c",continuity:"same_process",before:{state:"running",identity_reference:"phases/w3c-before/obi-identity.json"},after:{state:"running",identity_reference:"phases/w3c-after/obi-identity.json"},series:[{transport:$transport,operation:"availability",status:"valid",before:"1",after:"2",delta:"1"}],java_attach_errors:{before:"0",after:"0",delta:"0"}}')"
   printf '%s\n' "$pair" >"$directory/obi-metric-pairs/w3c.json"
-  terminal_java="$(jq -cnS --arg snapshot "$snapshot" --arg ref "$terminal_reference" --arg phase "$terminal_phase" \
-    '{available:true,counters:($snapshot|split(",")|map(split("=")|{(.[0]):.[1]})|add),phase:$phase,reference:$ref,schema:"obi-java-bridge-terminal-diagnostics-v1",sealed:true,snapshot:$snapshot}')"
+  terminal_java="$(jq -cn --arg snapshot "$snapshot" --arg ref "$terminal_reference" --arg phase "$terminal_phase" '
+    {reference:$ref,snapshot:$snapshot,
+     counters:($snapshot|split(",")|map(split("=")|{(.[0]):.[1]})|add)} +
+    {schema:"obi-java-bridge-terminal-diagnostics-v1",sealed:true,available:true,phase:$phase}')"
   printf '%s\n' "$terminal_java" >"$directory/terminal-java-diagnostics.json"
   before_java_evidence="$(jq -cnS --arg snapshot "$snapshot" --arg ref phases/w3c-before/java-diagnostics.txt '{counters:($snapshot|split(",")|map(split("=")|{(.[0]):.[1]})|add),reference:$ref,snapshot:$snapshot}')"
   after_java_evidence="$(jq -cnS --arg snapshot "$snapshot" --arg ref phases/w3c-after/java-diagnostics.txt '{counters:($snapshot|split(",")|map(split("=")|{(.[0]):.[1]})|add),reference:$ref,snapshot:$snapshot}')"
@@ -1499,6 +1501,33 @@ main() {
     '.phase="unbound-terminal" | .reference="phases/unbound-terminal/java-diagnostics.txt"'
   refresh_run_outer "$directory"
   expect_failure terminal-unbound-extra-phase "$mutated"
+
+  copy_mutation "$fixture" duplicate-terminal-java mutated
+  directory="$mutated/cells/otel-getsockopt-info"
+  report_copy="$(<"$directory/terminal-java-diagnostics.json")"
+  printf '%s %s\n' "$report_copy" "$report_copy" \
+    >"$directory/terminal-java-diagnostics.json"
+  expect_failure duplicate-terminal-java-object "$mutated"
+
+  copy_mutation "$fixture" terminal-java-extra-key mutated
+  directory="$mutated/cells/otel-getsockopt-info"
+  json_update_sorted "$directory/terminal-java-diagnostics.json" '.extra=true'
+  refresh_run_outer "$directory"
+  expect_failure terminal-java-closed-keyset "$mutated"
+
+  copy_mutation "$fixture" terminal-java-snapshot mutated
+  directory="$mutated/cells/otel-getsockopt-info"
+  json_update_sorted "$directory/terminal-java-diagnostics.json" \
+    '.snapshot |= sub("^cfg_on=0";"cfg_on=1") | .counters.cfg_on="1"'
+  refresh_run_outer "$directory"
+  expect_failure terminal-java-reference-snapshot "$mutated"
+
+  copy_mutation "$fixture" terminal-java-counters mutated
+  directory="$mutated/cells/otel-getsockopt-info"
+  json_update_sorted "$directory/terminal-java-diagnostics.json" \
+    '.counters.cfg_on="1"'
+  refresh_run_outer "$directory"
+  expect_failure terminal-java-reconstructed-counters "$mutated"
 
   copy_mutation "$fixture" reference-rewire mutated
   directory="$mutated/cells/otel-getsockopt-info"

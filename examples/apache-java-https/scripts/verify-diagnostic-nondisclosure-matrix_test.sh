@@ -957,6 +957,17 @@ assert_library_and_failure_seams() {
   # shellcheck disable=SC2016
   grep -F 'git -C "$REPO_ROOT" show "$workflow_sha:$workflow_relative"' "$VERIFIER" >/dev/null || return 1
   grep -F 'validate_repository_execution_bytes || die' "$VERIFIER" >/dev/null || return 1
+  grep -F '"${VERIFIER_FILE#"$REPO_ROOT/"}"' "$VERIFIER" >/dev/null || return 1
+  if sed -n '/^validate_repository_execution_bytes() {/,/^}/p' "$VERIFIER" |
+    grep -F 'BASH_SOURCE[0]' >/dev/null; then
+    return 1
+  fi
+  bash -c '
+    cd -- "$1" || exit $?
+    source ./examples/apache-java-https/scripts/verify-diagnostic-nondisclosure-matrix.sh
+    [[ "$VERIFIER_FILE" == "$1/examples/apache-java-https/scripts/verify-diagnostic-nondisclosure-matrix.sh" &&
+      "${VERIFIER_FILE#"$REPO_ROOT/"}" == examples/apache-java-https/scripts/verify-diagnostic-nondisclosure-matrix.sh ]]
+  ' _ "$REPO_ROOT" || return 1
   grep -F 'cleanup_temp_directory || return 1' "$VERIFIER" >/dev/null || return 1
   grep -F 'readonly MAX_OBI_LOG_BYTES=2097152' "$VERIFIER" >/dev/null || return 1
   grep -F 'readonly MAX_JAVA_LOG_BYTES=1048576' "$VERIFIER" >/dev/null || return 1

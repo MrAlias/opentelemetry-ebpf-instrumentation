@@ -13,6 +13,7 @@ REPO_ROOT="$(git -C "$DEMO_DIR" rev-parse --show-toplevel)"
 readonly REPO_ROOT
 readonly COMPOSE_FILE="$DEMO_DIR/docker-compose.yml"
 readonly MATRIX_RUNNER="$SCRIPT_DIR/run-diagnostic-nondisclosure-matrix.sh"
+readonly VERIFIER_FILE="$SCRIPT_DIR/verify-diagnostic-nondisclosure-matrix.sh"
 readonly WORKFLOW_FILE="$REPO_ROOT/.github/workflows/java_diagnostic_nondisclosure.yml"
 readonly REPORT_REFERENCE="scenario-diagnostic-nondisclosure-status.json"
 readonly MAX_SCENARIO_BYTES=1048576
@@ -432,7 +433,7 @@ validate_repository_execution_bytes() {
     examples/apache-java-https/run.sh
     "${COMPOSE_FILE#"$REPO_ROOT/"}"
     "${MATRIX_RUNNER#"$REPO_ROOT/"}"
-    "${BASH_SOURCE[0]#"$REPO_ROOT/"}"
+    "${VERIFIER_FILE#"$REPO_ROOT/"}"
   )
   local -a modes=(100755 100644 100755 100755)
   local index=0

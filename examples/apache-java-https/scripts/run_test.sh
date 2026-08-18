@@ -2567,8 +2567,9 @@ diagnostic_nondisclosure_control_source_contract() {
   )
   local -a ordered_tokens=(
     'run_scenario w3c'
+    'canary_source_sha256="$(diagnostic_nondisclosure_canary_source_sha256 "$scenario_result")"'
     'create_diagnostic_nondisclosure_request_directory'
-    'write_diagnostic_nondisclosure_canaries "$scenario_result"'
+    'write_diagnostic_nondisclosure_canaries "$scenario_result" "$canary_source_sha256"'
     'perform_diagnostic_nondisclosure_request'
     'run_diagnostic_nondisclosure_unix_probe'
     'capture_diagnostic_nondisclosure_java_endpoint'
@@ -2582,7 +2583,7 @@ diagnostic_nondisclosure_control_source_contract() {
     'diagnostic_nondisclosure_surface_json'
     'publish_diagnostic_nondisclosure_surface'
     'cleanup_diagnostic_nondisclosure_request_directory'
-    'publish_diagnostic_nondisclosure_status'
+    'publish_diagnostic_nondisclosure_status "$surfaces" "$canary_count" "$canary_bytes" "$DIAGNOSTIC_NONDISCLOSURE_LOG_SINCE" "$until" "$canary_source_sha256"'
     'attach_obi_artifact_capture'
     'bind_status_to_active_obi_metric_boundary "$status_reference"'
   )
@@ -2657,8 +2658,91 @@ diagnostic_nondisclosure_canary_source_contract() {
     "$probe_source" == *'payloadCanary      = "OBI_SECURITY_PROBE_PAYLOAD_CANARY"'* ]]
 }
 
+diagnostic_nondisclosure_canary_authority_source_contract() {
+  local -r validator_source="$1"
+  local -r digest_source="$2"
+  local -r writer_source="$3"
+  local -r builder_source="$4"
+  local -r live_validator_source="$5"
+  local first_writer_hash_line=""
+  local first_writer_match_line=""
+  local extraction_line=""
+  local promotion_line=""
+  local second_writer_hash_line=""
+  local second_writer_match_line=""
+
+  first_writer_hash_line="$(grep -nF -- \
+    'sha256sum < "$scenario_result"' <<<"$writer_source" | sed -n '1s/:.*//p')" ||
+    return 1
+  second_writer_hash_line="$(grep -nF -- \
+    'sha256sum < "$scenario_result"' <<<"$writer_source" | sed -n '2s/:.*//p')" ||
+    return 1
+  first_writer_match_line="$(grep -nF -- \
+    '"$observed_source_sha256" == "$expected_source_sha256"' \
+    <<<"$writer_source" | sed -n '1s/:.*//p')" || return 1
+  second_writer_match_line="$(grep -nF -- \
+    '"$observed_source_sha256" == "$expected_source_sha256"' \
+    <<<"$writer_source" | sed -n '2s/:.*//p')" || return 1
+  extraction_line="$(grep -nF -- "jq -er '" <<<"$writer_source" |
+    sed -n '1s/:.*//p')" || return 1
+  promotion_line="$(grep -nF -- \
+    'mv -T -- "$candidate" "$output"' <<<"$writer_source" |
+    sed -n '1s/:.*//p')" || return 1
+
+  [[ "$validator_source" == *'bounded_evidence_file'* &&
+    "$validator_source" == *'$DIAGNOSTIC_NONDISCLOSURE_CANARY_SOURCE_MAX_BYTES'* &&
+    "$validator_source" == *'$DIAGNOSTIC_NONDISCLOSURE_CANARY_SOURCE_MAX_LINES'* &&
+    "$validator_source" == *'jq -ces'* &&
+    "$validator_source" == *'length == 1'* &&
+    "$validator_source" == *'length >= 1 and length <= 128'* &&
+    "$validator_source" == *'test("^[A-Za-z0-9._:-]+$")'* &&
+    "$validator_source" == *'.status == "passed" and .scenario == "w3c"'* &&
+    "$validator_source" == *'(.cases | type == "array" and length > 0)'* &&
+    "$validator_source" == *'all(.cases[];'* &&
+    "$validator_source" == *'(.request | type == "object")'* &&
+    "$validator_source" == *'(.request.marker | canary)'* &&
+    "$validator_source" == *'(.trace | type == "object")'* &&
+    "$validator_source" == *'(.trace.spans | type == "array")'* &&
+    "$validator_source" == \
+      *'((.trace.related_spans? // []) | type == "array")'* &&
+    "$validator_source" == *'(.trace_id | canary)'* &&
+    "$validator_source" == *'(.span_id | canary)'* &&
+    "$validator_source" == \
+      *'((.parent_span_id? // "") | . == "" or canary)'* &&
+    "$(grep -Fc -- 'validate_diagnostic_nondisclosure_canary_source "$input"' \
+      <<<"$digest_source")" == 2 &&
+    "$(grep -Fc -- 'sha256_file "$input"' <<<"$digest_source")" == 2 &&
+    "$digest_source" == *'[[ "$first_digest" == "$second_digest" ]]'* &&
+    "$writer_source" == *'local -r expected_source_sha256="$2"'* &&
+    "$(grep -Fc -- 'sha256sum < "$scenario_result"' \
+      <<<"$writer_source")" == 2 &&
+    "$(grep -Fc -- \
+      '"$observed_source_sha256" == "$expected_source_sha256"' \
+      <<<"$writer_source")" == 2 &&
+    "$first_writer_hash_line" =~ ^[1-9][0-9]*$ &&
+    "$first_writer_match_line" =~ ^[1-9][0-9]*$ &&
+    "$extraction_line" =~ ^[1-9][0-9]*$ &&
+    "$promotion_line" =~ ^[1-9][0-9]*$ &&
+    "$second_writer_hash_line" =~ ^[1-9][0-9]*$ &&
+    "$second_writer_match_line" =~ ^[1-9][0-9]*$ &&
+    "$first_writer_hash_line" -lt "$first_writer_match_line" &&
+    "$first_writer_match_line" -lt "$extraction_line" &&
+    "$extraction_line" -lt "$promotion_line" &&
+    "$promotion_line" -lt "$second_writer_hash_line" &&
+    "$second_writer_hash_line" -lt "$second_writer_match_line" &&
+    "$builder_source" == *'local -r canary_source_sha256="$6"'* &&
+    "$builder_source" == *'--arg canary_source_sha256 "$canary_source_sha256"'* &&
+    "$builder_source" == *'reference: "scenario-w3c.json"'* &&
+    "$builder_source" == *'sha256: $canary_source_sha256'* &&
+    "$live_validator_source" == *'"$RESULT_DIR/scenario-w3c.json"'* &&
+    "$live_validator_source" == \
+      *'.canary_source.sha256 == $canary_source_sha256'* ]]
+}
+
 test_diagnostic_nondisclosure_source_contract_is_mutation_sensitive() {
   local control_source=""
+  local canary_source_validator_source=""
+  local canary_source_digest_source=""
   local capture_source=""
   local request_source=""
   local writer_source=""
@@ -2674,6 +2758,8 @@ test_diagnostic_nondisclosure_source_contract_is_mutation_sensitive() {
   local startup_source=""
   local export_source=""
   local environment_source=""
+  local status_builder_source=""
+  local status_live_validator_source=""
   local mutated=""
   local token=""
   local cursor_line=""
@@ -2688,7 +2774,8 @@ test_diagnostic_nondisclosure_source_contract_is_mutation_sensitive() {
   }
   for token in \
     'run_scenario w3c' \
-    'write_diagnostic_nondisclosure_canaries "$scenario_result"' \
+    'canary_source_sha256="$(diagnostic_nondisclosure_canary_source_sha256 "$scenario_result")"' \
+    'write_diagnostic_nondisclosure_canaries "$scenario_result" "$canary_source_sha256"' \
     'perform_diagnostic_nondisclosure_request' \
     'run_diagnostic_nondisclosure_unix_probe' \
     'capture_diagnostic_nondisclosure_java_endpoint' \
@@ -2701,7 +2788,7 @@ test_diagnostic_nondisclosure_source_contract_is_mutation_sensitive() {
     '"$java_log_candidate" || return $?' \
     'publish_diagnostic_nondisclosure_surface' \
     'cleanup_diagnostic_nondisclosure_request_directory' \
-    'publish_diagnostic_nondisclosure_status' \
+    'publish_diagnostic_nondisclosure_status "$surfaces" "$canary_count" "$canary_bytes" "$DIAGNOSTIC_NONDISCLOSURE_LOG_SINCE" "$until" "$canary_source_sha256"' \
     'bind_status_to_active_obi_metric_boundary "$status_reference"'; do
     mutated="${control_source/"$token"/removed_mutation}"
     if diagnostic_nondisclosure_control_source_contract "$mutated" \
@@ -2726,6 +2813,131 @@ test_diagnostic_nondisclosure_source_contract_is_mutation_sensitive() {
     if diagnostic_nondisclosure_control_source_contract "$mutated" \
       >/dev/null 2>&1; then
       printf 'source contract missed removed journal binding: %s\n' "$token" >&2
+      return 1
+    fi
+  done
+
+  canary_source_validator_source="$(
+    declare -f validate_diagnostic_nondisclosure_canary_source
+  )"
+  canary_source_digest_source="$(
+    declare -f diagnostic_nondisclosure_canary_source_sha256
+  )"
+  writer_source="$(declare -f write_diagnostic_nondisclosure_canaries)"
+  status_builder_source="$(declare -f build_diagnostic_nondisclosure_status_payload)"
+  status_live_validator_source="$(
+    declare -f validate_diagnostic_nondisclosure_status_payload
+  )"
+  [[ "$DIAGNOSTIC_NONDISCLOSURE_CANARY_MAX_COUNT" == 128 &&
+    "$DIAGNOSTIC_NONDISCLOSURE_CANARY_MAX_BYTES" == 16384 &&
+    "$DIAGNOSTIC_NONDISCLOSURE_CANARY_SOURCE_MAX_BYTES" == 1048576 &&
+    "$DIAGNOSTIC_NONDISCLOSURE_CANARY_SOURCE_MAX_LINES" == 10000 ]] || {
+    printf 'diagnostic canary authority bounds drifted\n' >&2
+    return 1
+  }
+  diagnostic_nondisclosure_canary_authority_source_contract \
+    "$canary_source_validator_source" "$canary_source_digest_source" \
+    "$writer_source" "$status_builder_source" "$status_live_validator_source" || {
+    printf 'diagnostic canary source authority contract drifted\n' >&2
+    return 1
+  }
+  for token in \
+    'bounded_evidence_file' \
+    '$DIAGNOSTIC_NONDISCLOSURE_CANARY_SOURCE_MAX_BYTES' \
+    '$DIAGNOSTIC_NONDISCLOSURE_CANARY_SOURCE_MAX_LINES' \
+    'jq -ces' \
+    'length == 1' \
+    'length >= 1 and length <= 128' \
+    'test("^[A-Za-z0-9._:-]+$")' \
+    '.status == "passed" and .scenario == "w3c"' \
+    '(.cases | type == "array" and length > 0)' \
+    'all(.cases[];' \
+    '(.request | type == "object")' \
+    '(.request.marker | canary)' \
+    '(.trace | type == "object")' \
+    '(.trace.spans | type == "array")' \
+    '((.trace.related_spans? // []) | type == "array")' \
+    '(.trace_id | canary)' \
+    '(.span_id | canary)' \
+    '((.parent_span_id? // "") | . == "" or canary)'; do
+    mutated="${canary_source_validator_source/"$token"/removed_authority_mutation}"
+    if diagnostic_nondisclosure_canary_authority_source_contract \
+      "$mutated" "$canary_source_digest_source" "$writer_source" \
+      "$status_builder_source" "$status_live_validator_source" \
+      >/dev/null 2>&1; then
+      printf 'canary authority contract missed validator mutation: %s\n' \
+        "$token" >&2
+      return 1
+    fi
+  done
+  for mutation in \
+    'length >= 1|length >= 0' \
+    'length <= 128|length <= 129' \
+    'length > 0|length >= 0'; do
+    token="${mutation%%|*}"
+    mutated="${canary_source_validator_source/"$token"/${mutation#*|}}"
+    if diagnostic_nondisclosure_canary_authority_source_contract \
+      "$mutated" "$canary_source_digest_source" "$writer_source" \
+      "$status_builder_source" "$status_live_validator_source" \
+      >/dev/null 2>&1; then
+      printf 'canary authority contract accepted widened bound: %s\n' \
+        "$mutation" >&2
+      return 1
+    fi
+  done
+  for token in \
+    'validate_diagnostic_nondisclosure_canary_source "$input"' \
+    'sha256_file "$input"' \
+    '[[ "$first_digest" == "$second_digest" ]]'; do
+    mutated="${canary_source_digest_source/"$token"/removed_authority_mutation}"
+    if diagnostic_nondisclosure_canary_authority_source_contract \
+      "$canary_source_validator_source" "$mutated" "$writer_source" \
+      "$status_builder_source" "$status_live_validator_source" \
+      >/dev/null 2>&1; then
+      printf 'canary authority contract missed digest mutation: %s\n' \
+        "$token" >&2
+      return 1
+    fi
+  done
+  for token in \
+    'local -r expected_source_sha256="$2"' \
+    'sha256sum < "$scenario_result"' \
+    '"$observed_source_sha256" == "$expected_source_sha256"'; do
+    mutated="${writer_source/"$token"/removed_authority_mutation}"
+    if diagnostic_nondisclosure_canary_authority_source_contract \
+      "$canary_source_validator_source" "$canary_source_digest_source" \
+      "$mutated" "$status_builder_source" "$status_live_validator_source" \
+      >/dev/null 2>&1; then
+      printf 'canary authority contract missed writer mutation: %s\n' \
+        "$token" >&2
+      return 1
+    fi
+  done
+  for token in \
+    'local -r canary_source_sha256="$6"' \
+    '--arg canary_source_sha256 "$canary_source_sha256"' \
+    'reference: "scenario-w3c.json"' \
+    'sha256: $canary_source_sha256'; do
+    mutated="${status_builder_source/"$token"/removed_authority_mutation}"
+    if diagnostic_nondisclosure_canary_authority_source_contract \
+      "$canary_source_validator_source" "$canary_source_digest_source" \
+      "$writer_source" "$mutated" "$status_live_validator_source" \
+      >/dev/null 2>&1; then
+      printf 'canary authority contract missed report mutation: %s\n' \
+        "$token" >&2
+      return 1
+    fi
+  done
+  for token in \
+    '"$RESULT_DIR/scenario-w3c.json"' \
+    '.canary_source.sha256 == $canary_source_sha256'; do
+    mutated="${status_live_validator_source/"$token"/removed_authority_mutation}"
+    if diagnostic_nondisclosure_canary_authority_source_contract \
+      "$canary_source_validator_source" "$canary_source_digest_source" \
+      "$writer_source" "$status_builder_source" "$mutated" \
+      >/dev/null 2>&1; then
+      printf 'canary authority contract missed live-validator mutation: %s\n' \
+        "$token" >&2
       return 1
     fi
   done
@@ -12179,6 +12391,7 @@ test_diagnostic_nondisclosure_write_failures_are_not_masked() {
       DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR="$RESULT_DIR/.diagnostic-nondisclosure-request.ABC123"
       local -r scenario_result="$RESULT_DIR/scenario-w3c.json"
       local -r curl_marker="$RESULT_DIR/curl.called"
+      local canary_source_sha256=""
       local -i printf_calls=0
       local status=0
 
@@ -12194,11 +12407,15 @@ test_diagnostic_nondisclosure_write_failures_are_not_masked() {
           }]
         }
       ' >"$scenario_result" || return $?
+      canary_source_sha256="$(
+        diagnostic_nondisclosure_canary_source_sha256 "$scenario_result"
+      )" || return $?
       case "$mode" in
         fixed-canary)
           SELECTED_TRANSPORT=getsockopt
           printf() { return 77; }
-          if write_diagnostic_nondisclosure_canaries "$scenario_result"; then
+          if write_diagnostic_nondisclosure_canaries \
+            "$scenario_result" "$canary_source_sha256"; then
             status=0
           else
             status=$?
@@ -12213,7 +12430,8 @@ test_diagnostic_nondisclosure_write_failures_are_not_masked() {
             fi
             builtin printf "$@"
           }
-          if write_diagnostic_nondisclosure_canaries "$scenario_result"; then
+          if write_diagnostic_nondisclosure_canaries \
+            "$scenario_result" "$canary_source_sha256"; then
             status=0
           else
             status=$?
@@ -12413,6 +12631,7 @@ test_diagnostic_nondisclosure_canary_manifest_is_complete_and_deduplicated() {
       DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR="$RESULT_DIR/.diagnostic-nondisclosure-request.ABC123"
       local -r scenario_result="$RESULT_DIR/scenario-w3c.json"
       local -r expected="$RESULT_DIR/canaries.expected"
+      local canary_source_sha256=""
 
       mkdir -p -- "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR" || return $?
       chmod 0700 -- "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR" || return $?
@@ -12448,6 +12667,9 @@ test_diagnostic_nondisclosure_canary_manifest_is_complete_and_deduplicated() {
             }]
           }
         ' >"$scenario_result" || return $?
+      canary_source_sha256="$(
+        diagnostic_nondisclosure_canary_source_sha256 "$scenario_result"
+      )" || return $?
       {
         printf '%s\n' \
           "$DIAGNOSTIC_NONDISCLOSURE_TRACE_ID" \
@@ -12465,13 +12687,20 @@ test_diagnostic_nondisclosure_canary_manifest_is_complete_and_deduplicated() {
         fi
       } | LC_ALL=C sort -u >"$expected" || return $?
 
-      write_diagnostic_nondisclosure_canaries "$scenario_result" || return $?
+      write_diagnostic_nondisclosure_canaries \
+        "$scenario_result" "$canary_source_sha256" || return $?
       cmp -s -- \
         "$expected" "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/canaries.txt" ||
         return $?
       [[ "$(stat --format='%u:%a:%h' -- \
         "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/canaries.txt")" == \
           "$EUID:600:1" ]] || return 1
+      printf '%s\n' '{}' >>"$scenario_result" || return $?
+      if diagnostic_nondisclosure_canary_source_sha256 \
+        "$scenario_result" >/dev/null 2>&1; then
+        printf 'canary source accepted a second JSON document\n' >&2
+        return 1
+      fi
       cleanup_diagnostic_nondisclosure_request_directory || return $?
       [[ -z "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR" ]] || return 1
     ) || {
@@ -12479,6 +12708,214 @@ test_diagnostic_nondisclosure_canary_manifest_is_complete_and_deduplicated() {
       return 1
     }
   done
+}
+
+test_diagnostic_nondisclosure_canary_source_is_exact_and_bounded() {
+  local -r root="$TEST_TMP_DIR/diagnostic-nondisclosure-canary-source"
+  local -r valid_source="$root/valid.json"
+  local -r exact_bytes="$root/exact-bytes.json"
+  local -r excess_bytes="$root/excess-bytes.json"
+  local -r exact_lines="$root/exact-lines.json"
+  local -r excess_lines="$root/excess-lines.json"
+  local source_payload=""
+  local specification=""
+  local case_name=""
+  local mutation=""
+  local candidate=""
+  local digest=""
+  local padding=0
+  local line=0
+  local -a invalid_sources=(
+    $'source-type\t. = []'
+    $'missing-status\tdel(.status)'
+    $'status-type\t.status = 1'
+    $'status-value\t.status = "failed"'
+    $'missing-scenario\tdel(.scenario)'
+    $'scenario-type\t.scenario = 1'
+    $'scenario-value\t.scenario = "restart"'
+    $'missing-cases\tdel(.cases)'
+    $'zero-cases\t.cases = []'
+    $'cases-type\t.cases = {}'
+    $'case-type\t.cases[0] = []'
+    $'missing-request\tdel(.cases[0].request)'
+    $'request-type\t.cases[0].request = []'
+    $'missing-marker\tdel(.cases[0].request.marker)'
+    $'marker-type\t.cases[0].request.marker = 1'
+    $'marker-empty\t.cases[0].request.marker = ""'
+    $'marker-too-long\t.cases[0].request.marker = ("x" * 129)'
+    $'marker-charset\t.cases[0].request.marker = "bad value"'
+    $'request-trace-type\t.cases[0].request.w3c_trace_id = 1'
+    $'request-trace-too-long\t.cases[0].request.w3c_trace_id = ("x" * 129)'
+    $'request-parent-type\t.cases[0].request.w3c_parent_span_id = 1'
+    $'request-parent-charset\t.cases[0].request.w3c_parent_span_id = "bad value"'
+    $'missing-trace\tdel(.cases[0].trace)'
+    $'trace-type\t.cases[0].trace = []'
+    $'missing-spans\tdel(.cases[0].trace.spans)'
+    $'spans-type\t.cases[0].trace.spans = {}'
+    $'span-type\t.cases[0].trace.spans[0] = []'
+    $'missing-trace-id\tdel(.cases[0].trace.spans[0].trace_id)'
+    $'trace-id-type\t.cases[0].trace.spans[0].trace_id = 1'
+    $'trace-id-empty\t.cases[0].trace.spans[0].trace_id = ""'
+    $'trace-id-too-long\t.cases[0].trace.spans[0].trace_id = ("x" * 129)'
+    $'trace-id-charset\t.cases[0].trace.spans[0].trace_id = "bad value"'
+    $'missing-span-id\tdel(.cases[0].trace.spans[0].span_id)'
+    $'span-id-type\t.cases[0].trace.spans[0].span_id = 1'
+    $'span-id-empty\t.cases[0].trace.spans[0].span_id = ""'
+    $'span-id-too-long\t.cases[0].trace.spans[0].span_id = ("x" * 129)'
+    $'span-id-charset\t.cases[0].trace.spans[0].span_id = "bad value"'
+    $'parent-id-type\t.cases[0].trace.spans[0].parent_span_id = 1'
+    $'parent-id-too-long\t.cases[0].trace.spans[0].parent_span_id = ("x" * 129)'
+    $'parent-id-charset\t.cases[0].trace.spans[0].parent_span_id = "bad value"'
+    $'related-spans-type\t.cases[0].trace.related_spans = {}'
+    $'related-span-type\t.cases[0].trace.related_spans[0] = []'
+    $'related-missing-trace-id\tdel(.cases[0].trace.related_spans[0].trace_id)'
+    $'related-missing-span-id\tdel(.cases[0].trace.related_spans[0].span_id)'
+  )
+
+  mkdir -p -- "$root" || return $?
+  jq -cnS '
+    {
+      cases: [{
+        request: {
+          marker: "dynamic-marker",
+          w3c_parent_span_id: ("2" * 16),
+          w3c_trace_id: ("1" * 32)
+        },
+        trace: {
+          related_spans: [{
+            parent_span_id: ("8" * 16),
+            span_id: ("7" * 16),
+            trace_id: ("6" * 32)
+          }],
+          spans: [{
+            parent_span_id: ("5" * 16),
+            span_id: ("4" * 16),
+            trace_id: ("3" * 32)
+          }]
+        }
+      }],
+      scenario: "w3c",
+      status: "passed"
+    }
+  ' >"$valid_source" || return $?
+  validate_diagnostic_nondisclosure_canary_source "$valid_source" || return $?
+  digest="$(diagnostic_nondisclosure_canary_source_sha256 "$valid_source")" ||
+    return $?
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+
+  for specification in "${invalid_sources[@]}"; do
+    case_name="${specification%%$'\t'*}"
+    mutation="${specification#*$'\t'}"
+    candidate="$root/$case_name.json"
+    jq -cS "$mutation" "$valid_source" >"$candidate" || return $?
+    if validate_diagnostic_nondisclosure_canary_source "$candidate" \
+      >/dev/null 2>&1; then
+      printf 'canary source accepted invalid case: %s\n' "$case_name" >&2
+      return 1
+    fi
+    if diagnostic_nondisclosure_canary_source_sha256 "$candidate" \
+      >/dev/null 2>&1; then
+      printf 'canary source digest accepted invalid case: %s\n' "$case_name" >&2
+      return 1
+    fi
+  done
+
+  # Request W3C IDs and span parents are optional for non-W3C/root spans.
+  candidate="$root/optional-parent.json"
+  jq -cS '
+    del(.cases[0].request.w3c_trace_id) |
+    del(.cases[0].request.w3c_parent_span_id) |
+    del(.cases[0].trace.spans[0].parent_span_id) |
+    del(.cases[0].trace.related_spans[0].parent_span_id)
+  ' "$valid_source" >"$candidate" || return $?
+  validate_diagnostic_nondisclosure_canary_source "$candidate" || return $?
+
+  source_payload="$(<"$valid_source")" || return $?
+  padding="$((DIAGNOSTIC_NONDISCLOSURE_CANARY_SOURCE_MAX_BYTES -
+    ${#source_payload}))"
+  ((padding >= 0)) || return 1
+  printf '%*s%s' "$padding" '' "$source_payload" >"$exact_bytes" || return $?
+  [[ "$(stat -c '%s' -- "$exact_bytes")" == \
+    "$DIAGNOSTIC_NONDISCLOSURE_CANARY_SOURCE_MAX_BYTES" ]] || return 1
+  validate_diagnostic_nondisclosure_canary_source "$exact_bytes" || return $?
+  printf ' %s' "$(<"$exact_bytes")" >"$excess_bytes" || return $?
+  [[ "$(stat -c '%s' -- "$excess_bytes")" == \
+    "$((DIAGNOSTIC_NONDISCLOSURE_CANARY_SOURCE_MAX_BYTES + 1))" ]] || return 1
+  if validate_diagnostic_nondisclosure_canary_source "$excess_bytes" \
+    >/dev/null 2>&1; then
+    printf 'canary source accepted byte cap + 1\n' >&2
+    return 1
+  fi
+
+  {
+    for ((line = 1; line < DIAGNOSTIC_NONDISCLOSURE_CANARY_SOURCE_MAX_LINES;
+      line++)); do
+      printf '\n' || return $?
+    done
+    printf '%s\n' "$source_payload" || return $?
+  } >"$exact_lines" || return $?
+  [[ "$(wc -l <"$exact_lines")" == \
+    "$DIAGNOSTIC_NONDISCLOSURE_CANARY_SOURCE_MAX_LINES" ]] || return 1
+  validate_diagnostic_nondisclosure_canary_source "$exact_lines" || return $?
+  printf '\n' >"$excess_lines" || return $?
+  cat -- "$exact_lines" >>"$excess_lines" || return $?
+  [[ "$(wc -l <"$excess_lines")" == \
+    "$((DIAGNOSTIC_NONDISCLOSURE_CANARY_SOURCE_MAX_LINES + 1))" ]] || return 1
+  if validate_diagnostic_nondisclosure_canary_source "$excess_lines" \
+    >/dev/null 2>&1; then
+    printf 'canary source accepted line cap + 1\n' >&2
+    return 1
+  fi
+
+  (
+    local -r original_trace_id="11111111111111111111111111111111"
+    local -r replacement_trace_id="99999999999999999999999999999999"
+    local scenario_result=""
+    local expected_source_sha256=""
+    local status=0
+
+    RESULT_DIR="$root/post-extraction-drift"
+    SELECTED_TRANSPORT=getsockopt
+    DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR="$RESULT_DIR/.diagnostic-nondisclosure-request.ABC123"
+    scenario_result="$RESULT_DIR/scenario-w3c.json"
+    mkdir -p -- "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR" || return $?
+    chmod 0700 -- "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR" || return $?
+    jq -cS --arg trace_id "$original_trace_id" \
+      '.cases[0].request.w3c_trace_id = $trace_id' \
+      "$valid_source" >"$scenario_result" || return $?
+    expected_source_sha256="$(
+      diagnostic_nondisclosure_canary_source_sha256 "$scenario_result"
+    )" || return $?
+    mv() {
+      local target="${*: -1}"
+
+      command mv "$@" || return $?
+      if [[ "$target" == \
+        "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/canaries.txt" ]]; then
+        command sed -i \
+          "s/$original_trace_id/$replacement_trace_id/" \
+          "$scenario_result" || return $?
+      fi
+    }
+    if write_diagnostic_nondisclosure_canaries \
+      "$scenario_result" "$expected_source_sha256"; then
+      status=0
+    else
+      status=$?
+    fi
+    unset -f mv || return $?
+    [[ "$status" == 1 &&
+      "$(grep -Foc -- "$replacement_trace_id" "$scenario_result")" == 1 &&
+      ! -e "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/canaries.unsorted" &&
+      ! -L "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/canaries.unsorted" &&
+      ! -e "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/canaries.txt" &&
+      ! -L "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/canaries.txt" ]] || return 1
+    cleanup_diagnostic_nondisclosure_request_directory || return $?
+    [[ -z "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR" ]] || return 1
+  ) || {
+    printf 'canary writer did not reject post-extraction source drift\n' >&2
+    return 1
+  }
 }
 
 test_diagnostic_nondisclosure_surface_publication_reconciles_side_effects() {
@@ -12618,15 +13055,22 @@ test_diagnostic_nondisclosure_surfaces_and_report_are_closed() {
   local -r metrics_ref="diagnostic-nondisclosure-obi-metrics.prom"
   local -r obi_log_ref="diagnostic-nondisclosure-obi.log"
   local -r java_log_ref="diagnostic-nondisclosure-java.log"
+  local -r scenario_ref="scenario-w3c.json"
+  local -r original_w3c_trace_id="11111111111111111111111111111111"
+  local -r replacement_w3c_trace_id="77777777777777777777777777777777"
   local -r since="2026-08-18T01:02:03.000000004Z"
   local -r until="2026-08-18T01:02:04.000000005Z"
   local canary_count=""
   local canary_bytes=""
+  local canary_source_sha256=""
+  local scenario_size=""
   local clean_probe="$result_dir/clean-probe.txt"
   local tainted_probe="$result_dir/tainted-probe.txt"
   local payload=""
   local mutation=""
   local mutated=""
+  local malformed_report=""
+  local report_candidate=""
   local surface=""
   local canary=""
   local surfaces=""
@@ -12641,16 +13085,33 @@ test_diagnostic_nondisclosure_surfaces_and_report_are_closed() {
     OBI_LOG_LEVEL=info
     mkdir -p -- "$request_dir" || return $?
     chmod 0700 -- "$request_dir" || return $?
-    printf '%s\n' \
-      "$DIAGNOSTIC_NONDISCLOSURE_TRACE_ID" \
-      "$DIAGNOSTIC_NONDISCLOSURE_PARENT_SPAN_ID" \
-      "$DIAGNOSTIC_NONDISCLOSURE_MARKER" \
-      "$DIAGNOSTIC_NONDISCLOSURE_HEADER_CANARY" \
-      "$DIAGNOSTIC_NONDISCLOSURE_BODY_CANARY" \
-      "$DIAGNOSTIC_NONDISCLOSURE_CREDENTIAL_CANARY" \
-      "$DIAGNOSTIC_NONDISCLOSURE_UNIX_PAYLOAD_CANARY" \
-      >"$request_dir/canaries.txt" || return $?
-    chmod 0600 -- "$request_dir/canaries.txt" || return $?
+    jq -cnS \
+      --arg trace_id "$original_w3c_trace_id" '
+        {
+          cases: [{
+            request: {
+              marker: "dynamic-w3c-marker",
+              w3c_parent_span_id: "2222222222222222",
+              w3c_trace_id: $trace_id
+            },
+            trace: {
+              related_spans: [],
+              spans: [{
+                parent_span_id: "5555555555555555",
+                span_id: "4444444444444444",
+                trace_id: "33333333333333333333333333333333"
+              }]
+            }
+          }],
+          scenario: "w3c",
+          status: "passed"
+        }
+      ' >"$result_dir/$scenario_ref" || return $?
+    chmod 0600 -- "$result_dir/$scenario_ref" || return $?
+    canary_source_sha256="$(diagnostic_nondisclosure_canary_source_sha256 \
+      "$result_dir/$scenario_ref")" || return $?
+    write_diagnostic_nondisclosure_canaries \
+      "$result_dir/$scenario_ref" "$canary_source_sha256" || return $?
     write_diagnostics_fixture "$result_dir/$endpoint_ref" 1 0 0 1 0 0 ||
       return $?
     cp -- "$result_dir/$endpoint_ref" "$result_dir/$header_ref" || return $?
@@ -12705,7 +13166,8 @@ test_diagnostic_nondisclosure_surfaces_and_report_are_closed() {
     canary_count="$(wc -l <"$request_dir/canaries.txt")" || return $?
     canary_bytes="$(stat -c '%s' -- "$request_dir/canaries.txt")" || return $?
     payload="$(build_diagnostic_nondisclosure_status_payload \
-      "$surfaces" "$canary_count" "$canary_bytes" "$since" "$until")" ||
+      "$surfaces" "$canary_count" "$canary_bytes" "$since" "$until" \
+      "$canary_source_sha256")" ||
       return $?
     validate_diagnostic_nondisclosure_status_payload "$payload" || return $?
     printf '%s\n' "$payload" \
@@ -12717,7 +13179,11 @@ test_diagnostic_nondisclosure_surfaces_and_report_are_closed() {
 
     for mutation in \
       'del(.policy)' \
+      'del(.canary_source)' \
       '.unexpected = true' \
+      '.canary_source.reference = "wrong.json"' \
+      '.canary_source.sha256 = "bad"' \
+      '.canary_source.unexpected = true' \
       '.debug_controls.bpf_debug = true' \
       '.obi_metric_boundary_ids = []' \
       '.surfaces[0].canary_match_count = 1' \
@@ -12734,6 +13200,38 @@ test_diagnostic_nondisclosure_surfaces_and_report_are_closed() {
         return 1
       fi
     done
+    mutated="$(jq -cS \
+      '.canary_source.sha256 =
+        "0000000000000000000000000000000000000000000000000000000000000000"' \
+      <<<"$payload")" || return $?
+    validate_diagnostic_nondisclosure_status_payload_intrinsic "$mutated" ||
+      return $?
+    if validate_diagnostic_nondisclosure_status_payload "$mutated" \
+      >/dev/null 2>&1; then
+      printf 'diagnostic report accepted wrong valid canary-source digest\n' >&2
+      return 1
+    fi
+
+    scenario_size="$(stat -c '%s' -- "$result_dir/$scenario_ref")" || return $?
+    sed -i \
+      "s/$original_w3c_trace_id/$replacement_w3c_trace_id/" \
+      "$result_dir/$scenario_ref" || return $?
+    [[ "$(stat -c '%s' -- "$result_dir/$scenario_ref")" == "$scenario_size" &&
+      "$(grep -Foc -- "$replacement_w3c_trace_id" \
+        "$result_dir/$scenario_ref")" == 1 ]] || return 1
+    validate_diagnostic_nondisclosure_status_payload_intrinsic "$payload" ||
+      return $?
+    if validate_diagnostic_nondisclosure_status_payload "$payload" \
+      >/dev/null 2>&1; then
+      printf 'diagnostic report accepted same-length W3C canary-source drift\n' >&2
+      return 1
+    fi
+    sed -i \
+      "s/$replacement_w3c_trace_id/$original_w3c_trace_id/" \
+      "$result_dir/$scenario_ref" || return $?
+    [[ "$(diagnostic_nondisclosure_canary_source_sha256 \
+      "$result_dir/$scenario_ref")" == "$canary_source_sha256" ]] || return 1
+    validate_diagnostic_nondisclosure_status_payload "$payload" || return $?
 
     printf '%s\n' 'trace_id authorization ordinary-diagnostic-words' \
       >"$clean_probe" || return $?
@@ -12748,8 +13246,7 @@ test_diagnostic_nondisclosure_surfaces_and_report_are_closed() {
         "$DIAGNOSTIC_NONDISCLOSURE_MARKER" \
         "$DIAGNOSTIC_NONDISCLOSURE_HEADER_CANARY" \
         "$DIAGNOSTIC_NONDISCLOSURE_BODY_CANARY" \
-        "$DIAGNOSTIC_NONDISCLOSURE_CREDENTIAL_CANARY" \
-        "$DIAGNOSTIC_NONDISCLOSURE_UNIX_PAYLOAD_CANARY"; do
+        "$DIAGNOSTIC_NONDISCLOSURE_CREDENTIAL_CANARY"; do
         cp -- "$result_dir/$surface" "$tainted_probe" || return $?
         printf '%s\n' "$canary" >>"$tainted_probe" || return $?
         if assert_diagnostic_nondisclosure_surface_has_no_canary \
@@ -12778,6 +13275,47 @@ test_diagnostic_nondisclosure_surfaces_and_report_are_closed() {
     TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER=true
     normalize_diagnostic_nondisclosure_report_candidate_before_freeze ||
       return $?
+    malformed_report="$(jq -cS 'del(.canary_source)' <<<"$payload")" ||
+      return $?
+    printf '%s\n' "$malformed_report" \
+      >"$result_dir/scenario-diagnostic-nondisclosure-status.json" || return $?
+    if normalize_diagnostic_nondisclosure_report_candidate_before_freeze \
+      >/dev/null 2>&1; then
+      printf 'prefreeze normalizer accepted a malformed canonical report\n' >&2
+      return 1
+    fi
+    [[ "$(<"$result_dir/scenario-diagnostic-nondisclosure-status.json")" == \
+      "$malformed_report" &&
+      "$(stat -Lc '%u:%a:%h' -- \
+        "$result_dir/scenario-diagnostic-nondisclosure-status.json")" == \
+        "$EUID:644:1" ]] || return 1
+    printf '%s\n' "$payload" \
+      >"$result_dir/scenario-diagnostic-nondisclosure-status.json" || return $?
+    report_candidate="$result_dir/.diagnostic-nondisclosure-report.ABC123"
+    ln -T -- "$result_dir/scenario-diagnostic-nondisclosure-status.json" \
+      "$report_candidate" || return $?
+    printf '%s\n' "$malformed_report" >"$report_candidate" || return $?
+    if normalize_diagnostic_nondisclosure_report_candidate_before_freeze \
+      >/dev/null 2>&1; then
+      printf 'prefreeze normalizer accepted a malformed h2 report candidate\n' \
+        >&2
+      return 1
+    fi
+    [[ -f "$report_candidate" && ! -L "$report_candidate" &&
+      "$report_candidate" -ef \
+        "$result_dir/scenario-diagnostic-nondisclosure-status.json" &&
+      "$(stat -Lc '%u:%a:%h' -- "$report_candidate")" == "$EUID:644:2" ]] ||
+      return 1
+    printf '%s\n' "$payload" \
+      >"$result_dir/scenario-diagnostic-nondisclosure-status.json" || return $?
+    normalize_diagnostic_nondisclosure_report_candidate_before_freeze ||
+      return $?
+    [[ ! -e "$report_candidate" && ! -L "$report_candidate" &&
+      "$(<"$result_dir/scenario-diagnostic-nondisclosure-status.json")" == \
+        "$payload" &&
+      "$(stat -Lc '%u:%a:%h' -- \
+        "$result_dir/scenario-diagnostic-nondisclosure-status.json")" == \
+        "$EUID:644:1" ]] || return 1
     TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER=false
     SELECTED_TRANSPORT=getsockopt
 
@@ -24266,6 +24804,211 @@ capture_fixture_source_state() {
       *) exit 64 ;;
     esac
   ' fixture-runner-child "$fixture_runner" "$result_directory" "$expectation"
+}
+
+capture_fixture_source_patch_identity_twice() {
+  local -r fixture_runner="$1"
+  local -r first_result_directory="$2"
+  local -r second_result_directory="$3"
+  local -r work_paths_file="$4"
+
+  bash -c '
+    set -Eeuo pipefail
+    fixture_runner=$1
+    first_result_directory=$2
+    second_result_directory=$3
+    work_paths_file=$4
+    source "$fixture_runner"
+    first_work_directory=""
+    second_work_directory=""
+
+    cleanup_fixture_source_work_directories() {
+      local candidate=""
+
+      for candidate in "$first_work_directory" "$second_work_directory"; do
+        [[ -n "$candidate" &&
+          "$candidate" == "$SOURCE_SNAPSHOT_PARENT"/obi-source-snapshot-work.* &&
+          -d "$candidate" && ! -L "$candidate" ]] || continue
+        rm -rf -- "$candidate" || return $?
+      done
+    }
+
+    capture_fixture_source_patch_identity_once() {
+      local -r result_directory=$1
+      local -r work_directory=$2
+
+      RESULT_DIR="$result_directory"
+      SOURCE_SNAPSHOT_WORK_DIR="$work_directory"
+      BRIDGE_EXPORT_DIR=""
+      SOURCE_DIRTY=""
+      SOURCE_PATCH_SHA256=""
+      SOURCE_REVISION=""
+      SOURCE_TRACKED_PATCH_SHA256=""
+      SOURCE_TREE_SHA256=""
+      SOURCE_TREE_MANIFEST_SCHEMA=""
+      ACCEPTANCE_EVIDENCE=true
+      ACCEPTANCE_EVIDENCE_REASON=""
+      capture_source_state || return $?
+      [[ "$SOURCE_DIRTY" == true &&
+        "$SOURCE_TREE_MANIFEST_SCHEMA" == worktree-v1 &&
+        "$ACCEPTANCE_EVIDENCE" == false &&
+        "$ACCEPTANCE_EVIDENCE_REASON" == dirty-source-tree ]] || return 1
+    }
+
+    trap cleanup_fixture_source_work_directories EXIT
+    first_work_directory="$(
+      mktemp -d "$SOURCE_SNAPSHOT_PARENT/obi-source-snapshot-work.XXXXXX"
+    )" || exit $?
+    second_work_directory="$(
+      mktemp -d "$SOURCE_SNAPSHOT_PARENT/obi-source-snapshot-work.XXXXXX"
+    )" || exit $?
+    [[ "$first_work_directory" != "$second_work_directory" ]] || exit 1
+    capture_fixture_source_patch_identity_once \
+      "$first_result_directory" "$first_work_directory" || exit $?
+    capture_fixture_source_patch_identity_once \
+      "$second_result_directory" "$second_work_directory" || exit $?
+    printf "%s\n%s\n" "$first_work_directory" "$second_work_directory" \
+      >"$work_paths_file" || exit $?
+  ' fixture-runner-child \
+    "$fixture_runner" "$first_result_directory" "$second_result_directory" \
+    "$work_paths_file"
+}
+
+test_source_patch_identity_is_content_only_and_path_independent() {
+  local -r fixture_repository="$TEST_TMP_DIR/source-patch-identity-fixture"
+  local -r fixture_hooks_directory="$fixture_repository/controlled-hooks"
+  local -r fixture_runner="$fixture_repository/examples/apache-java-https/run.sh"
+  local -r mutated_runner="$fixture_repository/examples/apache-java-https/run-path-sensitive.sh"
+  local -r first_result_directory="$TEST_TMP_DIR/source-patch-identity-first"
+  local -r second_result_directory="$TEST_TMP_DIR/source-patch-identity-second"
+  local -r mutated_first_result_directory="$TEST_TMP_DIR/source-patch-identity-mutated-first"
+  local -r mutated_second_result_directory="$TEST_TMP_DIR/source-patch-identity-mutated-second"
+  local -r work_paths_file="$TEST_TMP_DIR/source-patch-identity-work-paths"
+  local -r mutated_work_paths_file="$TEST_TMP_DIR/source-patch-identity-mutated-work-paths"
+  local first_identity=""
+  local second_identity=""
+  local mutated_first_identity=""
+  local mutated_second_identity=""
+  local source_status_sha256=""
+  local source_tree_manifest_sha256=""
+  local source_tree_sha256=""
+  local tracked_patch_sha256=""
+  local expected_identity=""
+  local -a work_paths=()
+
+  mkdir -p -- \
+    "$fixture_hooks_directory" "${fixture_runner%/*}" \
+    "$first_result_directory" "$second_result_directory" \
+    "$mutated_first_result_directory" "$mutated_second_result_directory" || return $?
+  git init --quiet "$fixture_repository" || return $?
+  git -C "$fixture_repository" config user.email 'source-patch-identity@example.invalid' ||
+    return $?
+  git -C "$fixture_repository" config user.name 'Source Patch Identity Test' || return $?
+  git -C "$fixture_repository" config commit.gpgSign false || return $?
+  git -C "$fixture_repository" config core.hooksPath "$fixture_hooks_directory" || return $?
+  cp -- "$TEST_SCRIPT_DIR/../run.sh" "$fixture_runner" || return $?
+  chmod 0755 -- "$fixture_runner" || return $?
+  printf 'canonical tracked content\n' >"$fixture_repository/tracked" || return $?
+  git -C "$fixture_repository" add -- tracked examples/apache-java-https/run.sh || return $?
+  git -C "$fixture_repository" commit --quiet -m 'Create source patch identity fixture' ||
+    return $?
+  printf 'modified tracked content\n' >"$fixture_repository/tracked" || return $?
+
+  capture_fixture_source_patch_identity_twice \
+    "$fixture_runner" "$first_result_directory" "$second_result_directory" \
+    "$work_paths_file" || {
+    printf 'content-only source patch identity fixture did not capture twice\n' >&2
+    return 1
+  }
+  mapfile -t work_paths <"$work_paths_file" || return $?
+  [[ "${#work_paths[@]}" == 2 && "${work_paths[0]}" != "${work_paths[1]}" ]] || {
+    printf 'source patch identity fixture did not use distinct private work paths\n' >&2
+    return 1
+  }
+  cmp -s -- \
+    "$first_result_directory/git-status.txt" \
+    "$second_result_directory/git-status.txt" || {
+    printf 'equivalent captures produced different source-status content\n' >&2
+    return 1
+  }
+  cmp -s -- \
+    "$first_result_directory/source-tree.manifest" \
+    "$second_result_directory/source-tree.manifest" || {
+    printf 'equivalent captures produced different source-tree manifests\n' >&2
+    return 1
+  }
+  first_identity="$(awk -F= '
+    $1 == "patch_identity_sha256" { print $2; found++ }
+    END { if (found != 1) exit 1 }
+  ' "$first_result_directory/source-state.txt")" || return $?
+  second_identity="$(awk -F= '
+    $1 == "patch_identity_sha256" { print $2; found++ }
+    END { if (found != 1) exit 1 }
+  ' "$second_result_directory/source-state.txt")" || return $?
+  tracked_patch_sha256="$(awk -F= '
+    $1 == "tracked_patch_sha256" { print $2; found++ }
+    END { if (found != 1) exit 1 }
+  ' "$first_result_directory/source-state.txt")" || return $?
+  source_tree_sha256="$(awk -F= '
+    $1 == "source_tree_sha256" { print $2; found++ }
+    END { if (found != 1) exit 1 }
+  ' "$first_result_directory/source-state.txt")" || return $?
+  source_status_sha256="$(sha256sum <"$first_result_directory/git-status.txt")" || return $?
+  source_status_sha256="${source_status_sha256%% *}"
+  source_tree_manifest_sha256="$(
+    sha256sum <"$first_result_directory/source-tree.manifest"
+  )" || return $?
+  source_tree_manifest_sha256="${source_tree_manifest_sha256%% *}"
+  expected_identity="$({
+    printf '%s\n' \
+      "$source_status_sha256" \
+      "$source_tree_manifest_sha256" \
+      "$tracked_patch_sha256"
+  } | sha256sum)" || return $?
+  expected_identity="${expected_identity%% *}"
+  [[ "$first_identity" =~ ^[0-9a-f]{64}$ &&
+    "$tracked_patch_sha256" =~ ^[0-9a-f]{64}$ &&
+    "$source_status_sha256" =~ ^[0-9a-f]{64}$ &&
+    "$source_tree_manifest_sha256" =~ ^[0-9a-f]{64}$ &&
+    "$source_tree_sha256" == "$source_tree_manifest_sha256" &&
+    "$first_identity" == "$second_identity" &&
+    "$first_identity" == "$expected_identity" ]] || {
+    printf 'source patch identity is not the exact ordered three-content-digest binding\n' >&2
+    return 1
+  }
+
+  sed \
+    -e 's/source_status_sha256="$(sha256_file "$source_status")"/source_status_sha256="$(sha256sum "$source_status")"/' \
+    -e 's/source_tree_manifest_sha256="$(sha256_file "$source_tree_manifest")"/source_tree_manifest_sha256="$(sha256sum "$source_tree_manifest")"/' \
+    "$fixture_runner" >"$mutated_runner" || return $?
+  chmod 0755 -- "$mutated_runner" || return $?
+  [[ "$(grep -Fc 'source_status_sha256="$(sha256sum "$source_status")"' \
+      "$mutated_runner")" == 1 &&
+    "$(grep -Fc 'source_tree_manifest_sha256="$(sha256sum "$source_tree_manifest")"' \
+      "$mutated_runner")" == 1 ]] || {
+    printf 'source patch identity regression did not install its path-sensitive mutation\n' >&2
+    return 1
+  }
+  capture_fixture_source_patch_identity_twice \
+    "$mutated_runner" "$mutated_first_result_directory" \
+    "$mutated_second_result_directory" "$mutated_work_paths_file" || {
+    printf 'path-sensitive source patch identity mutation did not execute\n' >&2
+    return 1
+  }
+  mutated_first_identity="$(awk -F= '
+    $1 == "patch_identity_sha256" { print $2; found++ }
+    END { if (found != 1) exit 1 }
+  ' "$mutated_first_result_directory/source-state.txt")" || return $?
+  mutated_second_identity="$(awk -F= '
+    $1 == "patch_identity_sha256" { print $2; found++ }
+    END { if (found != 1) exit 1 }
+  ' "$mutated_second_result_directory/source-state.txt")" || return $?
+  [[ "$mutated_first_identity" =~ ^[0-9a-f]{64}$ &&
+    "$mutated_second_identity" =~ ^[0-9a-f]{64}$ &&
+    "$mutated_first_identity" != "$mutated_second_identity" ]] || {
+    printf 'source patch identity test did not detect filename-sensitive hashing\n' >&2
+    return 1
+  }
 }
 
 materialize_fixture_source_snapshot() {
@@ -37226,6 +37969,7 @@ main() {
   test_diagnostic_nondisclosure_write_failures_are_not_masked
   test_diagnostic_nondisclosure_private_captures_are_bounded_and_cleaned
   test_diagnostic_nondisclosure_canary_manifest_is_complete_and_deduplicated
+  test_diagnostic_nondisclosure_canary_source_is_exact_and_bounded
   test_diagnostic_nondisclosure_surface_publication_reconciles_side_effects
   test_diagnostic_nondisclosure_exit_capture_suppresses_unscanned_surfaces
   test_diagnostic_nondisclosure_surfaces_and_report_are_closed
@@ -37474,6 +38218,7 @@ main() {
   test_non_acceptance_reasons_are_recorded
   test_retained_evidence_provenance_is_verified
   test_primary_wrong_live_socket_evidence_is_exact
+  test_source_patch_identity_is_content_only_and_path_independent
   test_retained_evidence_v2_git_tree_schema_is_verified
   test_source_gitlink_depth_is_bounded
   test_source_git_tree_path_validation_is_byte_safe

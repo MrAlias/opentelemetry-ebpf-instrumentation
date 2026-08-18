@@ -1,0 +1,183 @@
+name: Java diagnostic nondisclosure matrix
+run-name: >-
+  Java diagnostic nondisclosure matrix @
+  ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+
+on:
+  # The temporary feature-branch trigger bootstraps this workflow before it is
+  # registered on the default branch. Every push is still pinned to the exact
+  # event commit by the checked-out-object gate below.
+  push:
+    branches:
+      - agent/java-remote-parent-bridge
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Exact lowercase 40-hex Git commit to validate"
+        required: true
+        type: string
+
+concurrency:
+  group: java-diagnostic-nondisclosure-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Java 21 diagnostic nondisclosure (eight serial cells)
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      MATRIX_REQUESTED_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+    steps:
+      - name: Checkout selected ref
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify exact checked-out ref
+        run: |
+          set -Eeuo pipefail
+
+          if [[ ! "$MATRIX_REQUESTED_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            printf 'Requested ref is not an exact lowercase commit: %s\n' \
+              "$MATRIX_REQUESTED_REF" >&2
+            exit 1
+          fi
+          requested_type="$(git cat-file -t "$MATRIX_REQUESTED_REF")" || {
+            printf 'Requested object is unavailable: %s\n' "$MATRIX_REQUESTED_REF" >&2
+            exit 1
+          }
+          [[ "$requested_type" == commit ]] || {
+            printf 'Requested object is not a commit: %s\n' \
+              "$MATRIX_REQUESTED_REF" >&2
+            exit 1
+          }
+          requested_commit="$(
+            git rev-parse --verify --end-of-options "${MATRIX_REQUESTED_REF}^{commit}"
+          )" || {
+            printf 'Requested commit cannot be resolved: %s\n' "$MATRIX_REQUESTED_REF" >&2
+            exit 1
+          }
+          checked_out_commit="$(git rev-parse --verify HEAD)" || {
+            printf '%s\n' 'Checked-out HEAD cannot be resolved' >&2
+            exit 1
+          }
+          if [[ "$requested_commit" != "$MATRIX_REQUESTED_REF" ||
+            "$checked_out_commit" != "$MATRIX_REQUESTED_REF" ]]; then
+            printf 'Checked out %s, but requested ref resolves to %s\n' \
+              "$checked_out_commit" "$requested_commit" >&2
+            exit 1
+          fi
+          source_status="$(
+            git status --porcelain=v1 --untracked-files=all
+          )" || {
+            printf '%s\n' 'Could not inspect the selected source checkout' >&2
+            exit 1
+          }
+          if [[ -n "$source_status" ]]; then
+            printf '%s\n' 'Selected source checkout is not clean' >&2
+            exit 1
+          fi
+          printf 'Validated source commit: %s\n' "$checked_out_commit"
+
+      - uses: ./.github/actions/free-disk
+        with:
+          docker-prune: 'false'
+
+      - name: Set up Java 21
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # The matrix runner owns all eight cells and executes them serially in
+      # one privileged-capable hosted job. MATRIX_OUTPUT is private staging;
+      # private run directories remain under .runtime and are never uploaded.
+      - name: Run eight-cell diagnostic nondisclosure matrix
+        id: matrix
+        env:
+          MATRIX_OUTPUT: ${{ runner.temp }}/diagnostic-nondisclosure-matrix
+        run: |
+          set -Eeuo pipefail
+
+          [[ ! -e "$MATRIX_OUTPUT" && ! -L "$MATRIX_OUTPUT" ]] || {
+            printf 'Matrix output path already exists: %s\n' "$MATRIX_OUTPUT" >&2
+            exit 1
+          }
+          ./examples/apache-java-https/scripts/run-diagnostic-nondisclosure-matrix.sh \
+            "$MATRIX_OUTPUT"
+
+      # This focused verifier is an additional fail-closed gate. It neither
+      # invokes nor weakens the full retained-acceptance evidence verifier.
+      - name: Verify diagnostic nondisclosure matrix
+        id: verify
+        if: steps.matrix.outcome == 'success'
+        env:
+          MATRIX_OUTPUT: ${{ runner.temp }}/diagnostic-nondisclosure-matrix
+        run: |
+          set -Eeuo pipefail
+
+          ./examples/apache-java-https/scripts/verify-diagnostic-nondisclosure-matrix.sh \
+            "$MATRIX_OUTPUT"
+
+      - name: Verify mutually exclusive upload projection
+        id: projection
+        if: always()
+        env:
+          MATRIX_OUTCOME: ${{ steps.matrix.outcome }}
+          MATRIX_OUTPUT: ${{ runner.temp }}/diagnostic-nondisclosure-matrix
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+        run: |
+          set -Eeuo pipefail
+
+          public="$MATRIX_OUTPUT/public"
+          partial="$MATRIX_OUTPUT/partial-safe"
+          if [[ "$MATRIX_OUTCOME" == success ]]; then
+            [[ -d "$public" && ! -L "$public" && \
+              ! -e "$partial" && ! -L "$partial" ]] || {
+              printf '%s\n' 'Completed matrix did not produce only the public projection' >&2
+              exit 1
+            }
+            if [[ "$VERIFY_OUTCOME" != success ]]; then
+              printf '%s\n' \
+                'Independent verification failed; the local public projection is quarantined and will not be uploaded' >&2
+            fi
+          else
+            [[ -d "$partial" && ! -L "$partial" && \
+              ! -e "$public" && ! -L "$public" ]] || {
+              printf '%s\n' 'Failed matrix did not produce only partial-safe diagnostics' >&2
+              exit 1
+            }
+          fi
+
+      - name: Upload verified public diagnostic nondisclosure matrix
+        if: >-
+          always() &&
+          steps.matrix.outcome == 'success' &&
+          steps.verify.outcome == 'success' &&
+          steps.projection.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: java-diagnostic-nondisclosure-public-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/diagnostic-nondisclosure-matrix/public
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 14
+
+      - name: Upload non-publishable partial safe diagnostics
+        if: >-
+          always() &&
+          steps.matrix.outcome != 'success' &&
+          steps.projection.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: java-diagnostic-nondisclosure-partial-safe-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/diagnostic-nondisclosure-matrix/partial-safe
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 14

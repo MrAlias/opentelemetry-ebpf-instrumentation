@@ -158,6 +158,8 @@ DIAGNOSTIC_NONDISCLOSURE_RESPONSE_MAX_BYTES=16384
 DIAGNOSTIC_NONDISCLOSURE_RESPONSE_MAX_LINES=256
 DIAGNOSTIC_NONDISCLOSURE_CANARY_MAX_COUNT=128
 DIAGNOSTIC_NONDISCLOSURE_CANARY_MAX_BYTES=16384
+DIAGNOSTIC_NONDISCLOSURE_CANARY_SOURCE_MAX_BYTES=1048576
+DIAGNOSTIC_NONDISCLOSURE_CANARY_SOURCE_MAX_LINES=10000
 DIAGNOSTIC_NONDISCLOSURE_REPORT_MAX_BYTES=32768
 DIAGNOSTIC_NONDISCLOSURE_TRACE_ID="d139f67e43a24c51b87e02d964af3501"
 DIAGNOSTIC_NONDISCLOSURE_PARENT_SPAN_ID="a18c45067b29de03"
@@ -294,6 +296,8 @@ readonly DIAGNOSTIC_NONDISCLOSURE_RESPONSE_MAX_BYTES
 readonly DIAGNOSTIC_NONDISCLOSURE_RESPONSE_MAX_LINES
 readonly DIAGNOSTIC_NONDISCLOSURE_CANARY_MAX_COUNT
 readonly DIAGNOSTIC_NONDISCLOSURE_CANARY_MAX_BYTES
+readonly DIAGNOSTIC_NONDISCLOSURE_CANARY_SOURCE_MAX_BYTES
+readonly DIAGNOSTIC_NONDISCLOSURE_CANARY_SOURCE_MAX_LINES
 readonly DIAGNOSTIC_NONDISCLOSURE_REPORT_MAX_BYTES
 readonly DIAGNOSTIC_NONDISCLOSURE_TRACE_ID
 readonly DIAGNOSTIC_NONDISCLOSURE_PARENT_SPAN_ID
@@ -3544,7 +3548,9 @@ assert_clean_source_checkout_is_stable() {
 
 capture_source_state() {
   local source_status=""
+  local source_status_sha256=""
   local source_tree_manifest=""
+  local source_tree_manifest_sha256=""
 
   sanitize_git_environment
   ensure_source_snapshot_work_directory
@@ -3570,15 +3576,25 @@ capture_source_state() {
     capture_dirty_source_tree_manifest "$source_tree_manifest"
   fi
 
-  SOURCE_TREE_SHA256="$(sha256_file "$source_tree_manifest")" || {
+  source_status_sha256="$(sha256_file "$source_status")" || {
+    die "could not checksum the source-status evidence"
+  }
+  source_tree_manifest_sha256="$(sha256_file "$source_tree_manifest")" || {
     die "could not checksum the source-tree manifest"
   }
+  SOURCE_TREE_SHA256="$source_tree_manifest_sha256"
   SOURCE_PATCH_SHA256="$({
-    sha256sum "$source_status"
-    sha256sum "$source_tree_manifest"
-    printf '%s\n' "$SOURCE_TRACKED_PATCH_SHA256"
-  } | sha256sum)"
+    printf '%s\n' \
+      "$source_status_sha256" \
+      "$source_tree_manifest_sha256" \
+      "$SOURCE_TRACKED_PATCH_SHA256"
+  } | sha256sum)" || {
+    die "could not checksum the source patch identity"
+  }
   SOURCE_PATCH_SHA256="${SOURCE_PATCH_SHA256%% *}"
+  [[ "$SOURCE_PATCH_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
+    die "source patch identity checksum is invalid"
+  }
   assert_clean_source_checkout_is_stable
 
   install -m 0644 "$source_status" "$RESULT_DIR/git-status.txt" || {
@@ -22731,18 +22747,72 @@ create_diagnostic_nondisclosure_request_directory() {
   [[ "$metadata" == "$EUID:700" ]]
 }
 
+validate_diagnostic_nondisclosure_canary_source() {
+  local -r input="$1"
+
+  bounded_evidence_file \
+    "$input" \
+    "$DIAGNOSTIC_NONDISCLOSURE_CANARY_SOURCE_MAX_BYTES" \
+    "$DIAGNOSTIC_NONDISCLOSURE_CANARY_SOURCE_MAX_LINES" || return 1
+  jq -ces '
+    def canary:
+      type == "string" and length >= 1 and length <= 128 and
+      test("^[A-Za-z0-9._:-]+$");
+    length == 1 and
+    (.[0] | type == "object" and
+      .status == "passed" and .scenario == "w3c" and
+      (.cases | type == "array" and length > 0) and
+      all(.cases[];
+        type == "object" and
+        (.request | type == "object") and
+        (.request.marker | canary) and
+        ((.request.w3c_trace_id? // "") |
+          . == "" or canary) and
+        ((.request.w3c_parent_span_id? // "") |
+          . == "" or canary) and
+        (.trace | type == "object") and
+        (.trace.spans | type == "array") and
+        ((.trace.related_spans? // []) | type == "array") and
+        all((.trace.spans + (.trace.related_spans? // []))[];
+          type == "object" and
+          (.trace_id | canary) and
+          (.span_id | canary) and
+          ((.parent_span_id? // "") | . == "" or canary))))
+  ' "$input" >/dev/null
+}
+
+diagnostic_nondisclosure_canary_source_sha256() {
+  local -r input="$1"
+  local first_digest=""
+  local second_digest=""
+
+  validate_diagnostic_nondisclosure_canary_source "$input" || return $?
+  first_digest="$(sha256_file "$input")" || return $?
+  validate_diagnostic_nondisclosure_canary_source "$input" || return $?
+  second_digest="$(sha256_file "$input")" || return $?
+  [[ "$first_digest" == "$second_digest" ]] || return 1
+  printf '%s\n' "$first_digest"
+}
+
 write_diagnostic_nondisclosure_canaries() {
   local -r scenario_result="$1"
+  local -r expected_source_sha256="$2"
   local -r output="$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/canaries.txt"
   local -r candidate="$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/canaries.unsorted"
   local count=""
+  local observed_source_sha256=""
   local size=""
 
-  [[ -f "$scenario_result" && ! -L "$scenario_result" &&
+  [[ "$expected_source_sha256" =~ ^[0-9a-f]{64}$ &&
+    -f "$scenario_result" && ! -L "$scenario_result" &&
     -d "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR" &&
     ! -L "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR" ]] || return 1
   [[ ! -e "$candidate" && ! -L "$candidate" &&
     ! -e "$output" && ! -L "$output" ]] || return 1
+  observed_source_sha256="$(sha256sum <"$scenario_result")" || return $?
+  observed_source_sha256="${observed_source_sha256%% *}"
+  [[ "$observed_source_sha256" =~ ^[0-9a-f]{64}$ &&
+    "$observed_source_sha256" == "$expected_source_sha256" ]] || return 1
   if {
     printf '%s\n' \
       "$DIAGNOSTIC_NONDISCLOSURE_TRACE_ID" \
@@ -22801,12 +22871,23 @@ write_diagnostic_nondisclosure_canaries() {
     return 1
   }
   if chmod 0600 -- "$candidate" && mv -T -- "$candidate" "$output"; then
-    return 0
+    :
   else
     count=$?
+    rm -f -- "$candidate" || true
+    return "$count"
   fi
-  rm -f -- "$candidate" || true
-  return "$count"
+  observed_source_sha256="$(sha256sum <"$scenario_result")" || {
+    count=$?
+    rm -f -- "$output" || true
+    return "$count"
+  }
+  observed_source_sha256="${observed_source_sha256%% *}"
+  [[ "$observed_source_sha256" =~ ^[0-9a-f]{64}$ &&
+    "$observed_source_sha256" == "$expected_source_sha256" ]] || {
+    rm -f -- "$output" || true
+    return 1
+  }
 }
 
 assert_diagnostic_nondisclosure_surface_has_no_canary() {
@@ -23180,7 +23261,7 @@ validate_diagnostic_nondisclosure_status_payload_intrinsic() {
     --argjson transport_max_bytes "$TRANSPORT_CONFIGURATION_MAX_BYTES" '
       . as $report |
       if (keys == [
-        "agent_distribution", "canary_bytes", "canary_count",
+        "agent_distribution", "canary_bytes", "canary_count", "canary_source",
         "debug_controls", "obi_log_level", "obi_metric_boundary_ids",
         "policy", "scenario", "schema", "selected_transport", "status",
         "surfaces", "tls_protocol", "window"
@@ -23192,6 +23273,10 @@ validate_diagnostic_nondisclosure_status_payload_intrinsic() {
       (.obi_log_level == "info" or .obi_log_level == "debug") and
       .tls_protocol == "TLSv1.3" and
       .obi_metric_boundary_ids == ["diagnostic-nondisclosure"] and
+      (.canary_source | keys == ["reference", "sha256"]) and
+      .canary_source.reference == "scenario-w3c.json" and
+      (.canary_source.sha256 | type == "string" and
+        test("^[0-9a-f]{64}$")) and
       (.canary_count | type == "number" and floor == . and . >= 6 and . <= 128) and
       (.canary_bytes | type == "number" and floor == . and . >= 1 and . <= 16384) and
       (.debug_controls | keys == ["bpf_debug", "protocol_debug"]) and
@@ -23245,16 +23330,21 @@ validate_diagnostic_nondisclosure_status_payload_intrinsic() {
 
 validate_diagnostic_nondisclosure_status_payload() {
   local -r payload="$1"
+  local canary_source_sha256=""
 
   validate_diagnostic_nondisclosure_status_payload_intrinsic "$payload" ||
     return $?
+  canary_source_sha256="$(diagnostic_nondisclosure_canary_source_sha256 \
+    "$RESULT_DIR/scenario-w3c.json")" || return $?
   jq -e \
     --arg agent "$AGENT_DISTRIBUTION" \
     --arg transport "$SELECTED_TRANSPORT" \
-    --arg log_level "$OBI_LOG_LEVEL" '
+    --arg log_level "$OBI_LOG_LEVEL" \
+    --arg canary_source_sha256 "$canary_source_sha256" '
       .agent_distribution == $agent and
       .selected_transport == $transport and
-      .obi_log_level == $log_level
+      .obi_log_level == $log_level and
+      .canary_source.sha256 == $canary_source_sha256
     ' <<<"$payload" >/dev/null
 }
 
@@ -23301,12 +23391,14 @@ build_diagnostic_nondisclosure_status_payload() {
   local -r canary_bytes="$3"
   local -r since="$4"
   local -r until="$5"
+  local -r canary_source_sha256="$6"
   local payload=""
 
   payload="$(jq -cnS \
     --arg agent_distribution "$AGENT_DISTRIBUTION" \
     --arg selected_transport "$SELECTED_TRANSPORT" \
     --arg obi_log_level "$OBI_LOG_LEVEL" \
+    --arg canary_source_sha256 "$canary_source_sha256" \
     --arg since "$since" --arg until "$until" \
     --argjson canary_count "$canary_count" \
     --argjson canary_bytes "$canary_bytes" \
@@ -23315,6 +23407,10 @@ build_diagnostic_nondisclosure_status_payload() {
         agent_distribution: $agent_distribution,
         canary_bytes: $canary_bytes,
         canary_count: $canary_count,
+        canary_source: {
+          reference: "scenario-w3c.json",
+          sha256: $canary_source_sha256
+        },
         debug_controls: {bpf_debug: false, protocol_debug: false},
         obi_log_level: $obi_log_level,
         obi_metric_boundary_ids: ["diagnostic-nondisclosure"],
@@ -23461,6 +23557,7 @@ run_diagnostic_nondisclosure_control() {
   local until=""
   local canary_count=""
   local canary_bytes=""
+  local canary_source_sha256=""
   local parsed_metrics=""
   local parsed_unsorted=""
   local surface=""
@@ -23504,6 +23601,8 @@ run_diagnostic_nondisclosure_control() {
     return $?
 
   run_scenario w3c || return $?
+  canary_source_sha256="$(diagnostic_nondisclosure_canary_source_sha256 \
+    "$scenario_result")" || return $?
   create_diagnostic_nondisclosure_request_directory || return $?
   endpoint_capture="$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/.java-endpoint.capture"
   endpoint_candidate="$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/$endpoint_reference"
@@ -23512,7 +23611,8 @@ run_diagnostic_nondisclosure_control() {
   metrics_candidate="$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/$metrics_reference"
   obi_log_candidate="$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/$obi_log_reference"
   java_log_candidate="$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/$java_log_reference"
-  write_diagnostic_nondisclosure_canaries "$scenario_result" || return $?
+  write_diagnostic_nondisclosure_canaries \
+    "$scenario_result" "$canary_source_sha256" || return $?
   perform_diagnostic_nondisclosure_request || return $?
   run_diagnostic_nondisclosure_unix_probe || return $?
   capture_diagnostic_nondisclosure_java_endpoint || return $?
@@ -23616,7 +23716,8 @@ run_diagnostic_nondisclosure_control() {
   cleanup_diagnostic_nondisclosure_request_directory || return $?
   publish_diagnostic_nondisclosure_status \
     "$surfaces" "$canary_count" "$canary_bytes" \
-    "$DIAGNOSTIC_NONDISCLOSURE_LOG_SINCE" "$until" || return $?
+    "$DIAGNOSTIC_NONDISCLOSURE_LOG_SINCE" "$until" \
+    "$canary_source_sha256" || return $?
   validate_diagnostic_nondisclosure_status "$RESULT_DIR/$status_reference" ||
     return $?
   for surface in "${artifact_bindings[@]}"; do

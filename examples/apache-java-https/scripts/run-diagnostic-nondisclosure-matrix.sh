@@ -595,13 +595,40 @@ cleanup() {
 
 snapshot_results() {
   local -r output="$1"
-  if [[ ! -e "$RESULTS_ROOT" && ! -L "$RESULTS_ROOT" ]]; then
+  local -r results_root="${2:-$RESULTS_ROOT}"
+  if [[ ! -e "$results_root" && ! -L "$results_root" ]]; then
     : >"$output"
     return 0
   fi
-  [[ -d "$RESULTS_ROOT" && ! -L "$RESULTS_ROOT" ]] || return 1
-  find "$RESULTS_ROOT" -mindepth 1 -maxdepth 1 \
+  [[ -d "$results_root" && ! -L "$results_root" ]] || return 1
+  find "$results_root" -mindepth 1 -maxdepth 1 \
     -printf '%f\t%y:%D:%i:%U:%m\n' | LC_ALL=C sort >"$output"
+}
+
+metric_capture_lock_matches_snapshot() {
+  local -r results_root="$1"
+  local -r snapshot_identity="$2"
+  local -r lock="$results_root/.obi-metric-capture.lock"
+  local lock_fd=""
+  local path_identity=""
+  local descriptor_identity=""
+  local post_identity=""
+
+  [[ "$snapshot_identity" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-9]+$ &&
+    -d "$results_root" && ! -L "$results_root" &&
+    "$(realpath -e -- "$results_root")" == "$results_root" &&
+    -f "$lock" && ! -L "$lock" ]] || return 1
+  path_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$lock")" || return 1
+  [[ "${path_identity%:*}" == "$snapshot_identity" &&
+    "$path_identity" == *":$EUID:600:1" ]] || return 1
+  exec {lock_fd}<"$lock" || return $?
+  descriptor_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "/proc/self/fd/$lock_fd")" ||
+    descriptor_identity=""
+  post_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$lock")" || post_identity=""
+  exec {lock_fd}>&- || return $?
+  [[ -f "$lock" && ! -L "$lock" &&
+    "$path_identity" == "$descriptor_identity" &&
+    "$path_identity" == "$post_identity" ]]
 }
 
 resolve_new_result() {
@@ -609,23 +636,43 @@ resolve_new_result() {
   local -r after="$2"
   local -r output_path_name="$3"
   local -r output_identity_name="$4"
+  local -r results_root="${5:-$RESULTS_ROOT}"
   local removed="$TEMP_DIR/results-removed"
   local added="$TEMP_DIR/results-added"
   local name="" metadata="" type="" identity=""
+  local resolved_path="" resolved_identity=""
+  local result_seen=false
+  local lock_seen=false
 
   comm -23 -- "$before" "$after" >"$removed" || return 1
   comm -13 -- "$before" "$after" >"$added" || return 1
-  [[ ! -s "$removed" && "$(LC_ALL=C wc -l <"$added")" == 1 ]] || return 1
-  IFS=$'\t' read -r name metadata <"$added" || return 1
-  type="${metadata%%:*}"
-  identity="${metadata#*:}"
-  [[ "$type" == d && "$identity" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-9]+$ &&
-    "$name" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ &&
-    -d "$RESULTS_ROOT/$name" && ! -L "$RESULTS_ROOT/$name" &&
-    "$(stat -Lc '%d:%i:%u:%a' -- "$RESULTS_ROOT/$name")" == "$identity" &&
-    "$identity" == *":$EUID:755" ]] || return 1
-  printf -v "$output_path_name" '%s' "$RESULTS_ROOT/$name"
-  printf -v "$output_identity_name" '%s' "$identity"
+  [[ ! -s "$removed" ]] || return 1
+  while IFS=$'\t' read -r name metadata; do
+    [[ -n "$name" && -n "$metadata" ]] || return 1
+    type="${metadata%%:*}"
+    identity="${metadata#*:}"
+    case "$name" in
+      .obi-metric-capture.lock)
+        [[ "$lock_seen" == false && "$type" == f ]] || return 1
+        metric_capture_lock_matches_snapshot "$results_root" "$identity" || return 1
+        lock_seen=true
+        ;;
+      *)
+        [[ "$result_seen" == false && "$type" == d &&
+          "$identity" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-9]+$ &&
+          "$name" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ &&
+          -d "$results_root/$name" && ! -L "$results_root/$name" &&
+          "$(stat -Lc '%d:%i:%u:%a' -- "$results_root/$name")" == "$identity" &&
+          "$identity" == *":$EUID:755" ]] || return 1
+        resolved_path="$results_root/$name"
+        resolved_identity="$identity"
+        result_seen=true
+        ;;
+    esac
+  done <"$added"
+  [[ "$result_seen" == true ]] || return 1
+  printf -v "$output_path_name" '%s' "$resolved_path"
+  printf -v "$output_identity_name" '%s' "$resolved_identity"
 }
 
 result_directory_has_identity() {

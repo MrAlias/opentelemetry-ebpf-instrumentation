@@ -632,6 +632,228 @@ assert_production_identity_and_byte_gates() {
   ' _ "$repository/examples/apache-java-https/scripts/verify-diagnostic-nondisclosure-matrix.sh" || return 1
 }
 
+assert_result_resolution_inventory() {
+  bash -c '
+    source "$1"
+    sandbox="$(mktemp -d)"; trap '\''command rm -rf -- "$sandbox"'\'' EXIT
+    TEMP_DIR="$sandbox/work"
+    mkdir -m 0700 -- "$TEMP_DIR"
+
+    fd_count() {
+      find "/proc/$$/fd" -mindepth 1 -maxdepth 1 -printf ".\n" | wc -l
+    }
+    write_lock() {
+      local -r root="$1" mode="${2:-0600}"
+      (umask 077; : >"$root/.obi-metric-capture.lock")
+      chmod "$mode" -- "$root/.obi-metric-capture.lock"
+    }
+    write_result() {
+      mkdir -m 0755 -- "$1/$2"
+    }
+    expect_resolution_failure() {
+      local output="" resolved_id=""
+      if resolve_new_result "$1" "$2" output resolved_id "$3"; then
+        return 1
+      fi
+    }
+
+    root="$sandbox/new-lock-results"
+    before="$sandbox/new-lock.before"; after="$sandbox/new-lock.after"
+    snapshot_results "$before" "$root"
+    mkdir -m 0755 -- "$root"
+    write_lock "$root"
+    write_result "$root" 20260818T120000Z-101
+    snapshot_results "$after" "$root"
+    result=""; result_identity=""; before_fds="$(fd_count)"
+    resolve_new_result "$before" "$after" result result_identity "$root"
+    after_fds="$(fd_count)"
+    [[ "$result" == "$root/20260818T120000Z-101" &&
+      "$result_identity" == "$(stat -Lc "%d:%i:%u:%a" -- "$result")" &&
+      "$before_fds" == "$after_fds" ]]
+
+    root="$sandbox/stable-lock-results"
+    before="$sandbox/stable-lock.before"; after="$sandbox/stable-lock.after"
+    mkdir -m 0755 -- "$root"
+    write_lock "$root"
+    snapshot_results "$before" "$root"
+    write_result "$root" 20260818T120001Z-102
+    snapshot_results "$after" "$root"
+    result=""; result_identity=""
+    resolve_new_result "$before" "$after" result result_identity "$root"
+    [[ "$result" == "$root/20260818T120001Z-102" ]]
+
+    root="$sandbox/no-result"
+    before="$sandbox/no-result.before"; after="$sandbox/no-result.after"
+    snapshot_results "$before" "$root"
+    mkdir -m 0755 -- "$root"; write_lock "$root"
+    snapshot_results "$after" "$root"
+    expect_resolution_failure "$before" "$after" "$root"
+
+    root="$sandbox/two-results"
+    before="$sandbox/two-results.before"; after="$sandbox/two-results.after"
+    snapshot_results "$before" "$root"
+    mkdir -m 0755 -- "$root"; write_lock "$root"
+    write_result "$root" 20260818T120002Z-103
+    write_result "$root" 20260818T120003Z-104
+    snapshot_results "$after" "$root"
+    expect_resolution_failure "$before" "$after" "$root"
+
+    root="$sandbox/unrelated-addition"
+    before="$sandbox/unrelated.before"; after="$sandbox/unrelated.after"
+    snapshot_results "$before" "$root"
+    mkdir -m 0755 -- "$root"; write_lock "$root"
+    write_result "$root" 20260818T120004Z-105
+    : >"$root/unexpected"
+    snapshot_results "$after" "$root"
+    expect_resolution_failure "$before" "$after" "$root"
+
+    root="$sandbox/removal"
+    before="$sandbox/removal.before"; after="$sandbox/removal.after"
+    mkdir -m 0755 -- "$root"; write_lock "$root"
+    write_result "$root" 20260818T120005Z-106
+    snapshot_results "$before" "$root"
+    rmdir -- "$root/20260818T120005Z-106"
+    write_result "$root" 20260818T120006Z-107
+    snapshot_results "$after" "$root"
+    expect_resolution_failure "$before" "$after" "$root"
+
+    root="$sandbox/wrong-mode-lock"
+    before="$sandbox/wrong-mode.before"; after="$sandbox/wrong-mode.after"
+    snapshot_results "$before" "$root"
+    mkdir -m 0755 -- "$root"; write_lock "$root" 0644
+    write_result "$root" 20260818T120007Z-108
+    snapshot_results "$after" "$root"
+    expect_resolution_failure "$before" "$after" "$root"
+
+    root="$sandbox/hardlink-lock"
+    before="$sandbox/hardlink.before"; after="$sandbox/hardlink.after"
+    snapshot_results "$before" "$root"
+    mkdir -m 0755 -- "$root"; write_lock "$root"
+    ln -- "$root/.obi-metric-capture.lock" "$sandbox/hardlink-peer"
+    write_result "$root" 20260818T120008Z-109
+    snapshot_results "$after" "$root"
+    expect_resolution_failure "$before" "$after" "$root"
+
+    root="$sandbox/symlink-lock"
+    before="$sandbox/symlink.before"; after="$sandbox/symlink.after"
+    snapshot_results "$before" "$root"
+    mkdir -m 0755 -- "$root"; : >"$sandbox/symlink-target"
+    ln -s -- "$sandbox/symlink-target" "$root/.obi-metric-capture.lock"
+    write_result "$root" 20260818T120009Z-110
+    snapshot_results "$after" "$root"
+    expect_resolution_failure "$before" "$after" "$root"
+
+    root="$sandbox/nonregular-lock"
+    before="$sandbox/nonregular.before"; after="$sandbox/nonregular.after"
+    snapshot_results "$before" "$root"
+    mkdir -m 0755 -- "$root"; mkdir -m 0700 -- "$root/.obi-metric-capture.lock"
+    write_result "$root" 20260818T120010Z-111
+    snapshot_results "$after" "$root"
+    expect_resolution_failure "$before" "$after" "$root"
+
+    root="$sandbox/replaced-lock"
+    before="$sandbox/replaced.before"; after="$sandbox/replaced.after"
+    snapshot_results "$before" "$root"
+    mkdir -m 0755 -- "$root"; write_lock "$root"
+    write_result "$root" 20260818T120011Z-112
+    snapshot_results "$after" "$root"
+    (umask 077; : >"$sandbox/replacement-lock")
+    command mv -fT -- "$sandbox/replacement-lock" "$root/.obi-metric-capture.lock"
+    before_fds="$(fd_count)"
+    expect_resolution_failure "$before" "$after" "$root"
+    after_fds="$(fd_count)"
+    [[ "$before_fds" == "$after_fds" ]]
+
+    run_lock_race() {
+      local -r mode="$1"
+      local -r root="$sandbox/lock-race-$mode"
+      local -r before="$sandbox/lock-race-$mode.before"
+      local -r after="$sandbox/lock-race-$mode.after"
+      local -r lock="$root/.obi-metric-capture.lock"
+      local -r alternate="$sandbox/lock-race-$mode.alternate"
+      local -r saved="$sandbox/lock-race-$mode.saved"
+      local -r displaced="$sandbox/lock-race-$mode.displaced"
+      local -r first_marker="$sandbox/lock-race-$mode.first"
+      local -r second_marker="$sandbox/lock-race-$mode.second"
+      local output="" status=0 last=""
+
+      snapshot_results "$before" "$root"
+      mkdir -m 0755 -- "$root"
+      write_lock "$root"
+      write_result "$root" 20260818T120012Z-113
+      (umask 077; : >"$alternate")
+      snapshot_results "$after" "$root"
+
+      stat() {
+        local output="" last="${*: -1}"
+        case "$mode:$last" in
+          descriptor:"$lock")
+            if [[ ! -e "$first_marker" ]]; then
+              output="$(command stat "$@")" || return $?
+              command mv -T -- "$lock" "$saved" || return $?
+              command mv -T -- "$alternate" "$lock" || return $?
+              : >"$first_marker" || return $?
+              printf "%s\n" "$output"
+              return $?
+            fi
+            ;;
+          descriptor:/proc/self/fd/*)
+            if [[ -e "$first_marker" && ! -e "$second_marker" ]]; then
+              output="$(command stat "$@")" || return $?
+              command mv -T -- "$lock" "$displaced" || return $?
+              command mv -T -- "$saved" "$lock" || return $?
+              : >"$second_marker" || return $?
+              printf "%s\n" "$output"
+              return $?
+            fi
+            ;;
+          post:/proc/self/fd/*)
+            if [[ ! -e "$first_marker" ]]; then
+              output="$(command stat "$@")" || return $?
+              command mv -T -- "$lock" "$saved" || return $?
+              command mv -T -- "$alternate" "$lock" || return $?
+              : >"$first_marker" || return $?
+              printf "%s\n" "$output"
+              return $?
+            fi
+            ;;
+          symlink:/proc/self/fd/*)
+            if [[ ! -e "$first_marker" ]]; then
+              output="$(command stat "$@")" || return $?
+              command mv -T -- "$lock" "$saved" || return $?
+              ln -s -- "$saved" "$lock" || return $?
+              : >"$first_marker" || return $?
+              printf "%s\n" "$output"
+              return $?
+            fi
+            ;;
+        esac
+        command stat "$@"
+      }
+
+      before_fds="$(fd_count)"
+      if resolve_new_result "$before" "$after" output status "$root"; then
+        unset -f stat
+        return 1
+      fi
+      after_fds="$(fd_count)"
+      unset -f stat
+      [[ "$before_fds" == "$after_fds" && -e "$first_marker" ]] || return 1
+      if [[ "$mode" == descriptor ]]; then
+        [[ -e "$second_marker" && -f "$lock" && ! -L "$lock" ]] || return 1
+      elif [[ "$mode" == symlink ]]; then
+        [[ -L "$lock" ]] || return 1
+      else
+        [[ -f "$lock" && ! -L "$lock" ]] || return 1
+      fi
+    }
+
+    run_lock_race descriptor
+    run_lock_race post
+    run_lock_race symlink
+  ' _ "$RUNNER" || return 1
+}
+
 assert_library_and_failure_seams() {
   # shellcheck disable=SC2016
   grep -F 'git -C "$REPO_ROOT" show "$workflow_sha:$workflow_relative"' "$VERIFIER" >/dev/null || return 1
@@ -1375,6 +1597,7 @@ main() {
   expect_failure public-derived-schema "$mutated"
 
   assert_library_and_failure_seams
+  assert_result_resolution_inventory
   assert_workflow_contract
   assert_production_identity_and_byte_gates
 

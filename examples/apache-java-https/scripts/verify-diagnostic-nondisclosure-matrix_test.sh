@@ -228,12 +228,17 @@ write_cell() {
            {trace_id:"77777777777777777777777777777777",span_id:"aaaaaaaaaaaaaaaa",parent_span_id:"9999999999999999",flags:769,service_name:"java-backend",name:"GET /api/echo",kind:"SERVER",attributes:{"http.request.header.x-obi-demo-id":"dynamic-marker-b","http.route":"/api/echo"},start_unix_nano:3200,end_unix_nano:3800}],related_spans:[]}}
     ]
   }' >"$directory/scenario-w3c.json"
-  if [[ "$id" == otel-getsockopt-info ]]; then
-    printf ' Container %s-scenario-run-0123456789ab Creating \n Container %s-scenario-run-0123456789ab Created \n' \
-      "$project" "$project" >"$directory/scenario-w3c.stderr.log"
-  else
-    : >"$directory/scenario-w3c.stderr.log"
-  fi
+  case "$id" in
+    otel-getsockopt-info)
+      printf ' Container %s-scenario-run-0123456789ab Creating \n Container %s-scenario-run-0123456789ab Created \n' \
+        "$project" "$project" >"$directory/scenario-w3c.stderr.log"
+      ;;
+    otel-getsockopt-debug)
+      printf ' Container %s-scenario-run-0123456789ab  Creating\n Container %s-scenario-run-0123456789ab  Created\n' \
+        "$project" "$project" >"$directory/scenario-w3c.stderr.log"
+      ;;
+    *) : >"$directory/scenario-w3c.stderr.log" ;;
+  esac
   git -C "$REPO_ROOT" show "$revision:examples/apache-java-https/run.sh" >"$trusted_run"
   {
     sed -n -E 's/^DIAGNOSTIC_NONDISCLOSURE_(TRACE_ID|PARENT_SPAN_ID|MARKER|HEADER_CANARY|BODY_CANARY|CREDENTIAL_CANARY)="([A-Za-z0-9._:-]+)"$/\2/p' "$trusted_run"
@@ -503,10 +508,21 @@ reseal_cell() {
 expect_failure() {
   local -r label="$1"
   local -r root="$2"
+  local -r expected_stage="${3:-}"
   local had_public=false
+  local output=""
 
   if [[ -e "$root/public" || -L "$root/public" ]]; then had_public=true; fi
-  if run_verifier "$root" >/dev/null 2>&1; then
+  if [[ -n "$expected_stage" ]]; then
+    if output="$(run_verifier "$root" 2>&1)"; then
+      printf 'mutation unexpectedly passed: %s\n' "$label" >&2
+      return 1
+    fi
+    [[ "$output" == *"matrix cell failed verification: otel-getsockopt-info stage=$expected_stage"* ]] || {
+      printf 'mutation reported the wrong validation stage: %s\n' "$label" >&2
+      return 1
+    }
+  elif run_verifier "$root" >/dev/null 2>&1; then
     printf 'mutation unexpectedly passed: %s\n' "$label" >&2
     return 1
   fi
@@ -514,6 +530,17 @@ expect_failure() {
     printf 'failed verification published public output: %s\n' "$label" >&2
     return 1
   fi
+}
+
+assert_validation_stage_source_contract() {
+  local observed=""
+  local expected=$'initialization\nenvironment\nsource_provenance\nofficial_agent_pin\nw3c_result\nw3c_result_digest\ndiagnostic_report\nw3c_status\nterminal_evidence\nrun_status_freeze\nboundary_authority\ncanary_manifest\ncanary_summary\nsurface_binding\nsurface_canary_scan\njava_endpoint\njava_header\ntransport_configuration\nmetrics\nobi_log\njava_log\npublic_authority\nnone'
+
+  observed="$(sed -n '/^validate_cell() {/,/^}/p' "$VERIFIER" |
+    sed -n 's/^[[:space:]]*CELL_VALIDATION_STAGE=\([a-z0-9_]*\)$/\1/p')" || return 1
+  [[ "$observed" == "$expected" ]] || return 1
+  grep -Fq 'die "matrix cell failed verification: ${CELL_IDS[$index]} stage=$CELL_VALIDATION_STAGE"' \
+    "$VERIFIER"
 }
 
 run_verifier() {
@@ -1333,6 +1360,10 @@ main() {
   export GITHUB_EVENT_NAME=push
   export RUNNER_OS=Linux
   export RUNNER_ARCH=X64
+  assert_validation_stage_source_contract || {
+    printf '%s\n' 'validation-stage source contract failed' >&2
+    return 1
+  }
   TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/obi-i39-test.XXXXXX")"
   fixture="$TEMP_DIR/fixture"
   mkdir -m 0700 -- "$fixture" "$fixture/cells"
@@ -1513,7 +1544,7 @@ main() {
   directory="$mutated/cells/otel-getsockopt-info"
   json_update_sorted "$directory/terminal-java-diagnostics.json" '.extra=true'
   refresh_run_outer "$directory"
-  expect_failure terminal-java-closed-keyset "$mutated"
+  expect_failure terminal-java-closed-keyset "$mutated" terminal_evidence
 
   copy_mutation "$fixture" terminal-java-snapshot mutated
   directory="$mutated/cells/otel-getsockopt-info"
@@ -1651,6 +1682,13 @@ main() {
     obi-apache-java-https-i39-fixture-otel-getsockopt-info \
     >"$mutated/cells/otel-getsockopt-info/scenario-w3c.stderr.log"
   expect_failure missing-trailing-spaces-w3c-stderr "$mutated"
+
+  copy_mutation "$fixture" stderr-mixed-compose-renderings mutated
+  printf ' Container %s-scenario-run-0123456789ab  Creating\n Container %s-scenario-run-0123456789ab Created \n' \
+    obi-apache-java-https-i39-fixture-otel-getsockopt-info \
+    obi-apache-java-https-i39-fixture-otel-getsockopt-info \
+    >"$mutated/cells/otel-getsockopt-info/scenario-w3c.stderr.log"
+  expect_failure mixed-compose-renderings-w3c-stderr "$mutated" w3c_status
 
   copy_mutation "$fixture" status-as-artifact mutated
   directory="$mutated/cells/otel-getsockopt-info"

@@ -93,6 +93,7 @@ CI_TRIGGER_SHA=""
 CI_WORKFLOW_SHA=""
 CI_WORKFLOW_REF=""
 CI_WORKFLOW_BLOB_SHA256=""
+CELL_VALIDATION_STAGE=""
 
 die() {
   printf '%s: %s\n' "$SCRIPT_NAME" "$*" >&2
@@ -1057,7 +1058,7 @@ java_evidence_json() {
 validate_w3c_stderr() {
   local -r directory="$1"
   local -r input="$directory/scenario-w3c.stderr.log"
-  local project="" first="" prefix="" suffix="" container=""
+  local project="" first="" prefix="" suffix="" container="" rendering=""
 
   regular_file_at_most "$input" 256 || return 1
   if [[ ! -s "$input" ]]; then
@@ -1069,14 +1070,33 @@ validate_w3c_stderr() {
     ${#project} -le 63 ]] || return 1
   IFS= read -r first <"$input" || return 1
   prefix=" Container $project-scenario-run-"
-  [[ "$first" == "$prefix"*' Creating ' ]] || return 1
-  suffix="${first#"$prefix"}"
-  suffix="${suffix%' Creating '}"
+  case "$first" in
+    "$prefix"*' Creating ')
+      suffix="${first#"$prefix"}"
+      suffix="${suffix%' Creating '}"
+      rendering=compose-v5
+      ;;
+    "$prefix"*'  Creating')
+      suffix="${first#"$prefix"}"
+      suffix="${suffix%'  Creating'}"
+      rendering=compose-v2
+      ;;
+    *) return 1 ;;
+  esac
   [[ "$suffix" =~ ^[0-9a-f]{12}$ ]] || return 1
 
   container="$project-scenario-run-$suffix"
-  printf ' Container %s Creating \n Container %s Created \n' \
-    "$container" "$container" | cmp -s -- - "$input"
+  case "$rendering" in
+    compose-v5)
+      { printf ' Container %s Creating \n Container %s Created \n' \
+          "$container" "$container" || exit $?; } | cmp -s -- - "$input"
+      ;;
+    compose-v2)
+      { printf ' Container %s  Creating\n Container %s  Created\n' \
+          "$container" "$container" || exit $?; } | cmp -s -- - "$input"
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 validate_w3c_status() {
@@ -1421,24 +1441,38 @@ validate_cell() {
   local surface_digest_input="$TEMP_DIR/surface-digests-$ordinal"
   local i=0
 
+  CELL_VALIDATION_STAGE=initialization
   IFS='-' read -r agent transport level <<<"$id"
+  CELL_VALIDATION_STAGE=environment
   validate_environment "$directory/environment.txt" "$agent" "$transport" "$level" || return 1
+  CELL_VALIDATION_STAGE=source_provenance
   validate_source_provenance "$directory" || return 1
+  CELL_VALIDATION_STAGE=official_agent_pin
   validate_official_pin "$directory/official-javaagent.json" "$agent" || return 1
+  CELL_VALIDATION_STAGE=w3c_result
   validate_w3c_result "$scenario" || return 1
+  CELL_VALIDATION_STAGE=w3c_result_digest
   scenario_digest="$(sha256_file "$scenario")" || return 1
+  CELL_VALIDATION_STAGE=diagnostic_report
   validate_report "$report" "$agent" "$transport" "$level" "$scenario_digest" || return 1
+  CELL_VALIDATION_STAGE=w3c_status
   validate_w3c_status "$directory" || return 1
+  CELL_VALIDATION_STAGE=terminal_evidence
   validate_terminal_evidence "$directory" || return 1
+  CELL_VALIDATION_STAGE=run_status_freeze
   validate_run_status_and_freeze "$directory" || return 1
+  CELL_VALIDATION_STAGE=boundary_authority
   validate_boundary_authority "$directory" "$transport" || return 1
+  CELL_VALIDATION_STAGE=canary_manifest
   build_canaries "$scenario" "$transport" "$canaries" || return 1
+  CELL_VALIDATION_STAGE=canary_summary
   canary_count="$(LC_ALL=C wc -l <"$canaries")" || return 1
   canary_bytes="$(stat -Lc '%s' -- "$canaries")" || return 1
   [[ "$canary_count" == "$(jq -r '.canary_count' "$report")" &&
     "$canary_bytes" == "$(jq -r '.canary_bytes' "$report")" ]] || return 1
   : >"$surface_digest_input" || return 1
   for i in "${!SURFACE_REFERENCES[@]}"; do
+    CELL_VALIDATION_STAGE=surface_binding
     surface="${SURFACE_NAMES[$i]}"; reference="${SURFACE_REFERENCES[$i]}"
     digest="$(sha256_file "$directory/$reference")" || return 1
     size="$(stat -Lc '%s' -- "$directory/$reference")" || return 1
@@ -1448,15 +1482,23 @@ validate_cell() {
       .surfaces[$i].sha256 == $digest and .surfaces[$i].size_bytes == $size and
       .surfaces[$i].line_count == $lines
     ' "$report" >/dev/null || return 1
+    CELL_VALIDATION_STAGE=surface_canary_scan
     assert_no_canaries "$canaries" "$directory/$reference" || return 1
     printf '%s\n' "$digest" >>"$surface_digest_input" || return 1
   done
+  CELL_VALIDATION_STAGE=java_endpoint
   assert_java_diagnostics "$directory/${SURFACE_REFERENCES[0]}" || return 1
+  CELL_VALIDATION_STAGE=java_header
   assert_java_diagnostics "$directory/${SURFACE_REFERENCES[1]}" || return 1
+  CELL_VALIDATION_STAGE=transport_configuration
   assert_transport_configuration "$directory/${SURFACE_REFERENCES[2]}" "$transport" || return 1
+  CELL_VALIDATION_STAGE=metrics
   assert_metrics "$directory/${SURFACE_REFERENCES[3]}" "$transport" || return 1
+  CELL_VALIDATION_STAGE=obi_log
   assert_obi_log "$directory/${SURFACE_REFERENCES[4]}" "$level" "$transport" || return 1
+  CELL_VALIDATION_STAGE=java_log
   assert_java_log "$directory/${SURFACE_REFERENCES[5]}" || return 1
+  CELL_VALIDATION_STAGE=public_authority
   report_digest="$(sha256_file "$report")" || return 1
   surface_set_digest="$(sha256_file "$surface_digest_input")" || return 1
   boundary_digest="$(sha256_file "$directory/obi-metric-boundary-index.json")" || return 1
@@ -1486,6 +1528,7 @@ validate_cell() {
        selected_transport:$transport,status:"passed",tls_protocol:"TLSv1.3",
        surface_set_sha256:$surface_sha,surfaces:$surfaces}
     ' >>"$TEMP_DIR/cells.jsonl" || return 1
+  CELL_VALIDATION_STAGE=none
 }
 
 write_public_verify_script() {
@@ -1878,7 +1921,13 @@ main() {
   validate_source_runtime_contract || die "Java 21 Temurin source configuration is not pinned by the selected commit"
   validate_raw_closure || die "private raw matrix staging is not closed"
   for index in "${!CELL_IDS[@]}"; do
-    validate_cell "$index" || die "matrix cell failed verification: ${CELL_IDS[$index]}"
+    if ! validate_cell "$index"; then
+      case "$CELL_VALIDATION_STAGE" in
+        initialization|environment|source_provenance|official_agent_pin|w3c_result|w3c_result_digest|diagnostic_report|w3c_status|terminal_evidence|run_status_freeze|boundary_authority|canary_manifest|canary_summary|surface_binding|surface_canary_scan|java_endpoint|java_header|transport_configuration|metrics|obi_log|java_log|public_authority) ;;
+        *) CELL_VALIDATION_STAGE=unknown ;;
+      esac
+      die "matrix cell failed verification: ${CELL_IDS[$index]} stage=$CELL_VALIDATION_STAGE"
+    fi
   done
   publish_public_projection || die "could not publish the closed public projection"
   return 0

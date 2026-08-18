@@ -1672,7 +1672,7 @@ cells_sha="$(jq -cS '.cells[]' "$root/matrix-summary.json" | sha256sum)"; cells_
 revision="$(jq -er '.revision' <<<"$identity")"
 [[ "$evidence_id" == "diagnostic-nondisclosure-${revision:0:12}-${cells_sha:0:16}" ]]
 PUBLIC_VERIFY
-  printf '%s\n' "$content" >"$output" || return 1
+  printf '%s' "$content" >"$output" || return 1
 }
 
 validate_public_directory() {

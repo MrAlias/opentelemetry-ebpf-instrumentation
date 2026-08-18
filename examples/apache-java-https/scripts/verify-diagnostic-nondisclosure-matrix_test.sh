@@ -1377,6 +1377,19 @@ assert_library_and_failure_seams() {
     source "$1"
     if write_public_verify_script_v2 /dev/full >/dev/null 2>&1; then exit 1; fi
   ' _ "$VERIFIER" || return 1
+  bash -c '
+    source "$1"
+    output="$(mktemp)"; trap '\''rm -f -- "$output"'\'' EXIT
+    write_public_verify_script_v2 "$output"
+    [[ "$(tail -c 2 "$output" | od -An -t x1 | tr -d " \n")" != 0a0a &&
+      "$(tail -c 1 "$output" | od -An -t x1 | tr -d " \n")" == 0a ]]
+    if check_output="$(git diff --no-index --check -- /dev/null "$output" 2>&1)"; then
+      check_rc=0
+    else
+      check_rc=$?
+    fi
+    [[ "$check_rc" == 1 && -z "$check_output" ]]
+  ' _ "$VERIFIER" || return 1
 }
 
 main() {

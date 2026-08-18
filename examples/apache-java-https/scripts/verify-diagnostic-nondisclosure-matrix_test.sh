@@ -128,7 +128,7 @@ diagnostics_snapshot() {
 write_cell() {
   local -r root="$1"
   local -r id="$2"
-  local agent="" transport="" level="" directory="$root/cells/$id"
+  local agent="" transport="" level="" project="" directory="$root/cells/$id"
   local revision="" tree_sha="" patch="" status_sha=""
   local snapshot="" metrics="" requested="" selected=""
   local canaries="$TEMP_DIR/canaries-$id" count="" bytes=""
@@ -142,6 +142,7 @@ write_cell() {
   local -a names=(java_endpoint java_header java_transport_configuration obi_metrics obi_log java_log)
 
   IFS='-' read -r agent transport level <<<"$id"
+  project="obi-apache-java-https-i39-fixture-$id"
   if [[ "$id" == splunk-unix-debug ]]; then
     terminal_reference="phases/diagnostic-nondisclosure-header/java-diagnostics.txt"
     terminal_phase=diagnostic-nondisclosure-header
@@ -173,7 +174,7 @@ write_cell() {
     tls_protocol=TLSv1.3 "obi_log_level=$level" scenario=diagnostic-nondisclosure \
     request_count=0 repeat_count=1 scenario_seed=1 bridge_build_mode=fresh acceptance_evidence=false \
     acceptance_evidence_reason=targeted-scenario \
-    "compose_project=obi-apache-java-https-i39-fixture-$id" command_timeout_seconds=30 \
+    "compose_project=$project" command_timeout_seconds=30 \
     readiness_timeout_seconds=30 architecture=test kernel=test openssl=test docker=test compose=test \
     >"$directory/environment.txt"
   if [[ "$agent" == otel ]]; then
@@ -227,7 +228,12 @@ write_cell() {
            {trace_id:"77777777777777777777777777777777",span_id:"aaaaaaaaaaaaaaaa",parent_span_id:"9999999999999999",flags:769,service_name:"java-backend",name:"GET /api/echo",kind:"SERVER",attributes:{"http.request.header.x-obi-demo-id":"dynamic-marker-b","http.route":"/api/echo"},start_unix_nano:3200,end_unix_nano:3800}],related_spans:[]}}
     ]
   }' >"$directory/scenario-w3c.json"
-  : >"$directory/scenario-w3c.stderr.log"
+  if [[ "$id" == otel-getsockopt-info ]]; then
+    printf ' Container %s-scenario-run-0123456789ab Creating \n Container %s-scenario-run-0123456789ab Created \n' \
+      "$project" "$project" >"$directory/scenario-w3c.stderr.log"
+  else
+    : >"$directory/scenario-w3c.stderr.log"
+  fi
   git -C "$REPO_ROOT" show "$revision:examples/apache-java-https/run.sh" >"$trusted_run"
   {
     sed -n -E 's/^DIAGNOSTIC_NONDISCLOSURE_(TRACE_ID|PARENT_SPAN_ID|MARKER|HEADER_CANARY|BODY_CANARY|CREDENTIAL_CANARY)="([A-Za-z0-9._:-]+)"$/\2/p' "$trusted_run"
@@ -1562,6 +1568,60 @@ main() {
   copy_mutation "$fixture" unexpected-stderr mutated
   printf '%s\n' 'unexpected private diagnostic' >"$mutated/cells/otel-getsockopt-info/scenario-w3c.stderr.log"
   expect_failure nonempty-w3c-stderr "$mutated"
+
+  copy_mutation "$fixture" stderr-extra-line mutated
+  printf '%s\n' ' Container obi-apache-java-https-i39-fixture-otel-getsockopt-info-scenario-run-0123456789ab Started ' \
+    >>"$mutated/cells/otel-getsockopt-info/scenario-w3c.stderr.log"
+  expect_failure extra-w3c-stderr-line "$mutated"
+
+  copy_mutation "$fixture" stderr-wrong-project mutated
+  printf ' Container %s-scenario-run-0123456789ab Creating \n Container %s-scenario-run-0123456789ab Created \n' \
+    obi-apache-java-https-i39-fixture-otel-getsockopt-debug \
+    obi-apache-java-https-i39-fixture-otel-getsockopt-debug \
+    >"$mutated/cells/otel-getsockopt-info/scenario-w3c.stderr.log"
+  expect_failure wrong-project-w3c-stderr "$mutated"
+
+  copy_mutation "$fixture" stderr-mismatched-suffix mutated
+  printf ' Container %s-scenario-run-0123456789ab Creating \n Container %s-scenario-run-fedcba987654 Created \n' \
+    obi-apache-java-https-i39-fixture-otel-getsockopt-info \
+    obi-apache-java-https-i39-fixture-otel-getsockopt-info \
+    >"$mutated/cells/otel-getsockopt-info/scenario-w3c.stderr.log"
+  expect_failure mismatched-container-w3c-stderr "$mutated"
+
+  copy_mutation "$fixture" stderr-invalid-suffix mutated
+  printf ' Container %s-scenario-run-0123456789ag Creating \n Container %s-scenario-run-0123456789ag Created \n' \
+    obi-apache-java-https-i39-fixture-otel-getsockopt-info \
+    obi-apache-java-https-i39-fixture-otel-getsockopt-info \
+    >"$mutated/cells/otel-getsockopt-info/scenario-w3c.stderr.log"
+  expect_failure invalid-container-suffix-w3c-stderr "$mutated"
+
+  copy_mutation "$fixture" stderr-long-suffix mutated
+  printf ' Container %s-scenario-run-0123456789abc Creating \n Container %s-scenario-run-0123456789abc Created \n' \
+    obi-apache-java-https-i39-fixture-otel-getsockopt-info \
+    obi-apache-java-https-i39-fixture-otel-getsockopt-info \
+    >"$mutated/cells/otel-getsockopt-info/scenario-w3c.stderr.log"
+  expect_failure long-container-suffix-w3c-stderr "$mutated"
+
+  copy_mutation "$fixture" stderr-wrong-state mutated
+  printf ' Container %s-scenario-run-0123456789ab Created \n Container %s-scenario-run-0123456789ab Creating \n' \
+    obi-apache-java-https-i39-fixture-otel-getsockopt-info \
+    obi-apache-java-https-i39-fixture-otel-getsockopt-info \
+    >"$mutated/cells/otel-getsockopt-info/scenario-w3c.stderr.log"
+  expect_failure wrong-order-w3c-stderr "$mutated"
+
+  copy_mutation "$fixture" stderr-missing-final-lf mutated
+  printf ' Container %s-scenario-run-0123456789ab Creating \n Container %s-scenario-run-0123456789ab Created ' \
+    obi-apache-java-https-i39-fixture-otel-getsockopt-info \
+    obi-apache-java-https-i39-fixture-otel-getsockopt-info \
+    >"$mutated/cells/otel-getsockopt-info/scenario-w3c.stderr.log"
+  expect_failure missing-final-lf-w3c-stderr "$mutated"
+
+  copy_mutation "$fixture" stderr-missing-trailing-spaces mutated
+  printf ' Container %s-scenario-run-0123456789ab Creating\n Container %s-scenario-run-0123456789ab Created\n' \
+    obi-apache-java-https-i39-fixture-otel-getsockopt-info \
+    obi-apache-java-https-i39-fixture-otel-getsockopt-info \
+    >"$mutated/cells/otel-getsockopt-info/scenario-w3c.stderr.log"
+  expect_failure missing-trailing-spaces-w3c-stderr "$mutated"
 
   copy_mutation "$fixture" status-as-artifact mutated
   directory="$mutated/cells/otel-getsockopt-info"

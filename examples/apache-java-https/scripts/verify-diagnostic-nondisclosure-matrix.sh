@@ -1055,14 +1055,38 @@ java_evidence_json() {
   '
 }
 
+validate_w3c_stderr() {
+  local -r directory="$1"
+  local -r input="$directory/scenario-w3c.stderr.log"
+  local project="" first="" prefix="" suffix="" container=""
+
+  regular_file_at_most "$input" 256 || return 1
+  if [[ ! -s "$input" ]]; then
+    return 0
+  fi
+
+  project="$(environment_value "$directory/environment.txt" compose_project)" || return 1
+  [[ "$project" =~ ^obi-apache-java-https-i39-[a-z0-9-]{1,34}$ &&
+    ${#project} -le 63 ]] || return 1
+  IFS= read -r first <"$input" || return 1
+  prefix=" Container $project-scenario-run-"
+  [[ "$first" == "$prefix"*' Creating ' ]] || return 1
+  suffix="${first#"$prefix"}"
+  suffix="${suffix%' Creating '}"
+  [[ "$suffix" =~ ^[0-9a-f]{12}$ ]] || return 1
+
+  container="$project-scenario-run-$suffix"
+  printf ' Container %s Creating \n Container %s Created \n' \
+    "$container" "$container" | cmp -s -- - "$input"
+}
+
 validate_w3c_status() {
   local -r directory="$1"
   local status="$directory/scenario-w3c-status.json"
   local result="" stderr="" before_java="" after_java="" pair=""
 
   bounded_regular_file "$status" 1048576 10000 || return 1
-  regular_file_at_most "$directory/scenario-w3c.stderr.log" 1048576 || return 1
-  [[ ! -s "$directory/scenario-w3c.stderr.log" ]] || return 1
+  validate_w3c_stderr "$directory" || return 1
   before_java="$(java_evidence_json "$directory/phases/w3c-before/java-diagnostics.txt" \
     phases/w3c-before/java-diagnostics.txt)" || return 1
   after_java="$(java_evidence_json "$directory/phases/w3c-after/java-diagnostics.txt" \

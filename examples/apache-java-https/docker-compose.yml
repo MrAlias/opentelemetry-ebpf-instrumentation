@@ -125,6 +125,9 @@ services:
       OTEL_EBPF_JAVA_REMOTE_PARENT_TTL: ${REMOTE_PARENT_TTL:-30s}
       OTEL_EBPF_JAVA_REMOTE_PARENT_RETRIEVAL_TTL: ${REMOTE_PARENT_RETRIEVAL_TTL:-0s}
       OTEL_EBPF_BPF_CONTEXT_PROPAGATION: ${CONTEXT_PROPAGATION:-tcp}
+      OTEL_EBPF_LOG_LEVEL: ${OBI_LOG_LEVEL:-info}
+      OTEL_EBPF_BPF_DEBUG: "false"
+      OTEL_EBPF_PROTOCOL_DEBUG_PRINT: "false"
     volumes:
       - ./configs/obi.yaml:/config/obi.yaml:ro
       - java-remote-parent-socket:/var/run/obi

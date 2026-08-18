@@ -246,8 +246,15 @@ test_project_name_validation() {
   expect_invalid_project_name "contains.dot"
   expect_invalid_project_name "$overlong_name"
 
-  PROJECT_NAME="obi-apache-java-https-test_1"
-  parse_args --cleanup-only
+  (
+    PROJECT_NAME="obi-apache-java-https-test_1"
+    CLEANUP_ONLY=false
+    parse_args --cleanup-only || return $?
+    [[ "$CLEANUP_ONLY" == true ]]
+  ) || {
+    printf 'rejected a valid cleanup-only project name\n' >&2
+    return 1
+  }
 
   expect_invalid_project_name "obi-demo_1"
 }
@@ -2440,6 +2447,472 @@ test_control_modes_are_distinct() {
     printf 'accepted an uninstrumented benchmark control with an enabled transport\n' >&2
     return 1
   fi
+}
+
+test_diagnostic_nondisclosure_cli_and_dispatch_are_exact() {
+  local -r help_output="$TEST_TMP_DIR/diagnostic-nondisclosure-help"
+  local -r dispatch_output="$TEST_TMP_DIR/diagnostic-nondisclosure-dispatch"
+  local agent=""
+  local transport=""
+  local log_level=""
+
+  usage >"$help_output" || return $?
+  grep -Fq -- '--obi-log-level LEVEL' "$help_output" || return 1
+  grep -Fq -- 'diagnostic-nondisclosure' "$help_output" || return 1
+  for agent in otel splunk; do
+    for transport in getsockopt unix; do
+      for log_level in info debug; do
+        (
+          AGENT_DISTRIBUTION=otel
+          TRANSPORT=getsockopt
+          TLS_PROTOCOL=TLSv1.3
+          OBI_LOG_LEVEL=info
+          SCENARIO=all
+          REQUEST_COUNT=0
+          REPEAT_COUNT=1
+          KEEP_RUNNING=false
+          SKIP_BRIDGE_BUILD=false
+          CLEANUP_ONLY=false
+          ACCEPTANCE_EVIDENCE=true
+          ACCEPTANCE_EVIDENCE_REASON=""
+          parse_args \
+            --agent "$agent" --transport "$transport" \
+            --obi-log-level "$log_level" --scenario diagnostic-nondisclosure ||
+            return $?
+          [[ "$AGENT_DISTRIBUTION" == "$agent" &&
+            "$TRANSPORT" == "$transport" &&
+            "$OBI_LOG_LEVEL" == "$log_level" &&
+            "$SCENARIO" == diagnostic-nondisclosure &&
+            "$ACCEPTANCE_EVIDENCE" == false &&
+            "$ACCEPTANCE_EVIDENCE_REASON" == targeted-scenario ]] || return 1
+        ) || {
+          printf 'rejected diagnostic nondisclosure cell %s/%s/%s\n' \
+            "$agent" "$transport" "$log_level" >&2
+          return 1
+        }
+      done
+    done
+  done
+  for invalid in warn DEBUG ''; do
+    if (
+      OBI_LOG_LEVEL=info
+      SCENARIO=all
+      if [[ -n "$invalid" ]]; then
+        parse_args --obi-log-level "$invalid" \
+          --scenario diagnostic-nondisclosure
+      else
+        parse_args --obi-log-level
+      fi
+    ) >/dev/null 2>&1; then
+      printf 'accepted invalid OBI log level %q\n' "$invalid" >&2
+      return 1
+    fi
+  done
+  if (
+    OBI_LOG_LEVEL=info
+    SCENARIO=all
+    parse_args --obi-log-level debug --scenario basic
+  ) >/dev/null 2>&1; then
+    printf 'accepted debug OBI logging outside the focused scenario\n' >&2
+    return 1
+  fi
+  for arguments in \
+    '--transport auto' \
+    '--transport disabled' \
+    '--tls TLSv1.2' \
+    '--requests 1' \
+    '--repeat 2' \
+    '--skip-bridge-build' \
+    '--keep'; do
+    if (
+      OBI_LOG_LEVEL=info
+      SCENARIO=all
+      # The arguments are fixed test literals without shell metacharacters.
+      # shellcheck disable=SC2086
+      parse_args $arguments --scenario diagnostic-nondisclosure
+    ) >/dev/null 2>&1; then
+      printf 'accepted invalid diagnostic nondisclosure arguments: %s\n' \
+        "$arguments" >&2
+      return 1
+    fi
+  done
+  (
+    SCENARIO=diagnostic-nondisclosure
+    run_obi_metric_control_boundary() {
+      printf '%s\n' "$*" >"$dispatch_output"
+    }
+    run_diagnostic_nondisclosure_control() { return 91; }
+    execute_requested_scenarios || return $?
+  ) || return 1
+  [[ "$(<"$dispatch_output")" == \
+    'diagnostic-nondisclosure run_diagnostic_nondisclosure_control' ]] || {
+    printf 'diagnostic nondisclosure used the wrong dispatcher\n' >&2
+    return 1
+  }
+}
+
+diagnostic_nondisclosure_control_source_contract() {
+  local -r source="$1"
+  local token=""
+  local line=""
+  local previous=0
+  local binding=""
+  local -a exact_bindings=(
+    '"diagnostic-java-endpoint:$endpoint_reference"'
+    '"diagnostic-java-header:$header_reference"'
+    '"diagnostic-java-transport:$transport_reference"'
+    '"diagnostic-obi-metrics:$metrics_reference"'
+    '"diagnostic-obi-log:$obi_log_reference"'
+    '"diagnostic-java-log:$java_log_reference"'
+  )
+  local -a ordered_tokens=(
+    'run_scenario w3c'
+    'create_diagnostic_nondisclosure_request_directory'
+    'write_diagnostic_nondisclosure_canaries "$scenario_result"'
+    'perform_diagnostic_nondisclosure_request'
+    'run_diagnostic_nondisclosure_unix_probe'
+    'capture_diagnostic_nondisclosure_java_endpoint'
+    'stage_diagnostic_nondisclosure_surface'
+    'capture_obi_metrics_candidate "$metrics_candidate" 5'
+    'until="$(date -u'
+    'capture_diagnostic_nondisclosure_service_log obi "$obi_container_id" "$DIAGNOSTIC_NONDISCLOSURE_LOG_SINCE" "$until" "$obi_log_candidate" || return $?'
+    'capture_diagnostic_nondisclosure_service_log java-backend "$java_container_id" "$DIAGNOSTIC_NONDISCLOSURE_LOG_SINCE" "$until" "$java_log_candidate" || return $?'
+    'assert_diagnostic_nondisclosure_obi_log_policy'
+    'assert_diagnostic_nondisclosure_java_log_policy'
+    'diagnostic_nondisclosure_surface_json'
+    'publish_diagnostic_nondisclosure_surface'
+    'cleanup_diagnostic_nondisclosure_request_directory'
+    'publish_diagnostic_nondisclosure_status'
+    'attach_obi_artifact_capture'
+    'bind_status_to_active_obi_metric_boundary "$status_reference"'
+  )
+
+  for token in "${ordered_tokens[@]}"; do
+    line="$(grep -nF -- "$token" <<<"$source" | head -n 1)" || return 1
+    line="${line%%:*}"
+    [[ "$line" =~ ^[1-9][0-9]*$ ]] || return 1
+    ((line > previous)) || return 1
+    previous="$line"
+  done
+  [[ "$(grep -Fc -- 'stage_diagnostic_nondisclosure_surface' <<<"$source")" == 3 &&
+    "$(grep -Fc -- 'diagnostic_nondisclosure_surface_json' <<<"$source")" == 6 &&
+    "$(grep -Fc -- 'capture_diagnostic_nondisclosure_service_log' \
+      <<<"$source")" == 2 &&
+    "$(grep -Fc -- \
+      'capture_diagnostic_nondisclosure_service_log obi "$obi_container_id" "$DIAGNOSTIC_NONDISCLOSURE_LOG_SINCE" "$until" "$obi_log_candidate" || return $?' \
+      <<<"$source")" == 1 &&
+    "$(grep -Fc -- \
+      'capture_diagnostic_nondisclosure_service_log java-backend "$java_container_id" "$DIAGNOSTIC_NONDISCLOSURE_LOG_SINCE" "$until" "$java_log_candidate" || return $?' \
+      <<<"$source")" == 1 &&
+    "$(grep -Fc -- 'attach_obi_artifact_capture' <<<"$source")" == 1 &&
+    "$(grep -Eo '"diagnostic-[a-z-]+:\$[a-z_]+_reference"' \
+      <<<"$source" | wc -l)" == 6 &&
+    "$source" == *'for surface in "${artifact_bindings[@]}"'* &&
+    "$source" == *'attach_obi_artifact_capture "${surface%%:*}" "${surface#*:}"'* &&
+    "$source" == *'! -e "$RESULT_DIR/compose.log" && ! -L "$RESULT_DIR/compose.log"'* &&
+    "$source" == *'! -e "$RESULT_DIR/phases/final" && ! -L "$RESULT_DIR/phases/final"'* &&
+    "$source" == *'local -r status_reference="scenario-diagnostic-nondisclosure-status.json"'* &&
+    "$source" == *'bind_status_to_active_obi_metric_boundary "$status_reference"'* ]] ||
+    return 1
+  for binding in "${exact_bindings[@]}"; do
+    [[ "$(grep -Fc -- "$binding" <<<"$source")" == 1 ]] || return 1
+  done
+}
+
+diagnostic_nondisclosure_canary_source_contract() {
+  local -r writer_source="$1"
+  local -r request_source="$2"
+  local -r probe_source="$3"
+  local variable=""
+  local -a request_variables=(
+    DIAGNOSTIC_NONDISCLOSURE_TRACE_ID
+    DIAGNOSTIC_NONDISCLOSURE_PARENT_SPAN_ID
+    DIAGNOSTIC_NONDISCLOSURE_MARKER
+    DIAGNOSTIC_NONDISCLOSURE_HEADER_CANARY
+    DIAGNOSTIC_NONDISCLOSURE_BODY_CANARY
+    DIAGNOSTIC_NONDISCLOSURE_CREDENTIAL_CANARY
+  )
+
+  for variable in "${request_variables[@]}"; do
+    [[ "$writer_source" == *"\$$variable"* &&
+      "$request_source" == *"\$$variable"* ]] || return 1
+  done
+  [[ "$writer_source" == *'$DIAGNOSTIC_NONDISCLOSURE_UNIX_PAYLOAD_CANARY'* &&
+    "$(grep -Fc -- '.request.marker' <<<"$writer_source")" == 1 &&
+    "$(grep -Fc -- '.request.w3c_trace_id' <<<"$writer_source")" == 1 &&
+    "$(grep -Fc -- '.request.w3c_parent_span_id' <<<"$writer_source")" == 1 &&
+    "$(grep -Fc -- '.trace.spans[]?' <<<"$writer_source")" == 1 &&
+    "$(grep -Fc -- '.trace.related_spans[]?' <<<"$writer_source")" == 1 &&
+    "$(grep -Fc -- '.trace_id, .span_id, (.parent_span_id // empty)' \
+      <<<"$writer_source")" == 2 &&
+    "$(grep -Fc -- 'LC_ALL=C sort -u' <<<"$writer_source")" == 1 &&
+    "$(grep -Fc -- '|| exit $?' <<<"$writer_source")" == 3 &&
+    "$request_source" == *'"traceparent: 00-$DIAGNOSTIC_NONDISCLOSURE_TRACE_ID-$DIAGNOSTIC_NONDISCLOSURE_PARENT_SPAN_ID-01"'* &&
+    "$request_source" == *'"x-obi-demo-id: $DIAGNOSTIC_NONDISCLOSURE_MARKER"'* &&
+    "$request_source" == *'"x-obi-private-canary: $DIAGNOSTIC_NONDISCLOSURE_HEADER_CANARY"'* &&
+    "$request_source" == *'"Authorization: Bearer $DIAGNOSTIC_NONDISCLOSURE_CREDENTIAL_CANARY"'* &&
+    "$request_source" == *'printf '\''%s\n'\'' "$DIAGNOSTIC_NONDISCLOSURE_BODY_CANARY" > "$request_body"'* &&
+    "$DIAGNOSTIC_NONDISCLOSURE_UNIX_PAYLOAD_CANARY" == \
+      OBI_SECURITY_PROBE_PAYLOAD_CANARY &&
+    "$probe_source" == *'payloadCanary      = "OBI_SECURITY_PROBE_PAYLOAD_CANARY"'* ]]
+}
+
+test_diagnostic_nondisclosure_source_contract_is_mutation_sensitive() {
+  local control_source=""
+  local capture_source=""
+  local request_source=""
+  local writer_source=""
+  local probe_source=""
+  local endpoint_capture_source=""
+  local exit_capture_source=""
+  local cleanup_source=""
+  local request_directory_source=""
+  local surface_publisher_source=""
+  local surface_cleanup_source=""
+  local unix_source=""
+  local runtime_source=""
+  local startup_source=""
+  local export_source=""
+  local environment_source=""
+  local mutated=""
+  local token=""
+  local cursor_line=""
+  local compose_line=""
+  local scan_line=""
+  local publish_line=""
+
+  control_source="$(declare -f run_diagnostic_nondisclosure_control)"
+  diagnostic_nondisclosure_control_source_contract "$control_source" || {
+    printf 'diagnostic nondisclosure orchestration source contract drifted\n' >&2
+    return 1
+  }
+  for token in \
+    'run_scenario w3c' \
+    'write_diagnostic_nondisclosure_canaries "$scenario_result"' \
+    'perform_diagnostic_nondisclosure_request' \
+    'run_diagnostic_nondisclosure_unix_probe' \
+    'capture_diagnostic_nondisclosure_java_endpoint' \
+    'stage_diagnostic_nondisclosure_surface' \
+    'capture_obi_metrics_candidate "$metrics_candidate" 5' \
+    'capture_diagnostic_nondisclosure_service_log' \
+    'obi "$obi_container_id" "$DIAGNOSTIC_NONDISCLOSURE_LOG_SINCE" "$until"' \
+    '"$obi_log_candidate" || return $?' \
+    'java-backend "$java_container_id"' \
+    '"$java_log_candidate" || return $?' \
+    'publish_diagnostic_nondisclosure_surface' \
+    'cleanup_diagnostic_nondisclosure_request_directory' \
+    'publish_diagnostic_nondisclosure_status' \
+    'bind_status_to_active_obi_metric_boundary "$status_reference"'; do
+    mutated="${control_source/"$token"/removed_mutation}"
+    if diagnostic_nondisclosure_control_source_contract "$mutated" \
+      >/dev/null 2>&1; then
+      printf 'source contract missed removed action: %s\n' "$token" >&2
+      return 1
+    fi
+  done
+  for token in \
+    '"diagnostic-java-endpoint:$endpoint_reference"' \
+    '"diagnostic-java-header:$header_reference"' \
+    '"diagnostic-java-transport:$transport_reference"' \
+    '"diagnostic-obi-metrics:$metrics_reference"' \
+    '"diagnostic-obi-log:$obi_log_reference"' \
+    '"diagnostic-java-log:$java_log_reference"' \
+    'local -r status_reference="scenario-diagnostic-nondisclosure-status.json"' \
+    '! -e "$RESULT_DIR/compose.log" && ! -L "$RESULT_DIR/compose.log"' \
+    '! -e "$RESULT_DIR/phases/final" && ! -L "$RESULT_DIR/phases/final"' \
+    'for surface in "${artifact_bindings[@]}"' \
+    'attach_obi_artifact_capture "${surface%%:*}" "${surface#*:}"'; do
+    mutated="${control_source/"$token"/removed_binding_mutation}"
+    if diagnostic_nondisclosure_control_source_contract "$mutated" \
+      >/dev/null 2>&1; then
+      printf 'source contract missed removed journal binding: %s\n' "$token" >&2
+      return 1
+    fi
+  done
+
+  capture_source="$(declare -f capture_diagnostic_nondisclosure_service_log)"
+  [[ "$capture_source" == *'docker logs --timestamps'* &&
+    "$capture_source" == *'--since "$since" --until "$until" "$expected_container_id"'* &&
+    "$capture_source" == *'head -c "$((COMPOSE_LOG_MAX_BYTES + 1))"'* &&
+    "$capture_source" == *'cat > /dev/null'* &&
+    "$capture_source" == *'candidate="$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/.$service.log.capture"'* &&
+    "$capture_source" == *'"$output" == "$expected_output"'* &&
+    "$(grep -Fc -- 'diagnostic_nondisclosure_container_id "$service"' \
+      <<<"$capture_source")" == 2 ]] || {
+    printf 'diagnostic log capture lost completeness or identity fencing\n' >&2
+    return 1
+  }
+  [[ "$control_source" == *': > "$metrics_candidate"'* &&
+    "$control_source" == *'capture_obi_metrics_candidate "$metrics_candidate" 5'* &&
+    "$control_source" != *'fetch_obi_metrics'* &&
+    "$control_source" == *'"$obi_log_candidate"'* &&
+    "$control_source" == *'"$java_log_candidate"'* ]] || {
+    printf 'diagnostic surface capture escaped its private transaction\n' >&2
+    return 1
+  }
+  cleanup_source="$(declare -f cleanup_diagnostic_nondisclosure_request_directory)"
+  [[ "$cleanup_source" == *'"$directory/.java-endpoint.capture"'* &&
+    "$cleanup_source" == \
+      *'"$directory/diagnostic-nondisclosure-obi-metrics.prom"'* ]] || {
+    printf 'diagnostic private capture cleanup lost a fixed candidate\n' >&2
+    return 1
+  }
+  request_directory_source="$(declare -f create_diagnostic_nondisclosure_request_directory)"
+  [[ "$request_directory_source" == \
+      *'DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR="$(umask 077; mktemp -d'* &&
+    "$request_directory_source" != *'local directory='* ]] || {
+    printf 'diagnostic request directory is not assigned atomically\n' >&2
+    return 1
+  }
+  scan_line="$(grep -nF -- \
+    'DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR="$(umask 077; mktemp -d' \
+    <<<"$request_directory_source" | head -n 1)" || return 1
+  publish_line="$(grep -nF -- \
+    'metadata="$(stat --format=' <<<"$request_directory_source" | head -n 1)" ||
+    return 1
+  scan_line="${scan_line%%:*}"
+  publish_line="${publish_line%%:*}"
+  ((scan_line < publish_line)) || {
+    printf 'diagnostic request directory validation precedes ownership\n' >&2
+    return 1
+  }
+  surface_publisher_source="$(declare -f publish_diagnostic_nondisclosure_surface)"
+  surface_cleanup_source="$(declare -f remove_diagnostic_nondisclosure_surface_handle)"
+  [[ "$surface_publisher_source" == *'ln -T -- "$input" "$output"'* &&
+    "$(grep -Fc -- '[[ "$observed_digest" == "$expected_digest" ]]' \
+      <<<"$surface_publisher_source")" == 2 &&
+    "$surface_publisher_source" == *'"$input_identity:644:2"'* &&
+    "$surface_publisher_source" == *'remove_diagnostic_nondisclosure_surface_handle'* &&
+    "$surface_cleanup_source" == *'for attempt in 1 2 3'* &&
+    "$surface_cleanup_source" == *'rm -f -- "$input"'* &&
+    "$surface_cleanup_source" == *'! -e "$input" && ! -L "$input"'* &&
+    "$surface_cleanup_source" == *'"$input_identity:644:1"'* ]] || {
+    printf 'diagnostic clean-surface publication lost identity fencing\n' >&2
+    return 1
+  }
+  endpoint_capture_source="$(declare -f capture_diagnostic_nondisclosure_java_endpoint)"
+  [[ "$endpoint_capture_source" == \
+    *'output="$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/.java-endpoint.capture"'* &&
+    "$endpoint_capture_source" == \
+      *'head -c "$((TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES + 1))"'* &&
+    "$endpoint_capture_source" == *'cat > /dev/null'* ]] || {
+    printf 'dedicated endpoint capture lost private bounded completeness\n' >&2
+    return 1
+  }
+  exit_capture_source="$(declare -f capture_evidence)"
+  [[ "$(grep -Fc -- '[[ "$SCENARIO" != diagnostic-nondisclosure ]]' \
+    <<<"$exit_capture_source")" == 2 ]] || {
+    printf 'focused exit capture no longer suppresses both unscanned surfaces\n' >&2
+    return 1
+  }
+  [[ "$endpoint_capture_source" == \
+    *'assert_diagnostic_nondisclosure_surface_has_no_canary "$output"'* ]] ||
+    return 1
+  request_source="$(declare -f perform_diagnostic_nondisclosure_request)"
+  [[ "$request_source" == *'assert_diagnostic_nondisclosure_surface_has_no_canary "$response_headers"'* &&
+    "$request_source" == *'grep --fixed-strings -- "$sensitive" "$response_body"'* &&
+    "$(grep -Fc -- '|| exit $?' <<<"$request_source")" == 2 ]] || {
+    printf 'diagnostic request lost response disclosure checks\n' >&2
+    return 1
+  }
+  scan_line="$(grep -nF -- \
+    'assert_diagnostic_nondisclosure_surface_has_no_canary "$response_headers"' \
+    <<<"$request_source" | head -n 1)" || return 1
+  publish_line="$(grep -nF -- \
+    'extract_java_diagnostics_header "$response_headers" "$diagnostics_output"' \
+    <<<"$request_source" | head -n 1)" || return 1
+  scan_line="${scan_line%%:*}"
+  publish_line="${publish_line%%:*}"
+  ((scan_line < publish_line)) || {
+    printf 'diagnostic response headers are published before canary scanning\n' >&2
+    return 1
+  }
+  writer_source="$(declare -f write_diagnostic_nondisclosure_canaries)"
+  probe_source="$(<"$TEST_SCRIPT_DIR/../tracecheck/cmd/securityprobe/main.go")"
+  diagnostic_nondisclosure_canary_source_contract \
+    "$writer_source" "$request_source" "$probe_source" || {
+    printf 'fixed/dynamic canaries are not all bound to the scan manifest\n' >&2
+    return 1
+  }
+  for token in \
+    '$DIAGNOSTIC_NONDISCLOSURE_TRACE_ID' \
+    '$DIAGNOSTIC_NONDISCLOSURE_PARENT_SPAN_ID' \
+    '$DIAGNOSTIC_NONDISCLOSURE_MARKER' \
+    '$DIAGNOSTIC_NONDISCLOSURE_HEADER_CANARY' \
+    '$DIAGNOSTIC_NONDISCLOSURE_BODY_CANARY' \
+    '$DIAGNOSTIC_NONDISCLOSURE_CREDENTIAL_CANARY' \
+    '$DIAGNOSTIC_NONDISCLOSURE_UNIX_PAYLOAD_CANARY' \
+    '.request.marker' \
+    '.request.w3c_trace_id' \
+    '.request.w3c_parent_span_id' \
+    '.trace.spans[]?' \
+    '.trace.related_spans[]?' \
+    '.trace_id, .span_id, (.parent_span_id // empty)' \
+    'LC_ALL=C sort -u'; do
+    mutated="${writer_source/"$token"/removed_mutation}"
+    if diagnostic_nondisclosure_canary_source_contract \
+      "$mutated" "$request_source" "$probe_source" >/dev/null 2>&1; then
+      printf 'canary source contract missed removed producer: %s\n' "$token" >&2
+      return 1
+    fi
+  done
+  for token in \
+    '"traceparent: 00-$DIAGNOSTIC_NONDISCLOSURE_TRACE_ID-$DIAGNOSTIC_NONDISCLOSURE_PARENT_SPAN_ID-01"' \
+    '"x-obi-demo-id: $DIAGNOSTIC_NONDISCLOSURE_MARKER"' \
+    '"x-obi-private-canary: $DIAGNOSTIC_NONDISCLOSURE_HEADER_CANARY"' \
+    '"Authorization: Bearer $DIAGNOSTIC_NONDISCLOSURE_CREDENTIAL_CANARY"' \
+    'printf '\''%s\n'\'' "$DIAGNOSTIC_NONDISCLOSURE_BODY_CANARY" > "$request_body"'; do
+    mutated="${request_source/"$token"/removed_mutation}"
+    if diagnostic_nondisclosure_canary_source_contract \
+      "$writer_source" "$mutated" "$probe_source" >/dev/null 2>&1; then
+      printf 'canary source contract missed removed injection: %s\n' "$token" >&2
+      return 1
+    fi
+  done
+  mutated="${probe_source/OBI_SECURITY_PROBE_PAYLOAD_CANARY/removed_mutation}"
+  if diagnostic_nondisclosure_canary_source_contract \
+    "$writer_source" "$request_source" "$mutated" >/dev/null 2>&1; then
+    printf 'canary source contract missed Unix payload producer drift\n' >&2
+    return 1
+  fi
+  unix_source="$(declare -f run_diagnostic_nondisclosure_unix_probe)"
+  [[ "$unix_source" == *'local SECURITY_PROBE_MODE="abuse"'* &&
+    "$unix_source" == *'export SECURITY_PROBE_MODE'* &&
+    "$unix_source" == *'--env SECURITY_PROBE_MODE=abuse security-probe'* ]] || {
+    printf 'Unix diagnostic probe did not pin abuse mode on both Compose sides\n' >&2
+    return 1
+  }
+  runtime_source="$(declare -f assert_diagnostic_nondisclosure_runtime_configuration)"
+  [[ "$runtime_source" == *'OTEL_EBPF_LOG_LEVEL='* &&
+    "$runtime_source" == *'OTEL_EBPF_BPF_DEBUG=false'* &&
+    "$runtime_source" == *'OTEL_EBPF_PROTOCOL_DEBUG_PRINT=false'* ]] || {
+    printf 'diagnostic runtime attestation lost a debug control\n' >&2
+    return 1
+  }
+  export_source="$(declare -f export_compose_environment)"
+  environment_source="$(declare -f capture_environment)"
+  [[ "$export_source" == *'export OBI_LOG_LEVEL'* &&
+    "$environment_source" == *"printf 'obi_log_level=%s\\n' \"\$OBI_LOG_LEVEL\""* ]] || {
+    printf 'OBI log level lost environment export or retained attestation\n' >&2
+    return 1
+  }
+  grep -Fq -- 'OTEL_EBPF_LOG_LEVEL: ${OBI_LOG_LEVEL:-info}' "$COMPOSE_FILE" ||
+    return 1
+  grep -Fq -- 'OTEL_EBPF_BPF_DEBUG: "false"' "$COMPOSE_FILE" || return 1
+  grep -Fq -- 'OTEL_EBPF_PROTOCOL_DEBUG_PRINT: "false"' "$COMPOSE_FILE" ||
+    return 1
+  startup_source="$(declare -f start_stack)"
+  cursor_line="$(grep -nF -- \
+    'DIAGNOSTIC_NONDISCLOSURE_LOG_SINCE="$startup_since"' \
+    <<<"$startup_source" | head -n 1)" || return 1
+  compose_line="$(grep -nF -- 'run_logged_bounded' <<<"$startup_source" | head -n 1)" ||
+    return 1
+  cursor_line="${cursor_line%%:*}"
+  compose_line="${compose_line%%:*}"
+  ((cursor_line < compose_line)) || {
+    printf 'diagnostic log cursor no longer precedes Compose startup\n' >&2
+    return 1
+  }
 }
 
 test_benchmark_controls_use_shared_concurrency_workload() {
@@ -11642,6 +12115,784 @@ write_diagnostics_fixture() {
     snapshot+=",t_$status=$value,d_$status=0"
   done
   printf '%s\n' "$snapshot" >"$output"
+}
+
+test_diagnostic_nondisclosure_request_directory_is_cleanup_owned() {
+  local -r root="$TEST_TMP_DIR/diagnostic-nondisclosure-request-directory"
+  local mode=""
+
+  for mode in mktemp-side-effect stat-failure; do
+    (
+      RESULT_DIR="$root/$mode"
+      DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR=""
+      local status=0
+      local directory=""
+
+      mkdir -p -- "$RESULT_DIR" || return $?
+      case "$mode" in
+        mktemp-side-effect)
+          mktemp() {
+            command mktemp "$@" || return $?
+            return 77
+          }
+          ;;
+        stat-failure)
+          stat() { return 78; }
+          ;;
+      esac
+      if create_diagnostic_nondisclosure_request_directory; then
+        status=0
+      else
+        status=$?
+      fi
+      directory="$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR"
+      case "$mode" in
+        mktemp-side-effect) unset -f mktemp || return $? ;;
+        stat-failure) unset -f stat || return $? ;;
+      esac
+      case "$mode" in
+        mktemp-side-effect) [[ "$status" == 77 ]] || return 1 ;;
+        stat-failure) [[ "$status" == 78 ]] || return 1 ;;
+      esac
+      [[ "$directory" == "$RESULT_DIR"/.diagnostic-nondisclosure-request.* &&
+        -d "$directory" && ! -L "$directory" &&
+        "$(stat --format='%u:%a' -- "$directory")" == "$EUID:700" ]] ||
+        return 1
+      cleanup_diagnostic_nondisclosure_request_directory || return $?
+      [[ -z "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR" &&
+        ! -e "$directory" && ! -L "$directory" ]] || return 1
+    ) || {
+      printf 'diagnostic request directory cleanup ownership failed: %s\n' \
+        "$mode" >&2
+      return 1
+    }
+  done
+}
+
+test_diagnostic_nondisclosure_write_failures_are_not_masked() {
+  local -r root="$TEST_TMP_DIR/diagnostic-nondisclosure-write-failures"
+  local mode=""
+
+  for mode in fixed-canary unix-canary request-header request-body; do
+    (
+      RESULT_DIR="$root/$mode"
+      DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR="$RESULT_DIR/.diagnostic-nondisclosure-request.ABC123"
+      local -r scenario_result="$RESULT_DIR/scenario-w3c.json"
+      local -r curl_marker="$RESULT_DIR/curl.called"
+      local -i printf_calls=0
+      local status=0
+
+      mkdir -p -- "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR" || return $?
+      chmod 0700 -- "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR" || return $?
+      jq -cn '
+        {
+          status: "passed",
+          scenario: "w3c",
+          cases: [{
+            request: {marker: "dynamic-marker"},
+            trace: {spans: [], related_spans: []}
+          }]
+        }
+      ' >"$scenario_result" || return $?
+      case "$mode" in
+        fixed-canary)
+          SELECTED_TRANSPORT=getsockopt
+          printf() { return 77; }
+          if write_diagnostic_nondisclosure_canaries "$scenario_result"; then
+            status=0
+          else
+            status=$?
+          fi
+          ;;
+        unix-canary)
+          SELECTED_TRANSPORT=unix
+          printf() {
+            ((printf_calls += 1))
+            if ((printf_calls == 2)); then
+              return 78
+            fi
+            builtin printf "$@"
+          }
+          if write_diagnostic_nondisclosure_canaries "$scenario_result"; then
+            status=0
+          else
+            status=$?
+          fi
+          ;;
+        request-header|request-body)
+          printf() {
+            ((printf_calls += 1))
+            if [[ "$mode" == request-header && "$printf_calls" == 1 ]]; then
+              return 79
+            fi
+            if [[ "$mode" == request-body && "$printf_calls" == 2 ]]; then
+              return 80
+            fi
+            builtin printf "$@"
+          }
+          curl() {
+            : >"$curl_marker"
+            return 99
+          }
+          if perform_diagnostic_nondisclosure_request; then
+            status=0
+          else
+            status=$?
+          fi
+          ;;
+      esac
+      case "$mode" in
+        fixed-canary|unix-canary)
+          unset -f printf || return $?
+          ;;
+        request-header|request-body)
+          unset -f printf curl || return $?
+          ;;
+      esac
+      case "$mode" in
+        fixed-canary)
+          [[ "$status" == 77 ]] || return 1
+          ;;
+        unix-canary)
+          [[ "$status" == 78 ]] || return 1
+          ;;
+        request-header)
+          [[ "$status" == 79 && ! -e "$curl_marker" &&
+            ! -L "$curl_marker" &&
+            -f "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/request.headers" &&
+            ! -L "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/request.headers" &&
+            ! -e "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/request.body" &&
+            ! -L "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/request.body" ]] ||
+            return 1
+          ;;
+        request-body)
+          [[ "$status" == 80 && ! -e "$curl_marker" &&
+            ! -L "$curl_marker" &&
+            -s "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/request.headers" &&
+            ! -L "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/request.headers" &&
+            -f "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/request.body" &&
+            ! -s "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/request.body" &&
+            ! -L "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/request.body" ]] ||
+            return 1
+          ;;
+      esac
+      [[ ! -e "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/canaries.unsorted" &&
+        ! -L "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/canaries.unsorted" &&
+        ! -e "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/canaries.txt" &&
+        ! -L "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/canaries.txt" ]] ||
+        return 1
+      cleanup_diagnostic_nondisclosure_request_directory || return $?
+      [[ -z "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR" &&
+        ! -e "$RESULT_DIR/.diagnostic-nondisclosure-request.ABC123" &&
+        ! -L "$RESULT_DIR/.diagnostic-nondisclosure-request.ABC123" ]] ||
+        return 1
+    ) || {
+      printf 'diagnostic write failure was masked: %s\n' "$mode" >&2
+      return 1
+    }
+  done
+}
+
+test_diagnostic_nondisclosure_private_captures_are_bounded_and_cleaned() {
+  local -r root="$TEST_TMP_DIR/diagnostic-nondisclosure-private-captures"
+  local -r fixture="$root/java-endpoint.fixture"
+  local mode=""
+
+  mkdir -p -- "$root" || return $?
+  write_diagnostics_fixture "$fixture" 1 0 0 1 0 0 || return $?
+  for mode in clean producer-failure byte-overflow; do
+    (
+      RESULT_DIR="$root/$mode"
+      DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR="$RESULT_DIR/.diagnostic-nondisclosure-request.ABC123"
+      local -r raw="$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/.java-endpoint.capture"
+      local -r output="$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/diagnostic-nondisclosure-java-endpoint.txt"
+      local status=0
+
+      mkdir -p -- "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR" || return $?
+      chmod 0700 -- "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR" || return $?
+      printf '%s\n' no-diagnostic-canary \
+        >"$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/canaries.txt" || return $?
+      chmod 0600 -- "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/canaries.txt" ||
+        return $?
+      curl() {
+        case "$mode" in
+          clean) command cat -- "$fixture" ;;
+          producer-failure)
+            printf '%s\n' partial-endpoint
+            return 77
+            ;;
+          byte-overflow)
+            awk -v maximum="$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES" '
+              BEGIN { for (byte = 0; byte <= maximum; byte++) printf "x" }
+            '
+            ;;
+          *) return 99 ;;
+        esac
+      }
+
+      if capture_diagnostic_nondisclosure_java_endpoint; then
+        status=0
+      else
+        status=$?
+      fi
+      case "$mode" in
+        clean)
+          [[ "$status" == 0 && -f "$raw" && ! -L "$raw" &&
+            "$(stat --format='%u:%a:%h' -- "$raw")" == "$EUID:600:1" ]] ||
+            return 1
+          stage_diagnostic_nondisclosure_surface \
+            "$raw" diagnostic-nondisclosure-java-endpoint.txt || return $?
+          [[ -f "$output" && ! -L "$output" ]] || return 1
+          ;;
+        producer-failure)
+          [[ "$status" == 77 && -f "$raw" && ! -L "$raw" ]] || return 1
+          ;;
+        byte-overflow)
+          [[ "$status" == 1 && -f "$raw" && ! -L "$raw" &&
+            "$(stat -c '%s' -- "$raw")" == \
+              "$((TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES + 1))" ]] || return 1
+          ;;
+      esac
+      cleanup_diagnostic_nondisclosure_request_directory || return $?
+      [[ -z "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR" &&
+        ! -e "$RESULT_DIR/.diagnostic-nondisclosure-request.ABC123" &&
+        ! -L "$RESULT_DIR/.diagnostic-nondisclosure-request.ABC123" ]] ||
+        return 1
+    ) || {
+      printf 'private endpoint capture case failed: %s\n' "$mode" >&2
+      return 1
+    }
+  done
+
+  (
+    RESULT_DIR="$root/metrics-partial"
+    DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR="$RESULT_DIR/.diagnostic-nondisclosure-request.ABC123"
+    local -r metrics="$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/diagnostic-nondisclosure-obi-metrics.prom"
+    local status=0
+
+    mkdir -p -- "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR" || return $?
+    chmod 0700 -- "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR" || return $?
+    (umask 077; : >"$metrics") || return $?
+    curl() {
+      printf '%s\n' partial-metrics
+      return 79
+    }
+    if capture_obi_metrics_candidate "$metrics" 5; then
+      status=0
+    else
+      status=$?
+    fi
+    [[ "$status" == 79 && -f "$metrics" && ! -L "$metrics" &&
+      "$(<"$metrics")" == partial-metrics ]] || return 1
+    cleanup_diagnostic_nondisclosure_request_directory || return $?
+    [[ -z "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR" &&
+      ! -e "$RESULT_DIR/.diagnostic-nondisclosure-request.ABC123" &&
+      ! -L "$RESULT_DIR/.diagnostic-nondisclosure-request.ABC123" ]] ||
+      return 1
+  ) || {
+    printf 'private OBI metric partial capture cleanup failed\n' >&2
+    return 1
+  }
+}
+
+test_diagnostic_nondisclosure_canary_manifest_is_complete_and_deduplicated() {
+  local -r root="$TEST_TMP_DIR/diagnostic-nondisclosure-canary-manifest"
+  local -r dynamic_marker="dynamic-w3c-marker"
+  local -r dynamic_trace="11111111111111111111111111111111"
+  local -r dynamic_parent="2222222222222222"
+  local -r dynamic_span="3333333333333333"
+  local -r related_trace="44444444444444444444444444444444"
+  local -r related_span="5555555555555555"
+  local -r related_parent="6666666666666666"
+  local transport=""
+
+  for transport in getsockopt unix; do
+    (
+      RESULT_DIR="$root/$transport"
+      SELECTED_TRANSPORT="$transport"
+      DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR="$RESULT_DIR/.diagnostic-nondisclosure-request.ABC123"
+      local -r scenario_result="$RESULT_DIR/scenario-w3c.json"
+      local -r expected="$RESULT_DIR/canaries.expected"
+
+      mkdir -p -- "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR" || return $?
+      chmod 0700 -- "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR" || return $?
+      jq -cn \
+        --arg marker "$dynamic_marker" \
+        --arg trace "$dynamic_trace" \
+        --arg parent "$dynamic_parent" \
+        --arg span "$dynamic_span" \
+        --arg related_trace "$related_trace" \
+        --arg related_span "$related_span" \
+        --arg related_parent "$related_parent" '
+          {
+            status: "passed",
+            scenario: "w3c",
+            cases: [{
+              request: {
+                marker: $marker,
+                w3c_trace_id: $trace,
+                w3c_parent_span_id: $parent
+              },
+              trace: {
+                spans: [{
+                  trace_id: $trace,
+                  span_id: $span,
+                  parent_span_id: $parent
+                }],
+                related_spans: [{
+                  trace_id: $related_trace,
+                  span_id: $related_span,
+                  parent_span_id: $related_parent
+                }]
+              }
+            }]
+          }
+        ' >"$scenario_result" || return $?
+      {
+        printf '%s\n' \
+          "$DIAGNOSTIC_NONDISCLOSURE_TRACE_ID" \
+          "$DIAGNOSTIC_NONDISCLOSURE_PARENT_SPAN_ID" \
+          "$DIAGNOSTIC_NONDISCLOSURE_MARKER" \
+          "$DIAGNOSTIC_NONDISCLOSURE_HEADER_CANARY" \
+          "$DIAGNOSTIC_NONDISCLOSURE_BODY_CANARY" \
+          "$DIAGNOSTIC_NONDISCLOSURE_CREDENTIAL_CANARY" \
+          "$dynamic_marker" "$dynamic_trace" "$dynamic_parent" \
+          "$dynamic_span" "$related_trace" "$related_span" "$related_parent" ||
+          exit $?
+        if [[ "$transport" == unix ]]; then
+          printf '%s\n' "$DIAGNOSTIC_NONDISCLOSURE_UNIX_PAYLOAD_CANARY" ||
+            exit $?
+        fi
+      } | LC_ALL=C sort -u >"$expected" || return $?
+
+      write_diagnostic_nondisclosure_canaries "$scenario_result" || return $?
+      cmp -s -- \
+        "$expected" "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/canaries.txt" ||
+        return $?
+      [[ "$(stat --format='%u:%a:%h' -- \
+        "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/canaries.txt")" == \
+          "$EUID:600:1" ]] || return 1
+      cleanup_diagnostic_nondisclosure_request_directory || return $?
+      [[ -z "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR" ]] || return 1
+    ) || {
+      printf 'diagnostic canary manifest case failed: %s\n' "$transport" >&2
+      return 1
+    }
+  done
+}
+
+test_diagnostic_nondisclosure_surface_publication_reconciles_side_effects() {
+  local -r root="$TEST_TMP_DIR/diagnostic-nondisclosure-surface-publication"
+  local -r reference="diagnostic-nondisclosure-java-endpoint.txt"
+  local mode=""
+
+  for mode in digest-mismatch link-side-effect rm-side-effect persistent-rm-denial; do
+    (
+      RESULT_DIR="$root/$mode"
+      DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR="$RESULT_DIR/.diagnostic-nondisclosure-request.ABC123"
+      local -r input="$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/$reference"
+      local -r output="$RESULT_DIR/$reference"
+      local digest=""
+      local status=0
+      local -i rm_calls=0
+
+      mkdir -p -- "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR" || return $?
+      chmod 0700 -- "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR" || return $?
+      (umask 077; printf '%s\n' clean-diagnostic-surface >"$input") ||
+        return $?
+      digest="$(sha256sum "$input")" || return $?
+      digest="${digest%% *}"
+      ln() {
+        command ln "$@" || return $?
+        if [[ "$mode" == link-side-effect ]]; then
+          return 77
+        fi
+      }
+      rm() {
+        ((rm_calls += 1))
+        case "$mode" in
+          rm-side-effect)
+            command rm "$@" || return $?
+            return 78
+            ;;
+          persistent-rm-denial)
+            if ((rm_calls <= 3)); then
+              return 78
+            fi
+            command rm "$@"
+            ;;
+          *) command rm "$@" ;;
+        esac
+      }
+
+      if [[ "$mode" == digest-mismatch ]]; then
+        digest="0000000000000000000000000000000000000000000000000000000000000000"
+      fi
+      if publish_diagnostic_nondisclosure_surface "$reference" "$digest"; then
+        status=0
+      else
+        status=$?
+      fi
+      case "$mode" in
+        digest-mismatch)
+          [[ "$status" != 0 && -f "$input" && ! -L "$input" &&
+            "$(stat --format='%u:%a:%h' -- "$input")" == "$EUID:600:1" &&
+            ! -e "$output" && ! -L "$output" ]] || return 1
+          unset -f ln rm || return $?
+          cleanup_diagnostic_nondisclosure_request_directory || return $?
+          ;;
+        link-side-effect|rm-side-effect)
+          [[ "$status" == 0 && ! -e "$input" && ! -L "$input" &&
+            -f "$output" && ! -L "$output" &&
+            "$(stat --format='%u:%a:%h' -- "$output")" == "$EUID:644:1" &&
+            "$(sha256sum "$output")" == "$digest  $output" ]] || return 1
+          unset -f ln rm || return $?
+          cleanup_diagnostic_nondisclosure_request_directory || return $?
+          ;;
+        persistent-rm-denial)
+          [[ "$status" == 78 && -f "$input" && ! -L "$input" &&
+            -f "$output" && ! -L "$output" &&
+            "$(stat -Lc '%d:%i:%u:%a:%h' -- "$input")" == \
+              "$(stat -Lc '%d:%i:%u:%a:%h' -- "$output")" &&
+            "$(stat -Lc '%h' -- "$input")" == 2 ]] || return 1
+          cleanup_diagnostic_nondisclosure_request_directory || return $?
+          [[ "$rm_calls" == 4 &&
+            -z "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR" &&
+            -f "$output" && ! -L "$output" &&
+            "$(stat --format='%u:%a:%h' -- "$output")" == "$EUID:644:1" ]] ||
+            return 1
+          ;;
+      esac
+    ) || {
+      printf 'diagnostic surface publication case failed: %s\n' "$mode" >&2
+      return 1
+    }
+  done
+}
+
+test_diagnostic_nondisclosure_exit_capture_suppresses_unscanned_surfaces() {
+  local -r result_dir="$TEST_TMP_DIR/diagnostic-nondisclosure-exit-capture"
+
+  (
+    RESULT_DIR="$result_dir"
+    SCENARIO=diagnostic-nondisclosure
+    STACK_STARTED=true
+    mkdir -p -- "$RESULT_DIR" || return $?
+    capture_phase_evidence() {
+      mkdir -p -- "$RESULT_DIR/phases/$1" || return $?
+      printf '%s\n' leaked-metric-canary \
+        >"$RESULT_DIR/phases/$1/obi-metrics.prom"
+    }
+    capture_bounded_compose_logs() {
+      printf '%s\n' leaked-log-canary >"$1"
+    }
+    capture_final_java_diagnostics() {
+      printf '%s\n' called >"$RESULT_DIR/final-java.called"
+    }
+    run_bounded() {
+      printf '%s\n' safe-compose-ps
+    }
+    curl() {
+      printf '%s\n' '{"status":"safe"}'
+    }
+
+    capture_evidence || return $?
+    [[ -f "$RESULT_DIR/final-java.called" &&
+      -f "$RESULT_DIR/compose-ps.txt" &&
+      -f "$RESULT_DIR/final-receiver-snapshot.json" &&
+      ! -e "$RESULT_DIR/compose.log" && ! -L "$RESULT_DIR/compose.log" &&
+      ! -e "$RESULT_DIR/phases/final" && ! -L "$RESULT_DIR/phases/final" ]] ||
+      return 1
+  ) || {
+    printf 'focused exit capture republished an unscanned surface\n' >&2
+    return 1
+  }
+}
+
+test_diagnostic_nondisclosure_surfaces_and_report_are_closed() {
+  local -r result_dir="$TEST_TMP_DIR/diagnostic-nondisclosure-validator"
+  local -r request_dir="$result_dir/.diagnostic-nondisclosure-request.ABC123"
+  local -r endpoint_ref="diagnostic-nondisclosure-java-endpoint.txt"
+  local -r header_ref="diagnostic-nondisclosure-java-header.txt"
+  local -r transport_ref="diagnostic-nondisclosure-java-transport-configuration.txt"
+  local -r metrics_ref="diagnostic-nondisclosure-obi-metrics.prom"
+  local -r obi_log_ref="diagnostic-nondisclosure-obi.log"
+  local -r java_log_ref="diagnostic-nondisclosure-java.log"
+  local -r since="2026-08-18T01:02:03.000000004Z"
+  local -r until="2026-08-18T01:02:04.000000005Z"
+  local canary_count=""
+  local canary_bytes=""
+  local clean_probe="$result_dir/clean-probe.txt"
+  local tainted_probe="$result_dir/tainted-probe.txt"
+  local payload=""
+  local mutation=""
+  local mutated=""
+  local surface=""
+  local canary=""
+  local surfaces=""
+  local -a surface_json=()
+
+  (
+    RESULT_DIR="$result_dir"
+    DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR="$request_dir"
+    AGENT_DISTRIBUTION=otel
+    SELECTED_TRANSPORT=getsockopt
+    TRANSPORT=getsockopt
+    OBI_LOG_LEVEL=info
+    mkdir -p -- "$request_dir" || return $?
+    chmod 0700 -- "$request_dir" || return $?
+    printf '%s\n' \
+      "$DIAGNOSTIC_NONDISCLOSURE_TRACE_ID" \
+      "$DIAGNOSTIC_NONDISCLOSURE_PARENT_SPAN_ID" \
+      "$DIAGNOSTIC_NONDISCLOSURE_MARKER" \
+      "$DIAGNOSTIC_NONDISCLOSURE_HEADER_CANARY" \
+      "$DIAGNOSTIC_NONDISCLOSURE_BODY_CANARY" \
+      "$DIAGNOSTIC_NONDISCLOSURE_CREDENTIAL_CANARY" \
+      "$DIAGNOSTIC_NONDISCLOSURE_UNIX_PAYLOAD_CANARY" \
+      >"$request_dir/canaries.txt" || return $?
+    chmod 0600 -- "$request_dir/canaries.txt" || return $?
+    write_diagnostics_fixture "$result_dir/$endpoint_ref" 1 0 0 1 0 0 ||
+      return $?
+    cp -- "$result_dir/$endpoint_ref" "$result_dir/$header_ref" || return $?
+    printf '%s\n' \
+      'version=2,status=1,requested=1,selected=1,attempted=1,getsockopt=1,unix=0' \
+      >"$result_dir/$transport_ref" || return $?
+    printf '%s\n' \
+      'obi_java_remote_parent_operations_total{operation="availability",status="valid",transport="getsockopt"} 1' \
+      >"$result_dir/$metrics_ref" || return $?
+    printf '%s\n' \
+      'obi-1 | 2026-08-18T01:02:03.100000000Z level=INFO msg="Java remote parent bridge ready" transport=getsockopt' \
+      >"$result_dir/$obi_log_ref" || return $?
+    printf '%s\n' \
+      'java-1 | 2026-08-18T01:02:03.200000000Z OBI remote-parent propagator enabled' \
+      'java-1 | 2026-08-18T01:02:03.300000000Z OBI remote-parent provider ready' \
+      'java-1 | 2026-08-18T01:02:03.400000000Z Jetty HTTPS backend ready on 127.0.0.1:18443' \
+      >"$result_dir/$java_log_ref" || return $?
+    chmod 0644 -- \
+      "$result_dir/$endpoint_ref" "$result_dir/$header_ref" \
+      "$result_dir/$transport_ref" "$result_dir/$metrics_ref" \
+      "$result_dir/$obi_log_ref" "$result_dir/$java_log_ref" || return $?
+
+    assert_sanitized_java_diagnostics "$result_dir/$endpoint_ref" || return $?
+    assert_sanitized_java_diagnostics "$result_dir/$header_ref" || return $?
+    [[ "$(selected_transport_from_configuration \
+      "$(transport_configuration_from_file "$result_dir/$transport_ref")" \
+      getsockopt)" == getsockopt ]] || return 1
+    assert_diagnostic_nondisclosure_obi_log_policy "$result_dir/$obi_log_ref" ||
+      return $?
+    assert_diagnostic_nondisclosure_java_log_policy "$result_dir/$java_log_ref" ||
+      return $?
+
+    surface_json+=("$(diagnostic_nondisclosure_surface_json \
+      java_endpoint "$endpoint_ref" \
+      "$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES" 1)") || return $?
+    surface_json+=("$(diagnostic_nondisclosure_surface_json \
+      java_header "$header_ref" "$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES" 1)") ||
+      return $?
+    surface_json+=("$(diagnostic_nondisclosure_surface_json \
+      java_transport_configuration "$transport_ref" \
+      "$TRANSPORT_CONFIGURATION_MAX_BYTES" 1)") || return $?
+    surface_json+=("$(diagnostic_nondisclosure_surface_json \
+      obi_metrics "$metrics_ref" "$OBI_METRIC_SNAPSHOT_MAX_BYTES" \
+      "$OBI_METRIC_SNAPSHOT_MAX_LINES")") || return $?
+    surface_json+=("$(diagnostic_nondisclosure_surface_json \
+      obi_log "$obi_log_ref" "$COMPOSE_LOG_MAX_BYTES" "$COMPOSE_LOG_MAX_LINES")") ||
+      return $?
+    surface_json+=("$(diagnostic_nondisclosure_surface_json \
+      java_log "$java_log_ref" "$COMPOSE_LOG_MAX_BYTES" "$COMPOSE_LOG_MAX_LINES")") ||
+      return $?
+    surfaces="$(printf '%s\n' "${surface_json[@]}" | jq -ces '.')" || return $?
+    canary_count="$(wc -l <"$request_dir/canaries.txt")" || return $?
+    canary_bytes="$(stat -c '%s' -- "$request_dir/canaries.txt")" || return $?
+    payload="$(build_diagnostic_nondisclosure_status_payload \
+      "$surfaces" "$canary_count" "$canary_bytes" "$since" "$until")" ||
+      return $?
+    validate_diagnostic_nondisclosure_status_payload "$payload" || return $?
+    printf '%s\n' "$payload" \
+      >"$result_dir/scenario-diagnostic-nondisclosure-status.json" || return $?
+    chmod 0644 -- "$result_dir/scenario-diagnostic-nondisclosure-status.json" ||
+      return $?
+    validate_diagnostic_nondisclosure_status \
+      "$result_dir/scenario-diagnostic-nondisclosure-status.json" || return $?
+
+    for mutation in \
+      'del(.policy)' \
+      '.unexpected = true' \
+      '.debug_controls.bpf_debug = true' \
+      '.obi_metric_boundary_ids = []' \
+      '.surfaces[0].canary_match_count = 1' \
+      '.surfaces[0].sha256 = "bad"' \
+      '.surfaces[2].reference = "wrong"' \
+      '.surfaces = {a:.surfaces[0],b:.surfaces[1],c:.surfaces[2],d:.surfaces[3],e:.surfaces[4],f:.surfaces[5]}' \
+      '.surfaces = .surfaces[0:5]' \
+      '.surfaces = (.surfaces + [.surfaces[0]])' \
+      '.surfaces |= reverse'; do
+      mutated="$(jq -cS "$mutation" <<<"$payload")" || return $?
+      if validate_diagnostic_nondisclosure_status_payload "$mutated" \
+        >/dev/null 2>&1; then
+        printf 'diagnostic report accepted mutation: %s\n' "$mutation" >&2
+        return 1
+      fi
+    done
+
+    printf '%s\n' 'trace_id authorization ordinary-diagnostic-words' \
+      >"$clean_probe" || return $?
+    assert_diagnostic_nondisclosure_surface_has_no_canary "$clean_probe" ||
+      return $?
+    for surface in \
+      "$endpoint_ref" "$header_ref" "$transport_ref" \
+      "$metrics_ref" "$obi_log_ref" "$java_log_ref"; do
+      for canary in \
+        "$DIAGNOSTIC_NONDISCLOSURE_TRACE_ID" \
+        "$DIAGNOSTIC_NONDISCLOSURE_PARENT_SPAN_ID" \
+        "$DIAGNOSTIC_NONDISCLOSURE_MARKER" \
+        "$DIAGNOSTIC_NONDISCLOSURE_HEADER_CANARY" \
+        "$DIAGNOSTIC_NONDISCLOSURE_BODY_CANARY" \
+        "$DIAGNOSTIC_NONDISCLOSURE_CREDENTIAL_CANARY" \
+        "$DIAGNOSTIC_NONDISCLOSURE_UNIX_PAYLOAD_CANARY"; do
+        cp -- "$result_dir/$surface" "$tainted_probe" || return $?
+        printf '%s\n' "$canary" >>"$tainted_probe" || return $?
+        if assert_diagnostic_nondisclosure_surface_has_no_canary \
+          "$tainted_probe" >/dev/null 2>&1; then
+          printf 'surface %s accepted canary %s\n' "$surface" "$canary" >&2
+          return 1
+        fi
+      done
+    done
+    (
+      grep() { return 2; }
+      ! assert_diagnostic_nondisclosure_surface_has_no_canary "$clean_probe"
+    ) || {
+      printf 'surface scanner treated grep infrastructure failure as clean\n' >&2
+      return 1
+    }
+
+    SELECTED_TRANSPORT=""
+    if validate_diagnostic_nondisclosure_status_payload "$payload" \
+      >/dev/null 2>&1; then
+      printf 'live diagnostic report validation ignored cleared transport\n' >&2
+      return 1
+    fi
+    validate_diagnostic_nondisclosure_status_payload_intrinsic "$payload" ||
+      return $?
+    TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER=true
+    normalize_diagnostic_nondisclosure_report_candidate_before_freeze ||
+      return $?
+    TERMINAL_EVIDENCE_LOCK_HELD_BY_CALLER=false
+    SELECTED_TRANSPORT=getsockopt
+
+    printf '%s\n' \
+      'obi-1 | level=INFO msg="Java remote parent bridge ready" transport=getsockopt socket_path=/private' \
+      >"$result_dir/$obi_log_ref" || return $?
+    if assert_diagnostic_nondisclosure_obi_log_policy \
+      "$result_dir/$obi_log_ref" >/dev/null 2>&1; then
+      printf 'info log policy accepted debug path disclosure\n' >&2
+      return 1
+    fi
+    OBI_LOG_LEVEL=debug
+    printf '%s\n' \
+      'obi-1 | level=INFO msg="Java remote parent bridge ready" transport=getsockopt' \
+      'obi-1 | level=DEBUG msg="Java remote parent bridge ready details" transport=getsockopt socket_path=/configured/path' \
+      >"$result_dir/$obi_log_ref" || return $?
+    assert_diagnostic_nondisclosure_obi_log_policy "$result_dir/$obi_log_ref" ||
+      return $?
+  ) || {
+    printf 'diagnostic nondisclosure surface/report contract failed\n' >&2
+    return 1
+  }
+}
+
+test_diagnostic_nondisclosure_log_capture_is_complete_and_generation_fenced() {
+  local -r root="$TEST_TMP_DIR/diagnostic-nondisclosure-log-capture"
+  local -r since="2026-08-18T01:02:03.000000004Z"
+  local -r until="2026-08-18T01:02:04.000000005Z"
+  local -r expected_id="0000000000000000000000000000000000000000000000000000000000000000"
+  local -r drift_id="1111111111111111111111111111111111111111111111111111111111111111"
+  local mode=""
+
+  for mode in clean producer-failure byte-overflow line-overflow identity-drift; do
+    (
+      RESULT_DIR="$root/$mode"
+      DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR="$RESULT_DIR/.diagnostic-nondisclosure-request.ABC123"
+      local -r output="$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/diagnostic-nondisclosure-obi.log"
+      local -r identity_count="$RESULT_DIR/identity-count"
+      local status=0
+      local count=0
+
+      mkdir -p -- "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR" || return $?
+      chmod 0700 -- "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR" || return $?
+      diagnostic_nondisclosure_container_id() {
+        [[ "$1" == obi ]] || return 1
+        if [[ -f "$identity_count" ]]; then
+          read -r count <"$identity_count" || return $?
+        fi
+        ((count += 1))
+        printf '%s\n' "$count" >"$identity_count" || return $?
+        if [[ "$mode" == identity-drift && "$count" == 2 ]]; then
+          printf '%s\n' "$drift_id"
+        else
+          printf '%s\n' "$expected_id"
+        fi
+      }
+      run_bounded() {
+        shift
+        [[ "$*" == \
+          "docker logs --timestamps --since $since --until $until $expected_id" ]] ||
+          return 98
+        case "$mode" in
+          clean|identity-drift)
+            printf '%s\n' \
+              '2026-08-18T01:02:03.100000000Z level=INFO msg="safe"'
+            ;;
+          producer-failure)
+            printf '%s\n' partial
+            return 77
+            ;;
+          byte-overflow)
+            awk -v maximum="$COMPOSE_LOG_MAX_BYTES" '
+              BEGIN { for (byte = 0; byte <= maximum; byte++) printf "x" }
+            '
+            ;;
+          line-overflow)
+            awk -v maximum="$COMPOSE_LOG_MAX_LINES" \
+              'BEGIN { for (line = 0; line <= maximum; line++) print "safe" }'
+            ;;
+          *) return 99 ;;
+        esac
+      }
+
+      if capture_diagnostic_nondisclosure_service_log \
+        obi "$expected_id" "$since" "$until" "$output"; then
+        status=0
+      else
+        status=$?
+      fi
+      case "$mode" in
+        clean)
+          [[ "$status" == 0 && -f "$output" && ! -L "$output" &&
+            "$(stat --format='%u:%a:%h' -- "$output")" == "$EUID:600:1" &&
+            "$(<"$identity_count")" == 2 ]] || return 1
+          ;;
+        producer-failure)
+          [[ "$status" == 77 ]] || return 1
+          ;;
+        byte-overflow|line-overflow|identity-drift)
+          [[ "$status" == 1 ]] || return 1
+          ;;
+      esac
+      if [[ "$mode" != clean ]]; then
+        [[ ! -e "$output" && ! -L "$output" &&
+          ! -e "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/.obi.log.capture" &&
+          ! -L "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/.obi.log.capture" ]] ||
+          return 1
+      fi
+      rm -f -- "$identity_count" || return $?
+      cleanup_diagnostic_nondisclosure_request_directory || return $?
+    ) || {
+      printf 'diagnostic log capture case failed: %s\n' "$mode" >&2
+      return 1
+    }
+  done
 }
 
 java_diagnostics_schema_from_source() {
@@ -31133,6 +32384,7 @@ compose_runtime_model_interpolation_is_allowlisted() {
           service: "obi",
           command: ["--config=/config/obi.yaml"],
           environment: {
+            OTEL_EBPF_BPF_DEBUG: "false",
             OTEL_EBPF_BPF_CONTEXT_PROPAGATION:
               "${CONTEXT_PROPAGATION:-tcp}",
             OTEL_EBPF_JAVA_REMOTE_PARENT_RETRIEVAL_TTL:
@@ -31144,7 +32396,9 @@ compose_runtime_model_interpolation_is_allowlisted() {
             OTEL_EBPF_JAVA_REMOTE_PARENT_TRANSPORT:
               "${BRIDGE_TRANSPORT:-getsockopt}",
             OTEL_EBPF_JAVA_REMOTE_PARENT_TTL:
-              "${REMOTE_PARENT_TTL:-30s}"
+              "${REMOTE_PARENT_TTL:-30s}",
+            OTEL_EBPF_LOG_LEVEL: "${OBI_LOG_LEVEL:-info}",
+            OTEL_EBPF_PROTOCOL_DEBUG_PRINT: "false"
           }
         },
         {
@@ -31730,6 +32984,10 @@ compose_runtime_model_interpolation_is_allowlisted() {
           value: "${REMOTE_PARENT_TTL:-30s}"
         },
         {
+          path: ["services", "obi", "environment", "OTEL_EBPF_LOG_LEVEL"],
+          value: "${OBI_LOG_LEVEL:-info}"
+        },
+        {
           path: ["services", "benchmark", "volumes", 0, "source"],
           value: $expected_benchmark_source
         },
@@ -31852,6 +33110,7 @@ test_primary_live_fd_compose_topology_is_scoped() {
     "JAVA_TOOL_OPTIONS_VALUE=-javaagent:/otel/official-javaagent.jar"
     "OTEL_JAVAAGENT_EXTENSIONS_VALUE=/otel/obi-otel-extension.jar"
     "OTEL_PROPAGATORS_VALUE=obi,tracecontext,baggage"
+    "OBI_LOG_LEVEL=debug"
   )
   local compose_overlay=""
   local resolved_compose=""
@@ -35961,6 +37220,16 @@ main() {
   test_selected_transport_uses_java_diagnostics
   test_transport_configuration_file_size_boundary_is_exact
   test_control_modes_are_distinct
+  test_diagnostic_nondisclosure_cli_and_dispatch_are_exact
+  test_diagnostic_nondisclosure_source_contract_is_mutation_sensitive
+  test_diagnostic_nondisclosure_request_directory_is_cleanup_owned
+  test_diagnostic_nondisclosure_write_failures_are_not_masked
+  test_diagnostic_nondisclosure_private_captures_are_bounded_and_cleaned
+  test_diagnostic_nondisclosure_canary_manifest_is_complete_and_deduplicated
+  test_diagnostic_nondisclosure_surface_publication_reconciles_side_effects
+  test_diagnostic_nondisclosure_exit_capture_suppresses_unscanned_surfaces
+  test_diagnostic_nondisclosure_surfaces_and_report_are_closed
+  test_diagnostic_nondisclosure_log_capture_is_complete_and_generation_fenced
   test_benchmark_controls_use_shared_concurrency_workload
   test_benchmark_controls_configure_their_runtime
   test_benchmark_startup_selects_runtime_contract

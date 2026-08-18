@@ -3101,7 +3101,10 @@ test_diagnostic_nondisclosure_source_contract_is_mutation_sensitive() {
   runtime_source="$(declare -f assert_diagnostic_nondisclosure_runtime_configuration)"
   [[ "$runtime_source" == *'OTEL_EBPF_LOG_LEVEL='* &&
     "$runtime_source" == *'OTEL_EBPF_BPF_DEBUG=false'* &&
-    "$runtime_source" == *'OTEL_EBPF_PROTOCOL_DEBUG_PRINT=false'* ]] || {
+    "$runtime_source" == *'OTEL_EBPF_PROTOCOL_DEBUG_PRINT=false'* &&
+    "$runtime_source" == *'SPLUNK_TRACE_RESPONSE_HEADER_ENABLED=false'* &&
+    "$control_source" == \
+      *'"$obi_container_id" "$java_container_id" || return $?'* ]] || {
     printf 'diagnostic runtime attestation lost a debug control\n' >&2
     return 1
   }
@@ -3117,6 +3120,8 @@ test_diagnostic_nondisclosure_source_contract_is_mutation_sensitive() {
   grep -Fq -- 'OTEL_EBPF_BPF_DEBUG: "false"' "$COMPOSE_FILE" || return 1
   grep -Fq -- 'OTEL_EBPF_PROTOCOL_DEBUG_PRINT: "false"' "$COMPOSE_FILE" ||
     return 1
+  grep -Fq -- 'SPLUNK_TRACE_RESPONSE_HEADER_ENABLED: "false"' \
+    "$COMPOSE_FILE" || return 1
   startup_source="$(declare -f start_stack)"
   cursor_line="$(grep -nF -- \
     'DIAGNOSTIC_NONDISCLOSURE_LOG_SINCE="$startup_since"' \
@@ -3129,6 +3134,57 @@ test_diagnostic_nondisclosure_source_contract_is_mutation_sensitive() {
     printf 'diagnostic log cursor no longer precedes Compose startup\n' >&2
     return 1
   }
+}
+
+test_diagnostic_nondisclosure_runtime_configuration_disables_trace_response_header() {
+  local -r obi_container_id="1111111111111111111111111111111111111111111111111111111111111111"
+  local -r java_container_id="2222222222222222222222222222222222222222222222222222222222222222"
+  local java_setting=""
+
+  for java_setting in false true missing duplicate; do
+    (
+      OBI_LOG_LEVEL=debug
+      run_bounded() {
+        [[ "$1" == 10 && "$2" == docker && "$3" == inspect &&
+          "$4" == --format && "$5" == '{{json .Config.Env}}' ]] || return 1
+        case "$6" in
+          "$obi_container_id")
+            jq -cn '[
+              "OTEL_EBPF_LOG_LEVEL=debug",
+              "OTEL_EBPF_BPF_DEBUG=false",
+              "OTEL_EBPF_PROTOCOL_DEBUG_PRINT=false"
+            ]'
+            ;;
+          "$java_container_id")
+            case "$java_setting" in
+              false) jq -cn '["SPLUNK_TRACE_RESPONSE_HEADER_ENABLED=false"]' ;;
+              true) jq -cn '["SPLUNK_TRACE_RESPONSE_HEADER_ENABLED=true"]' ;;
+              missing) jq -cn '[]' ;;
+              duplicate)
+                jq -cn '[
+                  "SPLUNK_TRACE_RESPONSE_HEADER_ENABLED=false",
+                  "SPLUNK_TRACE_RESPONSE_HEADER_ENABLED=false"
+                ]'
+                ;;
+              *) return 1 ;;
+            esac
+            ;;
+          *) return 1 ;;
+        esac
+      }
+
+      if assert_diagnostic_nondisclosure_runtime_configuration \
+        "$obi_container_id" "$java_container_id"; then
+        [[ "$java_setting" == false ]]
+      else
+        [[ "$java_setting" != false ]]
+      fi
+    ) || {
+      printf 'diagnostic runtime trace-response setting case failed: %s\n' \
+        "$java_setting" >&2
+      return 1
+    }
+  done
 }
 
 test_benchmark_controls_use_shared_concurrency_workload() {
@@ -13069,6 +13125,7 @@ test_diagnostic_nondisclosure_surfaces_and_report_are_closed() {
   local canary_source_sha256=""
   local scenario_size=""
   local clean_probe="$result_dir/clean-probe.txt"
+  local response_header_probe="$result_dir/response-headers.txt"
   local tainted_probe="$result_dir/tainted-probe.txt"
   local payload=""
   local mutation=""
@@ -13260,6 +13317,15 @@ test_diagnostic_nondisclosure_surfaces_and_report_are_closed() {
       >"$clean_probe" || return $?
     assert_diagnostic_nondisclosure_surface_has_no_canary "$clean_probe" ||
       return $?
+    printf '%s\n' \
+      'HTTP/1.1 200 OK' \
+      "Server-Timing: traceparent;desc=\"00-$DIAGNOSTIC_NONDISCLOSURE_TRACE_ID-1111111111111111-01\"" \
+      >"$response_header_probe" || return $?
+    if assert_diagnostic_nondisclosure_surface_has_no_canary \
+      "$response_header_probe" >/dev/null 2>&1; then
+      printf 'response-header trace canary was accepted\n' >&2
+      return 1
+    fi
     for surface in \
       "$endpoint_ref" "$header_ref" "$transport_ref" \
       "$metrics_ref" "$obi_log_ref" "$java_log_ref"; do
@@ -33181,6 +33247,7 @@ compose_runtime_model_interpolation_is_allowlisted() {
               "${OTEL_PROPAGATORS_VALUE:-obi,tracecontext,baggage}",
             OTEL_SERVICE_NAME: "java-backend",
             OTEL_TRACES_SAMPLER: "always_on",
+            SPLUNK_TRACE_RESPONSE_HEADER_ENABLED: "false",
             TLS_BOUNDARY_COALESCED_HTTPS_PORT: "18446",
             TLS_BOUNDARY_SPLIT_HTTPS_PORT: "18445",
             TLS_KEYSTORE_PASSWORD: "changeit",
@@ -38039,6 +38106,7 @@ main() {
   test_control_modes_are_distinct
   test_diagnostic_nondisclosure_cli_and_dispatch_are_exact
   test_diagnostic_nondisclosure_source_contract_is_mutation_sensitive
+  test_diagnostic_nondisclosure_runtime_configuration_disables_trace_response_header
   test_diagnostic_nondisclosure_request_directory_is_cleanup_owned
   test_diagnostic_nondisclosure_write_failures_are_not_masked
   test_diagnostic_nondisclosure_private_captures_are_bounded_and_cleaned

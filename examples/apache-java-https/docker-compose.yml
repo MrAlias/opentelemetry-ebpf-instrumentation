@@ -59,6 +59,7 @@ services:
       OTEL_METRICS_EXPORTER: none
       OTEL_LOGS_EXPORTER: none
       OTEL_INSTRUMENTATION_HTTP_SERVER_CAPTURE_REQUEST_HEADERS: x-obi-demo-id
+      SPLUNK_TRACE_RESPONSE_HEADER_ENABLED: "false"
     volumes:
       - ./.runtime/certs/server.p12:/run/obi-demo/certs/server.p12:ro
       - java-remote-parent-socket:/var/run/obi

@@ -22720,11 +22720,16 @@ diagnostic_nondisclosure_container_id() {
 
 assert_diagnostic_nondisclosure_runtime_configuration() {
   local -r obi_container_id="$1"
+  local -r java_container_id="$2"
   local runtime_environment=""
+  local java_runtime_environment=""
 
-  [[ "$obi_container_id" =~ ^[0-9a-f]{64}$ ]] || return 1
+  [[ "$obi_container_id" =~ ^[0-9a-f]{64}$ &&
+    "$java_container_id" =~ ^[0-9a-f]{64}$ ]] || return 1
   runtime_environment="$(run_bounded 10 docker inspect \
     --format '{{json .Config.Env}}' "$obi_container_id")" || return $?
+  java_runtime_environment="$(run_bounded 10 docker inspect \
+    --format '{{json .Config.Env}}' "$java_container_id")" || return $?
   jq -e \
     --arg log_level "$OBI_LOG_LEVEL" '
       type == "array" and
@@ -22734,7 +22739,12 @@ assert_diagnostic_nondisclosure_runtime_configuration() {
         ["OTEL_EBPF_BPF_DEBUG=false"]) and
       ([.[] | select(startswith("OTEL_EBPF_PROTOCOL_DEBUG_PRINT="))] ==
         ["OTEL_EBPF_PROTOCOL_DEBUG_PRINT=false"])
-    ' <<<"$runtime_environment" >/dev/null
+    ' <<<"$runtime_environment" >/dev/null || return $?
+  jq -e '
+      type == "array" and
+      ([.[] | select(startswith("SPLUNK_TRACE_RESPONSE_HEADER_ENABLED="))] ==
+        ["SPLUNK_TRACE_RESPONSE_HEADER_ENABLED=false"])
+    ' <<<"$java_runtime_environment" >/dev/null
 }
 
 create_diagnostic_nondisclosure_request_directory() {
@@ -23616,8 +23626,8 @@ run_diagnostic_nondisclosure_control() {
   obi_container_id="$(diagnostic_nondisclosure_container_id obi)" || return $?
   java_container_id="$(diagnostic_nondisclosure_container_id java-backend)" ||
     return $?
-  assert_diagnostic_nondisclosure_runtime_configuration "$obi_container_id" ||
-    return $?
+  assert_diagnostic_nondisclosure_runtime_configuration \
+    "$obi_container_id" "$java_container_id" || return $?
 
   run_scenario w3c || return $?
   canary_source_sha256="$(diagnostic_nondisclosure_canary_source_sha256 \

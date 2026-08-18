@@ -652,6 +652,7 @@ assert_library_and_failure_seams() {
     sandbox="$(mktemp -d)"; trap '\''rm -rf -- "$sandbox"'\'' EXIT
     capture="$sandbox/calls"; : >"$capture"
     matrix_execute() {
+      [[ "$(umask)" == 0022 ]] || return 99
       printf "%s" "$COMPOSE_PROJECT_NAME" >>"$capture"
       printf "\t%s" "$@" >>"$capture"
       printf "\n" >>"$capture"

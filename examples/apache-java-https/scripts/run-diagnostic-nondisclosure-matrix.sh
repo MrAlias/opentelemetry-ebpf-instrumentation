@@ -74,9 +74,12 @@ invoke_matrix_producer() {
   local -r transport="$4"
   local -r level="$5"
 
-  COMPOSE_PROJECT_NAME="$project" matrix_execute "$RUN_SCRIPT" \
-    --agent "$agent" --transport "$transport" --tls TLSv1.3 \
-    --obi-log-level "$level" --scenario diagnostic-nondisclosure >"$log" 2>&1
+  (
+    umask 022
+    COMPOSE_PROJECT_NAME="$project" matrix_execute "$RUN_SCRIPT" \
+      --agent "$agent" --transport "$transport" --tls TLSv1.3 \
+      --obi-log-level "$level" --scenario diagnostic-nondisclosure
+  ) >"$log" 2>&1
 }
 
 invoke_matrix_verifier() {

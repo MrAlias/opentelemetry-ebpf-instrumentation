@@ -138,6 +138,8 @@ write_cell() {
   local terminal_reference="phases/final/java-diagnostics.txt" terminal_phase="final"
   local before_metrics_sha="" after_metrics_sha="" scenario_sha="" before_java_evidence="" after_java_evidence=""
   local boundary="" w3c_status="" report_digest="" boundary_digest=""
+  local started_at="2026-01-01T00:00:00.000000000Z"
+  local finished_at="2026-01-01T00:00:01.000000000Z"
   local i=0 ref="" name="" sha="" size="" lines=""
   local -a names=(java_endpoint java_header java_transport_configuration obi_metrics obi_log java_log)
 
@@ -147,6 +149,28 @@ write_cell() {
     terminal_reference="phases/diagnostic-nondisclosure-header/java-diagnostics.txt"
     terminal_phase=diagnostic-nondisclosure-header
   fi
+  case "$id" in
+    otel-getsockopt-debug)
+      started_at="2026-01-01T00:00:00Z"
+      finished_at="2026-01-01T00:00:00.1Z"
+      ;;
+    otel-unix-info)
+      started_at="2026-01-01T00:00:00.12Z"
+      finished_at="2026-01-01T00:00:01.123Z"
+      ;;
+    otel-unix-debug)
+      started_at="2026-01-01T00:00:00.1234Z"
+      finished_at="2026-01-01T00:00:01.12345Z"
+      ;;
+    splunk-getsockopt-info)
+      started_at="2026-01-01T00:00:00.123456Z"
+      finished_at="2026-01-01T00:00:01.123456Z"
+      ;;
+    splunk-getsockopt-debug)
+      started_at="2026-01-01T00:00:00.1234567Z"
+      finished_at="2026-01-01T00:00:00.12345678Z"
+      ;;
+  esac
   revision="$(git -C "$REPO_ROOT" rev-parse HEAD)"
   mkdir -p -- "$directory/obi-metric-pairs" "$directory/phases/w3c-before" \
     "$directory/phases/w3c-after" "$directory/phases/diagnostic-nondisclosure-header"
@@ -204,9 +228,9 @@ write_cell() {
   if [[ "$level" == debug ]]; then printf 'ts level=DEBUG msg="Java remote parent bridge ready details" transport=%s socket_path=/private\n' "$transport" >>"$directory/${SURFACE_REFS[4]}"; fi
   printf '%s\n' 'OBI remote-parent provider ready' 'OBI remote-parent propagator enabled' \
     'Jetty HTTPS backend ready on 127.0.0.1:18443' >"$directory/${SURFACE_REFS[5]}"
-  jq -nS '{
+  jq -nS --arg started_at "$started_at" --arg finished_at "$finished_at" '{
     status:"passed",scenario:"w3c",seed:1,
-    started_at:"2026-01-01T00:00:00.000000000Z",finished_at:"2026-01-01T00:00:01.000000000Z",
+    started_at:$started_at,finished_at:$finished_at,
     request_count:2,traffic_elapsed_nanos:1000000,throughput_per_second:2,
     latency:{p50_nanos:100,p95_nanos:200,p99_nanos:300},
     cases:[
@@ -1462,6 +1486,34 @@ main() {
     '.cases[1].trace.spans[] |= if .service_name == "java-backend" then .parent_span_id="8888888888888888" else . end'
   reseal_cell "$directory"
   expect_failure w3c-topology-rewire "$mutated"
+
+  copy_mutation "$fixture" w3c-timestamp-overprecision mutated
+  directory="$mutated/cells/otel-getsockopt-info"
+  json_update_sorted "$directory/scenario-w3c.json" \
+    '.started_at="2026-01-01T00:00:00.0000000000Z"'
+  reseal_cell "$directory"
+  expect_failure w3c-timestamp-overprecision "$mutated" w3c_result
+
+  copy_mutation "$fixture" w3c-timestamp-offset mutated
+  directory="$mutated/cells/otel-getsockopt-info"
+  json_update_sorted "$directory/scenario-w3c.json" \
+    '.started_at="2026-01-01T00:00:00+00:00"'
+  reseal_cell "$directory"
+  expect_failure w3c-timestamp-offset "$mutated" w3c_result
+
+  copy_mutation "$fixture" w3c-timestamp-malformed-fraction mutated
+  directory="$mutated/cells/otel-getsockopt-info"
+  json_update_sorted "$directory/scenario-w3c.json" \
+    '.started_at="2026-01-01T00:00:00.Z"'
+  reseal_cell "$directory"
+  expect_failure w3c-timestamp-malformed-fraction "$mutated" w3c_result
+
+  copy_mutation "$fixture" w3c-timestamp-order mutated
+  directory="$mutated/cells/otel-getsockopt-info"
+  json_update_sorted "$directory/scenario-w3c.json" \
+    '.started_at="2026-01-01T00:00:00.12Z" | .finished_at="2026-01-01T00:00:00.1Z"'
+  reseal_cell "$directory"
+  expect_failure w3c-timestamp-order "$mutated" w3c_result
 
   copy_mutation "$fixture" w3c-standard-parent-precedence mutated
   directory="$mutated/cells/otel-getsockopt-info"

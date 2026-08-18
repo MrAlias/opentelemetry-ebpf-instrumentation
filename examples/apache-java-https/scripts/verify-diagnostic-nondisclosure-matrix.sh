@@ -617,7 +617,10 @@ validate_w3c_result() {
   jq -e -s '
     def integer($min;$max): type == "number" and floor == . and . >= $min and . <= $max;
     def positive: type == "number" and isfinite and . > 0;
-    def timestamp: type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{9}Z$");
+    def timestamp: type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?Z$");
+    def timestamp_key:
+      capture("^(?<whole>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\\.(?<fraction>[0-9]{1,9}))?Z$") |
+      .whole + "." + (((.fraction // "") + "000000000")[0:9]);
     def marker: type == "string" and length >= 1 and length <= 128 and test("^[A-Za-z0-9._:-]+$");
     def trace_id: type == "string" and test("^[0-9a-f]{32}$") and . != "00000000000000000000000000000000";
     def span_id: type == "string" and test("^[0-9a-f]{16}$") and . != "0000000000000000";
@@ -666,7 +669,8 @@ validate_w3c_result() {
     (.[0] | . as $result | keys == ["cases","finished_at","latency","request_count","scenario","seed","started_at","status","throughput_per_second","traffic_elapsed_nanos"] and
       .status == "passed" and .scenario == "w3c" and
       (.seed | integer(0;9007199254740991)) and
-      (.started_at | timestamp) and (.finished_at | timestamp) and .started_at < .finished_at and
+      (.started_at | timestamp) and (.finished_at | timestamp) and
+      ((.started_at | timestamp_key) < (.finished_at | timestamp_key)) and
       .request_count == 2 and (.traffic_elapsed_nanos | integer(1;9007199254740991)) and
       (.throughput_per_second | positive) and
       (.latency | keys == ["p50_nanos","p95_nanos","p99_nanos"] and

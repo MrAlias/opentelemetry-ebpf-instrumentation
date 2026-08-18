@@ -21,7 +21,8 @@ readonly MAX_REPORT_BYTES=32768
 readonly MAX_JAVA_BYTES=16384
 readonly MAX_METRICS_BYTES=8388608
 readonly MAX_METRICS_LINES=20000
-readonly MAX_LOG_BYTES=1048576
+readonly MAX_OBI_LOG_BYTES=2097152
+readonly MAX_JAVA_LOG_BYTES=1048576
 readonly MAX_LOG_LINES=10000
 readonly MAX_TRANSPORT_BYTES=256
 readonly MAX_CANARY_BYTES=16384
@@ -568,7 +569,7 @@ assert_obi_log() {
   local -r level="$2"
   local -r transport="$3"
 
-  bounded_regular_file "$input" "$MAX_LOG_BYTES" "$MAX_LOG_LINES" || return 1
+  bounded_regular_file "$input" "$MAX_OBI_LOG_BYTES" "$MAX_LOG_LINES" || return 1
   LC_ALL=C awk -v level="$level" -v transport="$transport" '
     length($0) > 16384 { invalid = 1 }
     index($0, "msg=\"Java remote parent bridge ready details\"") {
@@ -580,6 +581,10 @@ assert_obi_log() {
       ready++
       if (!index($0, "transport=" transport)) invalid = 1
     }
+    index($0, "traceID=") || index($0, "spanID=") ||
+      index($0, " conn=") || index($0, " buf=") ||
+      index($0, " request=") || index($0, " response=") ||
+      index($0, " reqErr=") || index($0, " respErr=") { invalid = 1 }
     level == "info" &&
       (index($0, " level=DEBUG ") || index($0, "socket_path=") || index($0, " error=")) { invalid = 1 }
     END { exit invalid || ready != 1 || (level == "info" && details != 0) ||
@@ -590,7 +595,7 @@ assert_obi_log() {
 assert_java_log() {
   local -r input="$1"
 
-  bounded_regular_file "$input" "$MAX_LOG_BYTES" "$MAX_LOG_LINES" || return 1
+  bounded_regular_file "$input" "$MAX_JAVA_LOG_BYTES" "$MAX_LOG_LINES" || return 1
   LC_ALL=C awk '
     length($0) > 16384 { invalid = 1 }
     index($0, "OBI remote-parent provider ready") { provider++ }
@@ -794,7 +799,10 @@ validate_report() {
   bounded_regular_file "$report" "$MAX_REPORT_BYTES" 1 || return 1
   canonical="$(jq -ceS -s \
     --arg agent "$agent" --arg transport "$transport" --arg level "$level" \
-    --arg canary_sha "$canary_source_sha256" '
+    --arg canary_sha "$canary_source_sha256" \
+    --argjson obi_log_max_bytes "$MAX_OBI_LOG_BYTES" \
+    --argjson java_log_max_bytes "$MAX_JAVA_LOG_BYTES" \
+    --argjson log_max_lines "$MAX_LOG_LINES" '
     if length == 1 then .[0] else error("report must contain exactly one object") end | . as $r |
     if keys == ["agent_distribution","canary_bytes","canary_count","canary_source","debug_controls","obi_log_level","obi_metric_boundary_ids","policy","scenario","schema","selected_transport","status","surfaces","tls_protocol","window"] and
       .schema == "obi-diagnostic-nondisclosure-v1" and .status == "passed" and
@@ -817,7 +825,12 @@ validate_report() {
         .canary_match_count == 0 and .schema_valid == true and
         (.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
         (.size_bytes | type == "number" and floor == . and . >= 1) and
-        (.line_count | type == "number" and floor == . and . >= 1))
+        (.line_count | type == "number" and floor == . and . >= 1) and
+        (if .name == "obi_log" then
+          .size_bytes <= $obi_log_max_bytes and .line_count <= $log_max_lines
+         elif .name == "java_log" then
+          .size_bytes <= $java_log_max_bytes and .line_count <= $log_max_lines
+         else true end))
     then $r else error("invalid report") end
   ' "$report")" || return 1
   [[ "$(<"$report")" == "$canonical" ]]
@@ -1472,7 +1485,7 @@ write_public_verify_script() {
     '(cd -- "$root" && sha256sum --check --strict SHA256SUMS)' \
     'summary="$(jq -ceS -s '"'"'if length == 1 and (.[0] | keys == ["acceptance_evidence","cells","evidence_class","evidence_id","matrix","runtime_contract","schema","status"] and .schema == "obi-diagnostic-nondisclosure-public-matrix-v1" and .status == "passed" and .acceptance_evidence == false and .evidence_class == "focused_non_acceptance" and (.evidence_id | test("^diagnostic-nondisclosure-[0-9a-f]{12}-[0-9a-f]{16}$")) and .matrix == {agent_distributions:["otel","splunk"],cell_count:8,obi_log_levels:["info","debug"],selected_transports:["getsockopt","unix"]} and .runtime_contract == {java:{attestation:"source_configured",distribution:"temurin",version:"21"},tls_protocol:"TLSv1.3"} and (.cells | type == "array" and length == 8) and [.cells[].ordinal] == [1,2,3,4,5,6,7,8] and [.cells[].agent_distribution] == ["otel","otel","otel","otel","splunk","splunk","splunk","splunk"] and [.cells[].selected_transport] == ["getsockopt","getsockopt","unix","unix","getsockopt","getsockopt","unix","unix"] and [.cells[].obi_log_level] == ["info","debug","info","debug","info","debug","info","debug"] and all(.cells[]; keys == ["agent_distribution","authority","canary_bytes","canary_count","canary_source_sha256","diagnostic_report_sha256","obi_log_level","ordinal","selected_transport","status","surface_set_sha256","surfaces","tls_protocol"] and (.authority | keys == ["artifact_count","boundary_complete","boundary_freeze","boundary_index_sha256","metric_pair_sha256","run_status_sha256","status_only","terminal_java_sha256","terminal_obi_sha256","w3c_result_sha256","w3c_status_sha256"] and .artifact_count == 6 and .boundary_complete == true and .status_only == true and (.boundary_freeze | keys == ["payload","sha256"] and (.payload | test("^obi-metric-boundary-index-frozen-v1:[0-9a-f]{64}$")) and (.sha256 | test("^[0-9a-f]{64}$"))) and all([.boundary_index_sha256,.metric_pair_sha256,.run_status_sha256,.terminal_java_sha256,.terminal_obi_sha256,.w3c_result_sha256,.w3c_status_sha256][]; test("^[0-9a-f]{64}$"))) and .authority.boundary_freeze.payload == ("obi-metric-boundary-index-frozen-v1:" + .authority.boundary_index_sha256) and .authority.w3c_result_sha256 == .canary_source_sha256 and .status == "passed" and .tls_protocol == "TLSv1.3" and (.canary_count | type == "number" and floor == . and . >= 6 and . <= 128) and (.canary_bytes | type == "number" and floor == . and . >= 1 and . <= 16384) and (.canary_source_sha256 | test("^[0-9a-f]{64}$")) and (.diagnostic_report_sha256 | test("^[0-9a-f]{64}$")) and (.surface_set_sha256 | test("^[0-9a-f]{64}$")) and (.surfaces | type == "array" and length == 6) and [.surfaces[].name] == ["java_endpoint","java_header","java_transport_configuration","obi_metrics","obi_log","java_log"] and all(.surfaces[]; keys == ["canary_match_count","line_count","name","schema_valid","sha256","size_bytes"] and .canary_match_count == 0 and .schema_valid == true and (.sha256 | test("^[0-9a-f]{64}$")) and (.line_count | type == "number" and floor == . and . >= 1) and (.size_bytes | type == "number" and floor == . and . >= 1)))) then .[0] else error("invalid public summary") end'"'"' "$root/matrix-summary.json")"' \
     '[[ "$(<"$root/matrix-summary.json")" == "$summary" ]]' \
-    'jq -e '"'"'all(.cells[].surfaces[]; if .name == "java_endpoint" or .name == "java_header" then .line_count == 1 and .size_bytes <= 16384 elif .name == "java_transport_configuration" then .line_count == 1 and .size_bytes <= 256 elif .name == "obi_metrics" then .line_count <= 20000 and .size_bytes <= 8388608 else .line_count <= 10000 and .size_bytes <= 1048576 end)'"'"' "$root/matrix-summary.json" >/dev/null' \
+    'jq -e '"'"'all(.cells[].surfaces[]; if .name == "java_endpoint" or .name == "java_header" then .line_count == 1 and .size_bytes <= 16384 elif .name == "java_transport_configuration" then .line_count == 1 and .size_bytes <= 256 elif .name == "obi_metrics" then .line_count <= 20000 and .size_bytes <= 8388608 elif .name == "obi_log" then .line_count <= 10000 and .size_bytes <= 2097152 else .line_count <= 10000 and .size_bytes <= 1048576 end)'"'"' "$root/matrix-summary.json" >/dev/null' \
     'for index in {0..7}; do surface_sha="$(jq -er --argjson index "$index" '"'"'.cells[$index].surfaces[].sha256'"'"' "$root/matrix-summary.json" | sha256sum)"; surface_sha="${surface_sha%% *}"; [[ "$surface_sha" == "$(jq -er --argjson index "$index" '"'"'.cells[$index].surface_set_sha256'"'"' "$root/matrix-summary.json")" ]]; freeze_payload="$(jq -er --argjson index "$index" '"'"'.cells[$index].authority.boundary_freeze.payload'"'"' "$root/matrix-summary.json")"; freeze_sha="$({ printf '"'"'%s\n'"'"' "$freeze_payload" || exit $?; } | sha256sum)"; freeze_sha="${freeze_sha%% *}"; [[ "$freeze_sha" == "$(jq -er --argjson index "$index" '"'"'.cells[$index].authority.boundary_freeze.sha256'"'"' "$root/matrix-summary.json")" ]]; done' \
     'summary_sha="$(sha256sum <"$root/matrix-summary.json")"; summary_sha="${summary_sha%% *}"; [[ "$summary_sha" =~ ^[0-9a-f]{64}$ ]]' \
     'evidence_id="$(jq -er '"'"'.evidence_id'"'"' <<<"$summary")"' \
@@ -1535,6 +1548,7 @@ summary="$(jq -ceS -s '
           (if .name == "java_endpoint" or .name == "java_header" then .line_count == 1 and .size_bytes <= 16384
            elif .name == "java_transport_configuration" then .line_count == 1 and .size_bytes <= 256
            elif .name == "obi_metrics" then .line_count <= 20000 and .size_bytes <= 8388608
+           elif .name == "obi_log" then .line_count <= 10000 and .size_bytes <= 2097152
            else .line_count <= 10000 and .size_bytes <= 1048576 end))))
     then $s else error("invalid public summary") end
   else error("invalid public summary document count") end
@@ -1644,6 +1658,7 @@ validate_public_directory() {
           (if .name == "java_endpoint" or .name == "java_header" then .line_count == 1 and .size_bytes <= 16384
            elif .name == "java_transport_configuration" then .line_count == 1 and .size_bytes <= 256
            elif .name == "obi_metrics" then .line_count <= 20000 and .size_bytes <= 8388608
+           elif .name == "obi_log" then .line_count <= 10000 and .size_bytes <= 2097152
            else .line_count <= 10000 and .size_bytes <= 1048576 end))))
     then .[0] else error("invalid public summary") end
   ' "$directory/matrix-summary.json")" || return 1

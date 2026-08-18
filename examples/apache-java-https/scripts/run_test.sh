@@ -2943,9 +2943,13 @@ test_diagnostic_nondisclosure_source_contract_is_mutation_sensitive() {
   done
 
   capture_source="$(declare -f capture_diagnostic_nondisclosure_service_log)"
-  [[ "$capture_source" == *'docker logs --timestamps'* &&
+  [[ "$DIAGNOSTIC_NONDISCLOSURE_OBI_LOG_MAX_BYTES" == 2097152 &&
+    "$capture_source" == *'docker logs --timestamps'* &&
     "$capture_source" == *'--since "$since" --until "$until" "$expected_container_id"'* &&
-    "$capture_source" == *'head -c "$((COMPOSE_LOG_MAX_BYTES + 1))"'* &&
+    "$capture_source" == *'maximum_bytes="$DIAGNOSTIC_NONDISCLOSURE_OBI_LOG_MAX_BYTES"'* &&
+    "$capture_source" == *'maximum_bytes="$COMPOSE_LOG_MAX_BYTES"'* &&
+    "$capture_source" == *'head -c "$((maximum_bytes + 1))"'* &&
+    "$capture_source" == *'bounded_evidence_file "$candidate" "$maximum_bytes" "$COMPOSE_LOG_MAX_LINES"'* &&
     "$capture_source" == *'cat > /dev/null'* &&
     "$capture_source" == *'candidate="$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/.$service.log.capture"'* &&
     "$capture_source" == *'"$output" == "$expected_output"'* &&
@@ -13157,7 +13161,8 @@ test_diagnostic_nondisclosure_surfaces_and_report_are_closed() {
       obi_metrics "$metrics_ref" "$OBI_METRIC_SNAPSHOT_MAX_BYTES" \
       "$OBI_METRIC_SNAPSHOT_MAX_LINES")") || return $?
     surface_json+=("$(diagnostic_nondisclosure_surface_json \
-      obi_log "$obi_log_ref" "$COMPOSE_LOG_MAX_BYTES" "$COMPOSE_LOG_MAX_LINES")") ||
+      obi_log "$obi_log_ref" "$DIAGNOSTIC_NONDISCLOSURE_OBI_LOG_MAX_BYTES" \
+      "$COMPOSE_LOG_MAX_LINES")") ||
       return $?
     surface_json+=("$(diagnostic_nondisclosure_surface_json \
       java_log "$java_log_ref" "$COMPOSE_LOG_MAX_BYTES" "$COMPOSE_LOG_MAX_LINES")") ||
@@ -13197,6 +13202,24 @@ test_diagnostic_nondisclosure_surfaces_and_report_are_closed() {
       if validate_diagnostic_nondisclosure_status_payload "$mutated" \
         >/dev/null 2>&1; then
         printf 'diagnostic report accepted mutation: %s\n' "$mutation" >&2
+        return 1
+      fi
+    done
+    mutated="$(jq -cS '.surfaces[4].size_bytes = 1048577' \
+      <<<"$payload")" || return $?
+    validate_diagnostic_nondisclosure_status_payload_intrinsic "$mutated" || {
+      printf 'diagnostic report rejected an OBI log within its dedicated cap\n' \
+        >&2
+      return 1
+    }
+    for mutation in \
+      '.surfaces[4].size_bytes = 2097153' \
+      '.surfaces[5].size_bytes = 1048577'; do
+      mutated="$(jq -cS "$mutation" <<<"$payload")" || return $?
+      if validate_diagnostic_nondisclosure_status_payload_intrinsic "$mutated" \
+        >/dev/null 2>&1; then
+        printf 'diagnostic report accepted service-specific log overflow: %s\n' \
+          "$mutation" >&2
         return 1
       fi
     done
@@ -13334,6 +13357,28 @@ test_diagnostic_nondisclosure_surfaces_and_report_are_closed() {
       >"$result_dir/$obi_log_ref" || return $?
     assert_diagnostic_nondisclosure_obi_log_policy "$result_dir/$obi_log_ref" ||
       return $?
+    local forbidden_field=""
+    for forbidden_field in \
+      'traceID=d139f67e43a24c51b87e02d964af3501' \
+      'spanID=a18c45067b29de03' \
+      'conn=private-connection' \
+      'buf=issue39privatebodyvalue' \
+      'request=issue39privateheadervalue' \
+      'response=issue39syntheticcredential' \
+      'reqErr=malformed-private-request' \
+      'respErr=malformed-private-response'; do
+      printf '%s\n' \
+        'obi-1 | level=INFO msg="Java remote parent bridge ready" transport=getsockopt' \
+        'obi-1 | level=DEBUG msg="Java remote parent bridge ready details" transport=getsockopt socket_path=/configured/path' \
+        "obi-1 | level=DEBUG msg=unsafe $forbidden_field" \
+        >"$result_dir/$obi_log_ref" || return $?
+      if assert_diagnostic_nondisclosure_obi_log_policy \
+        "$result_dir/$obi_log_ref" >/dev/null 2>&1; then
+        printf 'debug log policy accepted private field: %s\n' \
+          "$forbidden_field" >&2
+        return 1
+      fi
+    done
   ) || {
     printf 'diagnostic nondisclosure surface/report contract failed\n' >&2
     return 1
@@ -13348,11 +13393,27 @@ test_diagnostic_nondisclosure_log_capture_is_complete_and_generation_fenced() {
   local -r drift_id="1111111111111111111111111111111111111111111111111111111111111111"
   local mode=""
 
-  for mode in clean producer-failure byte-overflow line-overflow identity-drift; do
+  for mode in \
+    clean obi-over-java-cap producer-failure byte-overflow \
+    java-byte-overflow line-overflow identity-drift; do
     (
       RESULT_DIR="$root/$mode"
       DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR="$RESULT_DIR/.diagnostic-nondisclosure-request.ABC123"
-      local -r output="$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/diagnostic-nondisclosure-obi.log"
+      local service=obi
+      if [[ "$mode" == java-byte-overflow ]]; then
+        service=java-backend
+      fi
+      local output=""
+      case "$service" in
+        obi)
+          output="$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/diagnostic-nondisclosure-obi.log"
+          ;;
+        java-backend)
+          output="$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/diagnostic-nondisclosure-java.log"
+          ;;
+        *) return 1 ;;
+      esac
+      readonly output service
       local -r identity_count="$RESULT_DIR/identity-count"
       local status=0
       local count=0
@@ -13360,7 +13421,7 @@ test_diagnostic_nondisclosure_log_capture_is_complete_and_generation_fenced() {
       mkdir -p -- "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR" || return $?
       chmod 0700 -- "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR" || return $?
       diagnostic_nondisclosure_container_id() {
-        [[ "$1" == obi ]] || return 1
+        [[ "$1" == "$service" ]] || return 1
         if [[ -f "$identity_count" ]]; then
           read -r count <"$identity_count" || return $?
         fi
@@ -13382,11 +13443,24 @@ test_diagnostic_nondisclosure_log_capture_is_complete_and_generation_fenced() {
             printf '%s\n' \
               '2026-08-18T01:02:03.100000000Z level=INFO msg="safe"'
             ;;
+          obi-over-java-cap)
+            awk -v maximum="$COMPOSE_LOG_MAX_BYTES" '
+              BEGIN {
+                for (byte = 0; byte <= maximum; byte++) printf "x"
+                print ""
+              }
+            '
+            ;;
           producer-failure)
             printf '%s\n' partial
             return 77
             ;;
           byte-overflow)
+            awk -v maximum="$DIAGNOSTIC_NONDISCLOSURE_OBI_LOG_MAX_BYTES" '
+              BEGIN { for (byte = 0; byte <= maximum; byte++) printf "x" }
+            '
+            ;;
+          java-byte-overflow)
             awk -v maximum="$COMPOSE_LOG_MAX_BYTES" '
               BEGIN { for (byte = 0; byte <= maximum; byte++) printf "x" }
             '
@@ -13400,13 +13474,13 @@ test_diagnostic_nondisclosure_log_capture_is_complete_and_generation_fenced() {
       }
 
       if capture_diagnostic_nondisclosure_service_log \
-        obi "$expected_id" "$since" "$until" "$output"; then
+        "$service" "$expected_id" "$since" "$until" "$output"; then
         status=0
       else
         status=$?
       fi
       case "$mode" in
-        clean)
+        clean|obi-over-java-cap)
           [[ "$status" == 0 && -f "$output" && ! -L "$output" &&
             "$(stat --format='%u:%a:%h' -- "$output")" == "$EUID:600:1" &&
             "$(<"$identity_count")" == 2 ]] || return 1
@@ -13414,14 +13488,14 @@ test_diagnostic_nondisclosure_log_capture_is_complete_and_generation_fenced() {
         producer-failure)
           [[ "$status" == 77 ]] || return 1
           ;;
-        byte-overflow|line-overflow|identity-drift)
+        byte-overflow|java-byte-overflow|line-overflow|identity-drift)
           [[ "$status" == 1 ]] || return 1
           ;;
       esac
-      if [[ "$mode" != clean ]]; then
+      if [[ "$mode" != clean && "$mode" != obi-over-java-cap ]]; then
         [[ ! -e "$output" && ! -L "$output" &&
-          ! -e "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/.obi.log.capture" &&
-          ! -L "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/.obi.log.capture" ]] ||
+          ! -e "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/.$service.log.capture" &&
+          ! -L "$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/.$service.log.capture" ]] ||
           return 1
       fi
       rm -f -- "$identity_count" || return $?

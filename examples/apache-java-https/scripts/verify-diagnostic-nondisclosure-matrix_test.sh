@@ -56,6 +56,43 @@ digest_lines() {
   printf '%s\n' "$output"
 }
 
+write_debug_log_volume() {
+  local -r output="$1"
+  local -r transport="$2"
+  local -r line_count="$3"
+  local -r filler_width="$4"
+
+  awk -v transport="$transport" -v line_count="$line_count" \
+    -v filler_width="$filler_width" '
+    BEGIN {
+      filler = ""
+      for (column = 0; column < filler_width; column++) filler = filler "x"
+      print "ts level=INFO msg=\"Java remote parent bridge ready\" transport=" transport
+      print "ts level=DEBUG msg=\"Java remote parent bridge ready details\" transport=" transport " socket_path=/configured/path"
+      for (line = 0; line < line_count; line++)
+        print "ts level=DEBUG msg=\"safe diagnostic volume\" filler=" filler
+    }
+  ' >"$output"
+}
+
+write_java_log_volume() {
+  local -r output="$1"
+  local -r line_count="$2"
+  local -r filler_width="$3"
+
+  awk -v line_count="$line_count" -v filler_width="$filler_width" '
+    BEGIN {
+      filler = ""
+      for (column = 0; column < filler_width; column++) filler = filler "x"
+      print "OBI remote-parent provider ready"
+      print "OBI remote-parent propagator enabled"
+      print "Jetty HTTPS backend ready on 127.0.0.1:18443"
+      for (line = 0; line < line_count; line++)
+        print "safe java diagnostic volume " filler
+    }
+  ' >"$output"
+}
+
 write_source_manifest() {
   local -r output="$1"
   local entries="$TEMP_DIR/tree.entries"
@@ -855,10 +892,24 @@ assert_result_resolution_inventory() {
 }
 
 assert_library_and_failure_seams() {
+  local forbidden_log_token=""
+
   # shellcheck disable=SC2016
   grep -F 'git -C "$REPO_ROOT" show "$workflow_sha:$workflow_relative"' "$VERIFIER" >/dev/null || return 1
   grep -F 'validate_repository_execution_bytes || die' "$VERIFIER" >/dev/null || return 1
   grep -F 'cleanup_temp_directory || return 1' "$VERIFIER" >/dev/null || return 1
+  grep -F 'readonly MAX_OBI_LOG_BYTES=2097152' "$VERIFIER" >/dev/null || return 1
+  grep -F 'readonly MAX_JAVA_LOG_BYTES=1048576' "$VERIFIER" >/dev/null || return 1
+  [[ "$(grep -Fc -- \
+    'elif .name == "obi_log" then .line_count <= 10000 and .size_bytes <= 2097152' \
+    "$VERIFIER")" == 3 ]] || return 1
+  for forbidden_log_token in \
+    'index($0, "traceID=")' 'index($0, "spanID=")' \
+    'index($0, " conn=")' 'index($0, " buf=")' \
+    'index($0, " request=")' 'index($0, " response=")' \
+    'index($0, " reqErr=")' 'index($0, " respErr=")'; do
+    grep -F -- "$forbidden_log_token" "$VERIFIER" >/dev/null || return 1
+  done
   bash -c 'source "$1"' _ "$RUNNER" >/dev/null || return 1
   bash -c 'source "$1"' _ "$VERIFIER" >/dev/null || return 1
   if "$RUNNER" >/dev/null 2>&1 || "$VERIFIER" >/dev/null 2>&1; then return 1; fi
@@ -1307,6 +1358,39 @@ main() {
     return 1
   fi
 
+  copy_mutation "$fixture" obi-log-dedicated-cap mutated
+  directory="$mutated/cells/otel-getsockopt-debug"
+  write_debug_log_volume "$directory/${SURFACE_REFS[4]}" getsockopt 6000 180
+  chmod 0600 -- "$directory/${SURFACE_REFS[4]}"
+  [[ "$(stat -Lc '%s' -- "$directory/${SURFACE_REFS[4]}")" -gt 1048576 &&
+    "$(stat -Lc '%s' -- "$directory/${SURFACE_REFS[4]}")" -le 2097152 ]]
+  reseal_cell "$directory"
+  run_verifier "$mutated" >/dev/null
+  bash "$mutated/public/verify.sh" >/dev/null
+
+  copy_mutation "$fixture" obi-log-overflow mutated
+  directory="$mutated/cells/otel-getsockopt-debug"
+  write_debug_log_volume "$directory/${SURFACE_REFS[4]}" getsockopt 9500 220
+  chmod 0600 -- "$directory/${SURFACE_REFS[4]}"
+  [[ "$(stat -Lc '%s' -- "$directory/${SURFACE_REFS[4]}")" -gt 2097152 ]]
+  reseal_cell "$directory"
+  expect_failure obi-log-dedicated-cap-overflow "$mutated"
+
+  copy_mutation "$fixture" java-log-overflow mutated
+  directory="$mutated/cells/otel-getsockopt-info"
+  write_java_log_volume "$directory/${SURFACE_REFS[5]}" 6000 180
+  chmod 0600 -- "$directory/${SURFACE_REFS[5]}"
+  [[ "$(stat -Lc '%s' -- "$directory/${SURFACE_REFS[5]}")" -gt 1048576 ]]
+  reseal_cell "$directory"
+  expect_failure java-log-generic-cap-overflow "$mutated"
+
+  copy_mutation "$fixture" obi-log-private-field mutated
+  directory="$mutated/cells/otel-getsockopt-debug"
+  printf '%s\n' 'ts level=DEBUG msg="unsafe" reqErr=non-canary-private-data' \
+    >>"$directory/${SURFACE_REFS[4]}"
+  reseal_cell "$directory"
+  expect_failure obi-log-private-field "$mutated"
+
   copy_mutation "$fixture" fixed-canary mutated
   directory="$mutated/cells/otel-getsockopt-info"
   printf '%s\n' 'issue39privatebodyvalue' >>"$mutated/cells/otel-getsockopt-info/${SURFACE_REFS[5]}"
@@ -1519,6 +1603,26 @@ main() {
   copy_mutation "$fixture" residue mutated
   : >"$mutated/.private-residue"
   expect_failure raw-residue "$mutated"
+
+  mutated="$TEMP_DIR/public-obi-dedicated-cap"; cp -a -- "$fixture" "$mutated"
+  json_update_sorted "$mutated/public/matrix-summary.json" \
+    '.cells[0].surfaces[4].size_bytes = 1048577'
+  refresh_public_outer "$mutated/public"
+  bash "$mutated/public/verify.sh" >/dev/null
+
+  mutated="$TEMP_DIR/public-obi-overflow"; cp -a -- "$fixture" "$mutated"
+  json_update_sorted "$mutated/public/matrix-summary.json" \
+    '.cells[0].surfaces[4].size_bytes = 2097153'
+  refresh_public_outer "$mutated/public"
+  if bash "$mutated/public/verify.sh" >/dev/null 2>&1; then return 1; fi
+  expect_failure public-obi-log-dedicated-cap-overflow "$mutated"
+
+  mutated="$TEMP_DIR/public-java-overflow"; cp -a -- "$fixture" "$mutated"
+  json_update_sorted "$mutated/public/matrix-summary.json" \
+    '.cells[0].surfaces[5].size_bytes = 1048577'
+  refresh_public_outer "$mutated/public"
+  if bash "$mutated/public/verify.sh" >/dev/null 2>&1; then return 1; fi
+  expect_failure public-java-log-generic-cap-overflow "$mutated"
 
   mutated="$TEMP_DIR/public-extra"; cp -a -- "$fixture" "$mutated"
   : >"$mutated/public/extra.txt"

@@ -316,14 +316,12 @@ func HTTPInfoEventToSpan(parseCtx *EBPFParseContext, event *BPFHTTPInfo) (reques
 		isClient                      = isClientEvent(event.Type)
 	)
 
-	slog.Debug("Event", "traceID", event.Tp.TraceId, "conn", event.ConnInfo, "buf", event.Buf[:])
-
 	if event.HasLargeBuffers == 1 {
 		b, ok := extractTCPLargeBuffer(parseCtx, event.Tp.TraceId, packetTypeRequest, directionByPacketType(packetTypeRequest, isClient), event.ConnInfo, ProtocolTypeHTTP)
 		if ok {
 			requestBuffer = b
 		} else {
-			slog.Debug("missing large buffer for HTTP request", "traceID", event.Tp.TraceId, "conn", event.ConnInfo, "packetType", packetTypeRequest)
+			slog.Debug("missing large buffer for HTTP request", "packetType", packetTypeRequest)
 			requestBuffer = largebuf.NewLargeBufferFrom(event.Buf[:])
 		}
 
@@ -332,7 +330,7 @@ func HTTPInfoEventToSpan(parseCtx *EBPFParseContext, event *BPFHTTPInfo) (reques
 			responseBuffer = b
 			hasResponse = true
 		} else {
-			slog.Debug("missing large buffer for HTTP response", "traceID", event.Tp.TraceId, "conn", event.ConnInfo, "packetType", packetTypeResponse)
+			slog.Debug("missing large buffer for HTTP response", "packetType", packetTypeResponse)
 		}
 	} else {
 		requestBuffer = largebuf.NewLargeBufferFrom(event.Buf[:])
@@ -354,7 +352,8 @@ func HTTPInfoEventToSpan(parseCtx *EBPFParseContext, event *BPFHTTPInfo) (reques
 	req, err := http.ReadRequest(bufio.NewReader(&reqReader))
 	resp, err2 := httpSafeParseResponse(responseBuffer, req)
 	if err != nil || err2 != nil {
-		slog.Debug("error while parsing http request or response, falling back to manual HTTP info parsing", "reqErr", err, "respErr", err2)
+		slog.Debug("error while parsing http request or response, falling back to manual HTTP info parsing",
+			"requestError", err != nil, "responseError", err2 != nil)
 		return httpRequestToSpan(event, requestBuffer), false, nil
 	}
 

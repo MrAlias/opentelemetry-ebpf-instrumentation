@@ -154,6 +154,7 @@ AUTO_UNAVAILABLE_TAKE_MAX=16
 COMPOSE_LOG_MAX_BYTES=1048576
 COMPOSE_LOG_MAX_LINES=10000
 COMPOSE_LOG_CAPTURE_TIMEOUT_SECONDS=30
+DIAGNOSTIC_NONDISCLOSURE_OBI_LOG_MAX_BYTES=2097152
 DIAGNOSTIC_NONDISCLOSURE_RESPONSE_MAX_BYTES=16384
 DIAGNOSTIC_NONDISCLOSURE_RESPONSE_MAX_LINES=256
 DIAGNOSTIC_NONDISCLOSURE_CANARY_MAX_COUNT=128
@@ -292,6 +293,7 @@ readonly AUTO_UNAVAILABLE_REGISTRATION_FAILURE_MAX
 readonly AUTO_UNAVAILABLE_TAKE_MIN AUTO_UNAVAILABLE_TAKE_MAX
 readonly COMPOSE_LOG_MAX_BYTES COMPOSE_LOG_MAX_LINES
 readonly COMPOSE_LOG_CAPTURE_TIMEOUT_SECONDS
+readonly DIAGNOSTIC_NONDISCLOSURE_OBI_LOG_MAX_BYTES
 readonly DIAGNOSTIC_NONDISCLOSURE_RESPONSE_MAX_BYTES
 readonly DIAGNOSTIC_NONDISCLOSURE_RESPONSE_MAX_LINES
 readonly DIAGNOSTIC_NONDISCLOSURE_CANARY_MAX_COUNT
@@ -23077,13 +23079,16 @@ capture_diagnostic_nondisclosure_service_log() {
   local size=""
   local capture_status=0
   local expected_output=""
+  local maximum_bytes=""
 
   case "$service" in
     obi)
       expected_output="$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/diagnostic-nondisclosure-obi.log"
+      maximum_bytes="$DIAGNOSTIC_NONDISCLOSURE_OBI_LOG_MAX_BYTES"
       ;;
     java-backend)
       expected_output="$DIAGNOSTIC_NONDISCLOSURE_REQUEST_DIR/diagnostic-nondisclosure-java.log"
+      maximum_bytes="$COMPOSE_LOG_MAX_BYTES"
       ;;
     *) return 1 ;;
   esac
@@ -23105,7 +23110,7 @@ capture_diagnostic_nondisclosure_service_log() {
     docker logs --timestamps \
       --since "$since" --until "$until" "$expected_container_id" 2>&1 |
     (
-      LC_ALL=C head -c "$((COMPOSE_LOG_MAX_BYTES + 1))" \
+      LC_ALL=C head -c "$((maximum_bytes + 1))" \
         >"$candidate" || exit $?
       cat >/dev/null
     ); then
@@ -23120,8 +23125,8 @@ capture_diagnostic_nondisclosure_service_log() {
     rm -f -- "$candidate" || return 1
     return "$capture_status"
   }
-  if ((size < 1 || size > COMPOSE_LOG_MAX_BYTES)) ||
-    ! bounded_evidence_file "$candidate" "$COMPOSE_LOG_MAX_BYTES" "$COMPOSE_LOG_MAX_LINES";
+  if ((size < 1 || size > maximum_bytes)) ||
+    ! bounded_evidence_file "$candidate" "$maximum_bytes" "$COMPOSE_LOG_MAX_LINES";
   then
     rm -f -- "$candidate" || return 1
     return 1
@@ -23152,7 +23157,8 @@ assert_diagnostic_nondisclosure_obi_log_policy() {
     ( "$SELECTED_TRANSPORT" == getsockopt ||
       "$SELECTED_TRANSPORT" == unix ) ]] || return 1
   bounded_evidence_file \
-    "$input" "$COMPOSE_LOG_MAX_BYTES" "$COMPOSE_LOG_MAX_LINES" || return 1
+    "$input" "$DIAGNOSTIC_NONDISCLOSURE_OBI_LOG_MAX_BYTES" \
+    "$COMPOSE_LOG_MAX_LINES" || return 1
   LC_ALL=C awk \
     -v level="$OBI_LOG_LEVEL" -v transport="$SELECTED_TRANSPORT" '
     length($0) > 16384 { invalid = 1 }
@@ -23167,6 +23173,14 @@ assert_diagnostic_nondisclosure_obi_log_policy() {
       if (index($0, "transport=" transport) == 0) invalid = 1
     }
     {
+      if (index($0, "traceID=") != 0 ||
+          index($0, "spanID=") != 0 ||
+          index($0, " conn=") != 0 ||
+          index($0, " buf=") != 0 ||
+          index($0, " request=") != 0 ||
+          index($0, " response=") != 0 ||
+          index($0, " reqErr=") != 0 ||
+          index($0, " respErr=") != 0) invalid = 1
       if (level == "info" &&
           (index($0, " level=DEBUG ") != 0 ||
            index($0, "socket_path=") != 0 ||
@@ -23256,6 +23270,8 @@ validate_diagnostic_nondisclosure_status_payload_intrinsic() {
     --argjson java_max_bytes "$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES" \
     --argjson metrics_max_bytes "$OBI_METRIC_SNAPSHOT_MAX_BYTES" \
     --argjson metrics_max_lines "$OBI_METRIC_SNAPSHOT_MAX_LINES" \
+    --argjson obi_log_max_bytes \
+      "$DIAGNOSTIC_NONDISCLOSURE_OBI_LOG_MAX_BYTES" \
     --argjson log_max_bytes "$COMPOSE_LOG_MAX_BYTES" \
     --argjson log_max_lines "$COMPOSE_LOG_MAX_LINES" \
     --argjson transport_max_bytes "$TRANSPORT_CONFIGURATION_MAX_BYTES" '
@@ -23320,6 +23336,9 @@ validate_diagnostic_nondisclosure_status_payload_intrinsic() {
          elif .name == "obi_metrics" then
           .size_bytes <= $metrics_max_bytes and
           .line_count <= $metrics_max_lines
+         elif .name == "obi_log" then
+          .size_bytes <= $obi_log_max_bytes and
+          .line_count <= $log_max_lines
          else
           .size_bytes <= $log_max_bytes and .line_count <= $log_max_lines
          end))
@@ -23686,7 +23705,8 @@ run_diagnostic_nondisclosure_control() {
     return $?
   surface_json+=("$(diagnostic_nondisclosure_surface_json \
     obi_log "$obi_log_reference" \
-    "$COMPOSE_LOG_MAX_BYTES" "$COMPOSE_LOG_MAX_LINES" \
+    "$DIAGNOSTIC_NONDISCLOSURE_OBI_LOG_MAX_BYTES" \
+    "$COMPOSE_LOG_MAX_LINES" \
     "$obi_log_candidate" 600)") || return $?
   surface_json+=("$(diagnostic_nondisclosure_surface_json \
     java_log "$java_log_reference" \

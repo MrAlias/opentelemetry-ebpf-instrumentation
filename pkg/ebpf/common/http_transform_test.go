@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -343,6 +344,83 @@ func TestHTTPInfoParsing(t *testing.T) {
 		s := httpInfoToSpanLegacy(&tr)
 		assertMatchesInfo(t, &s, "POST", "/users", "127.0.0.1", "127.0.0.2", 8080, 200, 5)
 	})
+}
+
+func TestHTTPInfoDebugLogDoesNotDiscloseRequestContext(t *testing.T) {
+	var logs bytes.Buffer
+	originalLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	})))
+	t.Cleanup(func() {
+		slog.SetDefault(originalLogger)
+	})
+
+	traceCanary := [16]uint8{
+		0xd1, 0x39, 0xf6, 0x7e, 0x43, 0xa2, 0x4c, 0x51,
+		0xb8, 0x7e, 0x02, 0xd9, 0x64, 0xaf, 0x35, 0x01,
+	}
+	event := BPFHTTPInfo{
+		Type:            uint8(request.EventTypeHTTP),
+		HasLargeBuffers: 1,
+	}
+	event.Tp.TraceId = traceCanary
+	event.ConnInfo.S_port = 43123
+	event.ConnInfo.D_port = 18443
+	copy(event.Buf[:], "POST /private HTTP/1.1\r\nAuthorization: Bearer issue39syntheticcredential\r\nX-Private: issue39privateheadervalue\r\nContent-Length: 23\r\n\r\nissue39privatebodyvalue")
+
+	_, _, err := HTTPInfoEventToSpan(NewEBPFParseContext(nil, nil, nil), &event)
+	require.NoError(t, err)
+
+	parseCtx := NewEBPFParseContext(nil, nil, nil)
+	parseCtx.payloadExtraction.HTTP.GraphQL.Enabled = true
+	requestCanary := "GET /private HTTP/1.1\r\nX-Private: malformed-request-value\r\nbad-header-canary\r\n\r\n"
+	responseCanary := "HTTP/1.1 200 OK\r\nX-Private: malformed-response-value\r\nbad-response-header-canary\r\n\r\n"
+	for _, packet := range []struct {
+		packetType uint8
+		direction  uint8
+		payload    string
+	}{
+		{packetTypeRequest, directionRecv, requestCanary},
+		{packetTypeResponse, directionSend, responseCanary},
+	} {
+		header := TCPLargeBufferHeader{
+			PacketType: packet.packetType,
+			Direction:  packet.direction,
+			Len:        uint32(len(packet.payload)),
+			Action:     largeBufferActionInit,
+			Kind:       uint8(KindLayerApp),
+		}
+		header.Tp.TraceId = traceCanary
+		header.ConnInfo = event.ConnInfo
+		_, _, err = appendTCPLargeBuffer(parseCtx, toRingbufRecord(t, header, packet.payload))
+		require.NoError(t, err)
+	}
+	_, _, err = HTTPInfoEventToSpan(parseCtx, &event)
+	require.NoError(t, err)
+
+	output := logs.String()
+	require.Contains(t, output, "missing large buffer for HTTP request")
+	require.Contains(t, output, "missing large buffer for HTTP response")
+	require.Contains(t, output, "falling back to manual HTTP info parsing")
+	for _, forbidden := range []string{
+		"traceID=",
+		"conn=",
+		"buf=",
+		"reqErr=",
+		"respErr=",
+		fmt.Sprint(traceCanary),
+		fmt.Sprint(event.ConnInfo),
+		"issue39syntheticcredential",
+		"issue39privateheadervalue",
+		"issue39privatebodyvalue",
+		"malformed-request-value",
+		"bad-header-canary",
+		"malformed-response-value",
+		"bad-response-header-canary",
+	} {
+		require.NotContains(t, output, forbidden)
+	}
 }
 
 func TestMethodURLParsing(t *testing.T) {

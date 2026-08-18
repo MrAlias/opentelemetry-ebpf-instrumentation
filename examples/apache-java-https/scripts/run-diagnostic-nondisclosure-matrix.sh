@@ -692,17 +692,6 @@ result_status_names_directory() {
   ' "$status_file" >/dev/null
 }
 
-assert_no_private_residue() {
-  local -r result="$1"
-  local hidden=""
-  local inventory="$TEMP_DIR/hidden-paths"
-
-  find "$result" -mindepth 1 -name '.*' -printf '%P\n' >"$inventory" || return 1
-  while IFS= read -r hidden; do
-    [[ "$hidden" == .obi-metric-boundary-index.freeze ]] || return 1
-  done <"$inventory"
-}
-
 collect_references() {
   local -r result="$1"
   local -r output="$2"
@@ -829,7 +818,6 @@ copy_raw_cell() {
 
   result_directory_has_identity "$result" "$result_identity" || return 1
   result_status_names_directory "$result/run-status.json" "$result" || return 1
-  assert_no_private_residue "$result" || return 1
   collect_references "$result" "$references" || return 1
   create_owned_candidate "cell-$id" 700 || return 1
   stage="$ACTIVE_CANDIDATE"

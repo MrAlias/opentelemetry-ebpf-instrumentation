@@ -955,11 +955,24 @@ assert_library_and_failure_seams() {
     done
 
     prepare_copy_case success-0600 0600
+    for private_path in \
+      .terminal-java-diagnostics.lock \
+      .terminal-java-diagnostics-transition.lock \
+      .terminal-java-diagnostics.freeze \
+      .last-valid-java-diagnostics.json \
+      .unexpected-private-canary; do
+      printf "private-runtime-canary:%s\n" "$private_path" >"$result/$private_path"
+      chmod 0600 -- "$result/$private_path"
+    done
     before_fds="$(fd_count)"
     copy_raw_cell "$result" otel-getsockopt-info "$result_identity"
     after_fds="$(fd_count)"
     [[ "$before_fds" == "$after_fds" && "$(stat -Lc "%u:%a:%h" -- "$RAW_ROOT/cells/otel-getsockopt-info/run-status.json")" == "$EUID:600:1" ]]
     cmp -s -- "$result/run-status.json" "$RAW_ROOT/cells/otel-getsockopt-info/run-status.json"
+    [[ "$(find "$RAW_ROOT/cells/otel-getsockopt-info" -mindepth 1 -printf "%P:%y\n")" == run-status.json:f ]]
+    if grep -R -F -- private-runtime-canary "$RAW_ROOT/cells/otel-getsockopt-info"; then
+      exit 1
+    fi
 
     prepare_copy_case success-0644 0644
     copy_raw_cell "$result" otel-getsockopt-info "$result_identity"

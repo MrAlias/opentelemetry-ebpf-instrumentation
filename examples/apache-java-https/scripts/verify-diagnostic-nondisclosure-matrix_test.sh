@@ -180,7 +180,7 @@ write_cell() {
   if [[ "$agent" == otel ]]; then
     jq -cnS '{distribution:"otel",sha256:"faa89bdeebf9b1f52be4a4374689176717b02a59df2d8f8b6eb9aa39f9292589",url:"https://repo.maven.apache.org/maven2/io/opentelemetry/javaagent/opentelemetry-javaagent/2.28.1/opentelemetry-javaagent-2.28.1.jar",version:"2.28.1"}' >"$directory/official-javaagent.json"
   else
-    jq -cnS '{distribution:"splunk",embedded_opentelemetry_version:"2.28.1",sha256:"70d177dd63a4bbdb153e65c962ff678ed98b5555ff5bb63afdb6e7fff05c1351",url:"https://repo.maven.apache.org/maven2/com/splunk/splunk-otel-javaagent/2.28.0/splunk-otel-javaagent-2.28.0.jar",version:"2.28.0"}' >"$directory/official-javaagent.json"
+    jq -cnS '{distribution:"splunk",sha256:"70d177dd63a4bbdb153e65c962ff678ed98b5555ff5bb63afdb6e7fff05c1351",url:"https://repo.maven.apache.org/maven2/com/splunk/splunk-otel-javaagent/2.28.0/splunk-otel-javaagent-2.28.0.jar",version:"2.28.0"}' >"$directory/official-javaagent.json"
   fi
 
   snapshot="$(diagnostics_snapshot)"
@@ -509,6 +509,7 @@ expect_failure() {
   local -r label="$1"
   local -r root="$2"
   local -r expected_stage="${3:-}"
+  local -r expected_cell="${4:-otel-getsockopt-info}"
   local had_public=false
   local output=""
 
@@ -518,7 +519,7 @@ expect_failure() {
       printf 'mutation unexpectedly passed: %s\n' "$label" >&2
       return 1
     fi
-    [[ "$output" == *"matrix cell failed verification: otel-getsockopt-info stage=$expected_stage"* ]] || {
+    [[ "$output" == *"matrix cell failed verification: $expected_cell stage=$expected_stage"* ]] || {
       printf 'mutation reported the wrong validation stage: %s\n' "$label" >&2
       return 1
     }
@@ -1382,6 +1383,7 @@ main() {
   ' "$fixture/public/matrix-summary.json" >/dev/null
   jq -e '
     .official_agents.otel.version == "2.28.1" and .official_agents.splunk.version == "2.28.0" and
+    (.official_agents.splunk | keys == ["distribution","sha256","url","version"]) and
     .runtime_contract == {java:{attestation:"source_configured",distribution:"temurin",version:"21"},tls_protocol:"TLSv1.3"} and
     .runner == {arch:"X64",os:"Linux"} and
     .bridge_artifacts == {obi_java_agent_sha256:("1"*64),obi_otel_extension_sha256:("2"*64)} and
@@ -1396,6 +1398,11 @@ main() {
     "$fixture/public" >/dev/null; then
     return 1
   fi
+
+  copy_mutation "$fixture" splunk-agent-pin-extra-key mutated
+  json_update_sorted "$mutated/cells/splunk-getsockopt-info/official-javaagent.json" \
+    '.embedded_opentelemetry_version="2.28.1"'
+  expect_failure splunk-agent-pin-extra-key "$mutated" official_agent_pin splunk-getsockopt-info
 
   copy_mutation "$fixture" obi-log-dedicated-cap mutated
   directory="$mutated/cells/otel-getsockopt-debug"

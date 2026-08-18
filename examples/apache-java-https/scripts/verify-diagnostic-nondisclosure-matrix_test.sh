@@ -661,6 +661,9 @@ assert_library_and_failure_seams() {
     for id in "${CELL_IDS[@]}"; do
       ((ordinal += 1)); IFS=- read -r agent transport level <<<"$id"
       invoke_matrix_producer "project-$ordinal" "$sandbox/log-$ordinal" "$agent" "$transport" "$level"
+      [[ "$(umask)" == 0077 ]]
+      [[ -f "$sandbox/log-$ordinal" && ! -L "$sandbox/log-$ordinal" ]]
+      [[ "$(stat -Lc "%u:%a:%h" -- "$sandbox/log-$ordinal")" == "$EUID:600:1" ]]
     done
     [[ "$(wc -l <"$capture")" == 8 ]]
     awk -F"\t" '\''

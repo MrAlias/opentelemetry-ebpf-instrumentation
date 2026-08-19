@@ -9,9 +9,9 @@
 
 OBI observes an upstream trace parent below TLS. An unmodified OpenTelemetry or
 Splunk Java agent needs that parent synchronously, before its normal server
-instrumenter starts a span. The Java process must not receive BPF map file
-descriptors, bpffs access, BPF capabilities, or a path that uses
-`bpf_probe_write_user`.
+instrumenter starts a span. The reverse transport must not give the Java
+process BPF map file descriptors, bpffs access, or BPF capabilities, and its
+BPF object must not use `bpf_probe_write_user`.
 
 The reverse transport is only one part of correctness. Both transports look up
 the same request-owned kernel state. If the current execution cannot be mapped
@@ -123,9 +123,9 @@ criterion from
 
 | Candidate | Java privilege and attack surface | Restart and version skew | Latency, allocation, and backpressure | Maintenance and diagnostics | `bpf_probe_write_user` | Decision |
 | --- | --- | --- | --- | --- | --- | --- |
-| Cgroup sockopt on accepted application socket | Ordinary socket syscalls; no BPF access | Optional object, explicit ABI, socket renegotiation, and request-triggered reprobe after backoff | Latency: synchronous syscall, untested; allocation: reused Java buffers focused, retained allocation untested; backpressure: 64-slot provider pool returns overload, syscall has no configured deadline | Maintenance: separate BPF/JNI ABI; diagnostics: reason-coded OBI counters and Java status counters | No | Primary |
+| Cgroup sockopt on accepted application socket | Ordinary socket syscalls; no BPF access | Optional object, explicit ABI, socket renegotiation, and request-triggered reprobe after backoff | Latency/allocation: the focused [eight-worker packaged-JVM result](../../examples/apache-java-https/focused-validation/packaged-jvm-transports-rhel96-a86faf01/README.md) retained raw- and bridge/provider-JNI miss, hit, and stale p99 values of 32,819–57,375 ns; raw-JNI allocation p50 was 0 B and bridge/provider p50 was 120/520/232 B in miss/hit/stale order. This is not application or production evidence. Backpressure: the 64-slot provider pool returns overload; the syscall has no configured deadline | Maintenance: separate BPF/JNI ABI; diagnostics: reason-coded OBI counters and Java status counters | No | Primary |
 | Cgroup getsockopt on a dummy socket | Ordinary probe socket; no BPF access | Recreated by a request-triggered reprobe after backoff | Latency and allocation: socket-pair setup plus negotiate/health untested; backpressure: not applicable to the data path | Maintenance: small native probe surface; diagnostics: selected transport and both probe outcomes in one fixed Java result | No | Probe only |
-| Credential-checked Unix socket | Access to one endpoint; peer UID remains in the trust boundary | Reconnectable, versioned framing, and request-triggered reprobe after backoff | Latency and allocation: comparative evidence untested; backpressure: absolute RPC deadline, bounded server admission, and 64-slot provider pool | Maintenance: server, framing, `/proc`, credentials, and path handling; diagnostics: reason-coded OBI counters plus fixed Java selection and probe outcomes | No | Fallback |
+| Credential-checked Unix socket | Access to one endpoint; peer UID remains in the trust boundary | Reconnectable, versioned framing, and request-triggered reprobe after backoff | Latency/allocation: the same focused packaged-JVM result retained non-timeout raw- and bridge/provider-JNI miss, hit, and stale p99 values of 2,254,629–5,543,878 ns and timeout p99 values of 50,293,077/50,310,343 ns; raw-JNI allocation p50 was 0 B and bridge/provider p50 was 128/528/184/184 B in miss/hit/stale/timeout order. This is not application or production evidence. Backpressure: absolute RPC deadline, bounded server admission, and 64-slot provider pool | Maintenance: server, framing, `/proc`, credentials, and path handling; diagnostics: reason-coded OBI counters plus fixed Java selection and probe outcomes | No | Fallback |
 | Brokered BPF map FD | Grants a BPF map capability to the application | Revocation and map-version skew are difficult | Latency, allocation, and backpressure: all untested | Maintenance: FD broker plus internal map ABI; diagnostics: new broker and access-status reporting required | No | Reject |
 | Direct bpffs lookup | Grants bpffs and BPF permissions | Stale pins and mixed map versions need cleanup | Latency, allocation, and backpressure: all untested | Maintenance: mounts, permissions, pins, and internal map ABI; diagnostics: new access and stale-pin reporting required | No | Reject |
 | Shared memory | Requires a cross-process shared mapping; Java write authority depends on the design | Stale mappings and restart ownership are complex | Latency, allocation, and backpressure: all untested | Maintenance: ownership, version, and corruption protocol; diagnostics: new integrity and ownership reporting required | No | Reject |
@@ -143,11 +143,13 @@ therefore cannot carry this remote parent.
 
 The retained runs establish the acceptance assertions and bounded failure
 cases only for the exact primary and fallback cells linked by the compatibility
-matrix. They do not contain a representative primary-versus-fallback latency
-or allocation comparison. The
-[benchmark matrix](../../examples/apache-java-https/BENCHMARK.md) remains
-**untested**, so this PoC decision is not a performance or production-support
-commitment.
+matrix. A separate focused packaged-JVM record supplies a bounded raw- and
+bridge/provider-JNI primary-versus-fallback latency and thread-allocation
+comparison. It excludes application requests, throughput, process/native
+resource growth, run-to-run variance, and native-sanitizer evidence. The
+application [benchmark matrix](../../examples/apache-java-https/BENCHMARK.md)
+remains **untested**, so this PoC decision is not a performance or
+production-support commitment.
 
 ## Feature and fallback gates
 

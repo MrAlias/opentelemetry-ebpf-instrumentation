@@ -246,6 +246,17 @@ bounded derived claims and an internal-consistency check, not raw evidence or an
 authentication claim. Until a source-revision-matched workflow artifact passes
 all three gates, existing untested rows remain untested.
 
+The campaign pins its private transaction, command-log parents, public parent,
+and public closure with open descriptors; campaign-owned private control,
+snapshot, receipt, and log leaves are created exclusively. It destroys the
+pinned private inode even if its pathname moves, then hands the public
+parent/directory identities plus an exact seven-file identity-and-byte digest
+to both post-campaign workflow gates. Persistent path, inode, mode, link-count,
+or byte replacement therefore makes the run non-publishable. The projector and
+bundled verifier descriptors remain pinned while their canonical paths are
+executed, preserving their `BASH_SOURCE`-relative sibling lookup; exact
+path-to-descriptor identity and digest checks immediately bracket execution.
+
 ### Exact component build mapping
 
 The clean-host `run.sh` command above is the canonical build command. It builds

@@ -142,28 +142,151 @@ jobs:
       - name: Independently verify the public closure
         id: independent_verify
         if: steps.campaign.outcome == 'success'
+        env:
+          EXPECTED_PARENT_IDENTITY: ${{ steps.campaign.outputs.public_parent_identity }}
+          EXPECTED_DIRECTORY_IDENTITY: ${{ steps.campaign.outputs.public_directory_identity }}
+          EXPECTED_CLOSURE_SHA256: ${{ steps.campaign.outputs.public_closure_sha256 }}
+          EXPECTED_EVIDENCE_ID: ${{ steps.campaign.outputs.public_evidence_id }}
         run: |
           set -Eeuo pipefail
 
-          expected=$'README.md\tf\nSANITIZATION.md\tf\nSHA256SUMS\tf\nacceptance-claims.json\tf\nauthority-summary.json\tf\nderivation-receipt.json\tf\nverify.sh\tf'
-          observed="$(find -- "$PUBLIC_OUTPUT" -mindepth 1 -maxdepth 1 \
-            -printf '%f\t%y\n' | LC_ALL=C sort)"
-          [[ "$observed" == "$expected" && \
-            "$(stat -Lc '%u:%a' -- "$PUBLIC_OUTPUT")" == "$(id -u):555" ]]
-          root_device="$(stat -Lc '%d' -- "$PUBLIC_OUTPUT")"
-          for file in README.md SANITIZATION.md SHA256SUMS \
-            acceptance-claims.json authority-summary.json \
-            derivation-receipt.json verify.sh; do
-            [[ -f "$PUBLIC_OUTPUT/$file" && ! -L "$PUBLIC_OUTPUT/$file" && \
-              "$(stat -Lc '%d:%u:%a:%h' -- "$PUBLIC_OUTPUT/$file")" == \
-                "$root_device:$(id -u):444:1" ]]
-          done
+          compute_public_closure() {
+            local expected=''
+            local observed=''
+            local directory_fd=''
+            local directory_identity=''
+            local descriptor_identity=''
+            local post_identity=''
+            local root_device=''
+            local file=''
+            local file_fd=''
+            local file_identity=''
+            local file_descriptor_identity=''
+            local file_post_identity=''
+            local file_sha256=''
+            local closure_sha256=''
+            local verifier_identity=''
+            local verifier_sha256=''
+            local close_status=0
+            local -a closure_rows=()
+            local -a files=(
+              README.md SANITIZATION.md acceptance-claims.json
+              authority-summary.json derivation-receipt.json verify.sh
+              SHA256SUMS
+            )
+
+            [[ "$EXPECTED_PARENT_IDENTITY" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-7]{3,4}$ &&
+              "$EXPECTED_DIRECTORY_IDENTITY" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-7]{3,4}$ &&
+              "$EXPECTED_CLOSURE_SHA256" =~ ^[0-9a-f]{64}$ &&
+              "$EXPECTED_EVIDENCE_ID" =~ ^[0-9a-f]{64}$ ]]
+            [[ -d "$PUBLIC_PARENT" && ! -L "$PUBLIC_PARENT" &&
+              "$(readlink -f -- "$PUBLIC_PARENT")" == "$PUBLIC_PARENT" &&
+              "$(stat -Lc '%d:%i:%u:%a' -- "$PUBLIC_PARENT")" == "$EXPECTED_PARENT_IDENTITY" ]]
+            [[ -d "$PUBLIC_OUTPUT" && ! -L "$PUBLIC_OUTPUT" &&
+              "$(readlink -f -- "$PUBLIC_OUTPUT")" == "$PUBLIC_OUTPUT" &&
+              "$(stat -Lc '%d:%i:%u:%a' -- "$PUBLIC_OUTPUT")" == "$EXPECTED_DIRECTORY_IDENTITY" &&
+              "$(stat -Lc '%u:%a' -- "$PUBLIC_OUTPUT")" == "$(id -u):555" ]]
+            exec {directory_fd}<"$PUBLIC_OUTPUT"
+            directory_identity="$(stat -Lc '%d:%i:%u:%a' -- "$PUBLIC_OUTPUT")"
+            descriptor_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+              "/proc/$BASHPID/fd/$directory_fd")"
+            [[ "$directory_identity" == "$EXPECTED_DIRECTORY_IDENTITY" &&
+              "$descriptor_identity" == "$EXPECTED_DIRECTORY_IDENTITY" ]]
+            expected=$'README.md\tf\nSANITIZATION.md\tf\nSHA256SUMS\tf\nacceptance-claims.json\tf\nauthority-summary.json\tf\nderivation-receipt.json\tf\nverify.sh\tf'
+            observed="$(find -H "/proc/$BASHPID/fd/$directory_fd" \
+              -mindepth 1 -maxdepth 1 -printf '%f\t%y\n' | LC_ALL=C sort)"
+            [[ "$observed" == "$expected" ]]
+            root_device="${EXPECTED_DIRECTORY_IDENTITY%%:*}"
+            for file in "${files[@]}"; do
+              [[ -f "$PUBLIC_OUTPUT/$file" && ! -L "$PUBLIC_OUTPUT/$file" &&
+                "$(readlink -f -- "$PUBLIC_OUTPUT/$file")" == "$PUBLIC_OUTPUT/$file" ]]
+              file_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+                "$PUBLIC_OUTPUT/$file")"
+              [[ "$file_identity" == "$root_device:"*":$(id -u):444:1:"* ]]
+              exec {file_fd}<"/proc/$BASHPID/fd/$directory_fd/$file"
+              file_descriptor_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+                "/proc/$BASHPID/fd/$file_fd")"
+              [[ "$file_descriptor_identity" == "$file_identity" ]]
+              file_sha256="$(sha256sum <"/proc/$BASHPID/fd/$file_fd")"
+              file_sha256="${file_sha256%% *}"
+              file_post_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+                "$PUBLIC_OUTPUT/$file")"
+              exec {file_fd}<&- || close_status=$?
+              (( close_status == 0 ))
+              [[ "$file_post_identity" == "$file_identity" &&
+                "$file_sha256" =~ ^[0-9a-f]{64}$ ]]
+              closure_rows+=("$file"$'\t'"$file_identity"$'\t'"$file_sha256")
+              if [[ "$file" == verify.sh ]]; then
+                verifier_identity="$file_identity"
+                verifier_sha256="$file_sha256"
+              fi
+            done
+            closure_sha256="$(printf '%s\n' "${closure_rows[@]}" | sha256sum)"
+            closure_sha256="${closure_sha256%% *}"
+            post_identity="$(stat -Lc '%d:%i:%u:%a' -- "$PUBLIC_OUTPUT")"
+            descriptor_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+              "/proc/$BASHPID/fd/$directory_fd")"
+            exec {directory_fd}<&- || close_status=$?
+            (( close_status == 0 ))
+            [[ "$post_identity" == "$EXPECTED_DIRECTORY_IDENTITY" &&
+              "$descriptor_identity" == "$EXPECTED_DIRECTORY_IDENTITY" &&
+              "$(stat -Lc '%d:%i:%u:%a' -- "$PUBLIC_PARENT")" == "$EXPECTED_PARENT_IDENTITY" ]]
+            [[ "$verifier_identity" == *:* &&
+              "$verifier_sha256" =~ ^[0-9a-f]{64}$ ]]
+            printf '%s\t%s\t%s\n' "$closure_sha256" "$verifier_identity" \
+              "$verifier_sha256"
+          }
+
+          observed_closure=''
+          verifier_identity=''
+          verifier_sha256=''
+          IFS=$'\t' read -r observed_closure verifier_identity verifier_sha256 \
+            < <(compute_public_closure)
+          [[ "$observed_closure" == "$EXPECTED_CLOSURE_SHA256" ]]
           evidence_id="$(jq -er '.evidence_id' \
             "$PUBLIC_OUTPUT/derivation-receipt.json")"
-          [[ "$evidence_id" =~ ^[0-9a-f]{64}$ ]]
-          verify_output="$(cd / && bash "$PUBLIC_OUTPUT/verify.sh")"
+          [[ "$evidence_id" == "$EXPECTED_EVIDENCE_ID" ]]
+          verify_directory_fd=''
+          verify_fd=''
+          verify_status=0
+          verify_output=''
+          exec {verify_directory_fd}<"$PUBLIC_OUTPUT"
+          [[ "$(stat -Lc '%d:%i:%u:%a' -- \
+            "/proc/$BASHPID/fd/$verify_directory_fd")" == "$EXPECTED_DIRECTORY_IDENTITY" ]]
+          exec {verify_fd}<"/proc/$BASHPID/fd/$verify_directory_fd/verify.sh"
+          [[ "$(stat -Lc '%d:%i:%u:%a' -- \
+            "/proc/$BASHPID/fd/$verify_directory_fd")" == "$EXPECTED_DIRECTORY_IDENTITY" &&
+            "$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+            "/proc/$BASHPID/fd/$verify_fd")" == "$verifier_identity" &&
+            "$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+            "$PUBLIC_OUTPUT/verify.sh")" == "$verifier_identity" &&
+            "$(sha256sum <"/proc/$BASHPID/fd/$verify_fd")" == "$verifier_sha256  -" &&
+            "$(sha256sum <"$PUBLIC_OUTPUT/verify.sh")" == "$verifier_sha256  -" ]]
+          if verify_output="$(cd / && bash "$PUBLIC_OUTPUT/verify.sh")"; then
+            verify_status=0
+          else
+            verify_status=$?
+          fi
+          [[ "$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+            "/proc/$BASHPID/fd/$verify_fd")" == "$verifier_identity" &&
+            "$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+            "$PUBLIC_OUTPUT/verify.sh")" == "$verifier_identity" &&
+            "$(sha256sum <"/proc/$BASHPID/fd/$verify_fd")" == "$verifier_sha256  -" &&
+            "$(sha256sum <"$PUBLIC_OUTPUT/verify.sh")" == "$verifier_sha256  -" &&
+            "$(stat -Lc '%d:%i:%u:%a' -- \
+            "/proc/$BASHPID/fd/$verify_directory_fd")" == "$EXPECTED_DIRECTORY_IDENTITY" ]]
+          exec {verify_fd}<&-
+          exec {verify_directory_fd}<&-
+          (( verify_status == 0 ))
           [[ "$verify_output" == \
             "bounded claim bundle internally consistent (not authenticated): $evidence_id" ]]
+          post_verifier_identity=''
+          post_verifier_sha256=''
+          IFS=$'\t' read -r observed_closure post_verifier_identity \
+            post_verifier_sha256 < <(compute_public_closure)
+          [[ "$observed_closure" == "$EXPECTED_CLOSURE_SHA256" &&
+            "$post_verifier_identity" == "$verifier_identity" &&
+            "$post_verifier_sha256" == "$verifier_sha256" ]]
 
       - name: Prove private destruction and classify publication
         id: privacy
@@ -171,6 +294,10 @@ jobs:
         env:
           CAMPAIGN_OUTCOME: ${{ steps.campaign.outcome }}
           INDEPENDENT_OUTCOME: ${{ steps.independent_verify.outcome }}
+          EXPECTED_PARENT_IDENTITY: ${{ steps.campaign.outputs.public_parent_identity }}
+          EXPECTED_DIRECTORY_IDENTITY: ${{ steps.campaign.outputs.public_directory_identity }}
+          EXPECTED_CLOSURE_SHA256: ${{ steps.campaign.outputs.public_closure_sha256 }}
+          EXPECTED_EVIDENCE_ID: ${{ steps.campaign.outputs.public_evidence_id }}
         run: |
           set -Eeuo pipefail
 
@@ -209,10 +336,46 @@ jobs:
           fi
           [[ "$sibling_inventory" == "${PUBLIC_OUTPUT##*/}"$'\td' && \
             "$INDEPENDENT_OUTCOME" == success ]]
+          [[ "$EXPECTED_PARENT_IDENTITY" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-7]{3,4}$ &&
+            "$EXPECTED_DIRECTORY_IDENTITY" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-7]{3,4}$ &&
+            "$EXPECTED_CLOSURE_SHA256" =~ ^[0-9a-f]{64}$ &&
+            "$EXPECTED_EVIDENCE_ID" =~ ^[0-9a-f]{64}$ &&
+            "$(stat -Lc '%d:%i:%u:%a' -- "$PUBLIC_PARENT")" == "$EXPECTED_PARENT_IDENTITY" &&
+            "$(stat -Lc '%d:%i:%u:%a' -- "$PUBLIC_OUTPUT")" == "$EXPECTED_DIRECTORY_IDENTITY" ]]
           expected=$'README.md\tf\nSANITIZATION.md\tf\nSHA256SUMS\tf\nacceptance-claims.json\tf\nauthority-summary.json\tf\nderivation-receipt.json\tf\nverify.sh\tf'
           observed="$(find -- "$PUBLIC_OUTPUT" -mindepth 1 -maxdepth 1 \
             -printf '%f\t%y\n' | LC_ALL=C sort)"
           [[ "$observed" == "$expected" ]]
+          output_fd=''
+          exec {output_fd}<"$PUBLIC_OUTPUT"
+          [[ "$(stat -Lc '%d:%i:%u:%a' -- "/proc/$BASHPID/fd/$output_fd")" == "$EXPECTED_DIRECTORY_IDENTITY" ]]
+          closure_rows=()
+          for file in README.md SANITIZATION.md acceptance-claims.json \
+            authority-summary.json derivation-receipt.json verify.sh \
+            SHA256SUMS; do
+            file_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+              "$PUBLIC_OUTPUT/$file")"
+            [[ -f "$PUBLIC_OUTPUT/$file" && ! -L "$PUBLIC_OUTPUT/$file" &&
+              "$file_identity" == "${EXPECTED_DIRECTORY_IDENTITY%%:*}:"*":$(id -u):444:1:"* ]]
+            file_fd=''
+            exec {file_fd}<"/proc/$BASHPID/fd/$output_fd/$file"
+            [[ "$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+              "/proc/$BASHPID/fd/$file_fd")" == "$file_identity" ]]
+            file_sha256="$(sha256sum <"/proc/$BASHPID/fd/$file_fd")"
+            file_sha256="${file_sha256%% *}"
+            exec {file_fd}<&-
+            [[ "$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+              "$PUBLIC_OUTPUT/$file")" == "$file_identity" ]]
+            closure_rows+=("$file"$'\t'"$file_identity"$'\t'"$file_sha256")
+          done
+          observed_closure="$(printf '%s\n' "${closure_rows[@]}" | sha256sum)"
+          observed_closure="${observed_closure%% *}"
+          exec {output_fd}<&-
+          [[ "$observed_closure" == "$EXPECTED_CLOSURE_SHA256" &&
+            "$(stat -Lc '%d:%i:%u:%a' -- "$PUBLIC_PARENT")" == "$EXPECTED_PARENT_IDENTITY" &&
+            "$(stat -Lc '%d:%i:%u:%a' -- "$PUBLIC_OUTPUT")" == "$EXPECTED_DIRECTORY_IDENTITY" &&
+            "$(jq -er '.evidence_id' \
+              "$PUBLIC_OUTPUT/derivation-receipt.json")" == "$EXPECTED_EVIDENCE_ID" ]]
           private_public_residue="$(find -- "$PUBLIC_PARENT" -xdev \
             \( -name 'runbook-receipt.json' -o -name 'command-rows.jsonl' \
               -o -name 'state-journal.tsv' -o -name '*.log' \

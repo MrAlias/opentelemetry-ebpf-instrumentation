@@ -55,6 +55,13 @@ OUTPUT_DIRECTORY=""
 OUTPUT_PARENT=""
 OUTPUT_NAME=""
 OUTPUT_PARENT_IDENTITY=""
+OUTPUT_PARENT_FD=""
+OUTPUT_DIRECTORY_IDENTITY=""
+OUTPUT_DIRECTORY_FD=""
+PUBLIC_CLOSURE_SHA256=""
+PUBLIC_EVIDENCE_ID=""
+WORKFLOW_OUTPUT_IDENTITY=""
+WORKFLOW_OUTPUT_FD=""
 SOURCE_REVISION=""
 SOURCE_TREE_SHA256=""
 WORKFLOW_BLOB_SHA256=""
@@ -74,11 +81,13 @@ OPERATING_SYSTEM=""
 TRANSACTION_PARENT='/tmp'
 PRIVATE_DIRECTORY=""
 PRIVATE_IDENTITY=""
+PRIVATE_DIRECTORY_FD=""
 CHECKOUT_DIRECTORY=""
 CHECKOUT_IDENTITY=""
 COMMAND_DIRECTORY=""
 COMMAND_DIRECTORY_IDENTITY=""
 STATE_JOURNAL=""
+STATE_JOURNAL_FD=""
 RECEIPT=""
 RECEIPT_IDENTITY=""
 RECEIPT_SHA256=""
@@ -98,6 +107,8 @@ declare -a COMMAND_ROWS_MEMORY=()
 declare -A COMMAND_OUTPUT_SHA256=()
 declare -A RESULT_SNAPSHOT_IDENTITY=()
 declare -A RESULT_SNAPSHOT_SHA256=()
+declare -A PUBLIC_FILE_IDENTITY=()
+declare -A PUBLIC_FILE_SHA256=()
 
 usage() {
   printf '%s\n' \
@@ -255,23 +266,16 @@ assert_exact_tracked_file() {
   [[ "$actual_digest" == "$blob_digest" ]]
 }
 
-assert_output_target() {
+assert_output_parent_unchanged() {
   local parent_physical=""
   local owner=""
   local mode=""
+  local observed_identity=""
+  local descriptor_identity=""
+  local candidate_fd=""
   local -i mode_bits=0
 
-  [[ "$OUTPUT_DIRECTORY" == /* && "$OUTPUT_DIRECTORY" != */ &&
-    ! -e "$OUTPUT_DIRECTORY" && ! -L "$OUTPUT_DIRECTORY" ]] || {
-    die "public output must be a nonexistent absolute path"
-    return 1
-  }
-  OUTPUT_PARENT="${OUTPUT_DIRECTORY%/*}"
-  OUTPUT_NAME="${OUTPUT_DIRECTORY##*/}"
-  is_safe_public_name "$OUTPUT_NAME" || {
-    die "public output name is not a safe evidence identifier"
-    return 1
-  }
+  [[ -n "$OUTPUT_PARENT" && "$OUTPUT_PARENT" == /* ]] || return 1
   [[ -d "$OUTPUT_PARENT" && ! -L "$OUTPUT_PARENT" ]] || {
     die "public output parent is not a physical directory"
     return 1
@@ -289,11 +293,27 @@ assert_output_target() {
     die "public output parent must not be group or world writable"
     return 1
   }
+  observed_identity="$(stat -Lc '%d:%i:%u:%a' -- "$OUTPUT_PARENT")" ||
+    return 1
   if [[ -z "$OUTPUT_PARENT_IDENTITY" ]]; then
-    OUTPUT_PARENT_IDENTITY="$(stat -Lc '%d:%i:%u:%a' -- "$OUTPUT_PARENT")" ||
+    exec {candidate_fd}<"$OUTPUT_PARENT" || return $?
+    descriptor_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+      "/proc/$BASHPID/fd/$candidate_fd")" || {
+      exec {candidate_fd}<&-
       return 1
+    }
+    [[ "$descriptor_identity" == "$observed_identity" ]] || {
+      exec {candidate_fd}<&-
+      return 1
+    }
+    OUTPUT_PARENT_IDENTITY="$observed_identity"
+    OUTPUT_PARENT_FD="$candidate_fd"
   else
-    [[ "$(stat -Lc '%d:%i:%u:%a' -- "$OUTPUT_PARENT")" == "$OUTPUT_PARENT_IDENTITY" ]] || {
+    [[ "$OUTPUT_PARENT_FD" =~ ^[0-9]+$ ]] || return 1
+    descriptor_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+      "/proc/$BASHPID/fd/$OUTPUT_PARENT_FD")" || return 1
+    [[ "$observed_identity" == "$OUTPUT_PARENT_IDENTITY" &&
+      "$descriptor_identity" == "$OUTPUT_PARENT_IDENTITY" ]] || {
       die "public output parent identity changed"
       return 1
     }
@@ -304,6 +324,31 @@ assert_output_target() {
       return 1
       ;;
   esac
+}
+
+assert_output_target() {
+  local derived_parent=""
+  local derived_name=""
+
+  [[ "$OUTPUT_DIRECTORY" == /* && "$OUTPUT_DIRECTORY" != */ &&
+    ! -e "$OUTPUT_DIRECTORY" && ! -L "$OUTPUT_DIRECTORY" ]] || {
+    die "public output must be a nonexistent absolute path"
+    return 1
+  }
+  derived_parent="${OUTPUT_DIRECTORY%/*}"
+  derived_name="${OUTPUT_DIRECTORY##*/}"
+  is_safe_public_name "$derived_name" || {
+    die "public output name is not a safe evidence identifier"
+    return 1
+  }
+  if [[ -n "$OUTPUT_PARENT" ]]; then
+    [[ "$derived_parent" == "$OUTPUT_PARENT" &&
+      "$derived_name" == "$OUTPUT_NAME" ]] || return 1
+  else
+    OUTPUT_PARENT="$derived_parent"
+    OUTPUT_NAME="$derived_name"
+  fi
+  assert_output_parent_unchanged
 }
 
 read_environment_version() {
@@ -417,6 +462,42 @@ validate_github_runner_environment() {
     "${GITHUB_WORKFLOW_SHA:-}" == "$SOURCE_REVISION" ]]
 }
 
+open_workflow_output_channel() {
+  local -r workflow_output="${GITHUB_OUTPUT:-}"
+  local path_identity=""
+  local descriptor_identity=""
+  local post_identity=""
+  local owner=""
+  local mode=""
+  local links=""
+  local candidate_fd=""
+  local -i mode_bits=0
+
+  [[ "$workflow_output" == /* && -f "$workflow_output" &&
+    ! -L "$workflow_output" &&
+    "$(readlink -f -- "$workflow_output")" == "$workflow_output" ]] ||
+    return 1
+  path_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$workflow_output")" ||
+    return 1
+  IFS=: read -r _ _ owner mode links <<<"$path_identity"
+  [[ "$owner" == "$EUID" && "$mode" =~ ^[0-7]{3,4}$ && "$links" == 1 ]] ||
+    return 1
+  mode_bits=$((8#$mode))
+  (( (mode_bits & 0022) == 0 )) || return 1
+  exec {candidate_fd}>>"$workflow_output" || return $?
+  descriptor_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "/proc/$BASHPID/fd/$candidate_fd")" || descriptor_identity=""
+  post_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$workflow_output")" ||
+    post_identity=""
+  if [[ "$descriptor_identity" != "$path_identity" ||
+    "$post_identity" != "$path_identity" ]]; then
+    exec {candidate_fd}>&-
+    return 1
+  fi
+  WORKFLOW_OUTPUT_IDENTITY="$path_identity"
+  WORKFLOW_OUTPUT_FD="$candidate_fd"
+}
+
 authority_preflight() {
   local head=""
   local object_type=""
@@ -501,9 +582,10 @@ enter_state() {
   CURRENT_STATE_INDEX=$next_index
   STATE_HISTORY+=("$requested")
   log_info "STATE $requested"
-  if [[ -n "$STATE_JOURNAL" && -f "$STATE_JOURNAL" &&
-    ! -L "$STATE_JOURNAL" ]]; then
-    printf '%02d\t%s\n' "$CURRENT_STATE_INDEX" "$requested" >>"$STATE_JOURNAL"
+  if [[ -n "$STATE_JOURNAL" && "$STATE_JOURNAL_FD" =~ ^[0-9]+$ &&
+    -f "/proc/$BASHPID/fd/$STATE_JOURNAL_FD" ]]; then
+    printf '%02d\t%s\n' "$CURRENT_STATE_INDEX" "$requested" \
+      >&"$STATE_JOURNAL_FD"
   fi
 }
 
@@ -535,15 +617,28 @@ assert_transaction_parent() {
 
 assert_private_directory_identity() {
   local observed=""
+  local descriptor_identity=""
 
   [[ -n "$PRIVATE_DIRECTORY" && -n "$PRIVATE_IDENTITY" &&
+    "$PRIVATE_DIRECTORY_FD" =~ ^[0-9]+$ &&
     "$PRIVATE_DIRECTORY" == "$TRANSACTION_PARENT"/obi-java-remote-parent-acceptance.* &&
     "${PRIVATE_DIRECTORY##*/}" =~ ^obi-java-remote-parent-acceptance\.[A-Za-z0-9]{6}$ &&
     -d "$PRIVATE_DIRECTORY" && ! -L "$PRIVATE_DIRECTORY" &&
     "$(CDPATH='' cd -- "$PRIVATE_DIRECTORY" && pwd -P)" == "$PRIVATE_DIRECTORY" ]] ||
     return 1
   observed="$(stat -Lc '%d:%i:%u:%a' -- "$PRIVATE_DIRECTORY")" || return 1
-  [[ "$observed" == "$PRIVATE_IDENTITY" && "$observed" == *":$EUID:700" ]]
+  descriptor_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "/proc/$BASHPID/fd/$PRIVATE_DIRECTORY_FD")" || return 1
+  [[ "$observed" == "$PRIVATE_IDENTITY" &&
+    "$descriptor_identity" == "$PRIVATE_IDENTITY" &&
+    "$observed" == *":$EUID:700" ]]
+}
+
+assert_private_descriptor_identity() {
+  [[ -n "$PRIVATE_IDENTITY" && "$PRIVATE_DIRECTORY_FD" =~ ^[0-9]+$ &&
+    -d "/proc/$BASHPID/fd/$PRIVATE_DIRECTORY_FD" &&
+    "$(stat -Lc '%d:%i:%u:%a' -- \
+      "/proc/$BASHPID/fd/$PRIVATE_DIRECTORY_FD")" == "$PRIVATE_IDENTITY" ]]
 }
 
 assert_command_directory_identity() {
@@ -561,6 +656,8 @@ assert_command_directory_identity() {
 
 create_private_transaction() {
   local create_status=0
+  local candidate_fd=""
+  local descriptor_identity=""
 
   assert_transaction_parent || {
     die "private transaction parent is not the trusted /tmp boundary"
@@ -580,6 +677,17 @@ create_private_transaction() {
     return 1
   PRIVATE_IDENTITY="$(stat -Lc '%d:%i:%u:%a' -- "$PRIVATE_DIRECTORY")" ||
     return 1
+  exec {candidate_fd}<"$PRIVATE_DIRECTORY" || return $?
+  descriptor_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "/proc/$BASHPID/fd/$candidate_fd")" || {
+    exec {candidate_fd}<&-
+    return 1
+  }
+  [[ "$descriptor_identity" == "$PRIVATE_IDENTITY" ]] || {
+    exec {candidate_fd}<&-
+    return 1
+  }
+  PRIVATE_DIRECTORY_FD="$candidate_fd"
   assert_private_directory_identity || return 1
   CHECKOUT_DIRECTORY="$PRIVATE_DIRECTORY/source"
   COMMAND_DIRECTORY="$PRIVATE_DIRECTORY/commands"
@@ -588,8 +696,12 @@ create_private_transaction() {
   COMMAND_DIRECTORY_IDENTITY="$(stat -Lc '%d:%i:%u:%a' -- \
     "$COMMAND_DIRECTORY")" || return 1
   assert_command_directory_identity || return 1
-  : >"$STATE_JOURNAL"
-  chmod 0600 -- "$STATE_JOURNAL"
+  open_exclusive_output_fd "$PRIVATE_DIRECTORY_FD" state-journal.tsv \
+    STATE_JOURNAL_FD || return 1
+  chmod 0600 -- "/proc/$BASHPID/fd/$STATE_JOURNAL_FD" || return 1
+  [[ "$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "/proc/$BASHPID/fd/$STATE_JOURNAL_FD")" == *":$EUID:600:1" ]] ||
+    return 1
   COMMAND_ROWS_MEMORY=()
   COMMAND_OUTPUT_SHA256=()
   RESULT_SNAPSHOT_IDENTITY=()
@@ -597,44 +709,107 @@ create_private_transaction() {
   local index=0
   local state=""
   for state in "${STATE_HISTORY[@]}"; do
-    printf '%02d\t%s\n' "$index" "$state" >>"$STATE_JOURNAL"
+    printf '%02d\t%s\n' "$index" "$state" >&"$STATE_JOURNAL_FD"
     index=$((index + 1))
   done
 }
 
 private_tree_has_mountpoint() {
   local -r mountinfo="$1"
+  local -r private_root="${2:-$PRIVATE_DIRECTORY}"
 
-  [[ -n "$PRIVATE_DIRECTORY" && -f "$mountinfo" && ! -L "$mountinfo" ]] ||
+  [[ "$private_root" == /* && -f "$mountinfo" && ! -L "$mountinfo" ]] ||
     return 0
-  awk -v root="$PRIVATE_DIRECTORY" '
+  awk -v root="$private_root" '
     $5 == root || index($5, root "/") == 1 { found=1 }
     END { exit(found ? 0 : 1) }
   ' "$mountinfo"
 }
 
+private_destroy_checkpoint() {
+  : "$@"
+}
+
 destroy_private_transaction() {
+  local descriptor_root=""
+  local descriptor_identity=""
+  local descriptor_links=""
+  local residue=""
   local removal_status=0
 
   if [[ -z "$PRIVATE_DIRECTORY" ]]; then
-    [[ -z "$PRIVATE_IDENTITY" ]]
+    [[ -z "$PRIVATE_IDENTITY" && -z "$PRIVATE_DIRECTORY_FD" ]]
     return
   fi
-  assert_private_directory_identity || {
+  assert_private_descriptor_identity || {
     STICKY_CLEANUP_FAILURE=true
     return 1
   }
-  if private_tree_has_mountpoint /proc/self/mountinfo; then
+  descriptor_root="$(readlink -f -- "/proc/$BASHPID/fd/$PRIVATE_DIRECTORY_FD")" || {
+    STICKY_CLEANUP_FAILURE=true
+    return 1
+  }
+  [[ "$descriptor_root" == /* && -d "$descriptor_root" &&
+    ! -L "$descriptor_root" &&
+    "$(stat -Lc '%d:%i:%u:%a' -- "$descriptor_root")" == "$PRIVATE_IDENTITY" ]] || {
+    STICKY_CLEANUP_FAILURE=true
+    return 1
+  }
+  if private_tree_has_mountpoint /proc/self/mountinfo "$descriptor_root"; then
     STICKY_CLEANUP_FAILURE=true
     return 1
   fi
-  assert_private_directory_identity || {
+  private_destroy_checkpoint before-delete "$descriptor_root" || {
     STICKY_CLEANUP_FAILURE=true
     return 1
   }
-  rm -rf --one-file-system -- "$PRIVATE_DIRECTORY" || removal_status=$?
-  if (( removal_status != 0 )) ||
-    [[ -e "$PRIVATE_DIRECTORY" || -L "$PRIVATE_DIRECTORY" ]]; then
+  assert_private_descriptor_identity || {
+    STICKY_CLEANUP_FAILURE=true
+    return 1
+  }
+  descriptor_root="$(readlink -f -- "/proc/$BASHPID/fd/$PRIVATE_DIRECTORY_FD")" || {
+    STICKY_CLEANUP_FAILURE=true
+    return 1
+  }
+  descriptor_identity="$(stat -Lc '%d:%i:%u:%a' -- "$descriptor_root")" || {
+    STICKY_CLEANUP_FAILURE=true
+    return 1
+  }
+  [[ "$descriptor_identity" == "$PRIVATE_IDENTITY" ]] || {
+    STICKY_CLEANUP_FAILURE=true
+    return 1
+  }
+  if private_tree_has_mountpoint /proc/self/mountinfo "$descriptor_root"; then
+    STICKY_CLEANUP_FAILURE=true
+    return 1
+  fi
+  find -H "/proc/$BASHPID/fd/$PRIVATE_DIRECTORY_FD" -xdev -depth \
+    -mindepth 1 -delete || removal_status=$?
+  residue="$(find -H "/proc/$BASHPID/fd/$PRIVATE_DIRECTORY_FD" -xdev \
+    -mindepth 1 -print -quit)" || removal_status=$?
+  if (( removal_status != 0 )) || [[ -n "$residue" ]]; then
+    STICKY_CLEANUP_FAILURE=true
+    return 1
+  fi
+  if [[ "$STATE_JOURNAL_FD" =~ ^[0-9]+$ ]]; then
+    exec {STATE_JOURNAL_FD}>&- || removal_status=$?
+    STATE_JOURNAL_FD=""
+  fi
+  assert_private_descriptor_identity || removal_status=1
+  [[ -d "$descriptor_root" && ! -L "$descriptor_root" &&
+    "$(stat -Lc '%d:%i:%u:%a' -- "$descriptor_root")" == "$PRIVATE_IDENTITY" ]] ||
+    removal_status=1
+  if (( removal_status == 0 )); then
+    rmdir -- "$descriptor_root" || removal_status=$?
+  fi
+  descriptor_links="$(stat -Lc '%h' -- "/proc/$BASHPID/fd/$PRIVATE_DIRECTORY_FD")" ||
+    descriptor_links=""
+  [[ "$descriptor_links" == 0 && ! -e "$descriptor_root" &&
+    ! -L "$descriptor_root" && ! -e "$PRIVATE_DIRECTORY" &&
+    ! -L "$PRIVATE_DIRECTORY" ]] || removal_status=1
+  exec {PRIVATE_DIRECTORY_FD}<&- || removal_status=$?
+  PRIVATE_DIRECTORY_FD=""
+  if (( removal_status != 0 )); then
     STICKY_CLEANUP_FAILURE=true
     return 1
   fi
@@ -645,6 +820,7 @@ destroy_private_transaction() {
   COMMAND_DIRECTORY=""
   COMMAND_DIRECTORY_IDENTITY=""
   STATE_JOURNAL=""
+  STATE_JOURNAL_FD=""
   RECEIPT=""
   RECEIPT_IDENTITY=""
   RECEIPT_SHA256=""
@@ -706,6 +882,10 @@ recorded_log_checkpoint() {
   : "$@"
 }
 
+recorded_log_preopen_checkpoint() {
+  : "$@"
+}
+
 sha256_open_fd() {
   local -r descriptor="$1"
   local output=""
@@ -716,6 +896,96 @@ sha256_open_fd() {
   digest="${output%% *}"
   is_sha256 "$digest" || return 1
   printf '%s\n' "$digest"
+}
+
+open_verified_input_fd() {
+  local -r path="$1"
+  local -r expected_mode="$2"
+  local -r expected_identity="$3"
+  local -r expected_digest="$4"
+  local -r output_fd_name="$5"
+  local -r output_identity_name="$6"
+  local opened_input_fd=""
+  local path_identity=""
+  local descriptor_identity=""
+  local post_identity=""
+  local digest=""
+
+  [[ "$path" == /* && -f "$path" && ! -L "$path" &&
+    "$(readlink -f -- "$path")" == "$path" &&
+    "$expected_mode" =~ ^[0-7]{3,4}$ &&
+    "$expected_digest" =~ ^[0-9a-f]{64}$ &&
+    "$output_fd_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+    "$output_identity_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+  path_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- "$path")" || return 1
+  [[ "$path_identity" == *":$EUID:$expected_mode:1:"* ]] || return 1
+  if [[ -n "$expected_identity" ]]; then
+    [[ "$path_identity" == "$expected_identity" ]] || return 1
+  fi
+  exec {opened_input_fd}<"$path" || return $?
+  descriptor_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+    "/proc/$BASHPID/fd/$opened_input_fd")" || descriptor_identity=""
+  if [[ "$descriptor_identity" == "$path_identity" ]]; then
+    digest="$(sha256_open_fd "$opened_input_fd")" || digest=""
+  fi
+  post_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- "$path")" ||
+    post_identity=""
+  if [[ "$descriptor_identity" != "$path_identity" ||
+    "$post_identity" != "$path_identity" || "$digest" != "$expected_digest" ]]; then
+    exec {opened_input_fd}<&-
+    return 1
+  fi
+  printf -v "$output_fd_name" '%s' "$opened_input_fd"
+  printf -v "$output_identity_name" '%s' "$path_identity"
+}
+
+assert_verified_input_fd_unchanged() {
+  local -r path="$1"
+  local -r descriptor="$2"
+  local -r expected_identity="$3"
+  local -r expected_digest="$4"
+  local descriptor_identity=""
+  local path_identity=""
+  local descriptor_digest=""
+
+  [[ "$descriptor" =~ ^[0-9]+$ && "$expected_identity" == *:* &&
+    "$expected_digest" =~ ^[0-9a-f]{64}$ && -f "$path" && ! -L "$path" &&
+    "$(readlink -f -- "$path")" == "$path" ]] || return 1
+  descriptor_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+    "/proc/$BASHPID/fd/$descriptor")" || return 1
+  path_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- "$path")" || return 1
+  descriptor_digest="$(sha256_open_fd "$descriptor")" || return 1
+  [[ "$descriptor_identity" == "$expected_identity" &&
+    "$path_identity" == "$expected_identity" &&
+    "$descriptor_digest" == "$expected_digest" ]]
+}
+
+open_exclusive_output_fd() {
+  local -r directory_fd="$1"
+  local -r leaf="$2"
+  local -r output_name="$3"
+  local opened_fd=""
+  local open_status=0
+  local restore_noclobber=false
+
+  [[ "$directory_fd" =~ ^[0-9]+$ &&
+    "$leaf" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ &&
+    "$output_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+    -d "/proc/$BASHPID/fd/$directory_fd" ]] || return 1
+  if [[ $- != *C* ]]; then
+    set -o noclobber
+    restore_noclobber=true
+  fi
+  if exec {opened_fd}>"/proc/$BASHPID/fd/$directory_fd/$leaf"; then
+    open_status=0
+  else
+    open_status=$?
+  fi
+  if [[ "$restore_noclobber" == true ]]; then
+    set +o noclobber
+  fi
+  (( open_status == 0 )) || return "$open_status"
+  printf -v "$output_name" '%s' "$opened_fd"
 }
 
 run_recorded_command() {
@@ -783,7 +1053,11 @@ run_recorded_command() {
     exec {command_directory_fd}<&-
     return 1
   fi
-  exec {log_fd}>"/proc/$BASHPID/fd/$command_directory_fd/$log_name" || {
+  recorded_log_preopen_checkpoint "$log" "$log_name" || {
+    exec {command_directory_fd}<&-
+    return 1
+  }
+  open_exclusive_output_fd "$command_directory_fd" "$log_name" log_fd || {
     close_status=$?
     exec {command_directory_fd}<&-
     return "$close_status"
@@ -1115,17 +1389,30 @@ assert_result_snapshot_unchanged() {
     "$(readlink -f -- "$snapshot")" == "$snapshot" ]]
 }
 
+result_snapshot_checkpoint() {
+  : "$@"
+}
+
 snapshot_result_names() {
   local -r output="$1"
   local -r results_root="$CHECKOUT_DIRECTORY/examples/apache-java-https/.runtime/results"
   local owner=""
   local mode=""
   local root_identity=""
+  local root_descriptor_identity=""
+  local root_post_identity=""
+  local results_root_fd=""
+  local snapshot_fd=""
+  local snapshot_identity=""
+  local snapshot_path_identity=""
+  local snapshot_status=0
+  local close_status=0
 
   [[ "$output" == "$PRIVATE_DIRECTORY/"* && ! -e "$output" &&
     ! -L "$output" ]] || return 1
-  : >"$output" || return 1
-  chmod 0600 -- "$output" || return 1
+  open_exclusive_output_fd "$PRIVATE_DIRECTORY_FD" "${output##*/}" \
+    snapshot_fd || return 1
+  chmod 0600 -- "/proc/$BASHPID/fd/$snapshot_fd" || return 1
   if [[ ! -e "$results_root" && ! -L "$results_root" ]]; then
     [[ -z "$RESULTS_ROOT_IDENTITY" ]] || return 1
   else
@@ -1142,9 +1429,34 @@ snapshot_result_names() {
     else
       [[ "$root_identity" == "$RESULTS_ROOT_IDENTITY" ]] || return 1
     fi
-    find -- "$results_root" -mindepth 1 -maxdepth 1 \
-      -printf '%f\t%y:%D:%i:%U:%m\n' | LC_ALL=C sort >"$output" || return 1
+    exec {results_root_fd}<"$results_root" || return $?
+    root_descriptor_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+      "/proc/$BASHPID/fd/$results_root_fd")" || snapshot_status=1
+    [[ "$root_descriptor_identity" == "$root_identity" ]] || snapshot_status=1
+    result_snapshot_checkpoint before-find "$results_root" "$results_root_fd" ||
+      snapshot_status=1
+    root_post_identity="$(stat -Lc '%d:%i:%u:%a' -- "$results_root")" ||
+      snapshot_status=1
+    [[ "$root_post_identity" == "$root_identity" ]] || snapshot_status=1
+    find -H "/proc/$BASHPID/fd/$results_root_fd" -mindepth 1 -maxdepth 1 \
+      -printf '%f\t%y:%D:%i:%U:%m\n' | LC_ALL=C sort \
+      >&"$snapshot_fd" || snapshot_status=$?
+    root_descriptor_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+      "/proc/$BASHPID/fd/$results_root_fd")" || snapshot_status=1
+    root_post_identity="$(stat -Lc '%d:%i:%u:%a' -- "$results_root")" ||
+      snapshot_status=1
+    [[ "$root_descriptor_identity" == "$root_identity" &&
+      "$root_post_identity" == "$root_identity" ]] || snapshot_status=1
+    exec {results_root_fd}<&- || close_status=$?
   fi
+  snapshot_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "/proc/$BASHPID/fd/$snapshot_fd")" || snapshot_status=1
+  snapshot_path_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$output")" ||
+    snapshot_status=1
+  exec {snapshot_fd}>&- || close_status=$?
+  (( snapshot_status == 0 && close_status == 0 )) || return 1
+  [[ "$snapshot_identity" == "$snapshot_path_identity" &&
+    "$snapshot_identity" == *":$EUID:600:1" ]] || return 1
   seal_result_snapshot "$output"
 }
 
@@ -1153,6 +1465,10 @@ metric_capture_lock_matches_snapshot() {
   local -r snapshot_identity="$2"
   local -r lock="$results_root/.obi-metric-capture.lock"
   local lock_fd=""
+  local results_root_fd=""
+  local root_identity=""
+  local root_descriptor_identity=""
+  local root_post_identity=""
   local path_identity=""
   local descriptor_identity=""
   local post_identity=""
@@ -1164,10 +1480,21 @@ metric_capture_lock_matches_snapshot() {
     "$(realpath -e -- "$results_root")" == "$results_root" &&
     -f "$lock" && ! -L "$lock" &&
     "$(realpath -e -- "$lock")" == "$lock" ]] || return 1
+  root_identity="$(stat -Lc '%d:%i:%u:%a' -- "$results_root")" || return 1
+  [[ -n "$RESULTS_ROOT_IDENTITY" &&
+    "$root_identity" == "$RESULTS_ROOT_IDENTITY" ]] || return 1
+  exec {results_root_fd}<"$results_root" || return $?
+  root_descriptor_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "/proc/$BASHPID/fd/$results_root_fd")" || root_descriptor_identity=""
+  [[ "$root_descriptor_identity" == "$root_identity" ]] || {
+    exec {results_root_fd}<&-
+    return 1
+  }
   path_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$lock")" || return 1
   [[ "${path_identity%:*}" == "$snapshot_identity" &&
     "$path_identity" == *":$EUID:600:1" ]] || return 1
-  exec {lock_fd}<"$lock" || return $?
+  exec {lock_fd}<"/proc/$BASHPID/fd/$results_root_fd/.obi-metric-capture.lock" ||
+    return $?
   descriptor_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
     "/proc/$BASHPID/fd/$lock_fd")" || descriptor_identity=""
   if [[ "$descriptor_identity" == "$path_identity" ]] &&
@@ -1177,10 +1504,17 @@ metric_capture_lock_matches_snapshot() {
   fi
   post_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$lock")" ||
     post_identity=""
+  root_descriptor_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "/proc/$BASHPID/fd/$results_root_fd")" || root_descriptor_identity=""
+  root_post_identity="$(stat -Lc '%d:%i:%u:%a' -- "$results_root")" ||
+    root_post_identity=""
   exec {lock_fd}<&- || return $?
+  exec {results_root_fd}<&- || return $?
   [[ "$lock_acquired" == true && "$unlock_status" == 0 &&
     -f "$lock" && ! -L "$lock" &&
     "$(realpath -e -- "$lock")" == "$lock" &&
+    "$root_descriptor_identity" == "$root_identity" &&
+    "$root_post_identity" == "$root_identity" &&
     "$path_identity" == "$descriptor_identity" &&
     "$path_identity" == "$post_identity" ]]
 }
@@ -1340,6 +1674,11 @@ resolve_new_result() {
   local identity=""
   local result=""
   local result_identity=""
+  local additions_fd=""
+  local removals_fd=""
+  local additions_identity=""
+  local removals_identity=""
+  local close_status=0
   local stable_lock_seen=false
   local added_lock_seen=false
   local result_seen=false
@@ -1350,10 +1689,30 @@ resolve_new_result() {
   snapshot_result_names "$after" || return 1
   assert_result_snapshot_unchanged "$before" || return 1
   assert_result_snapshot_unchanged "$after" || return 1
-  LC_ALL=C comm -13 -- "$before" "$after" >"$additions" || return 1
-  LC_ALL=C comm -23 -- "$before" "$after" >"$removals" || return 1
+  open_exclusive_output_fd "$PRIVATE_DIRECTORY_FD" "${additions##*/}" \
+    additions_fd || return 1
+  open_exclusive_output_fd "$PRIVATE_DIRECTORY_FD" "${removals##*/}" \
+    removals_fd || return 1
+  LC_ALL=C comm -13 -- "$before" "$after" >&"$additions_fd" || return 1
+  LC_ALL=C comm -23 -- "$before" "$after" >&"$removals_fd" || return 1
+  additions_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "/proc/$BASHPID/fd/$additions_fd")" || return 1
+  removals_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "/proc/$BASHPID/fd/$removals_fd")" || return 1
+  [[ "$additions_identity" == "$(stat -Lc '%d:%i:%u:%a:%h' -- \
+      "$additions")" && "$additions_identity" == *":$EUID:600:1" &&
+    "$removals_identity" == "$(stat -Lc '%d:%i:%u:%a:%h' -- \
+      "$removals")" && "$removals_identity" == *":$EUID:600:1" ]] ||
+    return 1
+  exec {additions_fd}>&- || close_status=$?
+  exec {removals_fd}>&- || close_status=$?
+  (( close_status == 0 )) || return 1
+  seal_result_snapshot "$additions" || return 1
+  seal_result_snapshot "$removals" || return 1
   assert_result_snapshot_unchanged "$before" || return 1
   assert_result_snapshot_unchanged "$after" || return 1
+  assert_result_snapshot_unchanged "$additions" || return 1
+  assert_result_snapshot_unchanged "$removals" || return 1
   [[ ! -s "$removals" ]] || return 1
   while IFS=$'\t' read -r name metadata; do
     [[ -n "$name" && -n "$metadata" ]] || return 1
@@ -1404,6 +1763,8 @@ resolve_new_result() {
   [[ -n "$RESULT_LOCK_IDENTITY" ]] || return 1
   assert_result_snapshot_unchanged "$before" || return 1
   assert_result_snapshot_unchanged "$after" || return 1
+  assert_result_snapshot_unchanged "$additions" || return 1
+  assert_result_snapshot_unchanged "$removals" || return 1
   printf -v "$output_name" '%s' "$result"
   printf -v "$output_identity_name" '%s' "$result_identity"
 }
@@ -1427,13 +1788,20 @@ assert_source_authority_unchanged() {
   [[ "$head" == "$SOURCE_REVISION" && -z "$status" ]]
 }
 
+receipt_preopen_checkpoint() {
+  : "$@"
+}
+
 seal_receipt() {
   local commands_json=""
   local candidate=""
   local candidate_identity=""
+  local candidate_descriptor_identity=""
+  local candidate_fd=""
   local source_tree=""
   local assertion_tree=""
   local receipt_size=""
+  local close_status=0
 
   (( COMMAND_COUNT == ${#RECEIPT_COMMAND_IDS[@]} )) || return 1
   (( ${#COMMAND_ROWS_MEMORY[@]} == ${#RECEIPT_COMMAND_IDS[@]} )) || return 1
@@ -1446,11 +1814,20 @@ seal_receipt() {
   [[ "$source_tree" == "$assertion_tree" ]] || return 1
   is_sha256 "$source_tree" || return 1
   SOURCE_TREE_SHA256="$source_tree"
-  candidate="$(mktemp "$PRIVATE_DIRECTORY/.runbook-receipt.XXXXXX")" ||
+  RECEIPT="$PRIVATE_DIRECTORY/runbook-receipt.json"
+  candidate="$RECEIPT"
+  [[ ! -e "$candidate" && ! -L "$candidate" ]] || return 1
+  receipt_preopen_checkpoint "$candidate" || return 1
+  open_exclusive_output_fd "$PRIVATE_DIRECTORY_FD" "${candidate##*/}" \
+    candidate_fd || return 1
+  candidate_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "/proc/$BASHPID/fd/$candidate_fd")" || return 1
+  candidate_descriptor_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "/proc/$BASHPID/fd/$candidate_fd")" || return 1
+  [[ "$candidate_descriptor_identity" == "$candidate_identity" &&
+    "$candidate_identity" == *":$EUID:600:1" &&
+    "$(stat -Lc '%d:%i:%u:%a:%h' -- "$candidate")" == "$candidate_identity" ]] ||
     return 1
-  candidate_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$candidate")" ||
-    return 1
-  [[ "$candidate_identity" == *":$EUID:600:1" ]] || return 1
   jq -cS -n \
     --arg schema "$RECEIPT_SCHEMA" \
     --arg source_revision "$SOURCE_REVISION" \
@@ -1501,18 +1878,27 @@ seal_receipt() {
       schema: $schema,
       source_revision: $source_revision,
       source_tree_sha256: $source_tree_sha256
-    }' >"$candidate" || return 1
-  receipt_size="$(stat -Lc '%s' -- "$candidate")" || return 1
+    }' >&"$candidate_fd" || return 1
+  candidate_descriptor_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "/proc/$BASHPID/fd/$candidate_fd")" || return 1
+  [[ "$candidate_descriptor_identity" == "$candidate_identity" &&
+    "$(stat -Lc '%d:%i:%u:%a:%h' -- "$candidate")" == "$candidate_identity" ]] ||
+    return 1
+  receipt_size="$(stat -Lc '%s' -- "/proc/$BASHPID/fd/$candidate_fd")" ||
+    return 1
   [[ "$receipt_size" =~ ^[0-9]+$ ]] || return 1
   (( receipt_size <= MAX_RECEIPT_BYTES )) || return 1
   validate_receipt "$candidate" || return 1
-  RECEIPT="$PRIVATE_DIRECTORY/runbook-receipt.json"
-  [[ ! -e "$RECEIPT" && ! -L "$RECEIPT" ]] || return 1
-  mv -T -- "$candidate" "$RECEIPT" || return 1
   RECEIPT_IDENTITY="$(stat -Lc '%d:%i:%u:%a:%h' -- "$RECEIPT")" ||
     return 1
-  [[ "$RECEIPT_IDENTITY" == *":$EUID:600:1" ]] || return 1
-  RECEIPT_SHA256="$(sha256_file "$RECEIPT")" || return 1
+  candidate_descriptor_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "/proc/$BASHPID/fd/$candidate_fd")" || return 1
+  [[ "$RECEIPT_IDENTITY" == "$candidate_identity" &&
+    "$candidate_descriptor_identity" == "$candidate_identity" ]] || return 1
+  RECEIPT_SHA256="$(sha256_open_fd "$candidate_fd")" || return 1
+  [[ "$(sha256_file "$RECEIPT")" == "$RECEIPT_SHA256" ]] || return 1
+  exec {candidate_fd}>&- || close_status=$?
+  (( close_status == 0 ))
 }
 
 validate_receipt() {
@@ -1602,10 +1988,29 @@ projector_execute() {
     "${PROJECT_TIMEOUT_SECONDS}s" "$@"
 }
 
+projection_blob_sha256() {
+  local -r relative="$1"
+
+  sha256_git_blob "$CHECKOUT_DIRECTORY" "$SOURCE_REVISION" "$relative"
+}
+
+public_closure_checkpoint() {
+  : "$@"
+}
+
 project_claims() {
-  local -r projector="$CHECKOUT_DIRECTORY/examples/apache-java-https/scripts/project-retained-acceptance-evidence.sh"
+  local -r projector_relative='examples/apache-java-https/scripts/project-retained-acceptance-evidence.sh'
+  local -r projector="$CHECKOUT_DIRECTORY/$projector_relative"
   local projector_log="$PRIVATE_DIRECTORY/projector.log"
+  local projector_log_fd=""
+  local projector_log_identity=""
+  local projector_log_path_identity=""
+  local projector_fd=""
+  local projector_identity=""
+  local projector_digest=""
+  local close_status=0
   local projector_status=0
+  local validation_status=0
 
   assert_output_target || return 1
   assert_private_directory_identity || return 1
@@ -1616,61 +2021,235 @@ project_claims() {
     return 1
   assert_receipt_unchanged || return 1
   assert_projection_execution_authority || return 1
+  projector_digest="$(projection_blob_sha256 "$projector_relative")" ||
+    return 1
+  open_verified_input_fd "$projector" 755 '' "$projector_digest" \
+    projector_fd projector_identity || return 1
+  open_exclusive_output_fd "$PRIVATE_DIRECTORY_FD" projector.log \
+    projector_log_fd || return 1
+  projector_log_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "/proc/$BASHPID/fd/$projector_log_fd")" || return 1
+  projector_log_path_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "$projector_log")" || return 1
+  [[ "$projector_log_identity" == "$projector_log_path_identity" &&
+    "$projector_log_identity" == *":$EUID:600:1" ]] || return 1
+  assert_verified_input_fd_unchanged "$projector" "$projector_fd" \
+    "$projector_identity" "$projector_digest" || return 1
   if projector_execute "$projector" "$RAW_ACCEPTANCE" \
       "$RAW_ASSERTION" "$RECEIPT" "$OUTPUT_DIRECTORY" \
-      >"$projector_log" 2>&1; then
+      >&"$projector_log_fd" 2>&1; then
     projector_status=0
   else
     projector_status=$?
   fi
-  chmod 0400 -- "$projector_log" 2>/dev/null || projector_status=1
-  (( projector_status == 0 )) || {
+  assert_verified_input_fd_unchanged "$projector" "$projector_fd" \
+    "$projector_identity" "$projector_digest" || validation_status=1
+  chmod 0400 -- "/proc/$BASHPID/fd/$projector_log_fd" 2>/dev/null ||
+    validation_status=1
+  assert_projection_execution_authority || validation_status=1
+  assert_receipt_unchanged || validation_status=1
+  assert_output_parent_unchanged || validation_status=1
+  exec {projector_log_fd}>&- || close_status=$?
+  exec {projector_fd}<&- || close_status=$?
+  (( close_status == 0 )) || validation_status=1
+  (( projector_status == 0 && validation_status == 0 )) || {
     die "bounded-claim projection failed"
     return 1
   }
-  assert_projection_execution_authority || return 1
-  assert_receipt_unchanged
 }
 
 assert_public_closure() {
   local expected=""
   local observed=""
   local file=""
+  local anchored_file=""
+  local path_identity=""
+  local descriptor_identity=""
+  local post_identity=""
+  local digest=""
+  local closure_digest=""
+  local directory_identity=""
+  local directory_descriptor_identity=""
+  local directory_post_identity=""
+  local candidate_directory_fd=""
+  local file_fd=""
+  local close_status=0
   local root_device=""
+  local -a closure_rows=()
 
+  assert_output_parent_unchanged || return 1
   [[ -d "$OUTPUT_DIRECTORY" && ! -L "$OUTPUT_DIRECTORY" &&
     "$(CDPATH='' cd -- "$OUTPUT_DIRECTORY" && pwd -P)" == "$OUTPUT_DIRECTORY" &&
     "$(stat -Lc '%u:%a' -- "$OUTPUT_DIRECTORY")" == "$EUID:555" ]] ||
     return 1
+  directory_identity="$(stat -Lc '%d:%i:%u:%a' -- "$OUTPUT_DIRECTORY")" ||
+    return 1
+  if [[ -z "$OUTPUT_DIRECTORY_IDENTITY" ]]; then
+    exec {candidate_directory_fd}<"$OUTPUT_DIRECTORY" || return $?
+    directory_descriptor_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+      "/proc/$BASHPID/fd/$candidate_directory_fd")" || {
+      exec {candidate_directory_fd}<&-
+      return 1
+    }
+    [[ "$directory_descriptor_identity" == "$directory_identity" ]] || {
+      exec {candidate_directory_fd}<&-
+      return 1
+    }
+    OUTPUT_DIRECTORY_IDENTITY="$directory_identity"
+    OUTPUT_DIRECTORY_FD="$candidate_directory_fd"
+  else
+    [[ "$OUTPUT_DIRECTORY_FD" =~ ^[0-9]+$ &&
+      "$directory_identity" == "$OUTPUT_DIRECTORY_IDENTITY" ]] || return 1
+    directory_descriptor_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+      "/proc/$BASHPID/fd/$OUTPUT_DIRECTORY_FD")" || return 1
+    [[ "$directory_descriptor_identity" == "$OUTPUT_DIRECTORY_IDENTITY" ]] ||
+      return 1
+  fi
   expected="$(printf '%s\tf\n' "${PUBLIC_FILES[@]}" | LC_ALL=C sort)" ||
     return 1
-  observed="$(find -- "$OUTPUT_DIRECTORY" -mindepth 1 -maxdepth 1 \
+  observed="$(find -H "/proc/$BASHPID/fd/$OUTPUT_DIRECTORY_FD" \
+    -mindepth 1 -maxdepth 1 \
     -printf '%f\t%y\n' | LC_ALL=C sort)" || return 1
   [[ "$observed" == "$expected" ]] || return 1
-  root_device="$(stat -Lc '%d' -- "$OUTPUT_DIRECTORY")" || return 1
+  root_device="${OUTPUT_DIRECTORY_IDENTITY%%:*}"
   for file in "${PUBLIC_FILES[@]}"; do
+    anchored_file="/proc/$BASHPID/fd/$OUTPUT_DIRECTORY_FD/$file"
     [[ -f "$OUTPUT_DIRECTORY/$file" && ! -L "$OUTPUT_DIRECTORY/$file" &&
-      "$(stat -Lc '%d:%u:%a:%h' -- "$OUTPUT_DIRECTORY/$file")" == "$root_device:$EUID:444:1" ]] || return 1
+      "$(readlink -f -- "$OUTPUT_DIRECTORY/$file")" == \
+        "$OUTPUT_DIRECTORY/$file" ]] || return 1
+    path_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+      "$OUTPUT_DIRECTORY/$file")" || return 1
+    [[ "$path_identity" == "$root_device:"*":$EUID:444:1:"* ]] || return 1
+    exec {file_fd}<"$anchored_file" || return $?
+    descriptor_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+      "/proc/$BASHPID/fd/$file_fd")" || descriptor_identity=""
+    if [[ "$descriptor_identity" == "$path_identity" ]]; then
+      digest="$(sha256_open_fd "$file_fd")" || digest=""
+    else
+      digest=""
+    fi
+    post_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+      "$OUTPUT_DIRECTORY/$file")" || post_identity=""
+    exec {file_fd}<&- || close_status=$?
+    (( close_status == 0 )) || return 1
+    [[ -n "$digest" && "$descriptor_identity" == "$path_identity" &&
+      "$post_identity" == "$path_identity" ]] || return 1
+    if [[ -n "${PUBLIC_FILE_IDENTITY[$file]:-}" ]]; then
+      [[ "${PUBLIC_FILE_IDENTITY[$file]}" == "$path_identity" &&
+        "${PUBLIC_FILE_SHA256[$file]}" == "$digest" ]] || return 1
+    else
+      PUBLIC_FILE_IDENTITY["$file"]="$path_identity"
+      PUBLIC_FILE_SHA256["$file"]="$digest"
+    fi
+    closure_rows+=("$file"$'\t'"$path_identity"$'\t'"$digest")
   done
+  closure_digest="$(printf '%s\n' "${closure_rows[@]}" | sha256sum)" ||
+    return 1
+  closure_digest="${closure_digest%% *}"
+  is_sha256 "$closure_digest" || return 1
+  if [[ -z "$PUBLIC_CLOSURE_SHA256" ]]; then
+    PUBLIC_CLOSURE_SHA256="$closure_digest"
+  else
+    [[ "$closure_digest" == "$PUBLIC_CLOSURE_SHA256" ]] || return 1
+  fi
+  assert_output_parent_unchanged || return 1
+  directory_post_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "$OUTPUT_DIRECTORY")" || return 1
+  directory_descriptor_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "/proc/$BASHPID/fd/$OUTPUT_DIRECTORY_FD")" || return 1
+  [[ "$directory_post_identity" == "$OUTPUT_DIRECTORY_IDENTITY" &&
+    "$directory_descriptor_identity" == "$OUTPUT_DIRECTORY_IDENTITY" ]]
 }
 
 public_reverify() {
   local output=""
   local evidence_id=""
+  local receipt="$OUTPUT_DIRECTORY/derivation-receipt.json"
+  local verifier="$OUTPUT_DIRECTORY/verify.sh"
+  local receipt_fd=""
+  local receipt_identity=""
+  local verifier_fd=""
+  local verifier_identity=""
+  local close_status=0
+  local verifier_status=0
+  local validation_status=0
 
   assert_public_closure || return 1
+  open_verified_input_fd "$receipt" 444 \
+    "${PUBLIC_FILE_IDENTITY[derivation-receipt.json]}" \
+    "${PUBLIC_FILE_SHA256[derivation-receipt.json]}" receipt_fd \
+    receipt_identity || return 1
   evidence_id="$(jq -er '.evidence_id' \
-    "$OUTPUT_DIRECTORY/derivation-receipt.json")" || return 1
+    "/proc/$BASHPID/fd/$receipt_fd")" || validation_status=1
+  assert_verified_input_fd_unchanged "$receipt" "$receipt_fd" \
+    "$receipt_identity" "${PUBLIC_FILE_SHA256[derivation-receipt.json]}" ||
+    validation_status=1
+  exec {receipt_fd}<&- || close_status=$?
+  (( close_status == 0 && validation_status == 0 )) || return 1
   is_sha256 "$evidence_id" || return 1
-  output="$(CDPATH='' cd / && timeout --foreground --signal=TERM \
-    --kill-after="${PUBLIC_VERIFY_KILL_AFTER_SECONDS}s" \
-    "${PUBLIC_VERIFY_TIMEOUT_SECONDS}s" \
-    bash "$OUTPUT_DIRECTORY/verify.sh")" || return 1
-  [[ "$output" == "$PUBLIC_VERIFY_SUCCESS_PREFIX$evidence_id" ]]
+  open_verified_input_fd "$verifier" 444 "${PUBLIC_FILE_IDENTITY[verify.sh]}" \
+    "${PUBLIC_FILE_SHA256[verify.sh]}" verifier_fd verifier_identity || return 1
+  assert_verified_input_fd_unchanged "$verifier" "$verifier_fd" \
+    "$verifier_identity" "${PUBLIC_FILE_SHA256[verify.sh]}" || return 1
+  if output="$(CDPATH='' cd / && timeout --foreground --signal=TERM \
+      --kill-after="${PUBLIC_VERIFY_KILL_AFTER_SECONDS}s" \
+      "${PUBLIC_VERIFY_TIMEOUT_SECONDS}s" bash "$verifier")"; then
+    verifier_status=0
+  else
+    verifier_status=$?
+  fi
+  assert_verified_input_fd_unchanged "$verifier" "$verifier_fd" \
+    "$verifier_identity" "${PUBLIC_FILE_SHA256[verify.sh]}" || validation_status=1
+  exec {verifier_fd}<&- || close_status=$?
+  (( close_status == 0 )) || validation_status=1
+  assert_public_closure || validation_status=1
+  (( verifier_status == 0 && validation_status == 0 )) || return 1
+  [[ "$output" == "$PUBLIC_VERIFY_SUCCESS_PREFIX$evidence_id" ]] || return 1
+  if [[ -z "$PUBLIC_EVIDENCE_ID" ]]; then
+    PUBLIC_EVIDENCE_ID="$evidence_id"
+  else
+    [[ "$PUBLIC_EVIDENCE_ID" == "$evidence_id" ]]
+  fi
+}
+
+publish_workflow_handoff() {
+  local descriptor_identity=""
+  local path_identity=""
+  local close_status=0
+
+  [[ "$OUTPUT_PARENT_IDENTITY" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-7]{3,4}$ &&
+    "$OUTPUT_DIRECTORY_IDENTITY" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-7]{3,4}$ ]] ||
+    return 1
+  is_sha256 "$PUBLIC_CLOSURE_SHA256" || return 1
+  is_sha256 "$PUBLIC_EVIDENCE_ID" || return 1
+  assert_public_closure || return 1
+  open_workflow_output_channel || return 1
+  descriptor_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "/proc/$BASHPID/fd/$WORKFLOW_OUTPUT_FD")" || return 1
+  path_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$GITHUB_OUTPUT")" ||
+    return 1
+  [[ "$descriptor_identity" == "$WORKFLOW_OUTPUT_IDENTITY" &&
+    "$path_identity" == "$WORKFLOW_OUTPUT_IDENTITY" ]] || return 1
+  printf '%s\n' \
+    "public_parent_identity=$OUTPUT_PARENT_IDENTITY" \
+    "public_directory_identity=$OUTPUT_DIRECTORY_IDENTITY" \
+    "public_closure_sha256=$PUBLIC_CLOSURE_SHA256" \
+    "public_evidence_id=$PUBLIC_EVIDENCE_ID" >&"$WORKFLOW_OUTPUT_FD" ||
+    return 1
+  descriptor_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "/proc/$BASHPID/fd/$WORKFLOW_OUTPUT_FD")" || return 1
+  path_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$GITHUB_OUTPUT")" ||
+    return 1
+  [[ "$descriptor_identity" == "$WORKFLOW_OUTPUT_IDENTITY" &&
+    "$path_identity" == "$WORKFLOW_OUTPUT_IDENTITY" ]] || return 1
+  exec {WORKFLOW_OUTPUT_FD}>&- || close_status=$?
+  WORKFLOW_OUTPUT_FD=""
+  (( close_status == 0 ))
 }
 
 emergency_scoped_cleanup() {
-  local emergency_log=""
+  local emergency_log_fd=""
+  local close_status=0
   local cleanup_status=0
 
   [[ "$CLEANUP_REQUIRED" == true ]] || return 0
@@ -1678,17 +2257,28 @@ emergency_scoped_cleanup() {
     STICKY_CLEANUP_FAILURE=true
     return 1
   fi
-  emergency_log="$PRIVATE_DIRECTORY/emergency-scoped-cleanup.log"
+  assert_private_directory_identity || {
+    STICKY_CLEANUP_FAILURE=true
+    return 1
+  }
+  open_exclusive_output_fd "$PRIVATE_DIRECTORY_FD" emergency-scoped-cleanup.log \
+    emergency_log_fd || {
+    STICKY_CLEANUP_FAILURE=true
+    return 1
+  }
   if (
     CDPATH='' cd -- "$CHECKOUT_DIRECTORY"
     campaign_execute emergency-scoped-cleanup \
       ./examples/apache-java-https/run.sh --cleanup-only
-  ) >"$emergency_log" 2>&1; then
+  ) >&"$emergency_log_fd" 2>&1; then
     cleanup_status=0
   else
     cleanup_status=$?
   fi
-  chmod 0400 -- "$emergency_log" 2>/dev/null || cleanup_status=1
+  chmod 0400 -- "/proc/$BASHPID/fd/$emergency_log_fd" 2>/dev/null ||
+    cleanup_status=1
+  exec {emergency_log_fd}>&- || close_status=$?
+  (( close_status == 0 )) || cleanup_status=1
   if (( cleanup_status != 0 )); then
     STICKY_CLEANUP_FAILURE=true
     return 1
@@ -1706,6 +2296,26 @@ cleanup_on_exit() {
   set +e
   emergency_scoped_cleanup || cleanup_status=1
   destroy_private_transaction || cleanup_status=1
+  if [[ "$STATE_JOURNAL_FD" =~ ^[0-9]+$ ]]; then
+    exec {STATE_JOURNAL_FD}>&- || cleanup_status=1
+    STATE_JOURNAL_FD=""
+  fi
+  if [[ "$PRIVATE_DIRECTORY_FD" =~ ^[0-9]+$ ]]; then
+    exec {PRIVATE_DIRECTORY_FD}<&- || cleanup_status=1
+    PRIVATE_DIRECTORY_FD=""
+  fi
+  if [[ "$OUTPUT_DIRECTORY_FD" =~ ^[0-9]+$ ]]; then
+    exec {OUTPUT_DIRECTORY_FD}<&- || cleanup_status=1
+    OUTPUT_DIRECTORY_FD=""
+  fi
+  if [[ "$OUTPUT_PARENT_FD" =~ ^[0-9]+$ ]]; then
+    exec {OUTPUT_PARENT_FD}<&- || cleanup_status=1
+    OUTPUT_PARENT_FD=""
+  fi
+  if [[ "$WORKFLOW_OUTPUT_FD" =~ ^[0-9]+$ ]]; then
+    exec {WORKFLOW_OUTPUT_FD}>&- || cleanup_status=1
+    WORKFLOW_OUTPUT_FD=""
+  fi
   if [[ -n "$PRIMARY_FAILURE" ]]; then
     log_info "failure context: $PRIMARY_FAILURE"
   fi
@@ -1830,12 +2440,14 @@ run_campaign() {
   enter_state PROJECT
   project_claims
   assert_public_closure
+  public_closure_checkpoint after-project-closure
 
   enter_state PRIVATE_DESTROY
   destroy_private_transaction
 
   enter_state PUBLIC_REVERIFY
   public_reverify
+  publish_workflow_handoff
 
   enter_state SUCCESS
   [[ "$CURRENT_STATE_INDEX" == $((${#CAMPAIGN_STATES[@]} - 1)) &&

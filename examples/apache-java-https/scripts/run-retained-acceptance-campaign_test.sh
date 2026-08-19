@@ -4,7 +4,7 @@
 
 # This test intentionally sources the runner, replaces dependency seams, and
 # exercises the resulting functions from subshells.
-# shellcheck disable=SC1090,SC1091,SC2016,SC2034,SC2153,SC2317,SC2329
+# shellcheck disable=SC1090,SC1091,SC2016,SC2030,SC2031,SC2034,SC2153,SC2317,SC2329
 
 set -Eeuo pipefail
 
@@ -161,6 +161,13 @@ create_public_fixture() {
     '{evidence_id:$evidence_id}' >"$output/derivation-receipt.json"
   {
     printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail' '[[ $# == 0 ]]'
+    printf '%s\n' \
+      'script_source="${BASH_SOURCE[0]}"' \
+      '[[ "$script_source" == /* ]]' \
+      'script_path="$(readlink -f -- "$script_source")"' \
+      '[[ "$script_path" == "$script_source" ]] || exit 91' \
+      'script_directory="$(CDPATH= cd -P -- "$(dirname -- "$script_source")" && pwd -P)"' \
+      '[[ -f "$script_directory/derivation-receipt.json" ]]'
     case "$verify_mutation" in
       public-verify-failure)
         printf '%s\n' 'exit 1'
@@ -194,6 +201,79 @@ create_public_fixture() {
   chmod 0555 -- "$output"
 }
 
+write_location_aware_projector_fixture() {
+  local -r scripts="$1"
+
+  mkdir -p -- "$scripts"
+  {
+    printf '%s\n' \
+      '#!/usr/bin/env bash' \
+      'set -Eeuo pipefail' \
+      'script_source="${BASH_SOURCE[0]}"' \
+      '[[ "$script_source" == /* ]]' \
+      'script_path="$(readlink -f -- "$script_source")"' \
+      '[[ "$script_path" == "$script_source" ]] || exit 91' \
+      'script_directory="$(CDPATH= cd -P -- "$(dirname -- "$script_source")" && pwd -P)"' \
+      '[[ -x "$script_directory/verify-retained-evidence.sh" ]]' \
+      '[[ $# == 4 ]]' \
+      '"$script_directory/verify-retained-evidence.sh" "$4" "$script_source"'
+  } >"$scripts/project-retained-acceptance-evidence.sh"
+  {
+    printf '%s\n' \
+      '#!/usr/bin/env bash' \
+      'set -Eeuo pipefail' \
+      '[[ $# == 2 ]]' \
+      'mkdir -m 0700 -- "$1"' \
+      'printf '\''%s\n'\'' "$2" >"$1/projector-source"'
+  } >"$scripts/verify-retained-evidence.sh"
+  chmod 0755 -- "$scripts/project-retained-acceptance-evidence.sh" \
+    "$scripts/verify-retained-evidence.sh"
+}
+
+compute_public_fixture_closure() {
+  local -r output="$1"
+  local file=""
+  local file_identity=""
+  local file_sha256=""
+  local closure_sha256=""
+  local -a closure_rows=()
+  local -a files=(
+    README.md SANITIZATION.md acceptance-claims.json authority-summary.json
+    derivation-receipt.json verify.sh SHA256SUMS
+  )
+
+  for file in "${files[@]}"; do
+    file_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- "$output/$file")" ||
+      return 1
+    file_sha256="$(sha256sum <"$output/$file")" || return 1
+    file_sha256="${file_sha256%% *}"
+    closure_rows+=("$file"$'\t'"$file_identity"$'\t'"$file_sha256")
+  done
+  closure_sha256="$(printf '%s\n' "${closure_rows[@]}" | sha256sum)" ||
+    return 1
+  printf '%s\n' "${closure_sha256%% *}"
+}
+
+extract_independent_verify_step() {
+  awk '
+    $0 == "      - name: Independently verify the public closure" {
+      found=1
+      next
+    }
+    found && $0 == "        run: |" {
+      body=1
+      next
+    }
+    body && /^      - name: / { exit }
+    body && $0 == "" { print; next }
+    body {
+      if (substr($0, 1, 10) != "          ") exit 42
+      print substr($0, 11)
+    }
+    END { if (!body) exit 43 }
+  ' "$CAMPAIGN_WORKFLOW"
+}
+
 mock_authority_preflight() {
   SOURCE_REVISION="$TEST_REVISION"
   SOURCE_TREE_SHA256="$TEST_TREE_SHA256"
@@ -208,6 +288,8 @@ mock_authority_preflight() {
   GO_VERSION=1.25.11
   JAVA_VERSION=21.0.8
   OPERATING_SYSTEM=Linux
+  GITHUB_OUTPUT="$CASE_ROOT/github-output"
+  install -m 0600 /dev/null "$GITHUB_OUTPUT"
   assert_output_target
 }
 
@@ -309,6 +391,110 @@ mock_assert_projection_execution_authority() {
   assert_checkout_identity
 }
 
+mock_private_destroy_checkpoint() {
+  local -r phase="$1"
+  local marker="$CASE_ROOT/private-destroy-renamed"
+
+  if [[ "$CAMPAIGN_TEST_MUTATION" == private-destroy-rename &&
+    "$phase" == before-delete && ! -e "$marker" && ! -L "$marker" ]]; then
+    mv -- "$PRIVATE_DIRECTORY" "$CASE_ROOT/renamed-private"
+    : >"$marker"
+  fi
+}
+
+mock_public_closure_checkpoint() {
+  local -r phase="$1"
+  local marker="$CASE_ROOT/public-directory-replaced"
+
+  if [[ "$CAMPAIGN_TEST_MUTATION" == output-directory-replacement &&
+    "$phase" == after-project-closure && ! -e "$marker" && ! -L "$marker" ]]; then
+    mv -- "$OUTPUT_DIRECTORY" "$CASE_ROOT/original-public-output"
+    create_public_fixture "$OUTPUT_DIRECTORY" none
+    : >"$marker"
+  fi
+}
+
+mock_result_snapshot_checkpoint() {
+  local -r phase="$1"
+  local -r results_root="$2"
+  local marker="$CASE_ROOT/results-root-pre-find-replaced"
+
+  if [[ "$CAMPAIGN_TEST_MUTATION" == results-root-pre-find-replacement &&
+    "$phase" == before-find && ! -e "$marker" && ! -L "$marker" ]]; then
+    mv -- "$results_root" "$PRIVATE_DIRECTORY/original-results-root"
+    cp -a -- "$PRIVATE_DIRECTORY/original-results-root" "$results_root"
+    : >"$marker"
+  fi
+}
+
+mock_receipt_preopen_checkpoint() {
+  local -r receipt="$1"
+  local sentinel="$CASE_ROOT/receipt-preopen-sentinel"
+
+  case "$CAMPAIGN_TEST_MUTATION" in
+    receipt-preopen-symlink|receipt-preopen-hardlink)
+      printf 'receipt sentinel content\n' >"$sentinel"
+      chmod 0600 -- "$sentinel"
+      if [[ "$CAMPAIGN_TEST_MUTATION" == receipt-preopen-symlink ]]; then
+        ln -s -- "$sentinel" "$receipt"
+      else
+        ln -- "$sentinel" "$receipt"
+      fi
+      ;;
+  esac
+}
+
+mock_assert_exact_command() {
+  local -r command_id="$1"
+  shift
+  local index=0
+  local -a actual=("$@")
+  local -a expected_argv=()
+
+  case "$command_id" in
+    clone)
+      expected_argv=(git clone --no-checkout --no-tags -- "$REPOSITORY_URL"
+        "$CHECKOUT_DIRECTORY")
+      ;;
+    checkout-exact-revision)
+      expected_argv=(git -C "$CHECKOUT_DIRECTORY" checkout --detach
+        "$SOURCE_REVISION")
+      ;;
+    clean-status-before|clean-status-after-validation|clean-status-final)
+      expected_argv=(git status --porcelain)
+      ;;
+    certificate-generation)
+      expected_argv=(./examples/apache-java-https/certs/generate_test.sh)
+      ;;
+    run-test)
+      expected_argv=(./examples/apache-java-https/scripts/run_test.sh)
+      ;;
+    tracecheck-tests)
+      expected_argv=(go test ./examples/apache-java-https/tracecheck/...)
+      ;;
+    compose-config)
+      expected_argv=(docker compose --project-name obi-apache-java-https --file
+        examples/apache-java-https/docker-compose.yml config --quiet)
+      ;;
+    acceptance-all-otel-getsockopt-tls13)
+      expected_argv=(./examples/apache-java-https/run.sh --transport getsockopt
+        --agent otel --tls TLSv1.3)
+      ;;
+    assertion-failure-exit-2)
+      expected_argv=(./examples/apache-java-https/run.sh --transport getsockopt
+        --scenario assertion-failure)
+      ;;
+    scoped-cleanup|emergency-scoped-cleanup)
+      expected_argv=(./examples/apache-java-https/run.sh --cleanup-only)
+      ;;
+    *) return 1 ;;
+  esac
+  (( ${#actual[@]} == ${#expected_argv[@]} )) || return 1
+  for ((index = 0; index < ${#expected_argv[@]}; index += 1)); do
+    [[ "${actual[$index]}" == "${expected_argv[$index]}" ]] || return 1
+  done
+}
+
 mock_campaign_execute() {
   local -r command_id="$1"
   shift
@@ -317,6 +503,7 @@ mock_campaign_execute() {
   local replacement=""
   local holder_pid=""
 
+  mock_assert_exact_command "$command_id" "$@" || return 96
   case "$command_id" in
     clone)
       mkdir -m 0700 -- "$CHECKOUT_DIRECTORY"
@@ -494,7 +681,8 @@ mock_projector_execute() {
   local mutant=""
   local receipt_mutation=""
 
-  [[ "$projector" == \
+  [[ -f "$projector" &&
+    "$(readlink -f -- "$projector")" == \
       "$CHECKOUT_DIRECTORY/examples/apache-java-https/scripts/project-retained-acceptance-evidence.sh" &&
     "$acceptance" == "$RAW_ACCEPTANCE" &&
     "$assertion_result" == "$RAW_ASSERTION" &&
@@ -557,6 +745,12 @@ mock_projector_execute() {
     chmod 0444 -- "$output/raw-evidence.json"
     chmod 0555 -- "$output"
   fi
+  if [[ "$CAMPAIGN_TEST_MUTATION" == output-parent-replacement ]]; then
+    mv -- "$OUTPUT_PARENT" "$CASE_ROOT/original-public-parent"
+    mkdir -m 0700 -- "$OUTPUT_PARENT"
+    create_public_fixture "$OUTPUT_DIRECTORY" none
+    : >"$CASE_ROOT/public-parent-replaced"
+  fi
 }
 
 run_mock_campaign_case() {
@@ -591,7 +785,14 @@ run_mock_campaign_case() {
     assert_projection_execution_authority() {
       mock_assert_projection_execution_authority
     }
+    projection_blob_sha256() {
+      printf '%s\n' '#!/usr/bin/env bash' 'exit 0' | sha256sum | awk '{print $1}'
+    }
     projector_execute() { mock_projector_execute "$@"; }
+    private_destroy_checkpoint() { mock_private_destroy_checkpoint "$@"; }
+    public_closure_checkpoint() { mock_public_closure_checkpoint "$@"; }
+    result_snapshot_checkpoint() { mock_result_snapshot_checkpoint "$@"; }
+    receipt_preopen_checkpoint() { mock_receipt_preopen_checkpoint "$@"; }
     campaign_entry "$output"
   ) >"$stdout_log" 2>"$stderr_log"
   status=$?
@@ -624,6 +825,55 @@ assert_success_state_machine() {
     PRIVATE_DESTROY PUBLIC_REVERIFY SUCCESS)"
   observed="$(awk '$2 == "STATE" { print $3 }' "$stderr_log")"
   [[ "$observed" == "$expected" ]] || die 'success state sequence is not exact'
+}
+
+assert_success_handoff() {
+  local -r case_root="$1"
+  local output_parent="$case_root/public-parent"
+  local output="$output_parent/test-claims"
+  local handoff="$case_root/github-output"
+  local parent_identity=""
+  local directory_identity=""
+  local closure_sha256=""
+  local evidence_id=""
+  local key=""
+  local value=""
+  local file=""
+  local file_identity=""
+  local file_sha256=""
+  local computed_closure=""
+  local -a closure_rows=()
+  local -a files=(
+    README.md SANITIZATION.md acceptance-claims.json authority-summary.json
+    derivation-receipt.json verify.sh SHA256SUMS
+  )
+
+  [[ -f "$handoff" && ! -L "$handoff" &&
+    "$(wc -l <"$handoff")" == 4 ]] || die 'workflow handoff is not exact'
+  while IFS='=' read -r key value; do
+    case "$key" in
+      public_parent_identity) parent_identity="$value" ;;
+      public_directory_identity) directory_identity="$value" ;;
+      public_closure_sha256) closure_sha256="$value" ;;
+      public_evidence_id) evidence_id="$value" ;;
+      *) die "unexpected workflow handoff key: $key" ;;
+    esac
+  done <"$handoff"
+  [[ "$parent_identity" == "$(stat -Lc '%d:%i:%u:%a' -- "$output_parent")" &&
+    "$directory_identity" == "$(stat -Lc '%d:%i:%u:%a' -- "$output")" &&
+    "$closure_sha256" =~ ^[0-9a-f]{64}$ &&
+    "$evidence_id" == "$TEST_EVIDENCE_ID" ]] ||
+    die 'workflow handoff identity is not bound to the public closure'
+  for file in "${files[@]}"; do
+    file_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- "$output/$file")"
+    file_sha256="$(sha256sum <"$output/$file")"
+    file_sha256="${file_sha256%% *}"
+    closure_rows+=("$file"$'\t'"$file_identity"$'\t'"$file_sha256")
+  done
+  computed_closure="$(printf '%s\n' "${closure_rows[@]}" | sha256sum)"
+  computed_closure="${computed_closure%% *}"
+  [[ "$computed_closure" == "$closure_sha256" ]] ||
+    die 'workflow handoff closure digest does not match exact public bytes'
 }
 
 assert_observed_receipt() {
@@ -688,6 +938,7 @@ assert_observed_receipt() {
 test_success_and_failure_campaigns() {
   local success_root=""
   local stable_lock_root=""
+  local private_rename_root=""
   local row_forgery_root=""
   local hardlink_root=""
   local case_root=""
@@ -696,6 +947,8 @@ test_success_and_failure_campaigns() {
     wrong-result-mode wrong-lock-mode lock-hardlink lock-symlink
     unrelated-addition held-lock lock-replacement lock-removal
     root-replacement root-disappearance acceptance-result-replacement
+    results-root-pre-find-replacement
+    receipt-preopen-symlink receipt-preopen-hardlink
     before-snapshot-rewrite before-snapshot-replacement before-snapshot-mode
     cleanup-run-sh-bytes cleanup-run-sh-symlink
     cleanup-checkout-root-replacement
@@ -703,10 +956,12 @@ test_success_and_failure_campaigns() {
     projector-failure public-extra-file public-verify-failure
     public-verify-missing public-verify-wrong public-verify-nonhex
     public-verify-extra-line public-verify-suffix public-evidence-id-nonhex
+    output-parent-replacement output-directory-replacement
   )
 
   success_root="$(run_mock_campaign_case success none success)"
   assert_success_state_machine "$success_root/stderr.log"
+  assert_success_handoff "$success_root"
   assert_observed_receipt "$success_root/observed-receipt.json"
   [[ -d "$success_root/public-parent/test-claims" &&
     "$(find -- "$success_root/public-parent/test-claims" -mindepth 1 \
@@ -719,6 +974,15 @@ test_success_and_failure_campaigns() {
   stable_lock_root="$(run_mock_campaign_case stable-preexisting-lock \
     stable-preexisting-lock success)"
   assert_success_state_machine "$stable_lock_root/stderr.log"
+  assert_success_handoff "$stable_lock_root"
+  private_rename_root="$(run_mock_campaign_case private-destroy-rename \
+    private-destroy-rename success)"
+  assert_success_state_machine "$private_rename_root/stderr.log"
+  assert_success_handoff "$private_rename_root"
+  [[ -f "$private_rename_root/private-destroy-renamed" &&
+    ! -e "$private_rename_root/renamed-private" &&
+    ! -L "$private_rename_root/renamed-private" ]] ||
+    die 'pinned private destruction did not remove the renamed transaction inode'
   row_forgery_root="$(run_mock_campaign_case command-row-forgery \
     command-row-forgery success)"
   jq -e --arg empty_sha \
@@ -752,6 +1016,19 @@ test_success_and_failure_campaigns() {
           ! -e "$case_root/public-parent/test-claims" ]] ||
           die "$mutation executed mutable projection authority or published"
         ;;
+      output-parent-replacement|output-directory-replacement)
+        [[ -f "$case_root/github-output" &&
+          ! -s "$case_root/github-output" ]] ||
+          die "$mutation produced an upload-authority handoff"
+        ;;
+      receipt-preopen-symlink|receipt-preopen-hardlink)
+        [[ -f "$case_root/receipt-preopen-sentinel" &&
+          ! -L "$case_root/receipt-preopen-sentinel" &&
+          "$(<"$case_root/receipt-preopen-sentinel")" == 'receipt sentinel content' &&
+          "$(stat -Lc '%u:%a:%h' -- \
+            "$case_root/receipt-preopen-sentinel")" == "$EUID:600:1" ]] ||
+          die "$mutation modified the preexisting receipt target"
+        ;;
     esac
   done
 }
@@ -772,6 +1049,7 @@ test_lock_validation_and_fd_closure() {
   (
     # shellcheck source=run-retained-acceptance-campaign.sh
     source "$CAMPAIGN_RUNNER"
+    RESULTS_ROOT_IDENTITY="$(stat -Lc '%d:%i:%u:%a' -- "$root")"
     before_count="$(find "/proc/$BASHPID/fd" -mindepth 1 -maxdepth 1 | wc -l)"
     for ((iteration = 0; iteration < 20; iteration += 1)); do
       metric_capture_lock_matches_snapshot "$root" "$identity"
@@ -922,6 +1200,7 @@ test_recorded_command_timeout_classification() {
     TRANSACTION_PARENT="$root"
     PRIVATE_DIRECTORY="$private"
     PRIVATE_IDENTITY="$(stat -Lc '%d:%i:%u:%a' -- "$PRIVATE_DIRECTORY")"
+    exec {PRIVATE_DIRECTORY_FD}<"$PRIVATE_DIRECTORY"
     COMMAND_DIRECTORY="$PRIVATE_DIRECTORY/commands"
     COMMAND_DIRECTORY_IDENTITY="$(stat -Lc '%d:%i:%u:%a' -- \
       "$COMMAND_DIRECTORY")"
@@ -941,6 +1220,7 @@ test_recorded_command_timeout_classification() {
   ) 2>"$stderr_log"; then
     :
   else
+    tail -80 -- "$stderr_log" >&2
     die 'recorded timeout classification harness failed'
   fi
   grep -Fq 'command clone exceeded its 1s deadline' "$stderr_log" ||
@@ -965,6 +1245,7 @@ test_recorded_log_identity_and_fd_closure() {
         '%s/obi-java-remote-parent-acceptance.A%05d' "$root" "$iteration"
       mkdir -m 0700 -- "$PRIVATE_DIRECTORY" "$PRIVATE_DIRECTORY/commands"
       PRIVATE_IDENTITY="$(stat -Lc '%d:%i:%u:%a' -- "$PRIVATE_DIRECTORY")"
+      exec {PRIVATE_DIRECTORY_FD}<"$PRIVATE_DIRECTORY"
       COMMAND_DIRECTORY="$PRIVATE_DIRECTORY/commands"
       COMMAND_DIRECTORY_IDENTITY="$(stat -Lc '%d:%i:%u:%a' -- \
         "$COMMAND_DIRECTORY")"
@@ -974,6 +1255,8 @@ test_recorded_log_identity_and_fd_closure() {
       run_recorded_command clone 0 "$PRIVATE_DIRECTORY" \
         bash -c 'printf "recorded-output-%s\\n" "$1"' _ "$iteration" \
         >/dev/null 2>&1
+      exec {PRIVATE_DIRECTORY_FD}<&-
+      PRIVATE_DIRECTORY_FD=""
     done
     after_count="$(find "/proc/$BASHPID/fd" -mindepth 1 -maxdepth 1 | wc -l)"
     [[ "$before_count" == "$after_count" ]]
@@ -998,6 +1281,7 @@ test_recorded_log_identity_and_fd_closure() {
       TRANSACTION_PARENT="$mutation_root"
       PRIVATE_DIRECTORY="$private"
       PRIVATE_IDENTITY="$(stat -Lc '%d:%i:%u:%a' -- "$PRIVATE_DIRECTORY")"
+      exec {PRIVATE_DIRECTORY_FD}<"$PRIVATE_DIRECTORY"
       COMMAND_DIRECTORY="$PRIVATE_DIRECTORY/commands"
       COMMAND_DIRECTORY_IDENTITY="$(stat -Lc '%d:%i:%u:%a' -- \
         "$COMMAND_DIRECTORY")"
@@ -1053,6 +1337,59 @@ test_recorded_log_identity_and_fd_closure() {
   done
 }
 
+test_recorded_log_preopen_leaf_fence() {
+  local mutation=""
+
+  for mutation in symlink hardlink; do
+    (
+      # shellcheck source=run-retained-acceptance-campaign.sh
+      source "$CAMPAIGN_RUNNER"
+      local root="$TEST_TMP_DIR/recorded-log-preopen-$mutation"
+      local private="$root/obi-java-remote-parent-acceptance.ABC123"
+      local external="$root/external"
+      local sentinel="$external/sentinel"
+      local marker="$root/command-invoked"
+      local before_count=""
+      local after_count=""
+      mkdir -m 0700 -- "$root" "$private" "$private/commands" "$external"
+      printf 'sentinel must survive\n' >"$sentinel"
+      chmod 0600 -- "$sentinel"
+      TRANSACTION_PARENT="$root"
+      PRIVATE_DIRECTORY="$private"
+      PRIVATE_IDENTITY="$(stat -Lc '%d:%i:%u:%a' -- "$PRIVATE_DIRECTORY")"
+      exec {PRIVATE_DIRECTORY_FD}<"$PRIVATE_DIRECTORY"
+      COMMAND_DIRECTORY="$PRIVATE_DIRECTORY/commands"
+      COMMAND_DIRECTORY_IDENTITY="$(stat -Lc '%d:%i:%u:%a' -- \
+        "$COMMAND_DIRECTORY")"
+      COMMAND_COUNT=0
+      recorded_log_preopen_checkpoint() {
+        local -r log="$1"
+
+        if [[ "$mutation" == symlink ]]; then
+          ln -s -- "$sentinel" "$log"
+        else
+          ln -- "$sentinel" "$log"
+        fi
+      }
+      before_count="$(find "/proc/$BASHPID/fd" -mindepth 1 -maxdepth 1 | wc -l)"
+      if run_recorded_command clone 0 "$PRIVATE_DIRECTORY" \
+          bash -c ': >"$1"' _ "$marker" >/dev/null 2>&1; then
+        exit 1
+      fi
+      after_count="$(find "/proc/$BASHPID/fd" -mindepth 1 -maxdepth 1 | wc -l)"
+      [[ "$before_count" == "$after_count" && ! -e "$marker" &&
+        ! -L "$marker" && "$(<"$sentinel")" == 'sentinel must survive' &&
+        "${#COMMAND_ROWS_MEMORY[@]}" == 0 && "$COMMAND_COUNT" == 0 ]]
+      if [[ "$mutation" == symlink ]]; then
+        [[ "$(stat -Lc '%h' -- "$sentinel")" == 1 ]]
+      else
+        [[ "$(stat -Lc '%h' -- "$sentinel")" == 2 ]]
+      fi
+      exec {PRIVATE_DIRECTORY_FD}<&-
+    ) || die "exclusive log creation accepted a pre-open $mutation leaf"
+  done
+}
+
 test_command_directory_and_working_root_fences() {
   local mutation=""
 
@@ -1071,6 +1408,7 @@ test_command_directory_and_working_root_fences() {
       TRANSACTION_PARENT="$root"
       PRIVATE_DIRECTORY="$private"
       PRIVATE_IDENTITY="$(stat -Lc '%d:%i:%u:%a' -- "$PRIVATE_DIRECTORY")"
+      exec {PRIVATE_DIRECTORY_FD}<"$PRIVATE_DIRECTORY"
       COMMAND_DIRECTORY="$PRIVATE_DIRECTORY/commands"
       COMMAND_DIRECTORY_IDENTITY="$(stat -Lc '%d:%i:%u:%a' -- \
         "$COMMAND_DIRECTORY")"
@@ -1103,6 +1441,7 @@ test_command_directory_and_working_root_fences() {
     TRANSACTION_PARENT="$root"
     PRIVATE_DIRECTORY="$private"
     PRIVATE_IDENTITY="$(stat -Lc '%d:%i:%u:%a' -- "$PRIVATE_DIRECTORY")"
+    exec {PRIVATE_DIRECTORY_FD}<"$PRIVATE_DIRECTORY"
     COMMAND_DIRECTORY="$PRIVATE_DIRECTORY/commands"
     COMMAND_DIRECTORY_IDENTITY="$(stat -Lc '%d:%i:%u:%a' -- \
       "$COMMAND_DIRECTORY")"
@@ -1304,8 +1643,9 @@ validate_workflow_contract_file() {
     'obi-java-remote-parent-acceptance.*'
     '.retained-projection-transaction.*'
     '          evidence_id="$(jq -er '
-    '          [[ "$evidence_id" =~ ^[0-9a-f]{64}$ ]]'
-    '          verify_output="$(cd / && bash "$PUBLIC_OUTPUT/verify.sh")"'
+    '          [[ "$evidence_id" == "$EXPECTED_EVIDENCE_ID" ]]'
+    '          exec {verify_fd}<"/proc/$BASHPID/fd/$verify_directory_fd/verify.sh"'
+    '          if verify_output="$(cd / && bash "$PUBLIC_OUTPUT/verify.sh")"; then'
     '            "bounded claim bundle internally consistent (not authenticated): $evidence_id" ]]'
     '          if-no-files-found: error'
     '          include-hidden-files: false'
@@ -1313,7 +1653,13 @@ validate_workflow_contract_file() {
 
   [[ "$(grep -Ec '^[[:space:]]+uses:' "$workflow")" == 5 &&
     "$(grep -Fc 'actions/upload-artifact@' "$workflow")" == 1 &&
-    "$(grep -Fc 'RUNNER_ENVIRONMENT: ${{ runner.environment }}' "$workflow")" == 2 ]] ||
+    "$(grep -Fc 'RUNNER_ENVIRONMENT: ${{ runner.environment }}' "$workflow")" == 2 &&
+    "$(grep -Fc 'EXPECTED_PARENT_IDENTITY: ${{ steps.campaign.outputs.public_parent_identity }}' "$workflow")" == 2 &&
+    "$(grep -Fc 'EXPECTED_DIRECTORY_IDENTITY: ${{ steps.campaign.outputs.public_directory_identity }}' "$workflow")" == 2 &&
+    "$(grep -Fc 'EXPECTED_CLOSURE_SHA256: ${{ steps.campaign.outputs.public_closure_sha256 }}' "$workflow")" == 2 &&
+    "$(grep -Fc 'EXPECTED_EVIDENCE_ID: ${{ steps.campaign.outputs.public_evidence_id }}' "$workflow")" == 2 &&
+    "$(grep -Fc '"$observed_closure" == "$EXPECTED_CLOSURE_SHA256"' "$workflow")" == 3 &&
+    "$(grep -Fc '$(sha256sum <"$PUBLIC_OUTPUT/verify.sh")' "$workflow")" == 2 ]] ||
     return 1
   for literal in "${exact_literals[@]}"; do
     workflow_has_once "$workflow" "$literal" || {
@@ -1389,6 +1735,113 @@ assert_workflow_mutation_rejected() {
   fi
 }
 
+test_real_location_aware_projector_execution() {
+  local case_root="$TEST_TMP_DIR/location-aware-projector"
+  local checkout="$case_root/checkout"
+  local scripts="$checkout/examples/apache-java-https/scripts"
+  local projector="$scripts/project-retained-acceptance-evidence.sh"
+  local acceptance="$case_root/acceptance"
+  local assertion_result="$case_root/assertion"
+  local receipt="$case_root/receipt.json"
+  local procfd_output="$case_root/procfd-output"
+  local projected_output="$case_root/public/projected"
+  local projector_fd=""
+  local projector_procfd=""
+  local procfd_status=0
+
+  mkdir -p -- "$case_root/public" "$case_root/private"
+  mkdir -m 0700 -- "$acceptance" "$assertion_result"
+  printf '%s\n' '{}' >"$receipt"
+  chmod 0600 -- "$receipt"
+  write_location_aware_projector_fixture "$scripts"
+
+  exec {projector_fd}<"$projector"
+  projector_procfd="/proc/$BASHPID/fd/$projector_fd"
+  set +e
+  "$projector_procfd" "$acceptance" "$assertion_result" "$receipt" \
+    "$procfd_output" >/dev/null 2>&1
+  procfd_status=$?
+  set -e
+  exec {projector_fd}<&-
+  [[ "$procfd_status" == 91 && ! -e "$procfd_output" &&
+    ! -L "$procfd_output" ]] ||
+    die 'location-aware projector did not reject procfd self-location'
+
+  (
+    # shellcheck source=run-retained-acceptance-campaign.sh
+    source "$CAMPAIGN_RUNNER"
+    PRIVATE_DIRECTORY="$case_root/private"
+    CHECKOUT_DIRECTORY="$checkout"
+    RAW_ACCEPTANCE="$acceptance"
+    RAW_ASSERTION="$assertion_result"
+    RECEIPT="$receipt"
+    OUTPUT_DIRECTORY="$projected_output"
+    exec {PRIVATE_DIRECTORY_FD}<"$PRIVATE_DIRECTORY"
+    assert_output_target() {
+      [[ ! -e "$OUTPUT_DIRECTORY" && ! -L "$OUTPUT_DIRECTORY" ]]
+    }
+    assert_private_directory_identity() { :; }
+    assert_projection_execution_authority() { :; }
+    assert_result_identity() { :; }
+    assert_receipt_unchanged() { :; }
+    assert_source_authority_unchanged() { :; }
+    assert_output_parent_unchanged() { :; }
+    projection_blob_sha256() {
+      sha256sum <"$projector" | awk '{print $1}'
+    }
+
+    project_claims
+    [[ -f "$projected_output/projector-source" &&
+      "$(<"$projected_output/projector-source")" == "$projector" ]]
+    exec {PRIVATE_DIRECTORY_FD}<&-
+  ) || die 'project_claims did not execute the pinned canonical projector path'
+}
+
+test_extracted_workflow_location_aware_verifier() {
+  local case_root="$TEST_TMP_DIR/location-aware-workflow-verifier"
+  local public_parent="$case_root/public-parent"
+  local public_output="$public_parent/projected"
+  local extracted="$case_root/independent-verify.sh"
+  local parent_identity=""
+  local directory_identity=""
+  local closure_sha256=""
+  local verifier_fd=""
+  local verifier_procfd=""
+  local procfd_status=0
+
+  mkdir -m 0700 -- "$case_root" "$public_parent"
+  create_public_fixture "$public_output" none
+  parent_identity="$(stat -Lc '%d:%i:%u:%a' -- "$public_parent")"
+  directory_identity="$(stat -Lc '%d:%i:%u:%a' -- "$public_output")"
+  closure_sha256="$(compute_public_fixture_closure "$public_output")"
+  extract_independent_verify_step >"$extracted"
+  chmod 0700 -- "$extracted"
+  grep -Fq 'bash "$PUBLIC_OUTPUT/verify.sh"' "$extracted" ||
+    die 'extracted independent verifier does not use its canonical path'
+  if grep -Fq 'bash "/proc/$BASHPID/fd/$verify_fd"' "$extracted"; then
+    die 'extracted independent verifier executes a procfd path'
+  fi
+  env \
+    PUBLIC_PARENT="$public_parent" \
+    PUBLIC_OUTPUT="$public_output" \
+    EXPECTED_PARENT_IDENTITY="$parent_identity" \
+    EXPECTED_DIRECTORY_IDENTITY="$directory_identity" \
+    EXPECTED_CLOSURE_SHA256="$closure_sha256" \
+    EXPECTED_EVIDENCE_ID="$TEST_EVIDENCE_ID" \
+    bash "$extracted" ||
+    die 'extracted independent workflow verifier rejected canonical execution'
+
+  exec {verifier_fd}<"$public_output/verify.sh"
+  verifier_procfd="/proc/$BASHPID/fd/$verifier_fd"
+  set +e
+  (CDPATH='' cd / && bash "$verifier_procfd") >/dev/null 2>&1
+  procfd_status=$?
+  set -e
+  exec {verifier_fd}<&-
+  [[ "$procfd_status" == 91 ]] ||
+    die 'location-aware bundled verifier did not reject procfd self-location'
+}
+
 test_workflow_contract() {
   local public_file=""
 
@@ -1422,12 +1875,31 @@ test_workflow_contract() {
     '"$disk_sha" == "$blob_sha"' '"$disk_sha" != "$blob_sha"'
   assert_workflow_mutation_rejected independent-gate \
     'id: independent_verify' 'id: mutated_verify'
+  assert_workflow_mutation_rejected handoff-parent \
+    'steps.campaign.outputs.public_parent_identity' \
+    'steps.campaign.outputs.mutated_parent_identity'
+  assert_workflow_mutation_rejected handoff-directory \
+    'steps.campaign.outputs.public_directory_identity' \
+    'steps.campaign.outputs.mutated_directory_identity'
+  assert_workflow_mutation_rejected handoff-closure \
+    'steps.campaign.outputs.public_closure_sha256' \
+    'steps.campaign.outputs.mutated_closure_sha256'
+  assert_workflow_mutation_rejected handoff-evidence \
+    'steps.campaign.outputs.public_evidence_id' \
+    'steps.campaign.outputs.mutated_evidence_id'
+  assert_workflow_mutation_rejected closure-digest-gate \
+    '"$observed_closure" == "$EXPECTED_CLOSURE_SHA256"' \
+    '"$observed_closure" != "$EXPECTED_CLOSURE_SHA256"'
   assert_workflow_mutation_rejected unrelated-cwd \
     '(cd / && bash' '(cd "$GITHUB_WORKSPACE" && bash'
+  assert_workflow_mutation_rejected verifier-procfd-execution \
+    'if verify_output="$(cd / && bash "$PUBLIC_OUTPUT/verify.sh")"; then' \
+    'if verify_output="$(cd / && bash "/proc/$BASHPID/fd/$verify_fd")"; then'
   assert_workflow_mutation_rejected verifier-evidence-read \
     'jq -er '\''.evidence_id'\''' 'jq -r '\''.evidence_id'\'''
   assert_workflow_mutation_rejected verifier-evidence-shape \
-    '^[0-9a-f]{64}$' '^.*$'
+    '"$evidence_id" == "$EXPECTED_EVIDENCE_ID"' \
+    '"$evidence_id" =~ ^.*$'
   assert_workflow_mutation_rejected verifier-stdout-contract \
     'bounded claim bundle internally consistent (not authenticated): $evidence_id' \
     'mutated verifier success: $evidence_id'
@@ -1469,16 +1941,32 @@ test_static_privacy_and_wiring_contract() {
   grep -Fq 'COMMAND_OUTPUT_SHA256["$command_id"]="$digest"' \
     "$CAMPAIGN_RUNNER" || return 1
   grep -Fq 'COMMAND_DIRECTORY_IDENTITY' "$CAMPAIGN_RUNNER" || return 1
-  grep -Fq '"/proc/$BASHPID/fd/$command_directory_fd/$log_name"' \
+  grep -Fq '"/proc/$BASHPID/fd/$directory_fd/$leaf"' \
     "$CAMPAIGN_RUNNER" || return 1
   grep -Fq 'RESULT_SNAPSHOT_IDENTITY["$snapshot"]="$sealed_identity"' \
     "$CAMPAIGN_RUNNER" || return 1
-  grep -Fq 'rm -rf --one-file-system -- "$PRIVATE_DIRECTORY"' \
+  grep -Fq 'find -H "/proc/$BASHPID/fd/$PRIVATE_DIRECTORY_FD" -xdev -depth' \
+    "$CAMPAIGN_RUNNER" || return 1
+  ! grep -Fq 'rm -rf --one-file-system -- "$PRIVATE_DIRECTORY"' \
+    "$CAMPAIGN_RUNNER" || return 1
+  grep -Fq 'open_exclusive_output_fd "$command_directory_fd" "$log_name" log_fd' \
+    "$CAMPAIGN_RUNNER" || return 1
+  grep -Fq 'public_parent_identity=$OUTPUT_PARENT_IDENTITY' \
+    "$CAMPAIGN_RUNNER" || return 1
+  grep -Fq 'public_directory_identity=$OUTPUT_DIRECTORY_IDENTITY' \
+    "$CAMPAIGN_RUNNER" || return 1
+  grep -Fq 'public_closure_sha256=$PUBLIC_CLOSURE_SHA256' \
     "$CAMPAIGN_RUNNER" || return 1
   grep -Fq 'output_contract:' "$CAMPAIGN_RUNNER" || return 1
   grep -Fq 'bytes: "exact-command-order-no-normalization"' "$CAMPAIGN_RUNNER" ||
     return 1
   grep -Fq 'stream: "combined-stdout-stderr"' "$CAMPAIGN_RUNNER" || return 1
+  grep -Fq 'if projector_execute "$projector" "$RAW_ACCEPTANCE"' \
+    "$CAMPAIGN_RUNNER" || return 1
+  grep -Fq '"${PUBLIC_VERIFY_TIMEOUT_SECONDS}s" bash "$verifier")"; then' \
+    "$CAMPAIGN_RUNNER" || return 1
+  ! grep -Fq 'projector_execution_path=' "$CAMPAIGN_RUNNER" || return 1
+  ! grep -Fq 'verifier_execution_path=' "$CAMPAIGN_RUNNER" || return 1
   grep -Fq 'run-retained-acceptance-campaign_test.sh' \
     "$TEST_SCRIPT_DIR/run_test.sh" || return 1
   [[ "$(grep -c 'run-retained-acceptance-campaign_test.sh' \
@@ -1492,12 +1980,15 @@ main() {
   test_real_git_private_checkout_modes
   test_recorded_command_timeout_classification
   test_recorded_log_identity_and_fd_closure
+  test_recorded_log_preopen_leaf_fence
   test_command_directory_and_working_root_fences
   test_state_transition_rejection
   test_private_cleanup_mount_fence
   test_github_authority_mutations
+  test_real_location_aware_projector_execution
   test_success_and_failure_campaigns
   test_workflow_contract
+  test_extracted_workflow_location_aware_verifier
   test_static_privacy_and_wiring_contract
   printf 'retained acceptance campaign transaction and mutation tests passed\n'
 }

@@ -23,6 +23,10 @@ readonly MAX_COMMAND_SECONDS=86400
 readonly MAX_ENVIRONMENT_TOKEN_BYTES=64
 readonly MAX_RECEIPT_BYTES=1048576
 readonly MAX_RUN_STATUS_BYTES=262144
+readonly MAX_FAILURE_BOUNDARY_INDEX_BYTES=4194304
+readonly MAX_FAILURE_JAVA_TERMINAL_BYTES=16384
+readonly MAX_FAILURE_OBI_TERMINAL_BYTES=131072
+readonly MAX_FAILURE_FREEZE_BYTES=160
 readonly MAX_ENVIRONMENT_BYTES=65536
 readonly MAX_GITHUB_EVENT_BYTES=2097152
 readonly PROJECT_TIMEOUT_SECONDS=1800
@@ -49,6 +53,48 @@ readonly -a RECEIPT_COMMAND_IDS=(
 readonly -a PUBLIC_FILES=(
   README.md SANITIZATION.md acceptance-claims.json authority-summary.json
   derivation-receipt.json verify.sh SHA256SUMS
+)
+
+# This is the exact scenario=all, repeat=1 boundary roster at the authority
+# revision.  Failure classification never publishes a boundary name supplied
+# only by private evidence; it first proves an exact match to this allowlist.
+readonly -a ACCEPTANCE_BOUNDARY_IDS=(
+  basic delayed-otlp-suppression security keepalive pipelining concurrency
+  connection-churn fd-port-reuse slow-body tls-boundary coalesced-bridge
+  timeout-retry pressure handoff virtual-thread netty netty-server dispatch
+  w3c w3c-match obi-flags primary-w3c-stale primary-generation-mismatch
+  primary-w3c-fault unix-w3c-stale unix-generation-mismatch w3c-fault
+  permanent-absence auto-unavailable late-attach restart-during-traffic
+  helper-attach-failure disabled extension-controls uninstrumented
+)
+
+readonly -a ACCEPTANCE_FAILURE_STAGES=(
+  initialization argument-validation project-guard runtime-preparation
+  source-state source-snapshot certificates official-agent bridge-artifacts
+  bridge-build source-snapshot-seal compose-environment environment-evidence
+  compose-ownership compose-configuration compose-build-start readiness
+  scenarios runtime-evidence deliberate-assertion-failure complete
+  primary-w3c-fault-recovery primary-generation-mismatch-recovery
+  unix-generation-mismatch-recovery permanent-absence-recovery
+  primary-live-fd-security-recovery temporary-cleanup compose-cleanup
+  project-guard-handoff signal evidence-publication project-guard-status
+)
+
+# This is the exact public counter schema accepted by run.sh for a sealed Java
+# terminal snapshot.  The classifier never publishes a counter or its value;
+# it uses the fixed roster only to prove that the terminal digest commits to a
+# structurally valid snapshot referenced by the frozen boundary index.
+readonly -a ACCEPTANCE_JAVA_DIAGNOSTIC_COUNTER_NAMES=(
+  cfg_on cfg_off provider_ok provider_reject provider_ver extension_reg
+  lookup_ready lookup_missing lookup_version lookup_error record_version
+  invoke_error discard_standard extract_fields extract_invalid extract_error
+  registration_ok registration_fail take_sampled take_unsampled tls_reads
+  tls_bytes framework_depth framework_cycle framework_late transport_missing
+  t_unknown d_unknown t_valid d_valid t_missing d_missing t_stale d_stale
+  t_unsupported d_unsupported t_malformed d_malformed t_version_mismatch
+  d_version_mismatch t_ambiguous d_ambiguous t_unauthorized d_unauthorized
+  t_already_consumed d_already_consumed t_timeout d_timeout t_overload
+  d_overload t_transport_error d_transport_error t_disabled d_disabled
 )
 
 OUTPUT_DIRECTORY=""
@@ -102,6 +148,19 @@ COMMAND_COUNT=0
 CLEANUP_REQUIRED=false
 STICKY_CLEANUP_FAILURE=false
 PRIMARY_FAILURE=""
+LAST_RECORDED_COMMAND_ID=""
+LAST_RECORDED_COMMAND_EXIT_STATUS=""
+LAST_RECORDED_COMMAND_VALIDATED=false
+FAILURE_CLASSIFICATION_JSON=""
+FAILURE_CLASSIFICATION_EMITTED=false
+FAILURE_CLASSIFICATION_STAGE=""
+FAILURE_CLASSIFICATION_SOURCE_LINE=""
+FAILURE_CLASSIFICATION_FIRST_INCOMPLETE=""
+FAILURE_CLASSIFICATION_TERMINAL_COUNT=""
+FAILURE_CLASSIFICATION_JAVA_TERMINAL_SHA256=""
+FAILURE_CLASSIFICATION_OBI_TERMINAL_SHA256=""
+FAILURE_CLASSIFICATION_INDEX_SHA256=""
+FAILURE_CLASSIFICATION_RUN_STATUS_SHA256=""
 declare -a STATE_HISTORY=()
 declare -a COMMAND_ROWS_MEMORY=()
 declare -A COMMAND_OUTPUT_SHA256=()
@@ -939,6 +998,262 @@ open_verified_input_fd() {
   printf -v "$output_identity_name" '%s' "$path_identity"
 }
 
+failure_classification_checkpoint() {
+  # A no-op production seam used by the sourced mutation test to exercise
+  # descriptor, same-inode, parent, and mount races at deterministic points.
+  : "$@"
+}
+
+failure_classification_mountinfo_path_is_mountpoint() {
+  local -r path="$1"
+
+  [[ "$path" == /* && "$path" != *[$'\t\n \\']* &&
+    -r /proc/self/mountinfo ]] || return 2
+  awk -v wanted="$path" '
+    $5 == wanted { found=1 }
+    END { exit(found ? 0 : 1) }
+  ' /proc/self/mountinfo
+}
+
+failure_classification_path_is_mountpoint() {
+  failure_classification_mountinfo_path_is_mountpoint "$@"
+}
+
+failure_classification_fdinfo_mount_id() {
+  local -r descriptor="$1"
+  local -r output_name="$2"
+  local mount_id=""
+
+  [[ "$descriptor" =~ ^[0-9]+$ &&
+    "$output_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+    -r "/proc/$BASHPID/fdinfo/$descriptor" ]] || return 1
+  mount_id="$(awk '
+    $1 == "mnt_id:" {
+      if (seen || NF != 2 || $2 !~ /^[1-9][0-9]*$/) exit 2
+      mount_id=$2
+      seen=1
+    }
+    END {
+      if (!seen) exit 1
+      print mount_id
+    }
+  ' "/proc/$BASHPID/fdinfo/$descriptor")" || return 1
+  [[ "$mount_id" =~ ^[1-9][0-9]*$ ]] || return 1
+  printf -v "$output_name" '%s' "$mount_id"
+}
+
+failure_classification_fd_mount_id() {
+  # A production wrapper retained as a narrow sourced-test seam.  Tests use
+  # it to model a same-device bind-mounted evidence leaf without mounting.
+  failure_classification_fdinfo_mount_id "$@"
+}
+
+create_failure_classification_snapshot_directory() {
+  local -r output_path_name="$1"
+  local -r output_fd_name="$2"
+  local -r output_identity_name="$3"
+  local candidate=""
+  local identity=""
+  local descriptor_identity=""
+  local parent_identity=""
+  local candidate_fd=""
+  local mount_status=0
+
+  [[ "$output_path_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+    "$output_fd_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+    "$output_identity_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+  assert_private_directory_identity || return 1
+  candidate="$(mktemp -d \
+    "$PRIVATE_DIRECTORY/.acceptance-failure-classifier.XXXXXX")" || return 1
+  [[ "${candidate%/*}" == "$PRIVATE_DIRECTORY" &&
+    "${candidate##*/}" =~ ^\.acceptance-failure-classifier\.[A-Za-z0-9]{6}$ &&
+    -d "$candidate" && ! -L "$candidate" &&
+    "$(readlink -f -- "$candidate")" == "$candidate" ]] || return 1
+  identity="$(stat -Lc '%d:%i:%u:%a' -- "$candidate")" || return 1
+  [[ "$identity" == "${PRIVATE_IDENTITY%%:*}:"* &&
+    "$identity" == *":$EUID:700" ]] || return 1
+  if failure_classification_path_is_mountpoint "$candidate"; then
+    return 1
+  else
+    mount_status=$?
+  fi
+  (( mount_status == 1 )) || return 1
+  exec {candidate_fd}<"$candidate" || return $?
+  descriptor_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "/proc/$BASHPID/fd/$candidate_fd")" || return 1
+  parent_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "/proc/$BASHPID/fd/$candidate_fd/..")" || return 1
+  [[ "$descriptor_identity" == "$identity" &&
+    "$parent_identity" == "$PRIVATE_IDENTITY" ]] || return 1
+  printf -v "$output_path_name" '%s' "$candidate"
+  printf -v "$output_fd_name" '%s' "$candidate_fd"
+  printf -v "$output_identity_name" '%s' "$identity"
+}
+
+open_bounded_failure_input_snapshot() {
+  local -r result="$1"
+  local -r result_fd="$2"
+  local -r expected_result_identity="$3"
+  local -r leaf="$4"
+  local -r expected_mode="$5"
+  local -r maximum_bytes="$6"
+  local -r snapshot_directory="$7"
+  local -r snapshot_directory_fd="$8"
+  local -r snapshot_leaf="$9"
+  local -r output_path_name="${10}"
+  local -r output_fd_name="${11}"
+  local -r output_identity_name="${12}"
+  local -r output_digest_name="${13}"
+  local path="$result/$leaf"
+  local snapshot="$snapshot_directory/$snapshot_leaf"
+  local source_fd=""
+  local snapshot_fd=""
+  local sealed_snapshot_fd=""
+  local result_descriptor_identity=""
+  local result_post_identity=""
+  local snapshot_directory_identity=""
+  local path_identity=""
+  local source_descriptor_identity=""
+  local source_post_descriptor_identity=""
+  local source_post_identity=""
+  local snapshot_created_identity=""
+  local snapshot_descriptor_identity=""
+  local snapshot_identity=""
+  local sealed_snapshot_flags=""
+  local result_mount_id=""
+  local source_mount_id=""
+  local source_post_mount_id=""
+  local digest=""
+  local device=""
+  local inode=""
+  local owner=""
+  local mode=""
+  local links=""
+  local size=""
+
+  [[ "$result" == /* && "$result_fd" =~ ^[0-9]+$ &&
+    "$expected_result_identity" =~ ^[0-9]+:[0-9]+:[0-9]+:755$ &&
+    "$leaf" =~ ^[.A-Za-z0-9][A-Za-z0-9._-]{0,127}$ &&
+    "$snapshot_directory" == "$PRIVATE_DIRECTORY/"* &&
+    "$snapshot_directory_fd" =~ ^[0-9]+$ &&
+    "$snapshot_leaf" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ &&
+    "$expected_mode" =~ ^[0-7]{3,4}$ &&
+    "$maximum_bytes" =~ ^[1-9][0-9]{0,18}$ &&
+    "$output_path_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+    "$output_fd_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+    "$output_identity_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+    "$output_digest_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+    -f "$path" && ! -L "$path" &&
+    "$(readlink -f -- "$path")" == "$path" ]] || return 1
+  result_descriptor_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "/proc/$BASHPID/fd/$result_fd")" || return 1
+  snapshot_directory_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "/proc/$BASHPID/fd/$snapshot_directory_fd")" || return 1
+  [[ "$result_descriptor_identity" == "$expected_result_identity" &&
+    "$snapshot_directory_identity" == *":$EUID:700" &&
+    -d "$snapshot_directory" && ! -L "$snapshot_directory" &&
+    "$(stat -Lc '%d:%i:%u:%a' -- "$snapshot_directory")" == \
+      "$snapshot_directory_identity" && ! -e "$snapshot" &&
+    ! -L "$snapshot" ]] || return 1
+  failure_classification_assert_not_mountpoint "$path" || return 1
+  failure_classification_fd_mount_id "$result_fd" result_mount_id || return 1
+  path_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- "$path")" || return 1
+  IFS=: read -r device inode owner mode links size <<<"$path_identity"
+  [[ "$device" =~ ^[0-9]+$ && "$inode" =~ ^[0-9]+$ &&
+    "$device" == "${expected_result_identity%%:*}" &&
+    "$owner" == "$EUID" && "$mode" == "$expected_mode" &&
+    "$links" == 1 && "$size" =~ ^[1-9][0-9]{0,18}$ ]] || return 1
+  (( size <= maximum_bytes )) || return 1
+  exec {source_fd}<"/proc/$BASHPID/fd/$result_fd/$leaf" || return $?
+  source_descriptor_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+    "/proc/$BASHPID/fd/$source_fd")" || source_descriptor_identity=""
+  failure_classification_fd_mount_id "$source_fd" source_mount_id || {
+    exec {source_fd}<&-
+    return 1
+  }
+  [[ "$source_descriptor_identity" == "$path_identity" &&
+    "$source_mount_id" == "$result_mount_id" ]] || {
+    exec {source_fd}<&-
+    return 1
+  }
+  open_exclusive_output_fd "$snapshot_directory_fd" "$snapshot_leaf" \
+    snapshot_fd || {
+    exec {source_fd}<&-
+    return 1
+  }
+  snapshot_created_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+    "/proc/$BASHPID/fd/$snapshot_fd")" || snapshot_created_identity=""
+  [[ "$snapshot_created_identity" == *":$EUID:600:1:0" &&
+    "${snapshot_created_identity%%:*}" == \
+      "${snapshot_directory_identity%%:*}" &&
+    "$(stat -Lc '%d:%i:%u:%a:%h:%s' -- "$snapshot")" == \
+      "$snapshot_created_identity" ]] || return 1
+  cp -- "/proc/$BASHPID/fd/$source_fd" \
+    "/proc/$BASHPID/fd/$snapshot_fd" || return 1
+  failure_classification_checkpoint after-input-snapshot "$path" "$source_fd" \
+    "$snapshot" "$snapshot_fd" || return 1
+  source_post_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- "$path")" ||
+    source_post_identity=""
+  source_post_descriptor_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+    "/proc/$BASHPID/fd/$source_fd")" || source_post_descriptor_identity=""
+  failure_classification_fd_mount_id "$source_fd" source_post_mount_id ||
+    source_post_mount_id=""
+  result_post_identity="$(stat -Lc '%d:%i:%u:%a' -- "$result")" ||
+    result_post_identity=""
+  snapshot_descriptor_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+    "/proc/$BASHPID/fd/$snapshot_fd")" || snapshot_descriptor_identity=""
+  if [[ "$source_descriptor_identity" != "$path_identity" ||
+    "$source_post_descriptor_identity" != "$path_identity" ||
+    "$source_mount_id" != "$result_mount_id" ||
+    "$source_post_mount_id" != "$result_mount_id" ||
+    "$source_post_identity" != "$path_identity" ||
+    "$result_post_identity" != "$expected_result_identity" ||
+    "$snapshot_descriptor_identity" != \
+      "${snapshot_created_identity%:*}:$size" ||
+    ! -f "$path" || -L "$path" ||
+    "$(readlink -f -- "$path")" != "$path" ]]; then
+    exec {source_fd}<&-
+    exec {snapshot_fd}>&-
+    return 1
+  fi
+  if ! failure_classification_assert_not_mountpoint "$path"; then
+    exec {source_fd}<&-
+    exec {snapshot_fd}>&-
+    return 1
+  fi
+  chmod 0400 -- "/proc/$BASHPID/fd/$snapshot_fd" || return 1
+  snapshot_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- "$snapshot")" ||
+    return 1
+  snapshot_descriptor_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+    "/proc/$BASHPID/fd/$snapshot_fd")" || return 1
+  [[ "$snapshot_identity" == "$snapshot_descriptor_identity" &&
+    "$snapshot_identity" == \
+      "${snapshot_created_identity%:600:1:0}:400:1:$size" &&
+    -f "$snapshot" && ! -L "$snapshot" &&
+    "$(readlink -f -- "$snapshot")" == "$snapshot" ]] || return 1
+  exec {snapshot_fd}>&- || return 1
+  exec {sealed_snapshot_fd}<"/proc/$BASHPID/fd/$snapshot_directory_fd/$snapshot_leaf" ||
+    return $?
+  snapshot_descriptor_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+    "/proc/$BASHPID/fd/$sealed_snapshot_fd")" || return 1
+  sealed_snapshot_flags="$(awk '$1 == "flags:" { print $2 }' \
+    "/proc/$BASHPID/fdinfo/$sealed_snapshot_fd")" || return 1
+  [[ "$snapshot_descriptor_identity" == "$snapshot_identity" &&
+    "$sealed_snapshot_flags" =~ ^[0-7]+$ &&
+    $((8#$sealed_snapshot_flags & 3)) == 0 &&
+    "$(stat -Lc '%d:%i:%u:%a:%h:%s' -- "$snapshot")" == \
+      "$snapshot_identity" ]] || return 1
+  digest="$(sha256_open_fd "$sealed_snapshot_fd")" || return 1
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+  failure_classification_checkpoint after-snapshot-seal "$path" "$source_fd" \
+    "$snapshot" "$sealed_snapshot_fd" || return 1
+  exec {source_fd}<&- || return 1
+  printf -v "$output_path_name" '%s' "$snapshot"
+  printf -v "$output_fd_name" '%s' "$sealed_snapshot_fd"
+  printf -v "$output_identity_name" '%s' "$snapshot_identity"
+  printf -v "$output_digest_name" '%s' "$digest"
+}
+
 assert_verified_input_fd_unchanged() {
   local -r path="$1"
   local -r descriptor="$2"
@@ -1023,6 +1338,10 @@ run_recorded_command() {
   local log_fd=""
   local timeout_seconds=""
   local command_row=""
+
+  LAST_RECORDED_COMMAND_ID=""
+  LAST_RECORDED_COMMAND_EXIT_STATUS=""
+  LAST_RECORDED_COMMAND_VALIDATED=false
 
   (( COMMAND_COUNT < ${#RECEIPT_COMMAND_IDS[@]} )) || return 1
   expected_id="${RECEIPT_COMMAND_IDS[$COMMAND_COUNT]}"
@@ -1112,6 +1431,8 @@ run_recorded_command() {
   else
     command_status=$?
   fi
+  LAST_RECORDED_COMMAND_ID="$command_id"
+  LAST_RECORDED_COMMAND_EXIT_STATUS="$command_status"
   if ! end_seconds="$(date +%s)"; then
     validation_status=1
   fi
@@ -1220,6 +1541,7 @@ run_recorded_command() {
   COMMAND_ROWS_MEMORY+=("$command_row")
   COMMAND_OUTPUT_SHA256["$command_id"]="$digest"
   COMMAND_COUNT=$((COMMAND_COUNT + 1))
+  LAST_RECORDED_COMMAND_VALIDATED=true
   log_info "command $command_id exit=$command_status sha256=$digest"
   if [[ "$command_status" == 124 || "$command_status" == 137 ]]; then
     die "command $command_id exceeded its ${timeout_seconds}s deadline"
@@ -1598,9 +1920,792 @@ read_environment_value() {
   printf '%s\n' "${values[0]}"
 }
 
+is_allowed_acceptance_failure_stage() {
+  local -r candidate="$1"
+  local allowed=""
+
+  for allowed in "${ACCEPTANCE_FAILURE_STAGES[@]}"; do
+    [[ "$candidate" == "$allowed" ]] && return 0
+  done
+  return 1
+}
+
+read_failure_environment_value() {
+  local -r descriptor="$1"
+  local -r key="$2"
+  local -r output_name="$3"
+  local -a values=()
+
+  [[ "$descriptor" =~ ^[0-9]+$ &&
+    "$key" =~ ^[a-z][a-z0-9_]{0,63}$ &&
+    "$output_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+  mapfile -t values < <(awk -F= -v wanted="$key" '$1 == wanted {
+    print substr($0, length($1) + 2)
+  }' "/proc/$BASHPID/fd/$descriptor")
+  (( ${#values[@]} == 1 )) || return 1
+  printf -v "$output_name" '%s' "${values[0]}"
+}
+
+validate_failure_environment_fd() {
+  local -r descriptor="$1"
+  local revision=""
+  local dirty=""
+  local source_tree=""
+  local transport=""
+  local agent=""
+  local tls=""
+  local scenario=""
+  local request_count=""
+  local repeat_count=""
+  local scenario_seed=""
+  local build_mode=""
+  local acceptance=""
+  local acceptance_reason=""
+  local architecture=""
+
+  read_failure_environment_value "$descriptor" revision revision || return 1
+  read_failure_environment_value "$descriptor" dirty dirty || return 1
+  read_failure_environment_value "$descriptor" source_tree_sha256 \
+    source_tree || return 1
+  read_failure_environment_value "$descriptor" transport transport || return 1
+  read_failure_environment_value "$descriptor" agent_distribution agent ||
+    return 1
+  read_failure_environment_value "$descriptor" tls_protocol tls || return 1
+  read_failure_environment_value "$descriptor" scenario scenario || return 1
+  read_failure_environment_value "$descriptor" request_count request_count ||
+    return 1
+  read_failure_environment_value "$descriptor" repeat_count repeat_count ||
+    return 1
+  read_failure_environment_value "$descriptor" scenario_seed scenario_seed ||
+    return 1
+  read_failure_environment_value "$descriptor" bridge_build_mode build_mode ||
+    return 1
+  read_failure_environment_value "$descriptor" acceptance_evidence acceptance ||
+    return 1
+  read_failure_environment_value "$descriptor" acceptance_evidence_reason \
+    acceptance_reason || return 1
+  read_failure_environment_value "$descriptor" architecture architecture ||
+    return 1
+  [[ "$revision" == "$SOURCE_REVISION" && "$dirty" == false &&
+    "$source_tree" =~ ^[0-9a-f]{64}$ && "$transport" == getsockopt &&
+    "$agent" == otel && "$tls" == TLSv1.3 && "$scenario" == all &&
+    "$request_count" == 0 && "$repeat_count" == 1 &&
+    "$scenario_seed" == 1 && "$build_mode" == fresh &&
+    "$acceptance" == true && "$acceptance_reason" == none &&
+    "$architecture" == "$ARCHITECTURE" ]]
+}
+
+acceptance_boundary_ids_json() {
+  printf '%s\n' "${ACCEPTANCE_BOUNDARY_IDS[@]}" |
+    jq -Rsc 'split("\n") | map(select(length > 0))'
+}
+
+validate_failure_boundary_index_fd() {
+  local -r descriptor="$1"
+  local -r output_count_name="$2"
+  local -r output_first_name="$3"
+  local -r output_active_name="$4"
+  local expected_ids=""
+  local summary=""
+  local observed_terminal_count=""
+  local observed_first_incomplete=""
+  local observed_active_boundary=""
+
+  [[ "$descriptor" =~ ^[0-9]+$ &&
+    "$output_count_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+    "$output_first_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+    "$output_active_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+  expected_ids="$(acceptance_boundary_ids_json)" || return 1
+  cmp -s -- "/proc/$BASHPID/fd/$descriptor" \
+    <(jq -cS . "/proc/$BASHPID/fd/$descriptor") || return 1
+  summary="$(jq -ceS --argjson ids "$expected_ids" '
+    def terminal: . == "complete" or . == "not_applicable";
+    if (keys == ["boundaries", "schema", "selection"] and
+    .schema == "obi-metric-boundary-index-v1" and
+    (.selection | keys == [
+      "repeat_count", "requested_transport", "scenario", "selected_transport"
+    ]) and
+    .selection.scenario == "all" and
+    .selection.requested_transport == "getsockopt" and
+    (.selection.selected_transport == null or
+      .selection.selected_transport == "getsockopt") and
+    .selection.repeat_count == 1 and
+    (.boundaries | type == "array" and length == ($ids | length)) and
+    [.boundaries[].id] == $ids and
+    [.boundaries[].ordinal] == [range(1; ($ids | length) + 1)] and
+    ([.boundaries[].captures[] |
+      select(.kind == "pair" and .state == "captured") |
+      .pair_reference] | length == (unique | length)) and
+    ([.boundaries[] | select(.state == "active")] | length) <= 1 and
+    all(.boundaries[];
+      keys == [
+        "captures", "id", "not_applicable_reason", "ordinal", "state",
+        "status_references"
+      ] and
+      (.id | type == "string" and test("^[a-z0-9][a-z0-9-]{0,63}$")) and
+      (.ordinal | type == "number" and floor == . and . >= 1) and
+      (.captures | type == "array") and
+      (.status_references | type == "array") and
+      ([.captures[].id] | length == (unique | length)) and
+      ([.status_references[].reference] | length == (unique | length)) and
+      (.state == "planned" or .state == "active" or
+        .state == "complete" or .state == "not_applicable") and
+      (if .state == "planned" then
+        .captures == [] and .status_references == [] and
+        .not_applicable_reason == null
+      elif .state == "active" then
+        .not_applicable_reason == null
+      elif .state == "complete" then
+        (.captures | length) > 0 and
+        all(.captures[]; .state == "captured") and
+        (any(.captures[]; .kind == "pair") or
+          all(.captures[]; .kind == "unavailable")) and
+        (.status_references | length) > 0 and
+        .not_applicable_reason == null
+      else
+        .captures == [] and (.status_references | length) == 1 and
+        (.not_applicable_reason | type == "string" and length >= 1 and
+          length <= 160)
+      end) and
+      all(.status_references[];
+        keys == ["reference", "sha256"] and
+        (.reference | type == "string" and
+          test("^scenario-[a-z0-9][a-z0-9-]{0,95}-status\\.json$")) and
+        (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))) and
+      all(.captures[];
+        ((.kind == "phase" and .state == "captured" and
+          keys == [
+            "id", "identity_reference", "identity_sha256", "kind", "state"
+          ] and
+          (.identity_reference | type == "string" and
+            test("^phases/[a-z0-9][a-z0-9-]{0,63}/obi-identity\\.json$")) and
+          (.identity_sha256 | type == "string" and
+            test("^[0-9a-f]{64}$"))) or
+        (.kind == "java" and .state == "captured" and
+          keys == ["id", "kind", "reference", "sha256", "state"] and
+          (.reference | type == "string" and
+            test("^phases/[a-z0-9][a-z0-9-]{0,63}/java-diagnostics\\.txt$")) and
+          (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))) or
+        (.kind == "artifact" and .state == "captured" and
+          keys == ["id", "kind", "reference", "sha256", "state"] and
+          (.reference | type == "string" and
+            test("^[a-z0-9][a-z0-9._-]{0,127}$")) and
+          (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))) or
+        (.kind == "unavailable" and .state == "captured" and
+          keys == [
+            "id", "kind", "reason", "reference", "sha256", "state"
+          ] and .reason == "obi_process_not_running" and
+          (.reference | type == "string" and
+            test("^phases/[a-z0-9][a-z0-9-]{0,63}/obi-metrics\\.prom$")) and
+          (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))) or
+        (.kind == "pair" and
+          keys == [
+            "id", "java_reference", "java_sha256", "kind", "pair_reference",
+            "pair_sha256", "state"
+          ] and
+          (.state == "planned" or .state == "captured") and
+          (.id | type == "string" and
+            test("^[a-z0-9][a-z0-9-]{0,63}$")) and
+          (if .state == "planned" then
+            .pair_reference == null and .pair_sha256 == null and
+            .java_reference == null and .java_sha256 == null
+          else
+            .pair_reference == ("obi-metric-pairs/" + .id + ".json") and
+            (.pair_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+            ((.java_reference == null and .java_sha256 == null) or
+              ((.java_reference | type == "string" and
+                test("^phases/[a-z0-9][a-z0-9-]{0,63}/java-diagnostics\\.txt$")) and
+                (.java_sha256 | type == "string" and
+                  test("^[0-9a-f]{64}$"))))
+          end))) and
+        (.id | type == "string" and test("^[a-z0-9][a-z0-9-]{0,95}$"))) and
+      ([.captures[] | select(.kind == "pair") | .state] as $pair_states |
+        all(range(0; $pair_states | length); . as $pair_index |
+          if $pair_states[$pair_index] == "planned" then
+            all(range($pair_index + 1; $pair_states | length); . as $later |
+              $pair_states[$later] == "planned")
+          else true end))) and
+    ([.boundaries[].state] as $states |
+      all(range(0; $states | length); . as $index |
+        if ($states[$index] | terminal) then
+          all(range(0; $index); . as $prior | ($states[$prior] | terminal))
+        elif $states[$index] == "active" then
+          all(range(0; $index); . as $prior | ($states[$prior] | terminal)) and
+          all(range($index + 1; $states | length); . as $later |
+            $states[$later] == "planned")
+        else
+          all(range($index + 1; $states | length); . as $later |
+            $states[$later] == "planned")
+        end)))
+    then
+    ([.boundaries[] | select(.state | terminal)] | length) as $terminal_count |
+    ([.boundaries[] | select((.state | terminal) | not) | .id] | first // null)
+      as $first |
+    ([.boundaries[] | select(.state == "active") | .id] | first // null)
+      as $active |
+    {
+      active_boundary: $active,
+      first_incomplete_boundary: $first,
+      terminal_boundary_count: $terminal_count
+    }
+    else error("invalid failure boundary index") end
+  ' "/proc/$BASHPID/fd/$descriptor")" || return 1
+  observed_terminal_count="$(jq -er '.terminal_boundary_count' \
+    <<<"$summary")" || return 1
+  observed_first_incomplete="$(jq -r '.first_incomplete_boundary // ""' \
+    <<<"$summary")" || return 1
+  observed_active_boundary="$(jq -r '.active_boundary // ""' \
+    <<<"$summary")" || return 1
+  [[ "$observed_terminal_count" =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
+  (( observed_terminal_count <= ${#ACCEPTANCE_BOUNDARY_IDS[@]} )) || return 1
+  if [[ -n "$observed_first_incomplete" ]]; then
+    local allowed=false
+    local boundary=""
+    for boundary in "${ACCEPTANCE_BOUNDARY_IDS[@]}"; do
+      if [[ "$observed_first_incomplete" == "$boundary" ]]; then
+        allowed=true
+        break
+      fi
+    done
+    [[ "$allowed" == true ]] || return 1
+  fi
+  if [[ -n "$observed_active_boundary" ]]; then
+    [[ "$observed_active_boundary" == "$observed_first_incomplete" ]] ||
+      return 1
+  fi
+  printf -v "$output_count_name" '%s' "$observed_terminal_count"
+  printf -v "$output_first_name" '%s' "$observed_first_incomplete"
+  printf -v "$output_active_name" '%s' "$observed_active_boundary"
+}
+
+failure_expected_java_link_json() {
+  local -r index_descriptor="$1"
+
+  [[ "$index_descriptor" =~ ^[0-9]+$ ]] || return 1
+  jq -ceS '
+    [.boundaries[] | select(.state == "active")] as $active |
+    if ($active | length) == 0 then
+      [.boundaries[].captures[] |
+        if .kind == "java" and .state == "captured" then
+          {reference: .reference, sha256: .sha256}
+        elif .kind == "pair" and .state == "captured" and
+          .java_reference != null then
+          {reference: .java_reference, sha256: .java_sha256}
+        else empty end] as $java |
+      if ($java | length) == 0 then {reference: null, sha256: null}
+      else $java[-1] end
+    else
+      $active[0].captures as $captures |
+      [$captures | to_entries[] | select(.value.kind == "pair")] as $pairs |
+      if ($pairs | length) == 0 then
+        [$captures[] | select(.kind == "java" and .state == "captured")] as $java |
+        if ($java | length) == 0 then {reference: null, sha256: null}
+        else {reference: $java[-1].reference, sha256: $java[-1].sha256} end
+      elif $pairs[-1].value.state == "captured" then
+        {
+          reference: $pairs[-1].value.java_reference,
+          sha256: $pairs[-1].value.java_sha256
+        }
+      else
+        $pairs[-1].key as $pair_index |
+        [$captures | to_entries[] |
+          select(.key > $pair_index and .value.kind == "java" and
+            .value.state == "captured") | .value] as $java |
+        if ($java | length) == 0 then {reference: null, sha256: null}
+        else {reference: $java[-1].reference, sha256: $java[-1].sha256} end
+      end
+    end
+  ' "/proc/$BASHPID/fd/$index_descriptor"
+}
+
+validate_failure_java_terminal_fd() {
+  local -r descriptor="$1"
+  local -r index_descriptor="$2"
+  local expected=""
+  local expected_reference=""
+  local expected_digest=""
+  local phase=""
+  local counter_names=""
+  local snapshot_digest=""
+
+  [[ "$descriptor" =~ ^[0-9]+$ && "$index_descriptor" =~ ^[0-9]+$ ]] ||
+    return 1
+  cmp -s -- "/proc/$BASHPID/fd/$descriptor" \
+    <(jq -cS . "/proc/$BASHPID/fd/$descriptor") || return 1
+  expected="$(failure_expected_java_link_json "$index_descriptor")" ||
+    return 1
+  expected_reference="$(jq -r '.reference // ""' <<<"$expected")" || return 1
+  expected_digest="$(jq -r '.sha256 // ""' <<<"$expected")" || return 1
+  if [[ -z "$expected_reference" ]]; then
+    [[ -z "$expected_digest" ]] || return 1
+    jq -e '
+      keys == ["available", "reason", "schema", "sealed"] and
+      .schema == "obi-java-bridge-terminal-diagnostics-v1" and
+      .sealed == true and .available == false and
+      .reason == "no-valid-snapshot-before-terminal-boundary"
+    ' "/proc/$BASHPID/fd/$descriptor" >/dev/null
+    return
+  fi
+  [[ "$expected_reference" =~ \
+    ^phases/([a-z0-9][a-z0-9-]{0,63})/java-diagnostics\.txt$ ]] || return 1
+  phase="${BASH_REMATCH[1]}"
+  [[ "$expected_digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+  counter_names="$(printf '%s\n' \
+    "${ACCEPTANCE_JAVA_DIAGNOSTIC_COUNTER_NAMES[@]}" |
+    jq -Rsc 'split("\n")[:-1]')" || return 1
+  jq -e --arg reference "$expected_reference" --arg phase "$phase" \
+    --argjson counter_names "$counter_names" '
+    def base36:
+      reduce (explode[]) as $code
+        (0;
+          . * 36 +
+          (if $code >= 48 and $code <= 57 then $code - 48
+           elif $code >= 97 and $code <= 122 then $code - 87
+           else error("invalid base36 digit")
+           end));
+    def entry_pattern:
+      "\\A(?<name>[a-z_]+)=(?<value>0|[1-9a-z][0-9a-z]{0,5})\\z";
+    . as $terminal |
+    keys == [
+        "available", "counters", "phase", "reference", "schema", "sealed",
+        "snapshot"
+      ] and
+      .schema == "obi-java-bridge-terminal-diagnostics-v1" and
+      .sealed == true and .available == true and
+      .phase == $phase and .reference == $reference and
+      (.snapshot | type == "string" and utf8bytelength <= 16384) and
+      (.counters | type == "object") and
+      ($terminal.snapshot | split(",")) as $entries |
+      ($entries | length) == ($counter_names | length) and
+      all(range(0; $counter_names | length);
+        ($entries[.] | test(entry_pattern)) and
+        (($entries[.] | capture(entry_pattern)) as $entry |
+          $entry.name == $counter_names[.] and
+          (($entry.value | base36) < 999999999))) and
+      $terminal.counters ==
+        ($entries |
+          map(capture(entry_pattern) | {(.name): .value}) |
+          add)
+  ' "/proc/$BASHPID/fd/$descriptor" >/dev/null || return 1
+  # The decoded snapshot can contain arbitrary bytes.  Stream it directly
+  # from the immutable JSON descriptor into the digest; never place it in a
+  # shell variable, where Bash would discard embedded NUL bytes.
+  snapshot_digest="$(
+    jq -jre '.snapshot + "\n"' "/proc/$BASHPID/fd/$descriptor" |
+      sha256sum
+  )" || return 1
+  snapshot_digest="${snapshot_digest%% *}"
+  [[ "$snapshot_digest" =~ ^[0-9a-f]{64}$ &&
+    "$snapshot_digest" == "$expected_digest" ]]
+}
+
+failure_expected_obi_link_json() {
+  local -r index_descriptor="$1"
+
+  [[ "$index_descriptor" =~ ^[0-9]+$ ]] || return 1
+  jq -ceS '
+    [.boundaries[] | select(.state == "active")] as $active |
+    if ($active | length) == 0 then
+      {active_boundary: null, pair_reference: null, pair_sha256: null}
+    else
+      [$active[0].captures[] | select(.kind == "pair")] as $pairs |
+      if ($pairs | length) > 0 and $pairs[-1].state == "captured" then
+        {
+          active_boundary: $active[0].id,
+          pair_reference: $pairs[-1].pair_reference,
+          pair_sha256: $pairs[-1].pair_sha256
+        }
+      else
+        {
+          active_boundary: $active[0].id,
+          pair_reference: null,
+          pair_sha256: null
+        }
+      end
+    end
+  ' "/proc/$BASHPID/fd/$index_descriptor"
+}
+
+validate_failure_obi_terminal_fd() {
+  local -r descriptor="$1"
+  local -r index_digest="$2"
+  local -r index_descriptor="$3"
+  local expected=""
+  local active_boundary=""
+  local pair_reference=""
+  local pair_digest=""
+  local observed_pair=""
+  local observed_pair_digest=""
+
+  [[ "$descriptor" =~ ^[0-9]+$ && "$index_digest" =~ ^[0-9a-f]{64}$ &&
+    "$index_descriptor" =~ ^[0-9]+$ ]] || return 1
+  cmp -s -- "/proc/$BASHPID/fd/$descriptor" \
+    <(jq -cS . "/proc/$BASHPID/fd/$descriptor") || return 1
+  expected="$(failure_expected_obi_link_json "$index_descriptor")" || return 1
+  active_boundary="$(jq -r '.active_boundary // ""' <<<"$expected")" ||
+    return 1
+  pair_reference="$(jq -r '.pair_reference // ""' <<<"$expected")" ||
+    return 1
+  pair_digest="$(jq -r '.pair_sha256 // ""' <<<"$expected")" || return 1
+  if [[ -z "$active_boundary" ]]; then
+    [[ -z "$pair_reference" && -z "$pair_digest" ]] || return 1
+    jq -e --arg index_digest "$index_digest" '
+      keys == [
+        "active_boundary_id", "available", "boundary_index_reference",
+        "boundary_index_sha256", "reason", "schema", "sealed"
+      ] and
+      .schema == "obi-java-remote-parent-terminal-metrics-v2" and
+      .sealed == true and .available == false and
+      .active_boundary_id == null and .reason == "no-active-boundary" and
+      .boundary_index_reference == "obi-metric-boundary-index.json" and
+      .boundary_index_sha256 == $index_digest
+    ' "/proc/$BASHPID/fd/$descriptor" >/dev/null
+    return
+  fi
+  [[ "$active_boundary" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] || return 1
+  if [[ -z "$pair_reference" ]]; then
+    [[ -z "$pair_digest" ]] || return 1
+    jq -e --arg index_digest "$index_digest" \
+      --arg active_boundary "$active_boundary" '
+      keys == [
+        "active_boundary_id", "available", "boundary_index_reference",
+        "boundary_index_sha256", "reason", "schema", "sealed"
+      ] and
+      .schema == "obi-java-remote-parent-terminal-metrics-v2" and
+      .sealed == true and .available == false and
+      .active_boundary_id == $active_boundary and
+      .reason == "active-boundary-incomplete" and
+      .boundary_index_reference == "obi-metric-boundary-index.json" and
+      .boundary_index_sha256 == $index_digest
+    ' "/proc/$BASHPID/fd/$descriptor" >/dev/null
+    return
+  fi
+  [[ "$pair_reference" =~ \
+      ^obi-metric-pairs/[a-z0-9][a-z0-9-]{0,63}\.json$ &&
+    "$pair_digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+  jq -e --arg index_digest "$index_digest" \
+    --arg active_boundary "$active_boundary" \
+    --arg pair_reference "$pair_reference" '
+    keys == [
+        "active_boundary_id", "available", "boundary_index_reference",
+        "boundary_index_sha256", "pair", "pair_reference", "schema", "sealed"
+      ] and
+      .schema == "obi-java-remote-parent-terminal-metrics-v2" and
+      .sealed == true and .available == true and
+      .active_boundary_id == $active_boundary and
+      .boundary_index_reference == "obi-metric-boundary-index.json" and
+      .boundary_index_sha256 == $index_digest and
+      .pair_reference == $pair_reference and
+      (.pair | type == "object")
+  ' "/proc/$BASHPID/fd/$descriptor" >/dev/null || return 1
+  observed_pair="$(jq -cS '.pair' "/proc/$BASHPID/fd/$descriptor")" || return 1
+  observed_pair_digest="$(printf '%s\n' "$observed_pair" | sha256sum)" ||
+    return 1
+  observed_pair_digest="${observed_pair_digest%% *}"
+  [[ "$observed_pair_digest" == "$pair_digest" ]]
+}
+
+failure_classification_assert_not_mountpoint() {
+  local -r path="$1"
+  local status=0
+
+  if failure_classification_path_is_mountpoint "$path"; then
+    return 1
+  else
+    status=$?
+  fi
+  (( status == 1 ))
+}
+
+assert_failure_result_topology_unchanged() {
+  local -r results_root="$1"
+  local -r results_root_fd="$2"
+  local -r results_root_identity="$3"
+  local -r result="$4"
+  local -r result_fd="$5"
+  local -r result_identity="$6"
+  local result_parent_identity=""
+  local results_root_mount_id=""
+  local result_mount_id=""
+
+  [[ "$results_root_fd" =~ ^[0-9]+$ && "$result_fd" =~ ^[0-9]+$ &&
+    "$results_root_identity" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-7]{3,4}$ &&
+    "$result_identity" =~ ^[0-9]+:[0-9]+:[0-9]+:755$ &&
+    "${results_root_identity%%:*}" == "${CHECKOUT_IDENTITY%%:*}" &&
+    "${result_identity%%:*}" == "${results_root_identity%%:*}" &&
+    -d "$results_root" && ! -L "$results_root" &&
+    "$(readlink -f -- "$results_root")" == "$results_root" &&
+    "$(stat -Lc '%d:%i:%u:%a' -- "$results_root")" == \
+      "$results_root_identity" &&
+    "$(stat -Lc '%d:%i:%u:%a' -- \
+      "/proc/$BASHPID/fd/$results_root_fd")" == "$results_root_identity" &&
+    -d "$result" && ! -L "$result" &&
+    "$(readlink -f -- "$result")" == "$result" &&
+    "$(stat -Lc '%d:%i:%u:%a' -- "$result")" == "$result_identity" &&
+    "$(stat -Lc '%d:%i:%u:%a' -- "/proc/$BASHPID/fd/$result_fd")" == \
+      "$result_identity" ]] || return 1
+  result_parent_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "/proc/$BASHPID/fd/$result_fd/..")" || return 1
+  failure_classification_fd_mount_id "$results_root_fd" \
+    results_root_mount_id || return 1
+  failure_classification_fd_mount_id "$result_fd" result_mount_id || return 1
+  [[ "$result_parent_identity" == "$results_root_identity" &&
+    "$(stat -Lc '%d:%i:%u:%a' -- "$result/..")" == \
+      "$results_root_identity" &&
+    "$result_mount_id" == "$results_root_mount_id" ]] || return 1
+  failure_classification_assert_not_mountpoint "$results_root" || return 1
+  failure_classification_assert_not_mountpoint "$result"
+}
+
+validate_acceptance_failure_result_details() {
+  local -r result="$1"
+  local -r expected_result_identity="$2"
+  local -r expected_exit_status="$3"
+  local -r results_root="$CHECKOUT_DIRECTORY/examples/apache-java-https/.runtime/results"
+  local result_name=""
+  local results_root_fd=""
+  local results_root_identity=""
+  local result_fd=""
+  local result_identity=""
+  local result_descriptor_identity=""
+  local snapshot_directory=""
+  local snapshot_directory_fd=""
+  local snapshot_directory_identity=""
+  local environment_snapshot=""
+  local environment_fd=""
+  local environment_identity=""
+  local environment_digest=""
+  local index_snapshot=""
+  local index_fd=""
+  local index_identity=""
+  local index_digest=""
+  local freeze_snapshot=""
+  local freeze_fd=""
+  local freeze_identity=""
+  local freeze_digest=""
+  local java_snapshot=""
+  local java_fd=""
+  local java_identity=""
+  local java_digest=""
+  local obi_snapshot=""
+  local obi_fd=""
+  local obi_identity=""
+  local obi_digest=""
+  local status_snapshot=""
+  local status_fd=""
+  local status_identity=""
+  local status_digest=""
+  local terminal_count=""
+  local first_incomplete=""
+  local active_boundary=""
+  local failure_stage=""
+  local failure_line=""
+  local maximum_source_line=""
+  local expected_freeze=""
+
+  [[ "$expected_exit_status" =~ ^[1-9][0-9]{0,2}$ ]] || return 1
+  (( expected_exit_status <= 255 )) || return 1
+  verify_exact_checkout || return 1
+  [[ "$result" == \
+      "$CHECKOUT_DIRECTORY/examples/apache-java-https/.runtime/results/"* &&
+    "$expected_result_identity" =~ ^[0-9]+:[0-9]+:[0-9]+:755$ &&
+    -n "$RESULTS_ROOT_IDENTITY" &&
+    -d "$result" && ! -L "$result" &&
+    "$(CDPATH='' cd -- "$result" && pwd -P)" == "$result" ]] || return 1
+  result_name="${result##*/}"
+  [[ "$result" == "$results_root/$result_name" &&
+    "$result_name" =~ ^[0-9]{8}T[0-9]{6}Z-[1-9][0-9]*$ &&
+    -d "$results_root" && ! -L "$results_root" &&
+    "$(readlink -f -- "$results_root")" == "$results_root" ]] || return 1
+  results_root_identity="$(stat -Lc '%d:%i:%u:%a' -- "$results_root")" ||
+    return 1
+  [[ "$results_root_identity" == "$RESULTS_ROOT_IDENTITY" &&
+    "${results_root_identity%%:*}" == "${CHECKOUT_IDENTITY%%:*}" ]] || return 1
+  exec {results_root_fd}<"$results_root" || return $?
+  [[ "$(stat -Lc '%d:%i:%u:%a' -- "/proc/$BASHPID/fd/$results_root_fd")" == \
+    "$results_root_identity" ]] || return 1
+  result_identity="$(stat -Lc '%d:%i:%u:%a' -- "$result")" || return 1
+  [[ "$result_identity" == "$expected_result_identity" &&
+    "$result_identity" == *":$EUID:755" &&
+    "${result_identity%%:*}" == "${results_root_identity%%:*}" ]] || return 1
+  exec {result_fd}<"/proc/$BASHPID/fd/$results_root_fd/$result_name" ||
+    return $?
+  result_descriptor_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "/proc/$BASHPID/fd/$result_fd")" || return 1
+  [[ "$result_descriptor_identity" == "$result_identity" ]] || return 1
+  failure_classification_checkpoint after-result-open "$result" "$result_fd" \
+    "$results_root" "$results_root_fd" || return 1
+  assert_failure_result_topology_unchanged "$results_root" "$results_root_fd" \
+    "$results_root_identity" "$result" "$result_fd" "$result_identity" ||
+    return 1
+  create_failure_classification_snapshot_directory snapshot_directory \
+    snapshot_directory_fd snapshot_directory_identity || return 1
+
+  open_bounded_failure_input_snapshot "$result" "$result_fd" \
+    "$result_identity" environment.txt 644 "$MAX_ENVIRONMENT_BYTES" \
+    "$snapshot_directory" "$snapshot_directory_fd" environment.txt \
+    environment_snapshot environment_fd environment_identity \
+    environment_digest || return 1
+  validate_failure_environment_fd "$environment_fd" || return 1
+
+  open_bounded_failure_input_snapshot "$result" "$result_fd" \
+    "$result_identity" obi-metric-boundary-index.json 644 \
+    "$MAX_FAILURE_BOUNDARY_INDEX_BYTES" "$snapshot_directory" \
+    "$snapshot_directory_fd" boundary-index.json index_snapshot index_fd \
+    index_identity index_digest || return 1
+  validate_failure_boundary_index_fd "$index_fd" terminal_count \
+    first_incomplete active_boundary || return 1
+  [[ -z "$active_boundary" || "$active_boundary" == "$first_incomplete" ]] ||
+    return 1
+  open_bounded_failure_input_snapshot "$result" "$result_fd" \
+    "$result_identity" .obi-metric-boundary-index.freeze 600 \
+    "$MAX_FAILURE_FREEZE_BYTES" "$snapshot_directory" \
+    "$snapshot_directory_fd" boundary-index.freeze freeze_snapshot freeze_fd \
+    freeze_identity freeze_digest || return 1
+  expected_freeze="obi-metric-boundary-index-frozen-v1:$index_digest"
+  cmp -s -- "/proc/$BASHPID/fd/$freeze_fd" \
+    <(printf '%s\n' "$expected_freeze") || return 1
+
+  open_bounded_failure_input_snapshot "$result" "$result_fd" \
+    "$result_identity" terminal-java-diagnostics.json 644 \
+    "$MAX_FAILURE_JAVA_TERMINAL_BYTES" "$snapshot_directory" \
+    "$snapshot_directory_fd" terminal-java.json java_snapshot java_fd \
+    java_identity java_digest || return 1
+  validate_failure_java_terminal_fd "$java_fd" "$index_fd" || return 1
+  open_bounded_failure_input_snapshot "$result" "$result_fd" \
+    "$result_identity" terminal-obi-metrics.json 644 \
+    "$MAX_FAILURE_OBI_TERMINAL_BYTES" "$snapshot_directory" \
+    "$snapshot_directory_fd" terminal-obi.json obi_snapshot obi_fd \
+    obi_identity obi_digest || return 1
+  validate_failure_obi_terminal_fd "$obi_fd" "$index_digest" "$index_fd" ||
+    return 1
+
+  open_bounded_failure_input_snapshot "$result" "$result_fd" \
+    "$result_identity" run-status.json 644 "$MAX_RUN_STATUS_BYTES" \
+    "$snapshot_directory" "$snapshot_directory_fd" run-status.json \
+    status_snapshot status_fd status_identity status_digest || return 1
+  # run.sh writes this object with jq's deterministic pretty printer.  An
+  # exact re-render rejects duplicate keys and alternate tokenizations before
+  # any field is trusted, while preserving the producer's v3 byte contract.
+  cmp -s -- "/proc/$BASHPID/fd/$status_fd" \
+    <(jq . "/proc/$BASHPID/fd/$status_fd") || return 1
+  jq -e --arg result "$result" --arg index_digest "$index_digest" \
+    --argjson expected_exit "$expected_exit_status" \
+    --slurpfile java "/proc/$BASHPID/fd/$java_fd" \
+    --slurpfile obi "/proc/$BASHPID/fd/$obi_fd" '
+    keys == [
+      "acceptance_evidence", "acceptance_evidence_reason", "evidence_directory",
+      "exit_status", "failure_line", "failure_stage", "java_bridge_diagnostics",
+      "java_bridge_diagnostics_reference", "obi_metric_boundary_index_reference",
+      "obi_metric_boundary_index_sha256", "obi_metric_evidence",
+      "obi_metric_evidence_reference", "schema", "status"
+    ] and
+    .schema == "obi-apache-java-https-run-status-v3" and
+    .status == "failed" and .exit_status == $expected_exit and
+    .acceptance_evidence == true and .acceptance_evidence_reason == "none" and
+    .evidence_directory == $result and
+    (.failure_stage | type == "string" and length >= 1 and length <= 64) and
+    (.failure_line | type == "number" and floor == . and . >= 0) and
+    .java_bridge_diagnostics_reference == "terminal-java-diagnostics.json" and
+    ($java | length) == 1 and .java_bridge_diagnostics == $java[0] and
+    .obi_metric_evidence_reference == "terminal-obi-metrics.json" and
+    ($obi | length) == 1 and .obi_metric_evidence == $obi[0] and
+    .obi_metric_boundary_index_reference == "obi-metric-boundary-index.json" and
+    .obi_metric_boundary_index_sha256 == $index_digest
+  ' "/proc/$BASHPID/fd/$status_fd" >/dev/null || return 1
+  failure_stage="$(jq -er '.failure_stage' \
+    "/proc/$BASHPID/fd/$status_fd")" || return 1
+  is_allowed_acceptance_failure_stage "$failure_stage" || return 1
+  failure_line="$(jq -er '.failure_line' \
+    "/proc/$BASHPID/fd/$status_fd")" || return 1
+  maximum_source_line="$(wc -l <"$CHECKOUT_DIRECTORY/examples/apache-java-https/run.sh")" ||
+    return 1
+  [[ "$maximum_source_line" =~ ^[1-9][0-9]{0,8}$ &&
+    "$failure_line" =~ ^(0|[1-9][0-9]{0,8})$ ]] || return 1
+  (( failure_line <= maximum_source_line )) || return 1
+
+  assert_verified_input_fd_unchanged "$environment_snapshot" "$environment_fd" \
+    "$environment_identity" "$environment_digest" || return 1
+  assert_verified_input_fd_unchanged "$index_snapshot" "$index_fd" \
+    "$index_identity" "$index_digest" || return 1
+  assert_verified_input_fd_unchanged "$freeze_snapshot" "$freeze_fd" \
+    "$freeze_identity" "$freeze_digest" || return 1
+  assert_verified_input_fd_unchanged "$java_snapshot" "$java_fd" \
+    "$java_identity" "$java_digest" || return 1
+  assert_verified_input_fd_unchanged "$obi_snapshot" "$obi_fd" \
+    "$obi_identity" "$obi_digest" || return 1
+  assert_verified_input_fd_unchanged "$status_snapshot" "$status_fd" \
+    "$status_identity" "$status_digest" || return 1
+  verify_exact_checkout || return 1
+  assert_failure_result_topology_unchanged "$results_root" "$results_root_fd" \
+    "$results_root_identity" "$result" "$result_fd" "$result_identity" ||
+    return 1
+  [[ "$(stat -Lc '%d:%i:%u:%a' -- "$snapshot_directory")" == \
+      "$snapshot_directory_identity" &&
+    "$(stat -Lc '%d:%i:%u:%a' -- \
+      "/proc/$BASHPID/fd/$snapshot_directory_fd")" == \
+      "$snapshot_directory_identity" &&
+    "$(stat -Lc '%d:%i:%u:%a' -- \
+      "/proc/$BASHPID/fd/$snapshot_directory_fd/..")" == \
+      "$PRIVATE_IDENTITY" ]] || return 1
+  exec {status_fd}<&- || return 1
+  exec {obi_fd}<&- || return 1
+  exec {java_fd}<&- || return 1
+  exec {freeze_fd}<&- || return 1
+  exec {index_fd}<&- || return 1
+  exec {environment_fd}<&- || return 1
+  exec {snapshot_directory_fd}<&- || return 1
+  exec {result_fd}<&- || return 1
+  exec {results_root_fd}<&- || return 1
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$failure_stage" "$failure_line" "$terminal_count" \
+    "${first_incomplete:-__none__}" "$java_digest" "$obi_digest" \
+    "$index_digest" "$status_digest"
+}
+
+validate_acceptance_failure_result() {
+  local -r result="$1"
+  local -r expected_result_identity="$2"
+  local details=""
+  local stage=""
+  local source_line=""
+  local terminal_count=""
+  local first_incomplete=""
+  local java_digest=""
+  local obi_digest=""
+  local index_digest=""
+  local status_digest=""
+
+  [[ "$LAST_RECORDED_COMMAND_ID" == \
+      acceptance-all-otel-getsockopt-tls13 &&
+    "$LAST_RECORDED_COMMAND_VALIDATED" == true &&
+    "$LAST_RECORDED_COMMAND_EXIT_STATUS" =~ ^[1-9][0-9]{0,2}$ ]] || return 1
+  details="$(validate_acceptance_failure_result_details "$result" \
+    "$expected_result_identity" "$LAST_RECORDED_COMMAND_EXIT_STATUS")" ||
+    return 1
+  IFS=$'\t' read -r stage source_line terminal_count first_incomplete \
+    java_digest obi_digest index_digest status_digest <<<"$details"
+  [[ -n "$stage" && "$source_line" =~ ^(0|[1-9][0-9]{0,8})$ &&
+    "$terminal_count" =~ ^(0|[1-9][0-9]{0,2})$ &&
+    "$first_incomplete" =~ ^(__none__|[a-z0-9][a-z0-9-]{0,63})$ &&
+    "$java_digest" =~ ^[0-9a-f]{64}$ &&
+    "$obi_digest" =~ ^[0-9a-f]{64}$ &&
+    "$index_digest" =~ ^[0-9a-f]{64}$ &&
+    "$status_digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+  FAILURE_CLASSIFICATION_STAGE="$stage"
+  FAILURE_CLASSIFICATION_SOURCE_LINE="$source_line"
+  FAILURE_CLASSIFICATION_TERMINAL_COUNT="$terminal_count"
+  FAILURE_CLASSIFICATION_FIRST_INCOMPLETE="$first_incomplete"
+  FAILURE_CLASSIFICATION_JAVA_TERMINAL_SHA256="$java_digest"
+  FAILURE_CLASSIFICATION_OBI_TERMINAL_SHA256="$obi_digest"
+  FAILURE_CLASSIFICATION_INDEX_SHA256="$index_digest"
+  FAILURE_CLASSIFICATION_RUN_STATUS_SHA256="$status_digest"
+}
+
 assert_raw_result() {
   local -r role="$1"
   local -r result="$2"
+  local -r expected_result_identity="${3:-}"
   local run_status="$result/run-status.json"
   local environment="$result/environment.txt"
   local result_physical=""
@@ -1611,6 +2716,11 @@ assert_raw_result() {
   local source_tree=""
   local architecture=""
   local scenario=""
+
+  if [[ "$role" == acceptance-failure ]]; then
+    validate_acceptance_failure_result "$result" "$expected_result_identity"
+    return
+  fi
 
   [[ "$result" == "$CHECKOUT_DIRECTORY/examples/apache-java-https/.runtime/results/"* &&
     -d "$result" && ! -L "$result" ]] || return 1
@@ -1755,7 +2865,7 @@ resolve_new_result() {
   [[ "$result_seen" == true &&
     ( "$stable_lock_seen" == true || "$added_lock_seen" == true ) ]] ||
     return 1
-  assert_raw_result "$role" "$result" || return 1
+  assert_raw_result "$role" "$result" "$result_identity" || return 1
   if [[ "$added_lock_seen" == true ]]; then
     RESULT_LOCK_IDENTITY="$(stat -Lc '%d:%i:%u:%a' -- \
       "$results_root/.obi-metric-capture.lock")" || return 1
@@ -1786,6 +2896,147 @@ assert_source_authority_unchanged() {
   status="$(git -C "$CHECKOUT_DIRECTORY" status --porcelain \
     --untracked-files=all --ignore-submodules=none)" || return 1
   [[ "$head" == "$SOURCE_REVISION" && -z "$status" ]]
+}
+
+acceptance_failure_run_binding_sha256() {
+  local payload=""
+  local digest=""
+
+  is_sha1 "$SOURCE_REVISION" || return 1
+  is_sha256 "$WORKFLOW_BLOB_SHA256" || return 1
+  is_positive_decimal "$RUN_ID" || return 1
+  is_positive_decimal "$RUN_ATTEMPT" || return 1
+  [[ "$WORKFLOW_REF" == \
+      "$REPOSITORY_SLUG/$WORKFLOW_PATH@$CAMPAIGN_BRANCH" &&
+    "$RUN_URL" == \
+      "https://github.com/$REPOSITORY_SLUG/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT" ]] ||
+    return 1
+  payload="$(jq -cnS \
+    --arg repository "$REPOSITORY_SLUG" \
+    --arg source_revision "$SOURCE_REVISION" \
+    --arg workflow_blob_sha256 "$WORKFLOW_BLOB_SHA256" \
+    --arg workflow_ref "$WORKFLOW_REF" \
+    --arg run_id "$RUN_ID" \
+    --arg run_attempt "$RUN_ATTEMPT" '{
+      repository: $repository,
+      run_attempt: $run_attempt,
+      run_id: $run_id,
+      source_revision: $source_revision,
+      workflow_blob_sha256: $workflow_blob_sha256,
+      workflow_ref: $workflow_ref
+    }')" || return 1
+  digest="$(printf '%s\n' "$payload" | sha256sum)" || return 1
+  digest="${digest%% *}"
+  is_sha256 "$digest" || return 1
+  printf '%s\n' "$digest"
+}
+
+reset_failure_classification_values() {
+  FAILURE_CLASSIFICATION_JSON=""
+  FAILURE_CLASSIFICATION_STAGE=""
+  FAILURE_CLASSIFICATION_SOURCE_LINE=""
+  FAILURE_CLASSIFICATION_FIRST_INCOMPLETE=""
+  FAILURE_CLASSIFICATION_TERMINAL_COUNT=""
+  FAILURE_CLASSIFICATION_JAVA_TERMINAL_SHA256=""
+  FAILURE_CLASSIFICATION_OBI_TERMINAL_SHA256=""
+  FAILURE_CLASSIFICATION_INDEX_SHA256=""
+  FAILURE_CLASSIFICATION_RUN_STATUS_SHA256=""
+}
+
+emit_acceptance_failure_classification() {
+  local -r before="$1"
+  local source_revision="$SOURCE_REVISION"
+  local run_binding_sha256=""
+  local exit_status="$LAST_RECORDED_COMMAND_EXIT_STATUS"
+  local reason=acceptance_failed
+  local source_line_json=null
+  local first_incomplete_json=null
+  local detailed=false
+
+  [[ "$FAILURE_CLASSIFICATION_EMITTED" == false &&
+    "$LAST_RECORDED_COMMAND_ID" == \
+      acceptance-all-otel-getsockopt-tls13 &&
+    "$exit_status" =~ ^[1-9][0-9]{0,2}$ ]] || return 1
+  (( exit_status <= 255 )) || return 1
+  reset_failure_classification_values
+  if ! is_sha1 "$source_revision"; then
+    source_revision=0000000000000000000000000000000000000000
+  fi
+  run_binding_sha256="$(acceptance_failure_run_binding_sha256 2>/dev/null)" ||
+    run_binding_sha256="$EMPTY_SHA256"
+
+  failure_classification_checkpoint before-classification-validation "$before" ||
+    return 1
+  if resolve_new_result acceptance-failure "$before" RAW_ACCEPTANCE \
+      RAW_ACCEPTANCE_IDENTITY 2>/dev/null; then
+    detailed=true
+  fi
+  failure_classification_checkpoint after-classification-validation "$before" ||
+    detailed=false
+  if [[ "$detailed" == true ]]; then
+    case "$exit_status:$FAILURE_CLASSIFICATION_STAGE" in
+      124:*|137:*) reason=acceptance_timeout ;;
+      129:*|130:*|143:*|*:signal) reason=acceptance_interrupted ;;
+      *) reason=acceptance_failed ;;
+    esac
+    if [[ "$FAILURE_CLASSIFICATION_SOURCE_LINE" != 0 ]]; then
+      source_line_json="$FAILURE_CLASSIFICATION_SOURCE_LINE"
+    fi
+    if [[ "$FAILURE_CLASSIFICATION_FIRST_INCOMPLETE" != __none__ ]]; then
+      first_incomplete_json="$(jq -cn \
+        --arg value "$FAILURE_CLASSIFICATION_FIRST_INCOMPLETE" '$value')" ||
+        detailed=false
+    fi
+  fi
+  if [[ "$detailed" == true ]]; then
+    FAILURE_CLASSIFICATION_JSON="$(jq -cnS \
+      --argjson exit_status "$exit_status" \
+      --arg failure_stage "$FAILURE_CLASSIFICATION_STAGE" \
+      --arg reason "$reason" \
+      --argjson source_line "$source_line_json" \
+      --argjson terminal_count "$FAILURE_CLASSIFICATION_TERMINAL_COUNT" \
+      --argjson first_incomplete "$first_incomplete_json" \
+      --arg terminal_java_sha256 \
+        "$FAILURE_CLASSIFICATION_JAVA_TERMINAL_SHA256" \
+      --arg terminal_obi_sha256 \
+        "$FAILURE_CLASSIFICATION_OBI_TERMINAL_SHA256" \
+      --arg boundary_index_sha256 "$FAILURE_CLASSIFICATION_INDEX_SHA256" \
+      --arg run_status_sha256 "$FAILURE_CLASSIFICATION_RUN_STATUS_SHA256" \
+      --arg source_revision "$source_revision" \
+      --arg run_binding_sha256 "$run_binding_sha256" '{
+        boundary_index_sha256: $boundary_index_sha256,
+        exit_status: $exit_status,
+        failure_stage: $failure_stage,
+        first_incomplete_boundary: $first_incomplete,
+        reason: $reason,
+        run_binding_sha256: $run_binding_sha256,
+        run_status_sha256: $run_status_sha256,
+        source_line: $source_line,
+        source_revision: $source_revision,
+        terminal_boundary_count: $terminal_count,
+        terminal_java_sha256: $terminal_java_sha256,
+        terminal_obi_sha256: $terminal_obi_sha256
+      }')" || detailed=false
+  fi
+  if [[ "$detailed" != true ]]; then
+    FAILURE_CLASSIFICATION_JSON="$(jq -cnS \
+      --argjson exit_status "$exit_status" \
+      --arg source_revision "$source_revision" \
+      --arg run_binding_sha256 "$run_binding_sha256" '{
+        exit_status: $exit_status,
+        failure_stage: "classification-unavailable",
+        reason: "classification_unavailable",
+        run_binding_sha256: $run_binding_sha256,
+        source_revision: $source_revision,
+        terminal_boundary_count: 0
+      }')" || return 1
+  fi
+  [[ -n "$FAILURE_CLASSIFICATION_JSON" &&
+    "$FAILURE_CLASSIFICATION_JSON" == \
+      "$(jq -cS . <<<"$FAILURE_CLASSIFICATION_JSON")" ]] || return 1
+  FAILURE_CLASSIFICATION_EMITTED=true
+  printf '%s: acceptance_failure_classification=%s\n' \
+    "$SCRIPT_NAME" "$FAILURE_CLASSIFICATION_JSON" >&2
 }
 
 receipt_preopen_checkpoint() {
@@ -2316,7 +3567,8 @@ cleanup_on_exit() {
     exec {WORKFLOW_OUTPUT_FD}>&- || cleanup_status=1
     WORKFLOW_OUTPUT_FD=""
   fi
-  if [[ -n "$PRIMARY_FAILURE" ]]; then
+  if [[ -n "$PRIMARY_FAILURE" &&
+    "$FAILURE_CLASSIFICATION_EMITTED" != true ]]; then
     log_info "failure context: $PRIMARY_FAILURE"
   fi
   if (( original_status == 0 )) &&
@@ -2391,9 +3643,16 @@ run_campaign() {
   }
   enter_state ACCEPTANCE
   CLEANUP_REQUIRED=true
-  run_recorded_command acceptance-all-otel-getsockopt-tls13 0 \
-    "$CHECKOUT_DIRECTORY" ./examples/apache-java-https/run.sh \
-      --transport getsockopt --agent otel --tls TLSv1.3
+  if ! run_recorded_command acceptance-all-otel-getsockopt-tls13 0 \
+      "$CHECKOUT_DIRECTORY" ./examples/apache-java-https/run.sh \
+        --transport getsockopt --agent otel --tls TLSv1.3; then
+    if [[ "$LAST_RECORDED_COMMAND_ID" == \
+        acceptance-all-otel-getsockopt-tls13 &&
+      "$LAST_RECORDED_COMMAND_EXIT_STATUS" =~ ^[1-9][0-9]{0,2}$ ]]; then
+      emit_acceptance_failure_classification "$before_acceptance" || return 1
+    fi
+    return 1
+  fi
   resolve_new_result acceptance "$before_acceptance" RAW_ACCEPTANCE \
     RAW_ACCEPTANCE_IDENTITY
 

@@ -140,6 +140,306 @@ create_raw_result_fixture() {
   printf '%s\n' "$result"
 }
 
+create_failed_acceptance_result_fixture() {
+  local -r checkout="$1"
+  local -r exit_status="$2"
+  local results_root="$checkout/examples/apache-java-https/.runtime/results"
+  local result="$results_root/20260819T120000Z-1001"
+  local index="$result/obi-metric-boundary-index.json"
+  local java_terminal="$result/terminal-java-diagnostics.json"
+  local obi_terminal="$result/terminal-obi-metrics.json"
+  local run_status="$result/run-status.json"
+  local ids_json=""
+  local java_reference='phases/keepalive-after/java-diagnostics.txt'
+  local java_snapshot=""
+  local pair_reference='obi-metric-pairs/keepalive-pair.json'
+  local pair_payload=""
+  local pair_digest=""
+  local index_digest=""
+  local java_digest=""
+  local obi_digest=""
+  local status_digest=""
+  local source_line=1
+  local terminal_count=3
+  local first_incomplete_json='"keepalive"'
+  local source_line_json=1
+  local counter=""
+  local reason=acceptance_failed
+  local all_terminal=false
+  local na_prefix=false
+
+  case "$CAMPAIGN_TEST_MUTATION" in
+    acceptance-failure-source-line-zero)
+      source_line=0
+      source_line_json=null
+      ;;
+    acceptance-failure-na-prefix)
+      na_prefix=true
+      ;;
+    acceptance-failure-all-terminal)
+      all_terminal=true
+      terminal_count="${#ACCEPTANCE_BOUNDARY_IDS[@]}"
+      first_incomplete_json=null
+      ;;
+  esac
+  case "$exit_status" in
+    124|137) reason=acceptance_timeout ;;
+    129|130|143) reason=acceptance_interrupted ;;
+  esac
+
+  mkdir -p -- "$results_root"
+  chmod 0755 -- "$results_root"
+  if [[ ! -e "$results_root/.obi-metric-capture.lock" &&
+    ! -L "$results_root/.obi-metric-capture.lock" ]]; then
+    install -m 0600 /dev/null "$results_root/.obi-metric-capture.lock"
+  fi
+  mkdir -m 0755 -- "$result"
+  write_environment_fixture "$result/environment.txt" all
+  ids_json="$(printf '%s\n' "${ACCEPTANCE_BOUNDARY_IDS[@]}" |
+    jq -Rsc 'split("\n") | map(select(length > 0))')" || return 1
+  for counter in "${ACCEPTANCE_JAVA_DIAGNOSTIC_COUNTER_NAMES[@]}"; do
+    if [[ -n "$java_snapshot" ]]; then
+      java_snapshot+=,
+    fi
+    java_snapshot+="$counter=0"
+  done
+  java_digest="$(printf '%s\n' "$java_snapshot" | sha256sum)"
+  java_digest="${java_digest%% *}"
+  pair_payload="$(jq -cnS '{
+    schema: "test-obi-metric-pair-v1",
+    before: {state: "running"},
+    after: {state: "running"}
+  }')" || return 1
+  pair_digest="$(printf '%s\n' "$pair_payload" | sha256sum)"
+  pair_digest="${pair_digest%% *}"
+  jq -cS -n --argjson ids "$ids_json" \
+    --arg java_reference "$java_reference" --arg java_digest "$java_digest" \
+    --arg pair_reference "$pair_reference" --arg pair_digest "$pair_digest" \
+    --argjson all_terminal "$all_terminal" --argjson na_prefix "$na_prefix" '{
+    schema: "obi-metric-boundary-index-v1",
+    selection: {
+      scenario: "all",
+      requested_transport: "getsockopt",
+      selected_transport: "getsockopt",
+      repeat_count: 1
+    },
+    boundaries: ($ids | to_entries | map(
+      if $all_terminal and .key == 3 then {
+        id: .value,
+        ordinal: (.key + 1),
+        state: "complete",
+        captures: [{
+          id: "keepalive-pair",
+          kind: "pair",
+          state: "captured",
+          pair_reference: $pair_reference,
+          pair_sha256: $pair_digest,
+          java_reference: $java_reference,
+          java_sha256: $java_digest
+        }],
+        status_references: [{
+          reference: ("scenario-" + .value + "-status.json"),
+          sha256: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        }],
+        not_applicable_reason: null
+      } elif $all_terminal then {
+        id: .value,
+        ordinal: (.key + 1),
+        state: "complete",
+        captures: [{
+          id: .value,
+          kind: "unavailable",
+          reason: "obi_process_not_running",
+          reference: ("phases/" + .value + "/obi-metrics.prom"),
+          sha256: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          state: "captured"
+        }],
+        status_references: [{
+          reference: ("scenario-" + .value + "-status.json"),
+          sha256: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        }],
+        not_applicable_reason: null
+      } elif $na_prefix and .key == 1 then {
+        id: .value,
+        ordinal: (.key + 1),
+        state: "not_applicable",
+        captures: [],
+        status_references: [{
+          reference: ("scenario-" + .value + "-status.json"),
+          sha256: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        }],
+        not_applicable_reason: "fixed-test-not-applicable"
+      } elif .key < 3 then {
+        id: .value,
+        ordinal: (.key + 1),
+        state: "complete",
+        captures: [{
+          id: .value,
+          kind: "unavailable",
+          reason: "obi_process_not_running",
+          reference: ("phases/" + .value + "/obi-metrics.prom"),
+          sha256: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          state: "captured"
+        }],
+        status_references: [{
+          reference: ("scenario-" + .value + "-status.json"),
+          sha256: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        }],
+        not_applicable_reason: null
+      } elif .key == 3 then {
+        id: .value,
+        ordinal: (.key + 1),
+        state: "active",
+        captures: [{
+          id: "keepalive-pair",
+          kind: "pair",
+          state: "captured",
+          pair_reference: $pair_reference,
+          pair_sha256: $pair_digest,
+          java_reference: $java_reference,
+          java_sha256: $java_digest
+        }],
+        status_references: [],
+        not_applicable_reason: null
+      } else {
+        id: .value,
+        ordinal: (.key + 1),
+        state: "planned",
+        captures: [],
+        status_references: [],
+        not_applicable_reason: null
+      } end))
+  }' >"$index"
+  chmod 0644 -- "$index"
+  index_digest="$(sha256sum <"$index")"
+  index_digest="${index_digest%% *}"
+  printf 'obi-metric-boundary-index-frozen-v1:%s\n' "$index_digest" \
+    >"$result/.obi-metric-boundary-index.freeze"
+  chmod 0600 -- "$result/.obi-metric-boundary-index.freeze"
+  jq -cS -n --arg reference "$java_reference" \
+    --arg snapshot "$java_snapshot" '{
+      schema: "obi-java-bridge-terminal-diagnostics-v1",
+      sealed: true,
+      available: true,
+      phase: "keepalive-after",
+      reference: $reference,
+      snapshot: $snapshot,
+      counters: ($snapshot | split(",") |
+        map(split("=") | {(.[0]): .[1]}) | add)
+  }' >"$java_terminal"
+  chmod 0644 -- "$java_terminal"
+  if [[ "$all_terminal" == true ]]; then
+    jq -cS -n --arg index_digest "$index_digest" '{
+      schema: "obi-java-remote-parent-terminal-metrics-v2",
+      sealed: true,
+      available: false,
+      reason: "no-active-boundary",
+      active_boundary_id: null,
+      boundary_index_reference: "obi-metric-boundary-index.json",
+      boundary_index_sha256: $index_digest
+    }' >"$obi_terminal"
+  else
+    jq -cS -n --arg index_digest "$index_digest" \
+      --arg pair_reference "$pair_reference" --argjson pair "$pair_payload" '{
+      schema: "obi-java-remote-parent-terminal-metrics-v2",
+      sealed: true,
+      available: true,
+      active_boundary_id: "keepalive",
+      boundary_index_reference: "obi-metric-boundary-index.json",
+      boundary_index_sha256: $index_digest,
+      pair_reference: $pair_reference,
+      pair: $pair
+    }' >"$obi_terminal"
+  fi
+  chmod 0644 -- "$obi_terminal"
+  jq -n --arg result "$result" --argjson exit_status "$exit_status" \
+    --arg index_digest "$index_digest" --argjson source_line "$source_line" \
+    --slurpfile java "$java_terminal" --slurpfile obi "$obi_terminal" '{
+      schema: "obi-apache-java-https-run-status-v3",
+      status: "failed",
+      exit_status: $exit_status,
+      acceptance_evidence: true,
+      acceptance_evidence_reason: "none",
+      failure_stage: "scenarios",
+      failure_line: $source_line,
+      evidence_directory: $result,
+      java_bridge_diagnostics_reference: "terminal-java-diagnostics.json",
+      java_bridge_diagnostics: $java[0],
+      obi_metric_evidence_reference: "terminal-obi-metrics.json",
+      obi_metric_evidence: $obi[0],
+      obi_metric_boundary_index_reference: "obi-metric-boundary-index.json",
+      obi_metric_boundary_index_sha256: $index_digest
+    }' >"$run_status"
+  chmod 0644 -- "$run_status"
+  java_digest="$(sha256sum <"$java_terminal")"
+  java_digest="${java_digest%% *}"
+  obi_digest="$(sha256sum <"$obi_terminal")"
+  obi_digest="${obi_digest%% *}"
+  status_digest="$(sha256sum <"$run_status")"
+  status_digest="${status_digest%% *}"
+  jq -cS -n --arg boundary_index_sha256 "$index_digest" --arg reason "$reason" \
+    --arg terminal_java_sha256 "$java_digest" \
+    --arg terminal_obi_sha256 "$obi_digest" \
+    --arg run_status_sha256 "$status_digest" \
+    --argjson terminal_count "$terminal_count" \
+    --argjson first_incomplete "$first_incomplete_json" \
+    --argjson source_line "$source_line_json" '{
+      boundary_index_sha256: $boundary_index_sha256,
+      failure_stage: "scenarios",
+      first_incomplete_boundary: $first_incomplete,
+      reason: $reason,
+      run_status_sha256: $run_status_sha256,
+      source_line: $source_line,
+      terminal_boundary_count: $terminal_count,
+      terminal_java_sha256: $terminal_java_sha256,
+      terminal_obi_sha256: $terminal_obi_sha256
+    }' >"$CASE_ROOT/expected-classification.json"
+  chmod 0600 -- "$CASE_ROOT/expected-classification.json"
+  printf '%s\n' "$result"
+}
+
+refresh_failed_run_status_terminals() {
+  local -r result="$1"
+  local run_status="$result/run-status.json"
+  local candidate="$result/run-status.refresh"
+
+  jq --slurpfile java "$result/terminal-java-diagnostics.json" \
+    --slurpfile obi "$result/terminal-obi-metrics.json" '
+      .java_bridge_diagnostics = $java[0] |
+      .obi_metric_evidence = $obi[0]
+    ' "$run_status" >"$candidate" || return 1
+  mv -fT -- "$candidate" "$run_status" || return 1
+  chmod 0644 -- "$run_status"
+}
+
+refresh_failed_index_bindings() {
+  local -r result="$1"
+  local index="$result/obi-metric-boundary-index.json"
+  local obi_terminal="$result/terminal-obi-metrics.json"
+  local run_status="$result/run-status.json"
+  local candidate=""
+  local index_digest=""
+
+  index_digest="$(sha256sum <"$index")" || return 1
+  index_digest="${index_digest%% *}"
+  printf 'obi-metric-boundary-index-frozen-v1:%s\n' "$index_digest" \
+    >"$result/.obi-metric-boundary-index.freeze" || return 1
+  chmod 0600 -- "$result/.obi-metric-boundary-index.freeze" || return 1
+  candidate="$result/terminal-obi-metrics.refresh"
+  jq -cS --arg digest "$index_digest" \
+    '.boundary_index_sha256 = $digest' "$obi_terminal" >"$candidate" ||
+    return 1
+  mv -fT -- "$candidate" "$obi_terminal" || return 1
+  chmod 0644 -- "$obi_terminal" || return 1
+  candidate="$result/run-status.refresh"
+  jq --arg digest "$index_digest" \
+    '.obi_metric_boundary_index_sha256 = $digest' "$run_status" \
+    >"$candidate" || return 1
+  mv -fT -- "$candidate" "$run_status" || return 1
+  chmod 0644 -- "$run_status" || return 1
+  refresh_failed_run_status_terminals "$result"
+}
+
 create_public_fixture() {
   local -r output="$1"
   local -r verify_mutation="$2"
@@ -427,6 +727,110 @@ mock_result_snapshot_checkpoint() {
   fi
 }
 
+mock_failure_classification_checkpoint() {
+  local -r phase="$1"
+  local -r path="${2:-}"
+  local marker="$CASE_ROOT/failure-classification-race"
+  local original=""
+  local mutated=""
+  local results_root=""
+  local fd_count=""
+  local fd_flags=""
+  local fd_access_mode=""
+  local -a observed_fds=()
+
+  case "$phase:$CAMPAIGN_TEST_MUTATION" in
+    after-snapshot-seal:*)
+      fd_flags="$(awk '$1 == "flags:" { print $2 }' "/proc/$BASHPID/fdinfo/${5}")"
+      [[ "$fd_flags" =~ ^[0-7]+$ ]] || return 1
+      fd_access_mode="$((8#$fd_flags & 3))"
+      printf '%s\t%s\t%s\n' "${path##*/}" "$(stat -Lc '%a' -- "${4}")" \
+        "$fd_access_mode" \
+        >>"$CASE_ROOT/classifier-snapshot-seals"
+      ;;
+    after-input-snapshot:acceptance-failure-race)
+      if [[ "${path##*/}" == run-status.json &&
+        ! -e "$marker" && ! -L "$marker" ]]; then
+        mv -- "$path" "$CASE_ROOT/original-run-status.json"
+        cp -- "$CASE_ROOT/original-run-status.json" "$path"
+        chmod 0644 -- "$path"
+        : >"$marker"
+      fi
+      ;;
+    after-input-snapshot:acceptance-failure-same-inode-aba)
+      marker="$CASE_ROOT/failure-classification-same-inode-aba"
+      if [[ "${path##*/}" == run-status.json &&
+        ! -e "$marker" && ! -L "$marker" ]]; then
+        original="$(<"$path")"
+        mutated="${original//\"scenarios\"/\"readiness\"}"
+        [[ "${#mutated}" == "${#original}" && "$mutated" != "$original" ]] ||
+          return 1
+        printf '%s\n' "$mutated" >"$path"
+        printf '%s\n' "$original" >"$path"
+        chmod 0644 -- "$path"
+        : >"$marker"
+      fi
+      ;;
+    after-result-open:acceptance-failure-result-parent-replacement)
+      marker="$CASE_ROOT/failure-classification-parent-replaced"
+      if [[ ! -e "$marker" && ! -L "$marker" ]]; then
+        results_root="${path%/*}"
+        mv -- "$results_root" "$PRIVATE_DIRECTORY/original-results-root"
+        cp -a -- "$PRIVATE_DIRECTORY/original-results-root" "$results_root"
+        : >"$marker"
+      fi
+      ;;
+    before-classification-validation:*)
+      observed_fds=("/proc/$BASHPID/fd/"*)
+      fd_count="${#observed_fds[@]}"
+      printf '%s\n' "$fd_count" >"$CASE_ROOT/classifier-fd-count-before"
+      ;;
+    after-classification-validation:*)
+      observed_fds=("/proc/$BASHPID/fd/"*)
+      fd_count="${#observed_fds[@]}"
+      printf '%s\n' "$fd_count" >"$CASE_ROOT/classifier-fd-count-after"
+      ;;
+  esac
+}
+
+mock_failure_classification_path_is_mountpoint() {
+  local -r path="$1"
+
+  if [[ "$CAMPAIGN_TEST_MUTATION" == acceptance-failure-result-mountpoint &&
+    "${path##*/}" == 20260819T120000Z-1001 ]]; then
+    : >"$CASE_ROOT/failure-classification-mountpoint"
+    return 0
+  fi
+  if [[ "$CAMPAIGN_TEST_MUTATION" == \
+      acceptance-failure-child-mountpoint &&
+    "${path##*/}" == terminal-java-diagnostics.json ]]; then
+    : >"$CASE_ROOT/failure-classification-child-mountpoint"
+    return 0
+  fi
+  failure_classification_mountinfo_path_is_mountpoint "$path"
+}
+
+mock_failure_classification_fd_mount_id() {
+  local -r descriptor="$1"
+  local -r output_name="$2"
+  local observed_mount_id=""
+  local descriptor_target=""
+
+  failure_classification_fdinfo_mount_id "$descriptor" observed_mount_id ||
+    return 1
+  descriptor_target="$(readlink -- "/proc/$BASHPID/fd/$descriptor")" ||
+    return 1
+  if [[ "$CAMPAIGN_TEST_MUTATION" == \
+      acceptance-failure-child-bind-mount &&
+    "${descriptor_target##*/}" == terminal-java-diagnostics.json ]]; then
+    # A bind-mounted regular file can retain its device/inode while acquiring
+    # a different mount ID.  Model only that kernel-observable distinction.
+    observed_mount_id="9$observed_mount_id"
+    : >"$CASE_ROOT/failure-classification-child-bind-mount"
+  fi
+  printf -v "$output_name" '%s' "$observed_mount_id"
+}
+
 mock_receipt_preopen_checkpoint() {
   local -r receipt="$1"
   local sentinel="$CASE_ROOT/receipt-preopen-sentinel"
@@ -502,6 +906,8 @@ mock_campaign_execute() {
   local acceptance_result=""
   local replacement=""
   local holder_pid=""
+  local failure_exit_status=7
+  local candidate=""
 
   mock_assert_exact_command "$command_id" "$@" || return 96
   case "$command_id" in
@@ -534,6 +940,195 @@ mock_campaign_execute() {
       fi
       ;;
     acceptance-all-otel-getsockopt-tls13)
+      if [[ "$CAMPAIGN_TEST_MUTATION" == acceptance-failure-* ]]; then
+        case "$CAMPAIGN_TEST_MUTATION" in
+          acceptance-failure-timeout) failure_exit_status=124 ;;
+          acceptance-failure-interrupted) failure_exit_status=130 ;;
+        esac
+        acceptance_result="$(create_failed_acceptance_result_fixture \
+          "$CHECKOUT_DIRECTORY" "$failure_exit_status")" || return 98
+        case "$CAMPAIGN_TEST_MUTATION" in
+          acceptance-failure-valid|acceptance-failure-race|\
+          acceptance-failure-same-inode-aba|acceptance-failure-timeout|\
+          acceptance-failure-interrupted|acceptance-failure-source-line-zero|\
+          acceptance-failure-na-prefix|acceptance-failure-all-terminal|\
+          acceptance-failure-result-parent-replacement|\
+          acceptance-failure-result-mountpoint|\
+          acceptance-failure-child-mountpoint|\
+          acceptance-failure-child-bind-mount) ;;
+          acceptance-failure-malformed)
+            printf '%s\n' '{malformed-private-status' \
+              >"$acceptance_result/run-status.json"
+            ;;
+          acceptance-failure-duplicate-key)
+            candidate="$acceptance_result/run-status.tmp"
+            sed '2i\  "failure_stage": "failure-classifier-secret-canary",' \
+              "$acceptance_result/run-status.json" >"$candidate"
+            mv -fT -- "$candidate" "$acceptance_result/run-status.json"
+            chmod 0644 -- "$acceptance_result/run-status.json"
+            ;;
+          acceptance-failure-multiple)
+            cp -a -- "$acceptance_result" \
+              "$results_root/20260819T120002Z-1003"
+            ;;
+          acceptance-failure-symlink)
+            mv -- "$acceptance_result/run-status.json" \
+              "$CASE_ROOT/private-run-status-target.json"
+            ln -s -- "$CASE_ROOT/private-run-status-target.json" \
+              "$acceptance_result/run-status.json"
+            ;;
+          acceptance-failure-hardlink)
+            ln -- "$acceptance_result/run-status.json" \
+              "$CASE_ROOT/private-run-status-hardlink.json"
+            ;;
+          acceptance-failure-extra-key)
+            jq '.private_extra_key="failure-classifier-secret-canary"' \
+              "$acceptance_result/run-status.json" \
+              >"$acceptance_result/run-status.tmp"
+            mv -- "$acceptance_result/run-status.tmp" \
+              "$acceptance_result/run-status.json"
+            chmod 0644 -- "$acceptance_result/run-status.json"
+            ;;
+          acceptance-failure-stage)
+            jq '.failure_stage="private/unallowlisted/stage"' \
+              "$acceptance_result/run-status.json" \
+              >"$acceptance_result/run-status.tmp"
+            mv -- "$acceptance_result/run-status.tmp" \
+              "$acceptance_result/run-status.json"
+            chmod 0644 -- "$acceptance_result/run-status.json"
+            ;;
+          acceptance-failure-reason)
+            jq '.acceptance_evidence_reason="private-unallowlisted-reason"' \
+              "$acceptance_result/run-status.json" \
+              >"$acceptance_result/run-status.tmp"
+            mv -- "$acceptance_result/run-status.tmp" \
+              "$acceptance_result/run-status.json"
+            chmod 0644 -- "$acceptance_result/run-status.json"
+            ;;
+          acceptance-failure-environment)
+            sed -i 's/^scenario=all$/scenario=security/' \
+              "$acceptance_result/environment.txt"
+            ;;
+          acceptance-failure-exit-crosslink)
+            candidate="$acceptance_result/run-status.tmp"
+            jq '.exit_status=8' "$acceptance_result/run-status.json" \
+              >"$candidate"
+            mv -fT -- "$candidate" "$acceptance_result/run-status.json"
+            chmod 0644 -- "$acceptance_result/run-status.json"
+            ;;
+          acceptance-failure-source-line-bound)
+            candidate="$acceptance_result/run-status.tmp"
+            jq '.failure_line=3' "$acceptance_result/run-status.json" \
+              >"$candidate"
+            mv -fT -- "$candidate" "$acceptance_result/run-status.json"
+            chmod 0644 -- "$acceptance_result/run-status.json"
+            ;;
+          acceptance-failure-hash-crosslink)
+            candidate="$acceptance_result/run-status.tmp"
+            jq '.obi_metric_boundary_index_sha256 =
+              "abababababababababababababababababababababababababababababababab"' \
+              "$acceptance_result/run-status.json" >"$candidate"
+            mv -fT -- "$candidate" "$acceptance_result/run-status.json"
+            chmod 0644 -- "$acceptance_result/run-status.json"
+            ;;
+          acceptance-failure-input-size)
+            truncate -s "$((MAX_ENVIRONMENT_BYTES + 1))" \
+              "$acceptance_result/environment.txt"
+            ;;
+          acceptance-failure-input-mode)
+            chmod 0600 -- "$acceptance_result/environment.txt"
+            ;;
+          acceptance-failure-active-boundary)
+            candidate="$acceptance_result/terminal-obi-metrics.tmp"
+            jq -cS '.active_boundary_id="security"' \
+              "$acceptance_result/terminal-obi-metrics.json" >"$candidate"
+            mv -fT -- "$candidate" \
+              "$acceptance_result/terminal-obi-metrics.json"
+            chmod 0644 -- "$acceptance_result/terminal-obi-metrics.json"
+            refresh_failed_run_status_terminals "$acceptance_result"
+            ;;
+          acceptance-failure-pair-reference)
+            candidate="$acceptance_result/terminal-obi-metrics.tmp"
+            jq -cS '.pair_reference="obi-metric-pairs/other.json"' \
+              "$acceptance_result/terminal-obi-metrics.json" >"$candidate"
+            mv -fT -- "$candidate" \
+              "$acceptance_result/terminal-obi-metrics.json"
+            chmod 0644 -- "$acceptance_result/terminal-obi-metrics.json"
+            refresh_failed_run_status_terminals "$acceptance_result"
+            ;;
+          acceptance-failure-pair-digest)
+            candidate="$acceptance_result/obi-metric-boundary-index.tmp"
+            jq -cS '(.boundaries[] | select(.id == "keepalive") |
+              .captures[] | select(.kind == "pair") |
+              .pair_sha256) =
+              "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"' \
+              "$acceptance_result/obi-metric-boundary-index.json" >"$candidate"
+            mv -fT -- "$candidate" \
+              "$acceptance_result/obi-metric-boundary-index.json"
+            chmod 0644 -- \
+              "$acceptance_result/obi-metric-boundary-index.json"
+            refresh_failed_index_bindings "$acceptance_result"
+            ;;
+          acceptance-failure-java-reference)
+            candidate="$acceptance_result/terminal-java-diagnostics.tmp"
+            jq -cS '.reference="phases/other/java-diagnostics.txt" |
+              .phase="other"' \
+              "$acceptance_result/terminal-java-diagnostics.json" >"$candidate"
+            mv -fT -- "$candidate" \
+              "$acceptance_result/terminal-java-diagnostics.json"
+            chmod 0644 -- "$acceptance_result/terminal-java-diagnostics.json"
+            refresh_failed_run_status_terminals "$acceptance_result"
+            ;;
+          acceptance-failure-java-counters)
+            candidate="$acceptance_result/terminal-java-diagnostics.tmp"
+            jq -cS '.counters.cfg_on="1"' \
+              "$acceptance_result/terminal-java-diagnostics.json" >"$candidate"
+            mv -fT -- "$candidate" \
+              "$acceptance_result/terminal-java-diagnostics.json"
+            chmod 0644 -- "$acceptance_result/terminal-java-diagnostics.json"
+            refresh_failed_run_status_terminals "$acceptance_result"
+            ;;
+          acceptance-failure-java-snapshot-nul)
+            candidate="$acceptance_result/terminal-java-diagnostics.tmp"
+            jq -cS '.snapshot += "\u0000"' \
+              "$acceptance_result/terminal-java-diagnostics.json" >"$candidate"
+            mv -fT -- "$candidate" \
+              "$acceptance_result/terminal-java-diagnostics.json"
+            chmod 0644 -- "$acceptance_result/terminal-java-diagnostics.json"
+            grep -Fq '\u0000' \
+              "$acceptance_result/terminal-java-diagnostics.json" || return 1
+            : >"$CASE_ROOT/failure-classification-java-snapshot-nul"
+            refresh_failed_run_status_terminals "$acceptance_result"
+            ;;
+          acceptance-failure-java-digest)
+            candidate="$acceptance_result/obi-metric-boundary-index.tmp"
+            jq -cS '(.boundaries[] | select(.id == "keepalive") |
+              .captures[] | select(.kind == "pair") |
+              .java_sha256) =
+              "dededededededededededededededededededededededededededededededede"' \
+              "$acceptance_result/obi-metric-boundary-index.json" >"$candidate"
+            mv -fT -- "$candidate" \
+              "$acceptance_result/obi-metric-boundary-index.json"
+            chmod 0644 -- \
+              "$acceptance_result/obi-metric-boundary-index.json"
+            refresh_failed_index_bindings "$acceptance_result"
+            ;;
+          acceptance-failure-terminal-index-hash)
+            candidate="$acceptance_result/terminal-obi-metrics.tmp"
+            jq -cS '.boundary_index_sha256 =
+              "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef"' \
+              "$acceptance_result/terminal-obi-metrics.json" >"$candidate"
+            mv -fT -- "$candidate" \
+              "$acceptance_result/terminal-obi-metrics.json"
+            chmod 0644 -- "$acceptance_result/terminal-obi-metrics.json"
+            refresh_failed_run_status_terminals "$acceptance_result"
+            ;;
+          *) return 99 ;;
+        esac
+        printf '%s\n' \
+          'failure-classifier-secret-canary path=/private/raw pid=4242 id=raw-id timestamp=2026-08-19T12:00:00Z'
+        return "$failure_exit_status"
+      fi
       if [[ "$CAMPAIGN_TEST_MUTATION" != missing-result ]]; then
         create_raw_result_fixture "$CHECKOUT_DIRECTORY" acceptance >/dev/null
       else
@@ -792,6 +1387,15 @@ run_mock_campaign_case() {
     private_destroy_checkpoint() { mock_private_destroy_checkpoint "$@"; }
     public_closure_checkpoint() { mock_public_closure_checkpoint "$@"; }
     result_snapshot_checkpoint() { mock_result_snapshot_checkpoint "$@"; }
+    failure_classification_checkpoint() {
+      mock_failure_classification_checkpoint "$@"
+    }
+    failure_classification_path_is_mountpoint() {
+      mock_failure_classification_path_is_mountpoint "$@"
+    }
+    failure_classification_fd_mount_id() {
+      mock_failure_classification_fd_mount_id "$@"
+    }
     receipt_preopen_checkpoint() { mock_receipt_preopen_checkpoint "$@"; }
     campaign_entry "$output"
   ) >"$stdout_log" 2>"$stderr_log"
@@ -963,6 +1567,8 @@ test_success_and_failure_campaigns() {
   assert_success_state_machine "$success_root/stderr.log"
   assert_success_handoff "$success_root"
   assert_observed_receipt "$success_root/observed-receipt.json"
+  ! grep -Fq 'acceptance_failure_classification=' "$success_root/stderr.log" ||
+    die 'successful campaign emitted a failure classification'
   [[ -d "$success_root/public-parent/test-claims" &&
     "$(find -- "$success_root/public-parent/test-claims" -mindepth 1 \
       -maxdepth 1 -printf '%f\n' | LC_ALL=C sort | wc -l)" == 7 ]] ||
@@ -1030,6 +1636,183 @@ test_success_and_failure_campaigns() {
           die "$mutation modified the preexisting receipt target"
         ;;
     esac
+  done
+}
+
+test_acceptance_failure_classification() {
+  local mutation=""
+  local case_root=""
+  local classification_line=""
+  local classification_json=""
+  local run_binding_payload=""
+  local expected_run_binding=""
+  local expected_exit=7
+  local -a detailed_mutations=(
+    acceptance-failure-valid acceptance-failure-same-inode-aba
+    acceptance-failure-timeout acceptance-failure-interrupted
+    acceptance-failure-source-line-zero acceptance-failure-na-prefix
+    acceptance-failure-all-terminal
+  )
+  local -a unavailable_mutations=(
+    acceptance-failure-malformed acceptance-failure-duplicate-key
+    acceptance-failure-multiple
+    acceptance-failure-symlink acceptance-failure-hardlink
+    acceptance-failure-race acceptance-failure-extra-key
+    acceptance-failure-stage acceptance-failure-reason
+    acceptance-failure-environment acceptance-failure-exit-crosslink
+    acceptance-failure-source-line-bound
+    acceptance-failure-hash-crosslink acceptance-failure-input-size
+    acceptance-failure-input-mode acceptance-failure-active-boundary
+    acceptance-failure-pair-reference acceptance-failure-pair-digest
+    acceptance-failure-java-reference acceptance-failure-java-counters
+    acceptance-failure-java-snapshot-nul acceptance-failure-java-digest
+    acceptance-failure-terminal-index-hash
+    acceptance-failure-result-parent-replacement
+    acceptance-failure-result-mountpoint
+    acceptance-failure-child-mountpoint acceptance-failure-child-bind-mount
+  )
+
+  run_binding_payload="$(jq -cnS \
+    --arg repository 'MrAlias/opentelemetry-ebpf-instrumentation' \
+    --arg source_revision "$TEST_REVISION" \
+    --arg workflow_blob_sha256 "$TEST_WORKFLOW_SHA256" \
+    --arg workflow_ref \
+      'MrAlias/opentelemetry-ebpf-instrumentation/.github/workflows/java_remote_parent_acceptance_claims.yml@refs/heads/agent/java-remote-parent-bridge' \
+    --arg run_id 123456789 --arg run_attempt 1 '{
+      repository: $repository,
+      run_attempt: $run_attempt,
+      run_id: $run_id,
+      source_revision: $source_revision,
+      workflow_blob_sha256: $workflow_blob_sha256,
+      workflow_ref: $workflow_ref
+    }')" || return 1
+  expected_run_binding="$(printf '%s\n' "$run_binding_payload" | sha256sum)"
+  expected_run_binding="${expected_run_binding%% *}"
+
+  for mutation in "${detailed_mutations[@]}"; do
+    expected_exit=7
+    case "$mutation" in
+      acceptance-failure-timeout) expected_exit=124 ;;
+      acceptance-failure-interrupted) expected_exit=130 ;;
+    esac
+    case_root="$(run_mock_campaign_case "$mutation" "$mutation" failure)"
+    [[ "$(grep -Fc 'acceptance_failure_classification=' \
+        "$case_root/stderr.log")" == 1 ]] ||
+      die "$mutation did not emit exactly one detailed classification"
+    classification_line="$(grep -F 'acceptance_failure_classification=' \
+      "$case_root/stderr.log")"
+    classification_json="${classification_line#*acceptance_failure_classification=}"
+    [[ "$classification_json" == "$(jq -cS . <<<"$classification_json")" ]] ||
+      die "$mutation classification is not canonical JSON"
+    jq -e --slurpfile expected "$case_root/expected-classification.json" \
+      --arg revision "$TEST_REVISION" --arg run_binding "$expected_run_binding" \
+      --argjson expected_exit "$expected_exit" '
+      keys == [
+        "boundary_index_sha256", "exit_status", "failure_stage",
+        "first_incomplete_boundary", "reason", "run_binding_sha256",
+        "run_status_sha256", "source_line", "source_revision",
+        "terminal_boundary_count", "terminal_java_sha256",
+        "terminal_obi_sha256"
+      ] and
+      .exit_status == $expected_exit and
+      .source_revision == $revision and .run_binding_sha256 == $run_binding and
+      .reason == $expected[0].reason and
+      .failure_stage == $expected[0].failure_stage and
+      .source_line == $expected[0].source_line and
+      .terminal_boundary_count == $expected[0].terminal_boundary_count and
+      .first_incomplete_boundary == $expected[0].first_incomplete_boundary and
+      .boundary_index_sha256 == $expected[0].boundary_index_sha256 and
+      .run_status_sha256 == $expected[0].run_status_sha256 and
+      .terminal_java_sha256 == $expected[0].terminal_java_sha256 and
+      .terminal_obi_sha256 == $expected[0].terminal_obi_sha256
+    ' <<<"$classification_json" >/dev/null ||
+      die "$mutation classification did not match its immutable snapshots"
+    [[ -f "$case_root/emergency-invoked" &&
+      ! -e "$case_root/public-parent/test-claims" &&
+      -f "$case_root/github-output" && ! -s "$case_root/github-output" &&
+      -f "$case_root/classifier-fd-count-before" &&
+      -f "$case_root/classifier-fd-count-after" &&
+      "$(<"$case_root/classifier-fd-count-before")" == \
+        "$(<"$case_root/classifier-fd-count-after")" &&
+      -f "$case_root/classifier-snapshot-seals" &&
+      "$(wc -l <"$case_root/classifier-snapshot-seals")" == 6 &&
+      "$(awk -F '\t' '$2 != 400 || $3 != 0 { bad=1 }
+          END { print bad + 0 }' \
+        "$case_root/classifier-snapshot-seals")" == 0 ]] ||
+      die "$mutation weakened cleanup, FD closure, or snapshot sealing"
+    if grep -Fq 'failure-classifier-secret-canary' \
+      "$case_root/stdout.log" "$case_root/stderr.log" \
+      "$case_root/github-output"; then
+      die "$mutation detailed classification disclosed private output"
+    fi
+  done
+  [[ -f "$TEST_TMP_DIR/acceptance-failure-same-inode-aba/failure-classification-same-inode-aba" ]] ||
+    die 'same-inode rewrite-and-restore regression did not reach its checkpoint'
+
+  for mutation in "${unavailable_mutations[@]}"; do
+    case_root="$(run_mock_campaign_case "$mutation" "$mutation" failure)"
+    case "$mutation" in
+      acceptance-failure-race)
+        [[ -f "$case_root/failure-classification-race" ]] ||
+          die 'path replacement race did not reach its checkpoint'
+        ;;
+      acceptance-failure-result-parent-replacement)
+        [[ -f "$case_root/failure-classification-parent-replaced" ]] ||
+          die 'result-parent replacement did not reach its checkpoint'
+        ;;
+      acceptance-failure-result-mountpoint)
+        [[ -f "$case_root/failure-classification-mountpoint" ]] ||
+          die 'result mountpoint fence was not exercised'
+        ;;
+      acceptance-failure-java-snapshot-nul)
+        [[ -f "$case_root/failure-classification-java-snapshot-nul" ]] ||
+          die 'escaped-NUL Java snapshot regression was not constructed'
+        ! grep -Fq 'ignored null byte' \
+          "$case_root/stdout.log" "$case_root/stderr.log" ||
+          die 'escaped-NUL Java snapshot reached Bash command substitution'
+        ;;
+      acceptance-failure-child-mountpoint)
+        [[ -f "$case_root/failure-classification-child-mountpoint" ]] ||
+          die 'evidence child mountpoint fence was not exercised'
+        ;;
+      acceptance-failure-child-bind-mount)
+        [[ -f "$case_root/failure-classification-child-bind-mount" ]] ||
+          die 'evidence child mount-ID fence was not exercised'
+        ;;
+    esac
+    [[ "$(grep -Fc 'acceptance_failure_classification=' \
+        "$case_root/stderr.log")" == 1 ]] ||
+      die "$mutation did not emit exactly one unavailable classification"
+    classification_line="$(grep -F 'acceptance_failure_classification=' \
+      "$case_root/stderr.log")"
+    classification_json="${classification_line#*acceptance_failure_classification=}"
+    [[ "$classification_json" == "$(jq -cS . <<<"$classification_json")" ]] ||
+      die "$mutation classification is not canonical JSON"
+    jq -e --arg revision "$TEST_REVISION" \
+      --arg run_binding "$expected_run_binding" '
+      keys == [
+        "exit_status", "failure_stage", "reason", "run_binding_sha256",
+        "source_revision", "terminal_boundary_count"
+      ] and
+      .terminal_boundary_count == 0 and .exit_status == 7 and
+      .failure_stage == "classification-unavailable" and
+      .reason == "classification_unavailable" and
+      .run_binding_sha256 == $run_binding and .source_revision == $revision
+    ' <<<"$classification_json" >/dev/null ||
+      die "$mutation did not fail closed to the fixed unavailable shape"
+    [[ -f "$case_root/emergency-invoked" &&
+      ! -e "$case_root/public-parent/test-claims" &&
+      -f "$case_root/github-output" && ! -s "$case_root/github-output" &&
+      -f "$case_root/classifier-fd-count-before" &&
+      -f "$case_root/classifier-fd-count-after" &&
+      "$(<"$case_root/classifier-fd-count-before")" == \
+        "$(<"$case_root/classifier-fd-count-after")" ]] ||
+      die "$mutation weakened cleanup, publication privacy, or FD closure"
+    if grep -Fq 'failure-classifier-secret-canary' \
+      "$case_root/stdout.log" "$case_root/stderr.log" \
+      "$case_root/github-output"; then
+      die "$mutation disclosed an unallowlisted private string"
+    fi
   done
 }
 
@@ -1987,10 +2770,13 @@ main() {
   test_github_authority_mutations
   test_real_location_aware_projector_execution
   test_success_and_failure_campaigns
+  test_acceptance_failure_classification
   test_workflow_contract
   test_extracted_workflow_location_aware_verifier
   test_static_privacy_and_wiring_contract
   printf 'retained acceptance campaign transaction and mutation tests passed\n'
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

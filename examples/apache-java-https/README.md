@@ -284,6 +284,25 @@ read with the existing Java 21 privileged Compose cells. It does not mark Java
 8, 11, or 17 as privileged Compose passes, establish `arm64`, or close the
 broader issue #23 or issue #38 matrices.
 
+The retained [diagnostic nondisclosure matrix](focused-validation/diagnostic-nondisclosure-f8775328d54a-6a2fe52aac6eab28/README.md)
+records exact revision `f8775328d54a7c0e45c3117539f5b99946601b1a`,
+source-configured Temurin Java 21, TLS 1.3, and checksum-verified OpenTelemetry
+2.28.1 and Splunk 2.28.0 agents across forced `getsockopt` and Unix transports
+at INFO and DEBUG: eight cells in total. For each cell, the verifier checked the
+Java diagnostic endpoint, response header, selected-transport configuration,
+OBI metrics, complete bounded OBI log, and complete bounded Java log. It
+reconstructed the request, context, and credential canaries from pinned source
+and W3C evidence and found zero matches; the six raw surfaces remain private.
+
+The `obi_java_remote_parent_operations_total` label contract permits four
+transports × eleven operations × eighteen statuses, or at most 792 distinct
+label tuples. The exact
+`obi_instrumentation_errors_total{error_type="attaching_java_agent",process_name="java"}`
+tuple is projected separately as one fixed scalar and is not part of that 792
+bound. This summary-only `focused_non_acceptance` record closes issue #39; it
+does not populate the full acceptance or compatibility matrix, expand issue #38,
+or close issue #40.
+
 Container base images are pinned by digest. The repository Java build exports
 the separately reviewed `obi-java-agent.jar` helper and
 `obi-otel-extension.jar` external extension. The helper is embedded into the

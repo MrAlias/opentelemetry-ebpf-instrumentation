@@ -1,9 +1,10 @@
 # Security and abuse-case matrix
 
-Status: **partial — retained named primary/Unix isolation controls and public
-bundle sanitization pass; explicit stale-generation, genuine TID/PID reuse,
-primary wrong-current-TID/logical-execution, runtime diagnostic-side-channel,
-and broader environment controls remain untested**
+Status: **partial — retained named primary/Unix isolation controls, public
+bundle sanitization, and runtime diagnostic nondisclosure pass; explicit
+stale-generation, genuine TID/PID reuse, primary
+wrong-current-TID/logical-execution, and broader environment controls remain
+untested**
 
 The PoC crosses a kernel/JVM trust boundary and exposes a local Unix fallback.
 Passing the happy path is insufficient. Every negative cell must preserve
@@ -17,6 +18,11 @@ and [OpenTelemetry/Unix/TLS 1.2](evidence/otel-unix-tls12-bd1c9327/README.md),
 and [OpenTelemetry/Unix/TLS 1.3](evidence/otel-unix-tls13-6c4a2505/README.md)
 runs. The current primary wrong-live-socket result is the exact
 [OpenTelemetry/`getsockopt`/TLS 1.3 bundle](evidence/otel-getsockopt-tls13-e8db066a/README.md).
+
+The retained [runtime diagnostic nondisclosure matrix](focused-validation/diagnostic-nondisclosure-f8775328d54a-6a2fe52aac6eab28/README.md)
+adds a focused Java 21/TLS 1.3 pass for checksum-verified OpenTelemetry 2.28.1
+and Splunk 2.28.0 agents across forced `getsockopt`/Unix and INFO/DEBUG. It is a
+summary-only `focused_non_acceptance` result, not a full compatibility cell.
 
 A primary probe's `native-unsupported` result is only an `unverified`
 observation. An unauthorized BPF call deliberately falls through to the native
@@ -73,7 +79,7 @@ silently to Unix.
 | valid W3C with no OBI state | exact W3C parent; bounded no-state lookup; no Apache span | pass | pass | [primary](evidence/otel-getsockopt-tls13-e8db066a/scenario-w3c-only-obi-absent.json) and [Unix](evidence/otel-unix-tls12-bd1c9327/scenario-w3c-only-obi-absent.json) W3C-only graphs |
 | repeated async redispatch | one Java server span; one request-scoped parent | pass | pass | [primary](evidence/otel-getsockopt-tls13-e8db066a/scenario-dispatch.json) and [Unix](evidence/otel-unix-tls12-bd1c9327/scenario-dispatch.json) redispatch graphs |
 | genuine TID/PID reuse | no prior execution's value becomes a parent | untested | untested | descriptor/port reuse and forged-identity controls do not establish kernel TID/PID reuse |
-| runtime diagnostic endpoint/log side channel | no raw context/request data; every negative remains diagnosable from bounded counters/logs | untested | untested | public-bundle sanitization proves only the publication boundary because raw runtime scrapes and operational logs are deliberately omitted |
+| runtime diagnostic endpoint/log side channel | no raw context/request data; every negative remains diagnosable from bounded counters/logs | pass | pass | [focused eight-cell runtime matrix](focused-validation/diagnostic-nondisclosure-f8775328d54a-6a2fe52aac6eab28/README.md) checked the Java endpoint/header, transport configuration, OBI metrics, and complete bounded OBI/Java logs with reconstructed request/context/credential canaries and zero matches; this proves only #40's diagnostic-side-channel threat and remains `focused_non_acceptance` |
 | published evidence-bundle disclosure scan | no checkout paths, raw context payloads, credentials, or private operational identifiers | pass | pass | [primary sanitization](evidence/otel-getsockopt-tls13-e8db066a/SANITIZATION.md) and [Unix sanitization](evidence/otel-unix-tls12-bd1c9327/SANITIZATION.md) |
 
 The Unix transport never receives or uses the application socket descriptor:

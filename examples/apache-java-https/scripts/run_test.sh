@@ -38399,6 +38399,7 @@ main() {
   test_demo_obi_lifecycle_timeouts_are_explicit
   test_primary_live_fd_compose_topology_is_scoped
   test_unix_security_probe_topology_is_least_privilege
+  "$TEST_SCRIPT_DIR/run-retained-acceptance-campaign_test.sh"
   printf 'demo harness tests passed\n'
 }
 

@@ -172,7 +172,8 @@ retains all four one-shot response modes and normal recovery.
 - A kernel supported by OBI (normally Linux 5.8+ with BTF, or a documented
   RHEL 8 backport).
 - Go 1.25.11 (for the repository and tracecheck tests).
-- `bash`, `curl`, `git`, `jq`, `openssl`, `sha256sum`, and GNU `timeout`.
+- `bash`, `cmp`, `curl`, `flock`, `git`, `jq`, `openssl`, `sha256sum`, and GNU
+  `timeout`.
 - Free loopback ports `14318`, `18080`, `18081`, `18443`, `18444`, `18445`,
   `18446`, and `18990`.
 - Internet access for pinned container images, Maven dependencies, and the
@@ -220,6 +221,30 @@ empty. `run.sh` builds the bridge artifacts from that checkout: it invokes
 resulting helper and external-extension checksums with the run. Do not replace
 those artifacts manually. `--skip-bridge-build` is only for checksum-verified,
 targeted local iteration and is never acceptance evidence.
+
+### Push-only retained-acceptance campaign
+
+The [clean-host acceptance workflow](../../.github/workflows/java_remote_parent_acceptance_claims.yml)
+runs only for pushes to `agent/java-remote-parent-bridge`. It rechecks the exact
+push event, workflow revision, tracked execution bytes, and clean authority
+checkout before using the local disk-reclamation action. The private campaign
+then clones and checks out that same revision, runs the four validation commands
+above, executes the exact OpenTelemetry/`getsockopt`/TLS 1.3 acceptance command,
+requires the deliberate assertion control to exit `2`, performs scoped cleanup,
+and proves a final clean checkout. Every command's exact combined output digest,
+exit status, and duration is sealed into an owner-private canonical receipt.
+
+Raw run directories, command logs, and that receipt are never artifacts. The
+projector validates them in its private transaction, emits only `README.md`,
+`SANITIZATION.md`, `acceptance-claims.json`, `authority-summary.json`,
+`derivation-receipt.json`, `verify.sh`, and `SHA256SUMS`, and destroys the raw
+transaction before the campaign re-verifies the public bundle. A separate
+workflow step runs the bundled verifier from `/`; an always-run privacy guard
+must also prove that no private residue or ambiguous public candidate remains
+before those seven individual files can be uploaded. The projection contains
+bounded derived claims and an internal-consistency check, not raw evidence or an
+authentication claim. Until a source-revision-matched workflow artifact passes
+all three gates, existing untested rows remain untested.
 
 ### Exact component build mapping
 

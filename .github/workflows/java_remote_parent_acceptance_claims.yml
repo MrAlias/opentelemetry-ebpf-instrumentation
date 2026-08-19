@@ -1,0 +1,248 @@
+name: Java remote-parent bounded acceptance claims
+run-name: Java remote-parent bounded acceptance claims @ ${{ github.sha }}
+
+on:
+  push:
+    branches:
+      - agent/java-remote-parent-bridge
+
+concurrency:
+  group: java-remote-parent-acceptance-claims-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  acceptance:
+    name: Clean-host OTel/getsockopt/TLS 1.3 acceptance and control
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      PUBLIC_PARENT: /tmp/obi-java-remote-parent-public-${{ github.run_id }}-${{ github.run_attempt }}
+      PUBLIC_OUTPUT: /tmp/obi-java-remote-parent-public-${{ github.run_id }}-${{ github.run_attempt }}/java-remote-parent-claims-${{ github.sha }}
+    steps:
+      - name: Checkout workflow authority
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify exact push and tracked execution bytes
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          set -Eeuo pipefail
+
+          workflow_path=.github/workflows/java_remote_parent_acceptance_claims.yml
+          expected_repository=MrAlias/opentelemetry-ebpf-instrumentation
+          expected_ref=refs/heads/agent/java-remote-parent-bridge
+          expected_workflow_ref="$expected_repository/$workflow_path@$expected_ref"
+          event_path_identity=''
+          event_descriptor_identity=''
+          event_post_identity=''
+          event_fd=''
+          event_valid=false
+          [[ "$GITHUB_ACTIONS" == true && "$CI" == true && \
+            "$RUNNER_ENVIRONMENT" == github-hosted && \
+            "$RUNNER_OS" == Linux && "$RUNNER_ARCH" == X64 && \
+            "$GITHUB_EVENT_NAME" == push && \
+            "$GITHUB_REPOSITORY" == "$expected_repository" && \
+            "$GITHUB_REF" == "$expected_ref" && \
+            "$GITHUB_WORKFLOW_REF" == "$expected_workflow_ref" && \
+            "$GITHUB_WORKFLOW_SHA" == "$GITHUB_SHA" && \
+            "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            printf '%s\n' 'Workflow execution authority is not exact' >&2
+            exit 1
+          }
+          [[ "$GITHUB_EVENT_PATH" == /* && -f "$GITHUB_EVENT_PATH" && \
+            ! -L "$GITHUB_EVENT_PATH" && \
+            "$(readlink -f -- "$GITHUB_EVENT_PATH")" == "$GITHUB_EVENT_PATH" ]]
+          event_path_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+            "$GITHUB_EVENT_PATH")"
+          IFS=: read -r _ _ event_owner event_mode event_links event_size \
+            <<<"$event_path_identity"
+          [[ "$event_owner" == "$(id -u)" && "$event_mode" =~ ^[0-7]{3,4}$ && \
+            "$event_links" == 1 && "$event_size" =~ ^[1-9][0-9]*$ && \
+            "$event_size" -le 2097152 && $((8#$event_mode & 0022)) == 0 ]]
+          exec {event_fd}<"$GITHUB_EVENT_PATH"
+          event_descriptor_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+            "/proc/$BASHPID/fd/$event_fd")" || event_descriptor_identity=''
+          if [[ "$event_descriptor_identity" == "$event_path_identity" ]] &&
+            jq -se --arg after "$GITHUB_SHA" --arg ref "$expected_ref" \
+              --arg repository "$expected_repository" '
+                length == 1 and (.[0] | .after == $after and .ref == $ref and
+                  .repository.full_name == $repository)
+              ' "/proc/$BASHPID/fd/$event_fd" >/dev/null; then
+            event_valid=true
+          fi
+          event_post_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+            "$GITHUB_EVENT_PATH")" || event_post_identity=''
+          exec {event_fd}<&-
+          [[ "$event_valid" == true && \
+            "$event_path_identity" == "$event_descriptor_identity" && \
+            "$event_path_identity" == "$event_post_identity" ]]
+          [[ "$(git rev-parse --verify 'HEAD^{commit}')" == "$GITHUB_SHA" ]]
+          [[ -z "$(git status --porcelain --untracked-files=all \
+            --ignore-submodules=none)" ]]
+          while IFS=$'\t' read -r relative expected_tree_mode expected_disk_mode; do
+            [[ -f "$relative" && ! -L "$relative" && \
+              "$(readlink -f -- "$relative")" == "$GITHUB_WORKSPACE/$relative" && \
+              "$(stat -Lc '%u:%a' -- "$relative")" == \
+                "$(id -u):$expected_disk_mode" ]]
+            [[ "$(git ls-tree "$GITHUB_SHA" -- "$relative" | \
+              awk 'NR == 1 { print $1 } END { if (NR != 1) exit 1 }')" == \
+                "$expected_tree_mode" ]]
+            git diff --quiet --no-ext-diff --no-textconv "$GITHUB_SHA" -- "$relative"
+            disk_sha="$(sha256sum <"$relative")"
+            disk_sha="${disk_sha%% *}"
+            blob_sha="$(git show "$GITHUB_SHA:$relative" | sha256sum)"
+            blob_sha="${blob_sha%% *}"
+            [[ "$disk_sha" == "$blob_sha" ]]
+          done <<'TRACKED_EXECUTION_FILES'
+          .github/workflows/java_remote_parent_acceptance_claims.yml	100644	644
+          .github/actions/free-disk/action.yml	100644	644
+          examples/apache-java-https/scripts/run-retained-acceptance-campaign.sh	100755	755
+          examples/apache-java-https/scripts/project-retained-acceptance-evidence.sh	100755	755
+          examples/apache-java-https/scripts/verify-retained-evidence.sh	100755	755
+          TRACKED_EXECUTION_FILES
+
+      - name: Reclaim hosted-runner disk space
+        uses: ./.github/actions/free-disk
+        with:
+          docker-prune: 'false'
+
+      - name: Set up pinned Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Set up Java 21
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Run private campaign and destroy raw evidence
+        id: campaign
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          set -Eeuo pipefail
+
+          [[ ! -e "$PUBLIC_PARENT" && ! -L "$PUBLIC_PARENT" ]] || {
+            printf '%s\n' 'Public output parent already exists' >&2
+            exit 1
+          }
+          install -d -m 0700 -- "$PUBLIC_PARENT"
+          ./examples/apache-java-https/scripts/run-retained-acceptance-campaign.sh \
+            "$PUBLIC_OUTPUT"
+
+      - name: Independently verify the public closure
+        id: independent_verify
+        if: steps.campaign.outcome == 'success'
+        run: |
+          set -Eeuo pipefail
+
+          expected=$'README.md\tf\nSANITIZATION.md\tf\nSHA256SUMS\tf\nacceptance-claims.json\tf\nauthority-summary.json\tf\nderivation-receipt.json\tf\nverify.sh\tf'
+          observed="$(find -- "$PUBLIC_OUTPUT" -mindepth 1 -maxdepth 1 \
+            -printf '%f\t%y\n' | LC_ALL=C sort)"
+          [[ "$observed" == "$expected" && \
+            "$(stat -Lc '%u:%a' -- "$PUBLIC_OUTPUT")" == "$(id -u):555" ]]
+          root_device="$(stat -Lc '%d' -- "$PUBLIC_OUTPUT")"
+          for file in README.md SANITIZATION.md SHA256SUMS \
+            acceptance-claims.json authority-summary.json \
+            derivation-receipt.json verify.sh; do
+            [[ -f "$PUBLIC_OUTPUT/$file" && ! -L "$PUBLIC_OUTPUT/$file" && \
+              "$(stat -Lc '%d:%u:%a:%h' -- "$PUBLIC_OUTPUT/$file")" == \
+                "$root_device:$(id -u):444:1" ]]
+          done
+          evidence_id="$(jq -er '.evidence_id' \
+            "$PUBLIC_OUTPUT/derivation-receipt.json")"
+          [[ "$evidence_id" =~ ^[0-9a-f]{64}$ ]]
+          verify_output="$(cd / && bash "$PUBLIC_OUTPUT/verify.sh")"
+          [[ "$verify_output" == \
+            "bounded claim bundle internally consistent (not authenticated): $evidence_id" ]]
+
+      - name: Prove private destruction and classify publication
+        id: privacy
+        if: always()
+        env:
+          CAMPAIGN_OUTCOME: ${{ steps.campaign.outcome }}
+          INDEPENDENT_OUTCOME: ${{ steps.independent_verify.outcome }}
+        run: |
+          set -Eeuo pipefail
+
+          private_residue="$(find /tmp -mindepth 1 -maxdepth 1 \
+            -user "$(id -u)" \( \
+              -name 'obi-java-remote-parent-acceptance.*' -o \
+              -name 'verify-retained-evidence.*' -o \
+              -name 'obi-claims-verify.*' \) -print -quit)"
+          [[ -z "$private_residue" ]] || {
+            printf '%s\n' 'Private campaign transaction residue remains' >&2
+            exit 1
+          }
+          [[ ! -e "$GITHUB_WORKSPACE/examples/apache-java-https/.runtime/results" && \
+            ! -L "$GITHUB_WORKSPACE/examples/apache-java-https/.runtime/results" ]] || {
+            printf '%s\n' 'Raw result state exists in the authority checkout' >&2
+            exit 1
+          }
+          if [[ ! -e "$PUBLIC_PARENT" && ! -L "$PUBLIC_PARENT" ]]; then
+            [[ "$CAMPAIGN_OUTCOME" != success ]] || {
+              printf '%s\n' 'Successful campaign lost its public parent' >&2
+              exit 1
+            }
+            exit 0
+          fi
+          [[ -d "$PUBLIC_PARENT" && ! -L "$PUBLIC_PARENT" && \
+            "$(readlink -f -- "$PUBLIC_PARENT")" == "$PUBLIC_PARENT" && \
+            "$(stat -Lc '%u:%a' -- "$PUBLIC_PARENT")" == "$(id -u):700" ]]
+          sibling_inventory="$(find -- "$PUBLIC_PARENT" -mindepth 1 \
+            -maxdepth 1 -printf '%f\t%y\n' | LC_ALL=C sort)"
+          if [[ "$CAMPAIGN_OUTCOME" != success ]]; then
+            [[ -z "$sibling_inventory" ]] || {
+              printf '%s\n' 'Failed campaign left an ambiguous public candidate' >&2
+              exit 1
+            }
+            exit 0
+          fi
+          [[ "$sibling_inventory" == "${PUBLIC_OUTPUT##*/}"$'\td' && \
+            "$INDEPENDENT_OUTCOME" == success ]]
+          expected=$'README.md\tf\nSANITIZATION.md\tf\nSHA256SUMS\tf\nacceptance-claims.json\tf\nauthority-summary.json\tf\nderivation-receipt.json\tf\nverify.sh\tf'
+          observed="$(find -- "$PUBLIC_OUTPUT" -mindepth 1 -maxdepth 1 \
+            -printf '%f\t%y\n' | LC_ALL=C sort)"
+          [[ "$observed" == "$expected" ]]
+          private_public_residue="$(find -- "$PUBLIC_PARENT" -xdev \
+            \( -name 'runbook-receipt.json' -o -name 'command-rows.jsonl' \
+              -o -name 'state-journal.tsv' -o -name '*.log' \
+              -o -name '.retained-projection-transaction.*' \) \
+            -print -quit)"
+          if [[ -n "$private_public_residue" ]]; then
+            printf '%s\n' 'Private receipt, journal, log, or transaction leaked' >&2
+            exit 1
+          fi
+
+      # The campaign step succeeds only after its private raw transaction has
+      # been destroyed and the portable verifier has rechecked this exact
+      # seven-file directory. No failure or raw-data path is uploadable.
+      - name: Upload verified bounded-claim projection
+        if: >-
+          !cancelled() &&
+          steps.campaign.outcome == 'success' &&
+          steps.independent_verify.outcome == 'success' &&
+          steps.privacy.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: java-remote-parent-acceptance-claims-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.PUBLIC_OUTPUT }}/README.md
+            ${{ env.PUBLIC_OUTPUT }}/SANITIZATION.md
+            ${{ env.PUBLIC_OUTPUT }}/acceptance-claims.json
+            ${{ env.PUBLIC_OUTPUT }}/authority-summary.json
+            ${{ env.PUBLIC_OUTPUT }}/derivation-receipt.json
+            ${{ env.PUBLIC_OUTPUT }}/verify.sh
+            ${{ env.PUBLIC_OUTPUT }}/SHA256SUMS
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 14

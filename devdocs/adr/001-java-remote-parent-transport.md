@@ -208,8 +208,12 @@ configured GID before startup; the demo uses an explicitly initialized named
 volume. A compromised instrumented JVM may consume its own record. A process
 running as the OBI UID can impersonate this local fallback, so the OBI UID and
 host root remain inside the trust boundary. The low-cardinality endpoint and
-diagnostic schema are designed not to expose context identifiers; the retained
-runtime endpoint/log side-channel audit remains untested.
+diagnostic schema are designed not to expose context identifiers. The retained
+[runtime diagnostic nondisclosure matrix](../../examples/apache-java-https/focused-validation/diagnostic-nondisclosure-f8775328d54a-6a2fe52aac6eab28/README.md)
+passes that endpoint/log side-channel threat for its exact Java 21/TLS 1.3,
+OpenTelemetry/Splunk, forced-primary/Unix, INFO/DEBUG scope; it is focused
+non-acceptance evidence and does not close the remaining abuse cases in
+[the security matrix](../../examples/apache-java-https/SECURITY.md).
 
 Fallback connections have one absolute deadline, a shorter pre-authentication
 read deadline, a per-peer cap, and a global cap shared by pre-authentication and

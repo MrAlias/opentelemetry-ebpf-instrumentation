@@ -4,12 +4,6 @@ run-name: >-
   ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
 
 on:
-  # The temporary feature-branch trigger bootstraps this workflow before it is
-  # registered on the default branch. Every push is still pinned to the exact
-  # event commit by the checked-out-object gate below.
-  push:
-    branches:
-      - agent/java-remote-parent-bridge
   workflow_dispatch:
     inputs:
       ref:

@@ -1,9 +1,7 @@
 # Apache-to-Java HTTPS remote-parent demo
 
 This example is a vendor-neutral, machine-verifiable proof of the OBI Java
-remote-parent bridge. It runs this fixed topology on a Linux Docker host:
-
-It is the executable evidence harness for
+remote-parent bridge. It is the executable evidence harness for
 [issue #2](https://github.com/MrAlias/opentelemetry-ebpf-instrumentation/issues/2)
 and its bridge architecture, implementation, integration, and validation
 sub-issues. The [compatibility matrix](COMPATIBILITY.md) limits support claims
@@ -13,6 +11,35 @@ boundary.
 
 Matrix revision: `apache-java-https-compatibility-v2`.
 <!-- obi-compatibility-matrix-revision: apache-java-https-compatibility-v2 -->
+
+## Request and context sequence
+
+<!-- obi-runbook-request-context-sequence: begin -->
+
+1. **Client request.** The `trace-scenario` client sends one marked HTTP/1.1
+   request to Apache on `127.0.0.1:18080`. A scenario may also supply an
+   explicit W3C `traceparent` for its precedence control.
+2. **Apache observation.** OBI instruments the Apache server and client sides.
+   For an OBI-parent case, the Apache proxy client span is the candidate remote
+   parent offered through the selected Java bridge transport.
+3. **Verified backend request.** Apache `mod_proxy_http` and `mod_ssl` forward
+   the same request over hostname-verified TLS 1.2 or TLS 1.3 to the selected
+   Java listener.
+4. **Java extraction.** The Java process runs the official agent with the
+   external OBI extension, while OBI dynamically attaches its helper. Valid
+   W3C context has precedence; otherwise the OBI provider attempts the selected
+   `getsockopt` or Unix bridge lookup and fails open when no valid candidate is
+   available.
+5. **Java server span.** The backend handles the request in Jetty or the named
+   Netty fixture. For an OBI-parent case, its server span must use the exact
+   Apache client span ID and trace ID, with the remote flag set.
+6. **Local assertion.** Apache, Java, and OBI export to the loopback receiver.
+   The scenario client reads its bounded snapshot and applies the
+   marker-, endpoint-, service-, kind-, trace-, and parent-ID assertions below.
+
+<!-- obi-runbook-request-context-sequence: end -->
+
+That sequence runs in this fixed topology on a Linux Docker host:
 
 ```text
 trace-scenario
@@ -225,10 +252,13 @@ resulting helper and external-extension checksums with the run. Do not replace
 those artifacts manually. `--skip-bridge-build` is only for checksum-verified,
 targeted local iteration and is never acceptance evidence.
 
-### Push-only retained-acceptance campaign
+### Push-only retained workflow jobs
+
+#### Seven-file retained acceptance
 
 The [clean-host acceptance workflow](../../.github/workflows/java_remote_parent_acceptance_claims.yml)
-runs only for pushes to `agent/java-remote-parent-bridge`. It rechecks the exact
+job `acceptance` runs only for pushes to `agent/java-remote-parent-bridge`. Its
+[campaign source](scripts/run-retained-acceptance-campaign.sh) rechecks the exact
 push event, workflow revision, tracked execution bytes, and clean authority
 checkout before using the local disk-reclamation action. The private campaign
 then clones and checks out that same revision, runs the four validation commands
@@ -240,16 +270,29 @@ exit status, and duration is sealed into an owner-private canonical receipt.
 Raw run directories, command logs, the owner-only pressure container inspection
 (`map-pressure-pressure-container-inspections.json`), and that receipt are never
 public artifacts. The projector validates them in its private transaction,
-emits only `README.md`,
-`SANITIZATION.md`, `acceptance-claims.json`, `authority-summary.json`,
-`derivation-receipt.json`, `verify.sh`, and `SHA256SUMS`, and destroys the raw
-transaction before the campaign re-verifies the public bundle. A separate
-workflow step runs the bundled verifier from `/`; an always-run privacy guard
-must also prove that no private residue or ambiguous public candidate remains
-before those seven individual files can be uploaded. The projection contains
-bounded derived claims and an internal-consistency check, not raw evidence or an
-authentication claim. Until a source-revision-matched workflow artifact passes
-all three gates, existing untested rows remain untested.
+destroys the raw transaction, and emits only this exact public roster:
+
+<!-- obi-retained-acceptance-public-roster: begin -->
+
+```text
+README.md
+SANITIZATION.md
+acceptance-claims.json
+authority-summary.json
+derivation-receipt.json
+verify.sh
+SHA256SUMS
+```
+
+<!-- obi-retained-acceptance-public-roster: end -->
+
+A separate workflow step runs the bundled verifier from `/`; an always-run
+privacy guard must also prove that no private residue or ambiguous public
+candidate remains before those seven individual files can be uploaded. The
+projection contains bounded derived claims and an internal-consistency check,
+not raw evidence or an authentication claim. Until a
+source-revision-matched workflow artifact passes all three gates, existing
+untested rows remain untested.
 
 The campaign pins its private transaction, command-log parents, public parent,
 and public closure with open descriptors; campaign-owned private control,
@@ -262,7 +305,91 @@ bundled verifier descriptors remain pinned while their canonical paths are
 executed, preserving their `BASH_SOURCE`-relative sibling lookup; exact
 path-to-descriptor identity and digest checks immediately bracket execution.
 
-### Exact component build mapping
+#### Six-file fault/security matrix
+
+The same workflow's `fault-security-matrix` job uses the
+[five-profile campaign source](scripts/run-retained-fault-security-campaign.sh)
+and [bounded projector](scripts/project-retained-fault-security-matrix.sh). It
+starts from another clean clone of the exact push revision and privately runs
+these five OpenTelemetry-agent/TLS 1.3 profiles:
+
+<!-- obi-fault-security-profile-roster: begin -->
+
+```text
+getsockopt/all
+unix/all
+auto/all
+getsockopt/pid-reuse
+unix/pid-reuse
+```
+
+<!-- obi-fault-security-profile-roster: end -->
+
+Every profile must pass its explicit raw-v3 verifier contract. In particular,
+an unsupported PID-reuse prerequisite remains a failed profile; it is not
+reclassified as a passing or skipped cell. The projector derives the bounded
+matrix while all five raw directories remain private, then the campaign
+destroys the complete raw transaction before handing off this exact public
+roster:
+
+<!-- obi-fault-security-public-roster: begin -->
+
+```text
+README.md
+SANITIZATION.md
+fault-security-matrix.json
+derivation-receipt.json
+verify.sh
+SHA256SUMS
+```
+
+<!-- obi-fault-security-public-roster: end -->
+
+The job independently checks the six-file closure, the source verifier, the
+portable verifier from `/`, and the absence of raw residue before upload.
+Source configuration, a successful Compose configuration render, and the
+presence of either campaign are not runtime passes. Only a
+source-revision-matched, independently verified uploaded artifact can promote
+a currently untested row; this runbook does not promote one.
+
+### Exact component and configuration inventory
+
+The runbook's source boundaries are the following files. This table is an
+inventory of inputs and responsibilities, not evidence that they ran.
+
+<!-- obi-runbook-component-inventory: begin -->
+
+| Source file | Exact responsibility |
+| --- | --- |
+| [run.sh](run.sh) | Validates the CLI, snapshots source, builds, starts, asserts, retains evidence, and performs scoped cleanup. |
+| [docker-compose.yml](docker-compose.yml) | Defines the fixed services, build contexts, entrypoints, host namespace choices, certificate mounts, and OBI config mount. |
+| [apache/httpd.conf](apache/httpd.conf) | Defines the plaintext frontend, verified-TLS proxy routes, protocols, CA, hostname checks, and backend pools. |
+| [java/Dockerfile](java/Dockerfile) | Builds the Maven backend and native fault/PID-reuse fixtures, then creates the Java runtime image with the official agent and external extension. |
+| [java/pom.xml](java/pom.xml) | Pins the Jetty, Netty, test, compiler, and shade inputs and declares the executable backend main class. |
+| [ApacheJavaHttpsBackend.java](java/src/main/java/io/opentelemetry/obi/examples/ApacheJavaHttpsBackend.java) | Is the backend entrypoint and owns the Jetty routes, diagnostics, and named handoff controls. |
+| [tracecheck/Dockerfile](tracecheck/Dockerfile) | Builds the receiver, scenario/assertion client, benchmark, source, fault, pressure, security, generation, and PID-reuse tools. |
+| [receiver main.go](tracecheck/cmd/receiver/main.go) | Implements the loopback OTLP receiver and its bounded health, reset, and snapshot endpoints. |
+| [scenario main.go](tracecheck/cmd/scenario/main.go) | Generates the marked requests and scenario-specific connection evidence, then invokes the assertions. |
+| [tracecheck/assertions.go](tracecheck/assertions.go) | Implements the shared exact trace, parent, remote-flag, marker, service, kind, and endpoint graph checks. |
+| [configs/obi.yaml](configs/obi.yaml) | Selects routes, loopback OTLP and Prometheus endpoints, bounded header enrichment, TCP propagation, Java bridge defaults, and discovery targets. |
+| [root Dockerfile](../../Dockerfile) | Builds the OBI service image selected by the Compose `obi` build boundary. |
+| [root javaagent.Dockerfile](../../javaagent.Dockerfile) | Builds both JNI architectures and exports the dynamically attached helper and external-extension JARs. |
+| [certs/generate.sh](certs/generate.sh) | Generates or validates the private runtime CA, server keypair, certificate metadata, and PKCS#12 keystore. |
+| [certs/openssl.cnf](certs/openssl.cnf) | Fixes the test CA/server subjects, extensions, and exact localhost/Java-backend/IP SAN set. |
+
+<!-- obi-runbook-component-inventory: end -->
+
+From the repository root, the exact direct certificate bootstrap command is:
+
+```bash
+./examples/apache-java-https/certs/generate.sh --output examples/apache-java-https/.runtime/certs
+```
+
+`run.sh` invokes the same generator inside its source snapshot and checks the
+result before Compose starts; the direct command is useful for inspecting that
+input contract and does not create an acceptance result.
+
+#### Build boundaries
 
 The clean-host `run.sh` command above is the canonical build command. It builds
 from a private snapshot of the recorded source tree, copies the two exported
@@ -594,6 +721,60 @@ The `auto` transport is available for feature-detection validation. Forced
 does not prove both paths.
 
 ## Target one control
+
+The `--scenario` parser currently accepts exactly the names below. This is the
+CLI roster, not the membership of `all`: transport restrictions still apply,
+targeted runs remain non-acceptance evidence, and the deliberate failure and
+benchmark controls are not silently promoted into the acceptance suite.
+
+<!-- obi-runbook-scenario-roster: begin -->
+
+```text
+all
+basic
+keepalive
+pipelining
+concurrency
+connection-churn
+fd-port-reuse
+slow-body
+tls-boundary
+coalesced-bridge
+timeout-retry
+pressure
+handoff
+virtual-thread
+netty
+netty-server
+dispatch
+w3c
+w3c-match
+obi-flags
+w3c-fault
+primary-w3c-fault
+primary-generation-mismatch
+unix-generation-mismatch
+pid-reuse
+primary-w3c-stale
+unix-w3c-stale
+w3c-only
+security
+restart-fault
+helper-attach-failure
+delayed-otlp-suppression
+assertion-failure
+fail-open
+permanent-absence
+auto-unavailable
+diagnostic-nondisclosure
+restart
+disabled
+uninstrumented
+benchmark-disabled
+benchmark-uninstrumented
+```
+
+<!-- obi-runbook-scenario-roster: end -->
 
 ```bash
 ./examples/apache-java-https/run.sh \

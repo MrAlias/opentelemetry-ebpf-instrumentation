@@ -2,8 +2,10 @@
 # Copyright The OpenTelemetry Authors
 # SPDX-License-Identifier: Apache-2.0
 
-# This harness intentionally overrides sourced run.sh globals and functions in isolated subshells.
-# shellcheck disable=SC2016,SC2030,SC2031,SC2034,SC2317,SC2329
+# This harness intentionally overrides sourced run.sh globals and functions in
+# isolated subshells. ShellCheck merges the sourced runner's array types with
+# same-named scalar test locals even though those seams execute in isolation.
+# shellcheck disable=SC2016,SC2030,SC2031,SC2034,SC2100,SC2128,SC2178,SC2317,SC2329
 
 set -Eeuo pipefail
 
@@ -35754,11 +35756,241 @@ test_markdown_workflow_uses_exact_event_ranges() {
   }
 }
 
+runbook_exact_line_count() {
+  local -r file="$1"
+  local -r expected="$2"
+
+  awk -v expected="$expected" '$0 == expected {count++} END {print count + 0}' \
+    "$file"
+}
+
+runbook_fenced_roster() {
+  local -r readme="$1"
+  local -r marker="$2"
+
+  [[ "$marker" =~ ^obi-[a-z0-9-]+$ ]] || return 1
+  awk -v marker="$marker" '
+    BEGIN {
+      begin_marker = "<!-- " marker ": begin -->"
+      end_marker = "<!-- " marker ": end -->"
+    }
+    $0 == begin_marker {
+      begin_count += 1
+      inside = 1
+      next
+    }
+    $0 == end_marker {
+      end_count += 1
+      inside = 0
+      next
+    }
+    inside && $0 == "```text" {
+      open_count += 1
+      fence = 1
+      next
+    }
+    inside && $0 == "```" {
+      close_count += 1
+      fence = 0
+      next
+    }
+    inside && fence && length($0) > 0 {
+      if ($0 !~ /^[A-Za-z0-9][A-Za-z0-9._\/-]*$/) {
+        bad = 1
+      }
+      print
+      rows += 1
+      next
+    }
+    inside && !fence && length($0) > 0 {
+      bad = 1
+    }
+    END {
+      if (begin_count != 1 || end_count != 1 || inside ||
+        open_count != 1 || close_count != 1 || fence || rows == 0 || bad) {
+        exit 1
+      }
+    }
+  ' "$readme"
+}
+
+runbook_component_inventory() {
+  local -r readme="$1"
+
+  awk '
+    $0 == "<!-- obi-runbook-component-inventory: begin -->" {
+      begin_count += 1
+      inside = 1
+      next
+    }
+    $0 == "<!-- obi-runbook-component-inventory: end -->" {
+      end_count += 1
+      inside = 0
+      next
+    }
+    inside && ($0 == "" ||
+      $0 == "| Source file | Exact responsibility |" ||
+      $0 == "| --- | --- |") {
+      next
+    }
+    inside && /^\| \[/ {
+      target = $0
+      original = target
+      sub(/^\| \[[^]]+\]\(/, "", target)
+      if (target == original) {
+        bad = 1
+        next
+      }
+      sub(/\) \|.*$/, "", target)
+      if (target == "" || target ~ /[[:space:]]/) {
+        bad = 1
+        next
+      }
+      print target
+      rows += 1
+      next
+    }
+    inside {
+      bad = 1
+    }
+    END {
+      if (begin_count != 1 || end_count != 1 || inside || rows == 0 || bad) {
+        exit 1
+      }
+    }
+  ' "$readme"
+}
+
+runbook_request_context_sequence() {
+  local -r readme="$1"
+
+  awk '
+    $0 == "<!-- obi-runbook-request-context-sequence: begin -->" {
+      begin_count += 1
+      inside = 1
+      next
+    }
+    $0 == "<!-- obi-runbook-request-context-sequence: end -->" {
+      end_count += 1
+      inside = 0
+      next
+    }
+    inside && /^[1-9][0-9]*\. \*\*/ {
+      number = $0
+      sub(/\..*$/, "", number)
+      label = $0
+      sub(/^[1-9][0-9]*\. \*\*/, "", label)
+      sub(/\.\*\*.*$/, "", label)
+      steps += 1
+      if (number != steps || label == "") {
+        bad = 1
+      }
+      print label
+    }
+    END {
+      if (begin_count != 1 || end_count != 1 || inside || steps == 0 || bad) {
+        exit 1
+      }
+    }
+  ' "$readme"
+}
+
+runbook_runner_scenario_roster() {
+  local -r runner="$1"
+
+  awk '
+    /^    all\|basic\|.*\)$/ {
+      line = $0
+      sub(/^    /, "", line)
+      sub(/\)$/, "", line)
+      matches += 1
+      count = split(line, scenarios, "|")
+      for (item_index = 1; item_index <= count; item_index++) {
+        if (scenarios[item_index] !~ /^[a-z0-9][a-z0-9-]*$/) {
+          bad = 1
+        }
+        print scenarios[item_index]
+      }
+    }
+    END {
+      if (matches != 1 || bad) {
+        exit 1
+      }
+    }
+  ' "$runner"
+}
+
+runbook_campaign_public_roster() {
+  local -r campaign="$1"
+
+  [[ -f "$campaign" && ! -L "$campaign" ]] || return 1
+  bash --noprofile --norc -c '
+    set -Eeuo pipefail
+    source "$1"
+    ((${#PUBLIC_FILES[@]} > 0))
+    for file in "${PUBLIC_FILES[@]}"; do
+      [[ "$file" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+      printf "%s\n" "$file"
+    done
+  ' bash "$campaign"
+}
+
+runbook_fault_security_profiles() {
+  local -r campaign="$1"
+
+  [[ -f "$campaign" && ! -L "$campaign" ]] || return 1
+  bash --noprofile --norc -c '
+    set -Eeuo pipefail
+    source "$1"
+    [[ ${#PROFILE_ROLES[@]} == 5 && ${#PROFILE_KINDS[@]} == 5 &&
+      ${#PROFILE_TRANSPORTS[@]} == 5 && ${#PROFILE_SCENARIOS[@]} == 5 ]]
+    for index in "${!PROFILE_TRANSPORTS[@]}"; do
+      printf "%s/%s\n" \
+        "${PROFILE_TRANSPORTS[index]}" "${PROFILE_SCENARIOS[index]}"
+    done
+  ' bash "$campaign"
+}
+
+runbook_workflow_public_roster() {
+  local -r workflow="$1"
+  local -r prefix="$2"
+
+  awk -v prefix="$prefix" '
+    index($0, prefix) {
+      value = substr($0, index($0, prefix) + length(prefix))
+      if (value !~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/) {
+        bad = 1
+      }
+      print value
+      count += 1
+    }
+    END {
+      if (count == 0 || bad) {
+        exit 1
+      }
+    }
+  ' "$workflow"
+}
+
 assert_runbook_build_and_control_contract() {
   local -r readme="$1"
-  local -r runner="$TEST_SCRIPT_DIR/../run.sh"
+  local -r runner="${2:-$TEST_SCRIPT_DIR/../run.sh}"
+  local -r workflow="${3:-$TEST_SCRIPT_DIR/../../../.github/workflows/java_remote_parent_acceptance_claims.yml}"
+  local -r acceptance_campaign="${4:-$TEST_SCRIPT_DIR/run-retained-acceptance-campaign.sh}"
+  local -r fault_campaign="${5:-$TEST_SCRIPT_DIR/run-retained-fault-security-campaign.sh}"
   local -r javaagent_dockerfile="$TEST_SCRIPT_DIR/../../../javaagent.Dockerfile"
   local -r compose="$TEST_SCRIPT_DIR/../docker-compose.yml"
+  local -r java_dockerfile="$TEST_SCRIPT_DIR/../java/Dockerfile"
+  local -r java_pom="$TEST_SCRIPT_DIR/../java/pom.xml"
+  local -r tracecheck_dockerfile="$TEST_SCRIPT_DIR/../tracecheck/Dockerfile"
+  local -r certificate_generator="$TEST_SCRIPT_DIR/../certs/generate.sh"
+  local -r expected_components=$'run.sh\ndocker-compose.yml\napache/httpd.conf\njava/Dockerfile\njava/pom.xml\njava/src/main/java/io/opentelemetry/obi/examples/ApacheJavaHttpsBackend.java\ntracecheck/Dockerfile\ntracecheck/cmd/receiver/main.go\ntracecheck/cmd/scenario/main.go\ntracecheck/assertions.go\nconfigs/obi.yaml\n../../Dockerfile\n../../javaagent.Dockerfile\ncerts/generate.sh\ncerts/openssl.cnf'
+  local -r expected_sequence=$'Client request\nApache observation\nVerified backend request\nJava extraction\nJava server span\nLocal assertion'
+  local -r expected_acceptance_files=$'README.md\nSANITIZATION.md\nacceptance-claims.json\nauthority-summary.json\nderivation-receipt.json\nverify.sh\nSHA256SUMS'
+  local -r expected_fault_files=$'README.md\nSANITIZATION.md\nfault-security-matrix.json\nderivation-receipt.json\nverify.sh\nSHA256SUMS'
+  local -r expected_profiles=$'getsockopt/all\nunix/all\nauto/all\ngetsockopt/pid-reuse\nunix/pid-reuse'
+  local observed=""
+  local relative=""
   local control=""
   local -a controls=(
     primary-generation-mismatch
@@ -35767,6 +35999,89 @@ assert_runbook_build_and_control_contract() {
     auto-unavailable
     pid-reuse
   )
+
+  [[ -f "$readme" && ! -L "$readme" && -f "$runner" && ! -L "$runner" &&
+    -f "$workflow" && ! -L "$workflow" ]] || return 1
+
+  observed="$(runbook_request_context_sequence "$readme")" || return 1
+  [[ "$observed" == "$expected_sequence" ]] || return 1
+  observed="$(runbook_component_inventory "$readme")" || return 1
+  [[ "$observed" == "$expected_components" ]] || return 1
+  while IFS= read -r relative; do
+    [[ -f "$TEST_SCRIPT_DIR/../$relative" &&
+      ! -L "$TEST_SCRIPT_DIR/../$relative" ]] || return 1
+  done <<<"$expected_components"
+
+  [[ "$(runbook_exact_line_count "$readme" \
+    './examples/apache-java-https/certs/generate.sh --output examples/apache-java-https/.runtime/certs')" == 1 ]] || return 1
+  grep -Fq -- 'dockerfile: java/Dockerfile' "$compose" || return 1
+  grep -Fq -- 'dockerfile: examples/apache-java-https/tracecheck/Dockerfile' \
+    "$compose" || return 1
+  grep -Fq -- './apache/httpd.conf:/usr/local/apache2/conf/httpd.conf:ro' \
+    "$compose" || return 1
+  grep -Fq -- './configs/obi.yaml:/config/obi.yaml:ro' "$compose" || return 1
+  grep -Fq -- './.runtime/certs/server.p12:/run/obi-demo/certs/server.p12:ro' \
+    "$compose" || return 1
+  grep -Fq -- 'COPY java/pom.xml ./pom.xml' "$java_dockerfile" || return 1
+  grep -Fq -- 'io.opentelemetry.obi.examples.ApacheJavaHttpsBackend' \
+    "$java_pom" || return 1
+  grep -Fq -- './examples/apache-java-https/tracecheck/cmd/receiver' \
+    "$tracecheck_dockerfile" || return 1
+  grep -Fq -- './examples/apache-java-https/tracecheck/cmd/scenario' \
+    "$tracecheck_dockerfile" || return 1
+  grep -Fq -- '-config "$SCRIPT_DIR/openssl.cnf"' \
+    "$certificate_generator" || return 1
+  grep -Fq -- '-extfile "$SCRIPT_DIR/openssl.cnf"' \
+    "$certificate_generator" || return 1
+
+  [[ "$(runbook_exact_line_count "$workflow" '  acceptance:')" == 1 &&
+    "$(runbook_exact_line_count "$workflow" '  fault-security-matrix:')" == 1 ]] || return 1
+  grep -Fq -- 'name: Clean-host OTel/getsockopt/TLS 1.3 acceptance and control' \
+    "$workflow" || return 1
+  grep -Fq -- 'name: Five-cell current-source fault/security matrix' \
+    "$workflow" || return 1
+  grep -Fq -- './examples/apache-java-https/scripts/run-retained-acceptance-campaign.sh' \
+    "$workflow" || return 1
+  grep -Fq -- './examples/apache-java-https/scripts/run-retained-fault-security-campaign.sh' \
+    "$workflow" || return 1
+  grep -Fq -- '[campaign source](scripts/run-retained-acceptance-campaign.sh)' \
+    "$readme" || return 1
+  grep -Fq -- '[five-profile campaign source](scripts/run-retained-fault-security-campaign.sh)' \
+    "$readme" || return 1
+
+  observed="$(runbook_campaign_public_roster "$acceptance_campaign")" || return 1
+  [[ "$observed" == "$expected_acceptance_files" ]] || return 1
+  observed="$(runbook_workflow_public_roster "$workflow" \
+    '${{ env.PUBLIC_OUTPUT }}/')" || return 1
+  [[ "$observed" == "$expected_acceptance_files" ]] || return 1
+  observed="$(runbook_fenced_roster "$readme" \
+    obi-retained-acceptance-public-roster)" || return 1
+  [[ "$observed" == "$expected_acceptance_files" ]] || return 1
+
+  observed="$(runbook_campaign_public_roster "$fault_campaign")" || return 1
+  [[ "$observed" == "$expected_fault_files" ]] || return 1
+  observed="$(runbook_workflow_public_roster "$workflow" \
+    '${{ env.MATRIX_OUTPUT }}/')" || return 1
+  [[ "$observed" == "$expected_fault_files" ]] || return 1
+  observed="$(runbook_fenced_roster "$readme" \
+    obi-fault-security-public-roster)" || return 1
+  [[ "$observed" == "$expected_fault_files" ]] || return 1
+
+  observed="$(runbook_fault_security_profiles "$fault_campaign")" || return 1
+  [[ "$observed" == "$expected_profiles" ]] || return 1
+  observed="$(runbook_fenced_roster "$readme" \
+    obi-fault-security-profile-roster)" || return 1
+  [[ "$observed" == "$expected_profiles" ]] || return 1
+  grep -Fq -- 'presence of either campaign are not runtime passes.' \
+    "$readme" || return 1
+  grep -Fq -- 'destroys the raw transaction' "$readme" || return 1
+  grep -Fq -- 'destroys the complete raw transaction' "$readme" || return 1
+  grep -Fq -- 'destroy_private_transaction' "$acceptance_campaign" || return 1
+  grep -Fq -- 'destroy_private_transaction' "$fault_campaign" || return 1
+
+  observed="$(runbook_runner_scenario_roster "$runner")" || return 1
+  [[ "$observed" == "$(runbook_fenced_roster "$readme" \
+    obi-runbook-scenario-roster)" ]] || return 1
 
   for control in "${controls[@]}"; do
     grep -Fq -- "$control" "$runner" || return 1
@@ -35777,6 +36092,14 @@ assert_runbook_build_and_control_contract() {
   grep -Fq 'its result is always labeled non-acceptance' "$readme" || return 1
   grep -Fq 'evidence and cannot promote a compatibility or final-result cell.' \
     "$readme" || return 1
+
+  grep -Fq -- 'then exits with status `2`' "$readme" || return 1
+  grep -Fq -- '`deliberate assertion failure requested`' "$readme" || return 1
+  grep -Fq -- '"expected_exit_status":2' "$runner" || return 1
+  [[ "$(runbook_exact_line_count "$runner" \
+    '  die "deliberate assertion failure requested"')" == 1 ]] || return 1
+  grep -Fq -- 'run_recorded_command assertion-failure-exit-2 2' \
+    "$acceptance_campaign" || return 1
 
   grep -Fq 'docker build \' "$readme" || return 1
   grep -Fq '    --file javaagent.Dockerfile \' "$readme" || return 1
@@ -35794,11 +36117,28 @@ assert_runbook_build_and_control_contract() {
 
 test_runbook_build_and_control_contract_is_mutation_sensitive() {
   local -r readme="$TEST_SCRIPT_DIR/../README.md"
+  local -r runner="$TEST_SCRIPT_DIR/../run.sh"
+  local -r workflow="$TEST_SCRIPT_DIR/../../../.github/workflows/java_remote_parent_acceptance_claims.yml"
+  local -r acceptance_campaign="$TEST_SCRIPT_DIR/run-retained-acceptance-campaign.sh"
+  local -r fault_campaign="$TEST_SCRIPT_DIR/run-retained-fault-security-campaign.sh"
   local -r missing_control="$TEST_TMP_DIR/runbook-missing-control.md"
   local -r stale_build="$TEST_TMP_DIR/runbook-stale-build.md"
+  local -r stale_config="$TEST_TMP_DIR/runbook-stale-config.md"
+  local -r stale_certificates="$TEST_TMP_DIR/runbook-stale-certificates.md"
+  local -r stale_acceptance_roster="$TEST_TMP_DIR/runbook-stale-acceptance-roster.md"
+  local -r stale_fault_roster="$TEST_TMP_DIR/runbook-stale-fault-roster.md"
+  local -r stale_profile="$TEST_TMP_DIR/runbook-stale-profile.md"
+  local -r stale_message="$TEST_TMP_DIR/runbook-stale-message.md"
+  local -r stale_scenario="$TEST_TMP_DIR/runbook-stale-scenario.md"
+  local -r stale_runner="$TEST_TMP_DIR/runbook-stale-runner.sh"
+  local -r stale_acceptance_workflow="$TEST_TMP_DIR/runbook-stale-acceptance-workflow.yml"
+  local -r stale_workflow="$TEST_TMP_DIR/runbook-stale-workflow.yml"
+  local -r stale_acceptance_campaign="$TEST_TMP_DIR/runbook-stale-acceptance-campaign.sh"
+  local -r stale_assertion_campaign="$TEST_TMP_DIR/runbook-stale-assertion-campaign.sh"
+  local -r stale_fault_campaign="$TEST_TMP_DIR/runbook-stale-fault-campaign.sh"
 
   assert_runbook_build_and_control_contract "$readme" || {
-    printf 'Runbook does not match the current CLI and build boundaries\n' >&2
+    printf 'Runbook does not match the current CLI, source, workflow, and build boundaries\n' >&2
     return 1
   }
   sed 's/--scenario pid-reuse/--scenario stale-pid-reuse/' \
@@ -35810,6 +36150,87 @@ test_runbook_build_and_control_contract_is_mutation_sensitive() {
   sed 's/--target export/--target stale-export/' "$readme" >"$stale_build"
   if assert_runbook_build_and_control_contract "$stale_build"; then
     printf 'Runbook contract accepted a stale bridge export target\n' >&2
+    return 1
+  fi
+  sed 's#(configs/obi.yaml)#(configs/stale-obi.yaml)#' \
+    "$readme" >"$stale_config"
+  if assert_runbook_build_and_control_contract "$stale_config"; then
+    printf 'Runbook contract accepted a stale OBI config path\n' >&2
+    return 1
+  fi
+  sed 's#certs/generate.sh --output examples/apache-java-https/.runtime/certs#certs/generate.sh --output examples/apache-java-https/.runtime/stale-certs#' \
+    "$readme" >"$stale_certificates"
+  if assert_runbook_build_and_control_contract "$stale_certificates"; then
+    printf 'Runbook contract accepted a stale certificate output path\n' >&2
+    return 1
+  fi
+  sed '0,/^authority-summary.json$/s//authority-stale.json/' \
+    "$readme" >"$stale_acceptance_roster"
+  if assert_runbook_build_and_control_contract "$stale_acceptance_roster"; then
+    printf 'Runbook contract accepted a stale seven-file acceptance roster\n' >&2
+    return 1
+  fi
+  sed '0,/^fault-security-matrix.json$/s//fault-security-stale.json/' \
+    "$readme" >"$stale_fault_roster"
+  if assert_runbook_build_and_control_contract "$stale_fault_roster"; then
+    printf 'Runbook contract accepted a stale six-file fault/security roster\n' >&2
+    return 1
+  fi
+  sed '0,/^auto\/all$/s//auto\/stale/' "$readme" >"$stale_profile"
+  if assert_runbook_build_and_control_contract "$stale_profile"; then
+    printf 'Runbook contract accepted a stale fault/security profile\n' >&2
+    return 1
+  fi
+  sed 's/deliberate assertion failure requested/deliberate stale failure requested/' \
+    "$readme" >"$stale_message"
+  if assert_runbook_build_and_control_contract "$stale_message"; then
+    printf 'Runbook contract accepted a stale deliberate-failure message\n' >&2
+    return 1
+  fi
+  sed '0,/^pid-reuse$/s//stale-pid-reuse/' "$readme" >"$stale_scenario"
+  if assert_runbook_build_and_control_contract "$stale_scenario"; then
+    printf 'Runbook contract accepted a stale documented scenario roster\n' >&2
+    return 1
+  fi
+  sed '0,/|pid-reuse|/s//|stale-pid-reuse|/' "$runner" >"$stale_runner"
+  if assert_runbook_build_and_control_contract "$readme" "$stale_runner"; then
+    printf 'Runbook contract accepted a mutated CLI scenario roster\n' >&2
+    return 1
+  fi
+  sed 's/^  acceptance:/  stale-acceptance:/' \
+    "$workflow" >"$stale_acceptance_workflow"
+  if assert_runbook_build_and_control_contract \
+    "$readme" "$runner" "$stale_acceptance_workflow"; then
+    printf 'Runbook contract accepted a renamed acceptance workflow job\n' >&2
+    return 1
+  fi
+  sed 's/^  fault-security-matrix:/  stale-fault-security-matrix:/' \
+    "$workflow" >"$stale_workflow"
+  if assert_runbook_build_and_control_contract \
+    "$readme" "$runner" "$stale_workflow"; then
+    printf 'Runbook contract accepted a renamed fault/security workflow job\n' >&2
+    return 1
+  fi
+  sed '0,/authority-summary.json/s//authority-stale.json/' \
+    "$acceptance_campaign" >"$stale_acceptance_campaign"
+  if assert_runbook_build_and_control_contract \
+    "$readme" "$runner" "$workflow" "$stale_acceptance_campaign"; then
+    printf 'Runbook contract accepted a mutated acceptance campaign roster\n' >&2
+    return 1
+  fi
+  sed '0,/run_recorded_command assertion-failure-exit-2 2/s//run_recorded_command assertion-failure-exit-2 3/' \
+    "$acceptance_campaign" >"$stale_assertion_campaign"
+  if assert_runbook_build_and_control_contract \
+    "$readme" "$runner" "$workflow" "$stale_assertion_campaign"; then
+    printf 'Runbook contract accepted a mutated deliberate-failure exit status\n' >&2
+    return 1
+  fi
+  sed 's/PROFILE_TRANSPORTS=(getsockopt unix auto getsockopt unix)/PROFILE_TRANSPORTS=(getsockopt unix auto unix unix)/' \
+    "$fault_campaign" >"$stale_fault_campaign"
+  if assert_runbook_build_and_control_contract \
+    "$readme" "$runner" "$workflow" "$acceptance_campaign" \
+    "$stale_fault_campaign"; then
+    printf 'Runbook contract accepted a mutated fault/security campaign profile\n' >&2
     return 1
   fi
 }
@@ -42171,6 +42592,9 @@ main() {
   test_demo_obi_lifecycle_timeouts_are_explicit
   test_primary_live_fd_compose_topology_is_scoped
   test_unix_security_probe_topology_is_least_privilege
+  "$TEST_SCRIPT_DIR/project-retained-fault-security-matrix_test.sh"
+  "$TEST_SCRIPT_DIR/run-retained-fault-security-campaign_test.sh"
+  "$TEST_SCRIPT_DIR/verify-retained-evidence_test.sh" fault-security-profiles
   "$TEST_SCRIPT_DIR/run-retained-acceptance-campaign_test.sh"
   printf 'demo harness tests passed\n'
 }

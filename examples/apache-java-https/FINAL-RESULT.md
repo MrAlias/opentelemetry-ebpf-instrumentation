@@ -34,6 +34,17 @@ validation. The full primary bundle independently exercises those
 controls and additionally retains the malformed declared-size response; the
 focused records are not used to promote an acceptance cell.
 
+The source now contains the
+[seven-file acceptance campaign](scripts/run-retained-acceptance-campaign.sh)
+and the new
+[five-profile fault/security campaign](scripts/run-retained-fault-security-campaign.sh).
+No source-revision-matched uploaded artifact from either campaign is linked for
+this runbook revision. The exact clean-host acceptance/control execution is
+therefore still pending for #32, and the `getsockopt`/`unix`/`auto` full runs
+plus forced-`getsockopt` and forced-Unix PID-reuse runs are still pending for
+#36 and #40. This source-only campaign availability changes no status, matrix
+row, or definition-of-done outcome in this report.
+
 ## Parent tracker definition-of-done reconciliation
 
 This is the explicit reconciliation for

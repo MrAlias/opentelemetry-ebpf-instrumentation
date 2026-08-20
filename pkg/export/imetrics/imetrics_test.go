@@ -68,6 +68,110 @@ func TestPrometheusReporterJavaRemoteParent(t *testing.T) {
 	assert.InDelta(t, 2, metric.GetCounter().GetValue(), 0)
 }
 
+func TestPrometheusReporterBpfProbeCollection(t *testing.T) {
+	reporter := NewPrometheusReporter(&InternalMetricsConfig{}, nil, prometheus.NewRegistry())
+
+	reporter.BpfProbeCollection("7", "CGroupSockopt", "obi_test")
+	reporter.BpfProbeCollection("7", "CGroupSockopt", "obi_test")
+
+	labels := []string{"7", "CGroupSockopt", "obi_test"}
+	var executions dto.Metric
+	var runtime dto.Metric
+	var passes dto.Metric
+	require.NoError(t, reporter.bpfProbeExecutions.WithLabelValues(labels...).Write(&executions))
+	require.NoError(t, reporter.bpfProbeLatencySum.WithLabelValues(labels...).Write(&runtime))
+	require.NoError(t, reporter.bpfProbeCollectionPasses.WithLabelValues(labels...).Write(&passes))
+	assert.Zero(t, executions.GetCounter().GetValue())
+	assert.Zero(t, runtime.GetCounter().GetValue())
+	assert.Equal(t, float64(2), passes.GetCounter().GetValue())
+}
+
+func TestPrometheusReporterBpfProbeLabelLeases(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	reporter := NewPrometheusReporter(&InternalMetricsConfig{}, nil, registry)
+	labels := map[string]string{
+		"probe_id": "7", "probe_type": "CGroupSockopt", "probe_name": "obi_test",
+	}
+
+	reporter.BpfProbeLabelsAcquire("7", "CGroupSockopt", "obi_test")
+	reporter.BpfProbeLabelsAcquire("7", "CGroupSockopt", "obi_test")
+	reporter.BpfProbeStats("7", "CGroupSockopt", "obi_test", 3, 0.5, nil)
+	reporter.BpfProbeCollection("7", "CGroupSockopt", "obi_test")
+	reporter.BpfProbeLabelsRelease("7", "CGroupSockopt", "obi_test")
+
+	for _, name := range []string{
+		"obi_bpf_probe_executions_total",
+		"obi_bpf_probe_latency_seconds_total",
+		"obi_bpf_probe_collection_passes_total",
+	} {
+		require.NotNil(t, gatheredInternalMetric(t, registry, name, labels), name)
+	}
+
+	// An unmatched release is idempotent and cannot affect another exact label set.
+	reporter.BpfProbeLabelsRelease("8", "CGroupSockopt", "obi_other")
+	reporter.BpfProbeLabelsRelease("7", "CGroupSockopt", "obi_test")
+	reporter.BpfProbeLabelsRelease("7", "CGroupSockopt", "obi_test")
+	for _, name := range []string{
+		"obi_bpf_probe_executions_total",
+		"obi_bpf_probe_latency_seconds_total",
+		"obi_bpf_probe_collection_passes_total",
+	} {
+		assert.Nil(t, gatheredInternalMetric(t, registry, name, labels), name)
+	}
+
+	// A later acquisition recreates clean series rather than reviving stale counters.
+	reporter.BpfProbeLabelsAcquire("7", "CGroupSockopt", "obi_test")
+	reporter.BpfProbeCollection("7", "CGroupSockopt", "obi_test")
+	executions := gatheredInternalMetric(t, registry, "obi_bpf_probe_executions_total", labels)
+	runtime := gatheredInternalMetric(t, registry, "obi_bpf_probe_latency_seconds_total", labels)
+	passes := gatheredInternalMetric(t, registry, "obi_bpf_probe_collection_passes_total", labels)
+	require.NotNil(t, executions)
+	require.NotNil(t, runtime)
+	require.NotNil(t, passes)
+	assert.Zero(t, executions.GetCounter().GetValue())
+	assert.Zero(t, runtime.GetCounter().GetValue())
+	assert.Equal(t, float64(1), passes.GetCounter().GetValue())
+}
+
+func TestPrometheusReporterBpfMapLabelLeases(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	reporter := NewPrometheusReporter(&InternalMetricsConfig{}, nil, registry)
+	labels := map[string]string{
+		"map_id": "11", "map_name": "java_remote_par", "map_type": "Hash",
+	}
+
+	reporter.BpfMapLabelsAcquire("11", "java_remote_par", "Hash")
+	reporter.BpfMapLabelsAcquire("11", "java_remote_par", "Hash")
+	reporter.BpfMapEntries("11", "java_remote_par", "Hash", 4)
+	reporter.BpfMapMaxEntries("11", "java_remote_par", "Hash", 16)
+	reporter.BpfMapLabelsRelease("11", "java_remote_par", "Hash")
+
+	entries := gatheredInternalMetric(t, registry, "obi_bpf_map_entries", labels)
+	maximum := gatheredInternalMetric(t, registry, "obi_bpf_map_max_entries", labels)
+	require.NotNil(t, entries)
+	require.NotNil(t, maximum)
+	assert.Equal(t, float64(4), entries.GetGauge().GetValue())
+	assert.Equal(t, float64(16), maximum.GetGauge().GetValue())
+
+	// Unmatched and repeated releases cannot delete another exact label set.
+	reporter.BpfMapLabelsRelease("12", "other", "Hash")
+	reporter.BpfMapLabelsRelease("11", "java_remote_par", "Hash")
+	reporter.BpfMapLabelsRelease("11", "java_remote_par", "Hash")
+	assert.Nil(t, gatheredInternalMetric(t, registry, "obi_bpf_map_entries", labels))
+	assert.Nil(t, gatheredInternalMetric(t, registry, "obi_bpf_map_max_entries", labels))
+
+	// Reacquisition recreates both gauges without stale values.
+	reporter.BpfMapLabelsAcquire("11", "java_remote_par", "Hash")
+	reporter.BpfMapEntries("11", "java_remote_par", "Hash", 1)
+	reporter.BpfMapMaxEntries("11", "java_remote_par", "Hash", 8)
+	entries = gatheredInternalMetric(t, registry, "obi_bpf_map_entries", labels)
+	maximum = gatheredInternalMetric(t, registry, "obi_bpf_map_max_entries", labels)
+	require.NotNil(t, entries)
+	require.NotNil(t, maximum)
+	assert.Equal(t, float64(1), entries.GetGauge().GetValue())
+	assert.Equal(t, float64(8), maximum.GetGauge().GetValue())
+}
+
 type noopEmbeddingReporter struct {
 	NoopReporter
 }
@@ -147,4 +251,27 @@ func metricLabels(metric *dto.Metric) map[string]string {
 		labels[pair.GetName()] = pair.GetValue()
 	}
 	return labels
+}
+
+func gatheredInternalMetric(
+	t *testing.T,
+	registry *prometheus.Registry,
+	name string,
+	labels map[string]string,
+) *dto.Metric {
+	t.Helper()
+
+	metricFamilies, err := registry.Gather()
+	require.NoError(t, err)
+	for _, family := range metricFamilies {
+		if family.GetName() != name {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			if assert.ObjectsAreEqual(metricLabels(metric), labels) {
+				return metric
+			}
+		}
+	}
+	return nil
 }

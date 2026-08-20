@@ -2,7 +2,7 @@
 
 Status: **partial — the core application harness and bounded/native fixtures
 are implemented, but no retained full application run completes the
-native-memory, BPF CPU, and contention acceptance evidence**
+native-memory, CPU-utilization, and contention acceptance evidence**
 
 The retained benchmark evidence remains partial and does not close the open
 [MrAlias/opentelemetry-ebpf-instrumentation issue #37](https://github.com/MrAlias/opentelemetry-ebpf-instrumentation/issues/37).
@@ -44,9 +44,13 @@ the map dimension closed. The bridge-disabled cell still has the minimized
 bridge maps (maximum one entry), so its samples are required rather than
 treated as not applicable. The overall status remains `partial` and its result
 becomes `failed` if a supported correctness, performance, process-growth, or
-owned-map-growth dimension fails. JFR/NMT
-allocation, native/direct-memory growth, primary cgroup-sockopt program CPU,
-and BPF lock contention are also uncollected. A `passed` `summary.json` status
+owned-map-growth dimension fails. Selected forced-`getsockopt` cells now also
+retain exact-owned kernel-reported program execution-count and cumulative
+run-time deltas across the sustained measurement window. Those counters are
+descriptive and are not host, process, or cgroup CPU utilization, CPU-isolation,
+or synchronization/lock-wait evidence. JFR/NMT allocation,
+native/direct-memory growth, primary cgroup-sockopt program CPU utilization,
+and BPF lock contention remain uncollected. A `passed` `summary.json` status
 means only that the requested harness execution completed; it is neither a
 passing PoC gate nor issue-acceptance evidence.
 
@@ -404,6 +408,28 @@ command-start allowance is not measurement time. Each cell ends with its fixed
 scenario-specific correctness sentinel before the harness invokes
 `run.sh --cleanup-only` for that project.
 
+Each successful client result retains every observed request latency exactly as
+a sorted run-length encoding of integer nanoseconds
+(`sorted_rle_nanos_v1`). The harness limits a result to 1,000,000 successful
+samples and histogram runs and to 96 MiB before publication. It rejects
+missing, unsorted, zero/negative, out-of-window, over-counted, truncated, or
+oversized results. Before ordinary JSON semantics can collapse duplicate
+members, a bounded streaming pass rejects duplicate keys at the top level, in
+the latency object, and in every histogram-run object. A passed result has
+exactly 20 top-level keys, five latency keys, and two keys per run. The harness
+requires nonzero canonical UTC RFC3339Nano start/finish timestamps in order,
+JSON-safe integral fields, and a seed no greater than 9007199254740991. It
+recomputes nearest-rank p50/p95/p99 directly from the encoded runs and
+recomputes throughput as
+`successful_requests * 1e9 / traffic_elapsed_nanos`, allowing only
+`max(1e-12 requests/s, recomputed throughput * 1e-12)` numeric tolerance.
+Client output is written to a private `.partial` path and is published
+atomically only after validation succeeds. Failure or interruption first reaps
+the exact recorded client session, then discards only an allowlisted
+`warmup.json.partial` or `measurements/rep-NN.json.partial` whose launch-time
+parent identity is unchanged; outside/malformed paths and directories fail
+closed, and a final symlink is unlinked without following its target.
+
 The schema-v2 manifest preserves its `w3c_headers: false` baseline for existing
 consumers. Its authoritative per-cell traffic record is
 `workload.w3c_headers_by_cell`: only `getsockopt-w3c` is `true`; the four
@@ -422,14 +448,17 @@ Apache upstream connection to hand off. The benchmark Compose client remains
 non-root, read-only, capability-free, and `no-new-privileges`; it does not
 receive the certificate private key or PKCS#12 keystore.
 
-The exact helper-idle window is deliberately ordered as follows: a Java
-diagnostics snapshot; a fresh OBI metrics seed followed by two serial
-`tcp/report/valid` BPF-stats passes; the direct warmup and all repetitions; a
-fresh post-workload seed followed by two more serial BPF-stats passes; then a
-Java diagnostics snapshot. The marker is published last by the single periodic
-stats reader, not by an individual request: the second pass after each boundary
-is therefore the retained causal fence. Normal before/after/idle resource
-snapshots, the preflight, and the post-load sentinel remain outside this window.
+The exact helper-idle Java bridge-counter window is deliberately ordered as
+follows: a Java diagnostics snapshot; a fresh OBI metrics seed followed by two
+serial `tcp/report/valid` Java bridge stats-map reader passes; the direct warmup
+and all repetitions; a fresh post-workload seed followed by two more serial
+stats-map reader passes; then a Java diagnostics snapshot. The report marker is
+published last by that single periodic Java bridge reader, not by an individual
+request: the second pass after each boundary is therefore the retained causal
+fence for the Java bridge map-counter deltas only. It is not the collection
+fence for kernel program execution/run-time counters. Normal before/after/idle
+resource snapshots, the preflight, and the post-load sentinel remain outside
+this window.
 
 Each helper-idle repetition still retains an unsynchronized in-load resource
 point sample for OBI and Java CPU/RSS/thread/FD/container comparison. Its
@@ -481,6 +510,9 @@ ports. It creates only project names in the demo's reserved Compose namespace
 and never calls raw `docker compose down`; teardown is delegated to the runner's
 ownership-checked cleanup path.
 
+`--seed` accepts only `0` through `9007199254740991`, the largest integer that
+remains exact when the retained JSON is evaluated by `jq`.
+
 Before any Compose execution, the harness rejects `DOCKER_HOST`, resolves the
 active Docker context and its Docker endpoint, and requires an absolute local
 `unix:///...` endpoint whose path is an existing non-symlink Unix socket.
@@ -500,6 +532,49 @@ JSON, post-load sentinel, host environment, Docker stats and inspect records,
 `/proc` memory/fd/thread snapshots, OBI metrics when applicable, and requested
 Java diagnostics. The helper-idle midpoint is the documented exception: it
 omits Java diagnostics and records that explicit reason in `snapshot.json`.
+In addition to the unsynchronized midpoint samples, every cell retains a
+`resources-measurement-baseline` snapshot after warmup and before the first
+measurement repetition, plus a `resources-measurement-end` snapshot initiated
+immediately after the final repetition. Java diagnostics are intentionally
+excluded from these two snapshots so they cannot extend or mutate the sustained
+client counter window.
+
+For the three cells whose selected transport is `getsockopt`, each measurement
+boundary also retains an exact-owned program collection fence. The required
+roster is the bridge `setsockopt` program, router, direct take/discard handlers,
+task take/discard handlers, and health handler—exactly seven distinct
+`CGroupSockopt` programs. The exporter increments
+`obi_bpf_probe_collection_passes_total{probe_id,probe_type,probe_name}` only
+after it has sampled and reported that same program's execution and cumulative
+run-time counters, including a pass with a zero delta. The harness first waits
+for every one of the seven owned markers to advance twice; the second advance
+cannot belong to a collection pass that was already in flight when the boundary
+scrape began. Because one Prometheus gather can read metric vectors
+non-atomically, it then starts a separate confirmation scrape after that fence
+response completes, requires every marker and counter to be nondecreasing, and
+retains only the confirmation scrape.
+Both scrapes are enclosed by byte-identical OBI FD-ownership receipts, and the
+confirmation marker values are cross-checked against the retained scrape and
+the stable OBI process identity. Missing, duplicate, reset, changed, truncated,
+or non-owned series fail closed. `bridge-disabled`, the forced-Unix cell, and
+the uninstrumented cell record this observation as `not_applicable`; they do
+not require bridge programs that their selected transport does not use.
+
+Each internal BPF collector leases only the exact program label sets it has
+observed. A complete program walk evicts and releases missing labels, and
+serialized collector shutdown releases the remainder; the last lease deletes
+the execution, run-time, and collection-pass series together. Incomplete walks
+and transient stats failures retain leases, and native collectors do not own or
+release another collector's labels.
+
+`bpf-program-runtime.json` subtracts the post-warmup confirmation from the
+confirmation initiated immediately after load and reports per-program and total
+execution and cumulative run-time deltas, plus successful-request denominators.
+It keeps
+`acceptance_evidence: false`. These are kernel-reported counters for the exact
+owned program roster, not host/process/cgroup CPU utilization, scheduler time,
+CPU isolation, synchronization contention, or lock-wait measurements.
+
 A process sample is available only when the Compose-owned full container ID,
 Docker-reported host PID, local `/proc/<pid>/stat` start time, and SHA-256 of
 the bounded local `/proc/<pid>/cgroup` file remain stable around collection,
@@ -569,8 +644,10 @@ successful harness completion as issue acceptance.
 The optional complete mode adds native transport/provider lookup percentiles
 and bounded pressure capacity/cleanup evidence as described above. It does not
 invoke the separate packaged-JVM transport fixture or collect JFR/NMT
-allocation/native/direct-memory summaries, primary cgroup-sockopt program CPU,
-or BPF lock contention. Its capacity-rejection observation is not a general
+allocation/native/direct-memory summaries, primary cgroup-sockopt program CPU
+utilization, or BPF lock contention. The exact-owned cumulative run-time and
+execution counters described above remain descriptive non-acceptance evidence.
+Its capacity-rejection observation is not a general
 BPF map-insertion-failure counter, and its non-evicting-map check is not an
 eviction-rate benchmark. Do not use the repository-wide
 `scripts/bpf-metrics-sampler.sh` for this harness: it changes a host-global BPF
@@ -648,6 +725,8 @@ Record at minimum:
   request rate;
 - client throughput and latency histogram;
 - OBI, Apache and Java container CPU and memory;
+- exact-owned CGroupSockopt execution and cumulative run-time counter deltas,
+  with their collection-fence and ownership receipts;
 - Java JFR/NMT allocation and native-memory summaries;
 - `/proc/<pid>/fd` and `/proc/<pid>/task` counts before, during, and after;
 - bridge lookup p50/p95/p99 and reason-coded hit/miss/timeout counters;

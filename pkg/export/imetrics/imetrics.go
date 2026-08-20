@@ -111,6 +111,32 @@ type Reporter interface {
 	JavaRemoteParent(transport, operation, status string, count uint64)
 }
 
+// BpfProbeCollectionReporter is an optional extension implemented by reporters
+// that expose a completion marker for each successfully sampled BPF program.
+// The collector invokes it after reporting the program's execution and runtime
+// deltas, including when those deltas are zero.
+type BpfProbeCollectionReporter interface {
+	BpfProbeCollection(probeID, probeType, probeName string)
+}
+
+// BpfProbeLabelLifecycleReporter is an optional extension for reporters that
+// retain exact-label BPF probe metric series. Internal collectors acquire one
+// lease per exact label set and release it only after a complete-walk eviction
+// or serialized shutdown.
+type BpfProbeLabelLifecycleReporter interface {
+	BpfProbeLabelsAcquire(probeID, probeType, probeName string)
+	BpfProbeLabelsRelease(probeID, probeType, probeName string)
+}
+
+// BpfMapLabelLifecycleReporter is an optional extension for reporters that
+// retain exact-label BPF map metric series. Internal collectors acquire one
+// lease per exact label set and release it only after a complete-walk eviction
+// or serialized shutdown.
+type BpfMapLabelLifecycleReporter interface {
+	BpfMapLabelsAcquire(mapID, mapName, mapType string)
+	BpfMapLabelsRelease(mapID, mapName, mapType string)
+}
+
 func IsBuiltinNoopReporter(reporter Reporter) bool {
 	if reporter == nil {
 		return false

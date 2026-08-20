@@ -140,6 +140,47 @@ func TestRunMaintainsConfiguredConcurrency(t *testing.T) {
 		result.Latency.P99Nanos < result.Latency.P95Nanos {
 		t.Fatalf("invalid latency summary: %+v", result.Latency)
 	}
+	if result.Latency.HistogramEncoding != latencyHistogramEncoding {
+		t.Fatalf("histogram encoding = %q", result.Latency.HistogramEncoding)
+	}
+	var histogramCount uint64
+	var previous int64
+	for index, entry := range result.Latency.Histogram {
+		if entry.Nanos <= 0 || entry.Count == 0 || (index > 0 && entry.Nanos <= previous) {
+			t.Fatalf("invalid histogram entry %d: %+v", index, entry)
+		}
+		previous = entry.Nanos
+		histogramCount += entry.Count
+	}
+	if histogramCount != result.SuccessfulRequests {
+		t.Fatalf("histogram count = %d, successful requests = %d", histogramCount, result.SuccessfulRequests)
+	}
+}
+
+func TestMeasurementsSummaryEmitsSortedRunLengthHistogram(t *testing.T) {
+	measurement := measurements{}
+	for _, latency := range []int64{300, 100, 200, 100, 300, 300} {
+		measurement.recordSuccess(latency)
+	}
+	successes, failures, firstFailure, summary := measurement.summary()
+	if successes != 6 || failures != 0 || firstFailure != "" {
+		t.Fatalf("unexpected counters: successes=%d failures=%d firstFailure=%q", successes, failures, firstFailure)
+	}
+	if summary.HistogramEncoding != latencyHistogramEncoding {
+		t.Fatalf("histogram encoding = %q", summary.HistogramEncoding)
+	}
+	want := []latencyHistogramRun{{Nanos: 100, Count: 2}, {Nanos: 200, Count: 1}, {Nanos: 300, Count: 3}}
+	if len(summary.Histogram) != len(want) {
+		t.Fatalf("histogram = %+v, want %+v", summary.Histogram, want)
+	}
+	for index := range want {
+		if summary.Histogram[index] != want[index] {
+			t.Fatalf("histogram[%d] = %+v, want %+v", index, summary.Histogram[index], want[index])
+		}
+	}
+	if summary.P50Nanos != 200 || summary.P95Nanos != 300 || summary.P99Nanos != 300 {
+		t.Fatalf("percentiles = (%d, %d, %d)", summary.P50Nanos, summary.P95Nanos, summary.P99Nanos)
+	}
 }
 
 func TestRunSendsW3CHeaders(t *testing.T) {
@@ -730,9 +771,13 @@ func TestParseFlagsRejectsUnsafeWorkloadSettings(t *testing.T) {
 		{"--base-url=http://user:secret@127.0.0.1:18080"},
 		{"--request-limit=0"},
 		{"--request-limit=1000001"},
+		{"--seed=9007199254740992"},
 	} {
 		if _, err := parseFlags(arguments); err == nil {
 			t.Fatalf("parseFlags(%v) error = nil", arguments)
 		}
+	}
+	if _, err := parseFlags([]string{"--seed=9007199254740991"}); err != nil {
+		t.Fatalf("parseFlags(maximum JSON-safe seed) error = %v", err)
 	}
 }

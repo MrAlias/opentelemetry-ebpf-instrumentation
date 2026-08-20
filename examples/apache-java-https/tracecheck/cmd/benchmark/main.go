@@ -34,9 +34,11 @@ const (
 	maxResponseBytes       = 1 << 20
 	maxResponseHeaderBytes = 64 << 10
 	maxTrustedCABytes      = 1 << 20
+	maxJSONSafeInteger     = uint64(1<<53 - 1)
 
 	tlsVerificationNotApplicable = "not_applicable"
 	tlsVerificationCAFile        = "verified_ca_file"
+	latencyHistogramEncoding     = "sorted_rle_nanos_v1"
 )
 
 type config struct {
@@ -53,9 +55,16 @@ type config struct {
 }
 
 type latencySummary struct {
-	P50Nanos int64 `json:"p50_nanos"`
-	P95Nanos int64 `json:"p95_nanos"`
-	P99Nanos int64 `json:"p99_nanos"`
+	P50Nanos          int64                 `json:"p50_nanos"`
+	P95Nanos          int64                 `json:"p95_nanos"`
+	P99Nanos          int64                 `json:"p99_nanos"`
+	HistogramEncoding string                `json:"histogram_encoding"`
+	Histogram         []latencyHistogramRun `json:"histogram"`
+}
+
+type latencyHistogramRun struct {
+	Nanos int64  `json:"nanos"`
+	Count uint64 `json:"count"`
 }
 
 type runResult struct {
@@ -170,6 +179,9 @@ func validateConfig(cfg config) error {
 	}
 	if cfg.requestLimit == 0 || cfg.requestLimit > maxRequestLimit {
 		return fmt.Errorf("--request-limit must be between 1 and %d", maxRequestLimit)
+	}
+	if cfg.seed > maxJSONSafeInteger {
+		return fmt.Errorf("--seed must be between 0 and %d", maxJSONSafeInteger)
 	}
 	if cfg.connectionMode != "close" && cfg.connectionMode != "reuse" {
 		return errors.New("--connection-mode must be close or reuse")
@@ -474,10 +486,24 @@ func (m *measurements) summary() (uint64, uint64, string, latencySummary) {
 	latencies := append([]int64(nil), m.latencies...)
 	sort.Slice(latencies, func(left, right int) bool { return latencies[left] < latencies[right] })
 	return m.successes, m.failures, m.firstFailure, latencySummary{
-		P50Nanos: percentile(latencies, 0.50),
-		P95Nanos: percentile(latencies, 0.95),
-		P99Nanos: percentile(latencies, 0.99),
+		P50Nanos:          percentile(latencies, 0.50),
+		P95Nanos:          percentile(latencies, 0.95),
+		P99Nanos:          percentile(latencies, 0.99),
+		HistogramEncoding: latencyHistogramEncoding,
+		Histogram:         encodeLatencyHistogram(latencies),
 	}
+}
+
+func encodeLatencyHistogram(sortedValues []int64) []latencyHistogramRun {
+	runs := make([]latencyHistogramRun, 0)
+	for _, value := range sortedValues {
+		if len(runs) > 0 && runs[len(runs)-1].Nanos == value {
+			runs[len(runs)-1].Count++
+			continue
+		}
+		runs = append(runs, latencyHistogramRun{Nanos: value, Count: 1})
+	}
+	return runs
 }
 
 func percentile(values []int64, percentile float64) int64 {

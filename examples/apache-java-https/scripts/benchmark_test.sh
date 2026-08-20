@@ -84,6 +84,9 @@ fake_bpf_metrics_increment() {
   local -r take_increment="${6:-0}"
   local -r discard_increment="${7:-0}"
   local -r negotiate_missing_increment="${8:-0}"
+  local -r program_executions_increment="${9:-0}"
+  local -r program_runtime_nanos_increment="${10:-0}"
+  local -r program_collection_passes_increment="${11:-0}"
   local report=""
   local candidate=""
   local inject=""
@@ -92,14 +95,22 @@ fake_bpf_metrics_increment() {
   local take=""
   local discard=""
   local negotiate_missing=""
+  local program_executions=""
+  local program_runtime_nanos=""
+  local program_collection_passes=""
   local extra=""
 
   [[ -n "${FAKE_BPF_METRICS_FILE:-}" && -f "$FAKE_BPF_METRICS_FILE" ]] || return 64
-  read -r report candidate inject stage handoff take discard negotiate_missing extra <"$FAKE_BPF_METRICS_FILE" || return 64
+  read -r report candidate inject stage handoff take discard negotiate_missing \
+    program_executions program_runtime_nanos program_collection_passes extra \
+    <"$FAKE_BPF_METRICS_FILE" || return 64
   [[ "$report" =~ ^[0-9]+$ && "$candidate" =~ ^[0-9]+$ && "$inject" =~ ^[0-9]+$ &&
     "$stage" =~ ^[0-9]+$ && "$handoff" =~ ^[0-9]+$ && "$take" =~ ^[0-9]+$ &&
-    "$discard" =~ ^[0-9]+$ && "$negotiate_missing" =~ ^[0-9]+$ && -z "$extra" ]] || return 64
-  printf '%s %s %s %s %s %s %s %s\n' \
+    "$discard" =~ ^[0-9]+$ && "$negotiate_missing" =~ ^[0-9]+$ &&
+    "$program_executions" =~ ^[0-9]+$ && "$program_runtime_nanos" =~ ^[0-9]+$ &&
+    "$program_collection_passes" =~ ^[0-9]+$ &&
+    -z "$extra" ]] || return 64
+  printf '%s %s %s %s %s %s %s %s %s %s %s\n' \
     "$((report + report_increment))" \
     "$((candidate + candidate_increment))" \
     "$((inject + inject_increment))" \
@@ -108,6 +119,9 @@ fake_bpf_metrics_increment() {
     "$((take + take_increment))" \
     "$((discard + discard_increment))" \
     "$((negotiate_missing + negotiate_missing_increment))" \
+    "$((program_executions + program_executions_increment))" \
+    "$((program_runtime_nanos + program_runtime_nanos_increment))" \
+    "$((program_collection_passes + program_collection_passes_increment))" \
     >"$FAKE_BPF_METRICS_FILE"
 }
 
@@ -120,16 +134,27 @@ fake_bpf_metrics_snapshot() {
   local take=""
   local discard=""
   local negotiate_missing=""
+  local program_executions=""
+  local program_runtime_nanos=""
+  local program_collection_passes=""
+  local program_runtime_seconds=""
   local extra=""
   local map_entries=1
   local map_max_entries=10000
   local project=""
 
   [[ -n "${FAKE_BPF_METRICS_FILE:-}" && -f "$FAKE_BPF_METRICS_FILE" ]] || return 64
-  read -r report candidate inject stage handoff take discard negotiate_missing extra <"$FAKE_BPF_METRICS_FILE" || return 64
+  read -r report candidate inject stage handoff take discard negotiate_missing \
+    program_executions program_runtime_nanos program_collection_passes extra \
+    <"$FAKE_BPF_METRICS_FILE" || return 64
   [[ "$report" =~ ^[0-9]+$ && "$candidate" =~ ^[0-9]+$ && "$inject" =~ ^[0-9]+$ &&
     "$stage" =~ ^[0-9]+$ && "$handoff" =~ ^[0-9]+$ && "$take" =~ ^[0-9]+$ &&
-    "$discard" =~ ^[0-9]+$ && "$negotiate_missing" =~ ^[0-9]+$ && -z "$extra" ]] || return 64
+    "$discard" =~ ^[0-9]+$ && "$negotiate_missing" =~ ^[0-9]+$ &&
+    "$program_executions" =~ ^[0-9]+$ && "$program_runtime_nanos" =~ ^[0-9]+$ &&
+    "$program_collection_passes" =~ ^[0-9]+$ &&
+    -z "$extra" ]] || return 64
+  printf -v program_runtime_seconds '%d.%09d' \
+    "$((program_runtime_nanos / 1000000000))" "$((program_runtime_nanos % 1000000000))"
   if [[ -n "${FAKE_COMPOSE_PROJECT_FILE:-}" &&
     -f "$FAKE_COMPOSE_PROJECT_FILE" ]]; then
     project="$(<"$FAKE_COMPOSE_PROJECT_FILE")"
@@ -141,6 +166,30 @@ fake_bpf_metrics_snapshot() {
   printf '%s\n' \
     'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"}'" $map_entries" \
     'obi_bpf_map_max_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"}'" $map_max_entries" \
+    "obi_bpf_probe_executions_total{probe_id=\"71\",probe_type=\"CGroupSockopt\",probe_name=\"obi_java_remote_parent_setsockopt\"} $program_executions" \
+    "obi_bpf_probe_latency_seconds_total{probe_id=\"71\",probe_type=\"CGroupSockopt\",probe_name=\"obi_java_remote_parent_setsockopt\"} $program_runtime_seconds" \
+    "obi_bpf_probe_collection_passes_total{probe_id=\"71\",probe_type=\"CGroupSockopt\",probe_name=\"obi_java_remote_parent_setsockopt\"} $program_collection_passes" \
+    "obi_bpf_probe_executions_total{probe_id=\"72\",probe_type=\"CGroupSockopt\",probe_name=\"obi_java_remote_parent_getsockopt\"} $program_executions" \
+    "obi_bpf_probe_latency_seconds_total{probe_id=\"72\",probe_type=\"CGroupSockopt\",probe_name=\"obi_java_remote_parent_getsockopt\"} $program_runtime_seconds" \
+    "obi_bpf_probe_collection_passes_total{probe_id=\"72\",probe_type=\"CGroupSockopt\",probe_name=\"obi_java_remote_parent_getsockopt\"} $program_collection_passes" \
+    "obi_bpf_probe_executions_total{probe_id=\"73\",probe_type=\"CGroupSockopt\",probe_name=\"obi_java_remote_parent_getsockopt_direct_take\"} $program_executions" \
+    "obi_bpf_probe_latency_seconds_total{probe_id=\"73\",probe_type=\"CGroupSockopt\",probe_name=\"obi_java_remote_parent_getsockopt_direct_take\"} $program_runtime_seconds" \
+    "obi_bpf_probe_collection_passes_total{probe_id=\"73\",probe_type=\"CGroupSockopt\",probe_name=\"obi_java_remote_parent_getsockopt_direct_take\"} $program_collection_passes" \
+    "obi_bpf_probe_executions_total{probe_id=\"74\",probe_type=\"CGroupSockopt\",probe_name=\"obi_java_remote_parent_getsockopt_direct_discard\"} $program_executions" \
+    "obi_bpf_probe_latency_seconds_total{probe_id=\"74\",probe_type=\"CGroupSockopt\",probe_name=\"obi_java_remote_parent_getsockopt_direct_discard\"} $program_runtime_seconds" \
+    "obi_bpf_probe_collection_passes_total{probe_id=\"74\",probe_type=\"CGroupSockopt\",probe_name=\"obi_java_remote_parent_getsockopt_direct_discard\"} $program_collection_passes" \
+    "obi_bpf_probe_executions_total{probe_id=\"75\",probe_type=\"CGroupSockopt\",probe_name=\"obi_java_remote_parent_getsockopt_task_take\"} $program_executions" \
+    "obi_bpf_probe_latency_seconds_total{probe_id=\"75\",probe_type=\"CGroupSockopt\",probe_name=\"obi_java_remote_parent_getsockopt_task_take\"} $program_runtime_seconds" \
+    "obi_bpf_probe_collection_passes_total{probe_id=\"75\",probe_type=\"CGroupSockopt\",probe_name=\"obi_java_remote_parent_getsockopt_task_take\"} $program_collection_passes" \
+    "obi_bpf_probe_executions_total{probe_id=\"76\",probe_type=\"CGroupSockopt\",probe_name=\"obi_java_remote_parent_getsockopt_task_discard\"} $program_executions" \
+    "obi_bpf_probe_latency_seconds_total{probe_id=\"76\",probe_type=\"CGroupSockopt\",probe_name=\"obi_java_remote_parent_getsockopt_task_discard\"} $program_runtime_seconds" \
+    "obi_bpf_probe_collection_passes_total{probe_id=\"76\",probe_type=\"CGroupSockopt\",probe_name=\"obi_java_remote_parent_getsockopt_task_discard\"} $program_collection_passes" \
+    "obi_bpf_probe_executions_total{probe_id=\"77\",probe_type=\"CGroupSockopt\",probe_name=\"obi_java_remote_parent_getsockopt_health\"} $program_executions" \
+    "obi_bpf_probe_latency_seconds_total{probe_id=\"77\",probe_type=\"CGroupSockopt\",probe_name=\"obi_java_remote_parent_getsockopt_health\"} $program_runtime_seconds" \
+    "obi_bpf_probe_collection_passes_total{probe_id=\"77\",probe_type=\"CGroupSockopt\",probe_name=\"obi_java_remote_parent_getsockopt_health\"} $program_collection_passes" \
+    'obi_bpf_probe_executions_total{probe_id="99",probe_type="CGroupSockopt",probe_name="foreign_fixture"} 999' \
+    'obi_bpf_probe_latency_seconds_total{probe_id="99",probe_type="CGroupSockopt",probe_name="foreign_fixture"} 0.999' \
+    'obi_bpf_probe_collection_passes_total{probe_id="99",probe_type="CGroupSockopt",probe_name="foreign_fixture"} 999' \
     "obi_java_remote_parent_operations_total{operation=\"candidate\",status=\"valid\",transport=\"tcp\"} $candidate" \
     "obi_java_remote_parent_operations_total{operation=\"handoff\",status=\"valid\",transport=\"tcp\"} $handoff" \
     "obi_java_remote_parent_operations_total{operation=\"inject\",status=\"valid\",transport=\"tcp\"} $inject" \
@@ -1033,6 +1082,7 @@ fake_benchmark_result() {
   if [[ "$w3c" == true ]]; then
     fake_diagnostics_increment 4 4 || return $?
   fi
+  fake_bpf_metrics_increment 0 0 0 0 0 0 0 0 4 4000 || return $?
   printf 'benchmark duration=%s concurrency=%s\n' "$duration" "$concurrency" >>"$FAKE_DOCKER_LOG"
   # Give the harness enough real time to verify the dedicated client session.
   /bin/sleep 0.2
@@ -1048,6 +1098,8 @@ fake_benchmark_result() {
     --argjson w3c "$w3c" '
       {
         status: "passed",
+        started_at: "2026-08-20T00:00:00.000000001Z",
+        finished_at: "2026-08-20T00:00:02.000000001Z",
         base_url: $base_url,
         path: $path,
         connection_mode: $connection_mode,
@@ -1063,8 +1115,14 @@ fake_benchmark_result() {
         successful_requests: 4,
         failed_requests: 0,
         traffic_elapsed_nanos: $duration_nanos,
-        throughput_per_second: 4,
-        latency: {p50_nanos: 1, p95_nanos: 2, p99_nanos: 3}
+        throughput_per_second: (4 * 1000000000 / $duration_nanos),
+        latency: {
+          p50_nanos: 1,
+          p95_nanos: 1,
+          p99_nanos: 1,
+          histogram_encoding: "sorted_rle_nanos_v1",
+          histogram: [{nanos: 1, count: 4}]
+        }
       }
     '
 }
@@ -1306,15 +1364,24 @@ fake_docker() {
 
 fake_curl() {
   local argument=""
+  local project=""
 
   for argument in "$@"; do
     case "$argument" in
       http://127.0.0.1:18990/internal/metrics)
         printf '%s\n' obi-metrics >>"$FAKE_EVENTS"
-        # Model the periodic BPF stats reader: every completed fake scrape has
-        # a new report marker after the counters it published.
-        fake_bpf_metrics_increment 1 || return $?
-        fake_bpf_metrics_snapshot
+        # Model both independent periodic collectors. Each completed fake scrape has a
+        # new Java bridge report and a new per-program collection pass.
+        fake_bpf_metrics_increment 1 0 0 0 0 0 0 0 0 0 1 || return $?
+        if [[ -n "${FAKE_COMPOSE_PROJECT_FILE:-}" &&
+          -f "$FAKE_COMPOSE_PROJECT_FILE" ]]; then
+          project="$(<"$FAKE_COMPOSE_PROJECT_FILE")"
+        fi
+        if [[ "$project" == *-bridge-disabled || "$project" == *-unix-hit ]]; then
+          fake_bpf_metrics_snapshot | awk '!/^obi_bpf_probe_/'
+        else
+          fake_bpf_metrics_snapshot
+        fi
         return 0
         ;;
       https://127.0.0.1:18443/obi-diagnostics)
@@ -1461,6 +1528,12 @@ run_benchmark_with_fake_bound_proc() {
         printf "fd=4 map_id=41\n"
         printf "fd=5 prog_id=71\n"
         printf "fd=6 map_id=41\n"
+        printf "fd=7 prog_id=72\n"
+        printf "fd=8 prog_id=73\n"
+        printf "fd=9 prog_id=74\n"
+        printf "fd=10 prog_id=75\n"
+        printf "fd=11 prog_id=76\n"
+        printf "fd=12 prog_id=77\n"
       } >"$output"
     }
     trap '\''on_exit "$?"'\'' EXIT
@@ -1519,6 +1592,10 @@ reset_options() {
   ACTIVE_CELL_DIR=""
   BENCHMARK_PID=""
   BENCHMARK_IDENTITY=""
+  BENCHMARK_OUTPUT=""
+  BENCHMARK_DURATION_SECONDS=""
+  BENCHMARK_CELL_DIR=""
+  BENCHMARK_OUTPUT_PARENT_IDENTITY=""
   HARNESS_INVOCATION=""
   DOCKER_ACTIVE_CONTEXT=""
   DOCKER_ACTIVE_ENDPOINT=""
@@ -1565,6 +1642,26 @@ expect_parse_failure() {
   fi
 }
 
+test_java_bridge_program_allowlist_matches_source() {
+  local -r source="$REPO_ROOT/bpf/javabridge/javabridge.c"
+  local name=""
+  local names_json="[]"
+
+  [[ -f "$source" && ! -L "$source" &&
+    "${#JAVA_BRIDGE_CGROUP_SOCKOPT_PROGRAM_NAMES[@]}" == 7 ]] || return 1
+  names_json="$(jq -cn '$ARGS.positional' --args \
+    "${JAVA_BRIDGE_CGROUP_SOCKOPT_PROGRAM_NAMES[@]}")" || return 1
+  jq -e 'length == 7 and (unique | length) == 7' \
+    <<<"$names_json" >/dev/null || return 1
+  for name in "${JAVA_BRIDGE_CGROUP_SOCKOPT_PROGRAM_NAMES[@]}"; do
+    [[ "$(grep -Ec "^int ${name}\\(struct bpf_sockopt \\*ctx\\) \\{$" "$source")" == 1 ]] || {
+      printf 'Java bridge program allowlist drifted from source definition: %s\n' \
+        "$name" >&2
+      return 1
+    }
+  done
+}
+
 test_parser_defaults_and_boundaries() {
   local -r output="$TEST_TMP_DIR/parse-output"
 
@@ -1591,9 +1688,9 @@ test_parser_defaults_and_boundaries() {
   (
     reset_options
     parse_args --output "$output" --warmup-seconds 2 --duration-seconds 600 \
-      --concurrency 1 --repetitions 5 --seed 0 --cells core
+      --concurrency 1 --repetitions 5 --seed 9007199254740991 --cells core
     [[ "$WARMUP_SECONDS" == 2 && "$DURATION_SECONDS" == 600 && "$CONCURRENCY" == 1 &&
-      "$REPETITIONS" == 5 && "$SEED" == 0 ]]
+      "$REPETITIONS" == 5 && "$SEED" == 9007199254740991 ]]
   ) || {
     printf 'valid benchmark boundaries were rejected\n' >&2
     return 1
@@ -1609,6 +1706,7 @@ test_parser_defaults_and_boundaries() {
   expect_parse_failure --output "$output" --repetitions 10
   expect_parse_failure --output "$output" --repetitions 11
   expect_parse_failure --output "$output" --seed -1
+  expect_parse_failure --output "$output" --seed 9007199254740992
   expect_parse_failure --output "$output" --seed 9223372036854775808
   expect_parse_failure --output "$output" --duration-seconds 600 --concurrency 256
   expect_parse_failure --output "$output" --cells getsockopt-miss
@@ -1894,6 +1992,7 @@ test_benchmark_documentation_binds_partial_status_to_mralias_issue() (
   local -r document="$TEST_SCRIPT_DIR/../BENCHMARK.md"
   local -r issue_link='[MrAlias/opentelemetry-ebpf-instrumentation issue #37](https://github.com/MrAlias/opentelemetry-ebpf-instrumentation/issues/37)'
   local flattened=""
+  local result_cap_mib=0
   local -a issue_lines=()
 
   [[ "$(grep -Fc -- "$issue_link" "$document")" == 1 ]] || {
@@ -1908,6 +2007,12 @@ test_benchmark_documentation_binds_partial_status_to_mralias_issue() (
   flattened="$(tr '\n' ' ' <"$document")" || return 1
   [[ "$flattened" == *"The retained benchmark evidence remains partial and does not close the open $issue_link."* ]] || {
     printf 'benchmark documentation does not keep the fork issue explicitly partial and open\n' >&2
+    return 1
+  }
+  ((MAX_BENCHMARK_RESULT_BYTES % (1024 * 1024) == 0)) || return 1
+  result_cap_mib="$((MAX_BENCHMARK_RESULT_BYTES / 1024 / 1024))"
+  [[ "$flattened" == *"and to $result_cap_mib MiB before publication"* ]] || {
+    printf 'benchmark documentation drifted from the enforced result byte cap\n' >&2
     return 1
   }
 )
@@ -3828,10 +3933,18 @@ write_valid_benchmark_result() {
   local -r successful_requests="${3:-1}"
   local -r failed_requests="${4:-0}"
   local -r traffic_elapsed_nanos="${5:-$((duration_seconds * 1000000000))}"
-  local -r throughput_per_second="${6:-1}"
+  local throughput_per_second="${6:-}"
   local -r p50_nanos="${7:-1}"
-  local -r p95_nanos="${8:-1}"
-  local -r p99_nanos="${9:-1}"
+  local -r p95_nanos="${8:-$p50_nanos}"
+  local -r p99_nanos="${9:-$p50_nanos}"
+
+  [[ "$p50_nanos" == "$p95_nanos" && "$p50_nanos" == "$p99_nanos" ]] || return 1
+  if [[ -z "$throughput_per_second" ]]; then
+    throughput_per_second="$(jq -cn \
+      --argjson successful_requests "$successful_requests" \
+      --argjson traffic_elapsed_nanos "$traffic_elapsed_nanos" \
+      '$successful_requests * 1000000000 / $traffic_elapsed_nanos')" || return 1
+  fi
 
   jq -n \
     --arg base_url "$CELL_WORKLOAD_BASE_URL" \
@@ -3853,6 +3966,8 @@ write_valid_benchmark_result() {
     --argjson p99_nanos "$p99_nanos" '
       {
         status: "passed", base_url: $base_url, path: $path,
+        started_at: "2026-08-20T00:00:00.000000001Z",
+        finished_at: "2026-08-20T00:00:02.000000001Z",
         connection_mode: $connection_mode, tls_verification: $tls_verification,
         w3c: $w3c, seed: $seed,
         requested_duration_nanos: $duration_nanos,
@@ -3860,14 +3975,20 @@ write_valid_benchmark_result() {
         request_limit: $request_limit, request_limit_reached: false,
         canceled: false, successful_requests: $successful_requests, failed_requests: $failed_requests,
         traffic_elapsed_nanos: $traffic_elapsed_nanos, throughput_per_second: $throughput_per_second,
-        latency: {p50_nanos: $p50_nanos, p95_nanos: $p95_nanos, p99_nanos: $p99_nanos}
+        latency: {
+          p50_nanos: $p50_nanos,
+          p95_nanos: $p95_nanos,
+          p99_nanos: $p99_nanos,
+          histogram_encoding: "sorted_rle_nanos_v1",
+          histogram: [{nanos: $p50_nanos, count: $successful_requests}]
+        }
       }
     ' >"$output"
 }
 
 write_variance_fixture_cell() {
   local -r cell="$1"
-  local -r successful_requests="${2:-1}"
+  local -r successful_requests="${2:-$DURATION_SECONDS}"
   local -r failed_requests="${3:-0}"
   local -r traffic_elapsed_nanos="${4:-$((DURATION_SECONDS * 1000000000))}"
   local -r throughput_per_second="${5:-1}"
@@ -3986,7 +4107,7 @@ prepare_poc_gate_fixture() {
   mkdir -p -- "$OUTPUT_DIR/cells"
   for cell in "${CORE_CELLS[@]}"; do
     obi_pid=""
-    write_variance_fixture_cell "$cell" 10 0 2000000000 100 50 90 100
+    write_variance_fixture_cell "$cell" 200 0 2000000000 100 100 100 100
     cell_spec "$cell" || return 1
     cell_dir="$OUTPUT_DIR/cells/$cell"
     mkdir -- "$cell_dir/resources-before" "$cell_dir/resources-idle-recovery"
@@ -4069,6 +4190,12 @@ test_json_validators_require_one_document() {
   local -r drained_result="$TEST_TMP_DIR/drained-result.json"
   local -r non_numeric_metric_result="$TEST_TMP_DIR/non-numeric-metric-result.json"
   local -r fractional_metric_result="$TEST_TMP_DIR/fractional-metric-result.json"
+  local -r histogram_result="$TEST_TMP_DIR/histogram-result.json"
+  local -r invalid_histogram_result="$TEST_TMP_DIR/invalid-histogram-result.json"
+  local -r invalid_benchmark_result="$TEST_TMP_DIR/invalid-benchmark-result.json"
+  local -r oversized_result="$TEST_TMP_DIR/oversized-benchmark-result.json"
+  local -r truncated_result="$TEST_TMP_DIR/truncated-benchmark-result.json"
+  local mutation=""
 
   reset_options
   cell_spec getsockopt-hit
@@ -4077,6 +4204,131 @@ test_json_validators_require_one_document() {
     printf 'valid benchmark result was rejected\n' >&2
     return 1
   }
+  jq '
+    .successful_requests = 4 |
+    .throughput_per_second = 2 |
+    .latency = {
+      p50_nanos: 1,
+      p95_nanos: 3,
+      p99_nanos: 3,
+      histogram_encoding: "sorted_rle_nanos_v1",
+      histogram: [
+        {nanos: 1, count: 2},
+        {nanos: 2, count: 1},
+        {nanos: 3, count: 1}
+      ]
+    }
+  ' "$benchmark_result" >"$histogram_result"
+  validate_benchmark_result "$histogram_result" 2 || {
+    printf 'benchmark validator rejected a recomputable sorted RLE histogram\n' >&2
+    return 1
+  }
+  for mutation in top_schema run_schema timestamp_epoch timestamp_offset \
+    timestamp_noncanonical timestamp_invalid timestamp_order throughput; do
+    case "$mutation" in
+      top_schema)
+        jq '.unexpected = true' "$histogram_result" >"$invalid_benchmark_result"
+        ;;
+      run_schema)
+        jq '.latency.histogram[1].unexpected = true' \
+          "$histogram_result" >"$invalid_benchmark_result"
+        ;;
+      timestamp_epoch)
+        jq '.started_at = "1970-01-01T00:00:00Z"' \
+          "$histogram_result" >"$invalid_benchmark_result"
+        ;;
+      timestamp_offset)
+        jq '.started_at = "2026-08-20T00:00:00+00:00"' \
+          "$histogram_result" >"$invalid_benchmark_result"
+        ;;
+      timestamp_noncanonical)
+        jq '.started_at = "2026-08-20T00:00:00.000000010Z"' \
+          "$histogram_result" >"$invalid_benchmark_result"
+        ;;
+      timestamp_invalid)
+        jq '.started_at = "2026-02-30T00:00:00Z"' \
+          "$histogram_result" >"$invalid_benchmark_result"
+        ;;
+      timestamp_order)
+        jq '.started_at = "2026-08-20T00:00:03Z"' \
+          "$histogram_result" >"$invalid_benchmark_result"
+        ;;
+      throughput)
+        jq '.throughput_per_second += 0.000001' \
+          "$histogram_result" >"$invalid_benchmark_result"
+        ;;
+    esac
+    if validate_benchmark_result "$invalid_benchmark_result" 2 >/dev/null 2>&1; then
+      printf 'benchmark validator accepted invalid %s evidence\n' "$mutation" >&2
+      return 1
+    fi
+  done
+  jq '.seed = 9007199254740992' \
+    "$histogram_result" >"$invalid_benchmark_result"
+  if validate_benchmark_result \
+    "$invalid_benchmark_result" 2 9007199254740992 >/dev/null 2>&1; then
+    printf 'benchmark validator accepted an inexact JSON integer seed\n' >&2
+    return 1
+  fi
+  for mutation in top latency histogram_runs; do
+    case "$mutation" in
+      top)
+        awk '
+          {print}
+          !duplicated && /"status": "passed",/ {print; duplicated = 1}
+          END {if (!duplicated) exit 1}
+        ' "$histogram_result" >"$invalid_benchmark_result"
+        ;;
+      latency)
+        awk '
+          {print}
+          !duplicated && /"p50_nanos": 1,/ {print; duplicated = 1}
+          END {if (!duplicated) exit 1}
+        ' "$histogram_result" >"$invalid_benchmark_result"
+        ;;
+      histogram_runs)
+        awk '
+          {print}
+          /"count":/ {print; duplicated += 1}
+          END {if (duplicated != 3) exit 1}
+        ' "$histogram_result" >"$invalid_benchmark_result"
+        ;;
+    esac
+    if validate_benchmark_result "$invalid_benchmark_result" 2 >/dev/null 2>&1; then
+      printf 'benchmark validator accepted duplicate %s object keys\n' "$mutation" >&2
+      return 1
+    fi
+  done
+  for mutation in count order percentile schema range; do
+    case "$mutation" in
+      count) jq '.latency.histogram[0].count = 1' "$histogram_result" >"$invalid_histogram_result" ;;
+      order) jq '.latency.histogram |= [.[1], .[0], .[2]]' "$histogram_result" >"$invalid_histogram_result" ;;
+      percentile) jq '.latency.p95_nanos = 2' "$histogram_result" >"$invalid_histogram_result" ;;
+      schema) jq '.latency.unbounded_samples = []' "$histogram_result" >"$invalid_histogram_result" ;;
+      range)
+        jq --argjson too_large "$(((2 + MEASUREMENT_OVERRUN_TOLERANCE_SECONDS) * 1000000000 + 1))" '
+          .latency.histogram[2].nanos = $too_large |
+          .latency.p95_nanos = $too_large |
+          .latency.p99_nanos = $too_large
+        ' "$histogram_result" >"$invalid_histogram_result"
+        ;;
+    esac
+    if validate_benchmark_result "$invalid_histogram_result" 2 >/dev/null 2>&1; then
+      printf 'benchmark validator accepted invalid histogram %s evidence\n' "$mutation" >&2
+      return 1
+    fi
+  done
+  head -c 100 "$histogram_result" >"$truncated_result"
+  if validate_benchmark_result "$truncated_result" 2 >/dev/null 2>&1; then
+    printf 'benchmark validator accepted a truncated client result\n' >&2
+    return 1
+  fi
+  cp -- "$histogram_result" "$oversized_result"
+  truncate -s "$((MAX_BENCHMARK_RESULT_BYTES + 1))" "$oversized_result"
+  if validate_benchmark_result "$oversized_result" 2 >/dev/null 2>&1; then
+    printf 'benchmark validator accepted an oversized client result\n' >&2
+    return 1
+  fi
   write_valid_benchmark_result "$drained_result" 2 1 0 3000000000
   validate_benchmark_result "$drained_result" 2 || {
     printf 'valid benchmark result with bounded in-flight drain was rejected\n' >&2
@@ -4291,11 +4543,11 @@ test_variance_summary_records_ordered_per_cell_statistics() (
   local canonical=""
   local repetition=0
   local repetition_label=""
-  local -a successful_requests=(6 1 5 2 4 3)
+  local -a successful_requests=(120 20 100 40 80 60)
   local -a throughput_per_second=(60 10 50 20 40 30)
   local -a p50_nanos=(6 1 5 2 4 3)
-  local -a p95_nanos=(60 10 50 20 40 30)
-  local -a p99_nanos=(600 100 500 200 400 300)
+  local -a p95_nanos=(6 1 5 2 4 3)
+  local -a p99_nanos=(6 1 5 2 4 3)
 
   reset_options
   DURATION_SECONDS=2
@@ -4356,13 +4608,13 @@ test_variance_summary_records_ordered_per_cell_statistics() (
       {repetition: 5, source: "cells/getsockopt-hit/measurements/rep-05.json"},
       {repetition: 6, source: "cells/getsockopt-hit/measurements/rep-06.json"}
     ] and
-    $cell.statistics.successful_requests == {min: 1, median: 3.5, max: 6} and
+    $cell.statistics.successful_requests == {min: 20, median: 70, max: 120} and
     $cell.statistics.failed_requests == {min: 0, median: 0, max: 0} and
     $cell.statistics.traffic_elapsed_nanos == {min: 2000000000, median: 2000000000, max: 2000000000} and
     $cell.statistics.throughput_per_second == {min: 10, median: 35, max: 60} and
     $cell.statistics.latency.p50_nanos == {min: 1, median: 3.5, max: 6} and
-    $cell.statistics.latency.p95_nanos == {min: 10, median: 35, max: 60} and
-    $cell.statistics.latency.p99_nanos == {min: 100, median: 350, max: 600} and
+    $cell.statistics.latency.p95_nanos == {min: 1, median: 3.5, max: 6} and
+    $cell.statistics.latency.p99_nanos == {min: 1, median: 3.5, max: 6} and
     (.cells[] | select(.cell == "unix-hit").statistics.throughput_per_second) ==
       {min: 1, median: 1, max: 1}
   ' "$output/variance.json" >/dev/null || {
@@ -4443,7 +4695,11 @@ rewrite_cell_performance_fixture() {
     temporary="$result.tmp"
     jq --argjson throughput "$throughput" --argjson p99 "$p99" '
       .throughput_per_second = $throughput |
-      .latency.p99_nanos = $p99
+      .successful_requests = ($throughput * .traffic_elapsed_nanos / 1000000000) |
+      .latency.p50_nanos = $p99 |
+      .latency.p95_nanos = $p99 |
+      .latency.p99_nanos = $p99 |
+      .latency.histogram = [{nanos: $p99, count: .successful_requests}]
     ' "$result" >"$temporary" || return 1
     mv -T -- "$temporary" "$result" || return 1
   done
@@ -5070,7 +5326,15 @@ test_summary_marks_unavailable_variance_after_failure() (
   jq -e '
     .status == "failed" and
     .acceptance_evidence == false and
-    .variance == {status: "not_available", path: null}
+    .variance == {status: "not_available", path: null} and
+    .measurement_scope.exact_owned_cgroupsockopt_program_counters == {
+      status: "not_available",
+      artifact: "cells/*/bpf-program-runtime.json",
+      retained_cell_artifacts: 0,
+      expected_cell_artifacts: 6,
+      metric: "kernel_reported_program_execution_count_and_cumulative_run_time_deltas",
+      acceptance_evidence: false
+    }
   ' "$output/summary.json" >/dev/null || {
     printf 'failed summary misrepresented unavailable variance\n' >&2
     return 1
@@ -5416,6 +5680,8 @@ test_helper_idle_bpf_metrics_require_constrained_deltas() (
   local -r after_zero="$TEST_TMP_DIR/helper-idle-bpf-after-zero.prom"
   local -r churn_before="$TEST_TMP_DIR/helper-idle-bpf-churn-before.prom"
   local -r churn_after="$TEST_TMP_DIR/helper-idle-bpf-churn-after.prom"
+  local -r safe_counter="$TEST_TMP_DIR/helper-idle-bpf-safe-counter.prom"
+  local -r unsafe_counter="$TEST_TMP_DIR/helper-idle-bpf-unsafe-counter.prom"
   local -r output="$TEST_TMP_DIR/helper-idle-bpf-deltas.json"
   local -r state="$TEST_TMP_DIR/helper-idle-bpf-state.txt"
   local mutation=""
@@ -5433,9 +5699,9 @@ test_helper_idle_bpf_metrics_require_constrained_deltas() (
   reset_options
   cell_spec getsockopt-helper-idle
   export FAKE_BPF_METRICS_FILE="$state"
-  printf '5 0 0 0 0 0 0 1\n' >"$state"
+  printf '5 0 0 0 0 0 0 1 0 0 0\n' >"$state"
   fake_bpf_metrics_snapshot >"$before"
-  printf '13 0 0 0 0 0 0 9\n' >"$state"
+  printf '13 0 0 0 0 0 0 9 0 0 0\n' >"$state"
   fake_bpf_metrics_snapshot >"$after"
   helper_idle_metric_delta_json "$before" "$after" "$output" || {
     printf 'helper-idle BPF metrics rejected a no-handoff direct-Java window\n' >&2
@@ -5498,7 +5764,7 @@ test_helper_idle_bpf_metrics_require_constrained_deltas() (
     'getsockopt discard 13 0 0 0 0 0 1 9'; do
     read -r transport operation report candidate inject stage handoff take discard negotiate_missing \
       <<<"$mutation"
-    printf '%s %s %s %s %s %s %s %s\n' \
+    printf '%s %s %s %s %s %s %s %s 0 0 0\n' \
       "$report" "$candidate" "$inject" "$stage" "$handoff" "$take" "$discard" \
       "$negotiate_missing" >"$state"
     fake_bpf_metrics_snapshot >"$after"
@@ -5507,7 +5773,7 @@ test_helper_idle_bpf_metrics_require_constrained_deltas() (
       return 1
     fi
   done
-  printf '13 0 0 0 0 0 0 9\n' >"$state"
+  printf '13 0 0 0 0 0 0 9 0 0 0\n' >"$state"
   fake_bpf_metrics_snapshot >"$after"
   for mutation in ambiguous overload; do
     cp -- "$after" "$after.$mutation"
@@ -5536,7 +5802,7 @@ test_helper_idle_bpf_metrics_require_constrained_deltas() (
     printf 'helper-idle BPF metrics accepted a reset or status-series churn hidden by an aggregate\n' >&2
     return 1
   fi
-  printf '13 0 0 0 0 0 0 9\n' >"$state"
+  printf '13 0 0 0 0 0 0 9 0 0 0\n' >"$state"
   fake_bpf_metrics_snapshot >"$after"
   cp -- "$after" "$duplicate"
   printf '%s\n' \
@@ -5546,6 +5812,46 @@ test_helper_idle_bpf_metrics_require_constrained_deltas() (
     printf 'helper-idle BPF metrics accepted duplicate label sets\n' >&2
     return 1
   fi
+  sed \
+    's/{operation="report",status="valid",transport="tcp"} 13$/{operation="report",status="valid",transport="tcp"} 9007199254740991/' \
+    "$after" >"$safe_counter"
+  [[ "$(helper_idle_report_value "$safe_counter")" == 9007199254740991 ]] || {
+    printf 'helper-idle BPF metrics rejected the largest exact JSON integer counter\n' >&2
+    return 1
+  }
+  sed \
+    's/{operation="report",status="valid",transport="tcp"} 13$/{operation="report",status="valid",transport="tcp"} 9007199254740992/' \
+    "$after" >"$unsafe_counter"
+  if helper_idle_report_value "$unsafe_counter" >/dev/null 2>&1; then
+    printf 'helper-idle BPF metrics accepted an inexact JSON integer counter\n' >&2
+    return 1
+  fi
+)
+
+test_obi_metrics_capture_cleans_partial_after_stat_failure() (
+  local -r output="$TEST_TMP_DIR/obi-metrics-stat-failure.prom"
+
+  reset_options
+  CELL_REQUIRES_OBI=true
+  run_bounded() {
+    printf '%s\n' '# fake OBI metrics payload'
+  }
+  stat() {
+    return 1
+  }
+
+  capture_obi_metrics "$output" || {
+    printf 'OBI metrics capture did not fail closed after stat failure\n' >&2
+    return 1
+  }
+  grep -Fxq 'status=unavailable' "$output" || {
+    printf 'OBI metrics capture did not publish unavailable status after stat failure\n' >&2
+    return 1
+  }
+  [[ ! -e "$output.partial" && ! -L "$output.partial" ]] || {
+    printf 'OBI metrics capture retained a partial file after stat failure\n' >&2
+    return 1
+  }
 )
 
 test_helper_idle_bpf_fence_requires_two_post_boundary_passes() (
@@ -5560,7 +5866,7 @@ test_helper_idle_bpf_fence_requires_two_post_boundary_passes() (
   reset_options
   cell_spec getsockopt-helper-idle
   export FAKE_BPF_METRICS_FILE="$state"
-  printf '10 0 0 0 0 0 0 0\n' >"$state"
+  printf '10 0 0 0 0 0 0 0 0 0 0\n' >"$state"
   fake_bpf_metrics_snapshot >"$observed"
   capture_obi_metrics() {
     local -r capture="$1"
@@ -5569,10 +5875,10 @@ test_helper_idle_bpf_fence_requires_two_post_boundary_passes() (
     case "$captures" in
       # The first post-boundary pass is a delayed prior report. The direct
       # workload's candidate only arrives in the following stats pass.
-      1) printf '11 0 0 0 0 0 0 0\n' >"$state" ;;
-      2) printf '12 4 0 0 0 0 0 0\n' >"$state" ;;
-      3) printf '13 4 0 0 0 0 0 0\n' >"$state" ;;
-      4) printf '14 4 0 0 0 0 0 0\n' >"$state" ;;
+      1) printf '11 0 0 0 0 0 0 0 0 0 0\n' >"$state" ;;
+      2) printf '12 4 0 0 0 0 0 0 0 0 0\n' >"$state" ;;
+      3) printf '13 4 0 0 0 0 0 0 0 0 0\n' >"$state" ;;
+      4) printf '14 4 0 0 0 0 0 0 0 0 0\n' >"$state" ;;
       *)
         printf 'unexpected helper-idle fence metric capture: %s\n' "$captures" >&2
         return 1
@@ -5598,7 +5904,7 @@ test_helper_idle_bpf_fence_requires_two_post_boundary_passes() (
     .observed_delta == 2 and
     .fence == {
       required_serial_post_boundary_report_passes: 2,
-      report_is_published_after_each_successful_bpf_counter_pass: true
+      report_is_published_after_each_successful_java_bridge_stats_pass: true
     }
   ' "$fence" >/dev/null || {
     printf 'helper-idle BPF fence omitted its two-pass causal evidence\n' >&2
@@ -5646,14 +5952,14 @@ test_helper_idle_sustained_rejects_delayed_post_workload_lifecycle() (
     ((metrics_captures += 1))
     case "$metrics_captures" in
       # pre seed, then the serial stale/fresh report passes
-      1) printf '10 0 0 0 0 0 0 0\n' >"$state" ;;
-      2) printf '11 0 0 0 0 0 0 0\n' >"$state" ;;
-      3) printf '12 0 0 0 0 0 0 0\n' >"$state" ;;
+      1) printf '10 0 0 0 0 0 0 0 0 0 0\n' >"$state" ;;
+      2) printf '11 0 0 0 0 0 0 0 0 0 0\n' >"$state" ;;
+      3) printf '12 0 0 0 0 0 0 0 0 0 0\n' >"$state" ;;
       # post seed, then a delayed pre-window pass followed by the pass that
       # actually publishes the direct-workload candidate.
-      4) printf '12 0 0 0 0 0 0 0\n' >"$state" ;;
-      5) printf '13 0 0 0 0 0 0 0\n' >"$state" ;;
-      6) printf '14 1 0 0 0 0 0 0\n' >"$state" ;;
+      4) printf '12 0 0 0 0 0 0 0 0 0 0\n' >"$state" ;;
+      5) printf '13 0 0 0 0 0 0 0 0 0 0\n' >"$state" ;;
+      6) printf '14 1 0 0 0 0 0 0 0 0 0\n' >"$state" ;;
       *)
         printf 'unexpected delayed-lifecycle BPF metric capture: %s\n' \
           "$metrics_captures" >&2
@@ -5664,6 +5970,10 @@ test_helper_idle_sustained_rejects_delayed_post_workload_lifecycle() (
   }
   run_benchmark_client() {
     write_valid_benchmark_result "$1" "$2" 4
+  }
+  capture_resource_snapshot() {
+    [[ "$2" == measurement_baseline || "$2" == measurement_end ]] || return 1
+    mkdir -- "$1"
   }
   run_helper_idle_measurement_rep() {
     local -r measurement_cell_dir="$1"
@@ -5763,6 +6073,7 @@ test_failed_measurement_clears_reaped_pid() {
       return 1
     }
     DURATION_SECONDS=2
+    ACTIVE_CELL_DIR="$2"
     trap verify_pid_cleared EXIT
     run_measurement_rep "$2" 1
   ' bash "$TEST_SCRIPT_DIR/benchmark.sh" "$cell_dir"
@@ -5774,8 +6085,193 @@ test_failed_measurement_clears_reaped_pid() {
   }
 }
 
+test_invalid_benchmark_result_is_not_published_or_retained() (
+  local -r cell_dir="$TEST_TMP_DIR/unpublishable-benchmark-result"
+  local -r output="$cell_dir/warmup.json"
+  local mutation=""
+
+  reset_options
+  cell_spec getsockopt-hit
+  mkdir -p -- "$cell_dir/measurements"
+  ACTIVE_CELL_DIR="$cell_dir"
+  terminate_active_benchmark() {
+    clear_active_benchmark
+  }
+  for mutation in truncated oversized; do
+    case "$mutation" in
+      truncated)
+        printf '{"status":"passed"' >"${output}.partial"
+        ;;
+      oversized)
+        write_valid_benchmark_result "${output}.partial" 2
+        truncate -s "$((MAX_BENCHMARK_RESULT_BYTES + 1))" "${output}.partial"
+        ;;
+    esac
+    (exit 0) &
+    BENCHMARK_PID=$!
+    # shellcheck disable=SC2034 # Consumed by sourced wait_for_active_benchmark.
+    BENCHMARK_OUTPUT="$output"
+    # shellcheck disable=SC2034 # Consumed by sourced wait_for_active_benchmark.
+    BENCHMARK_DURATION_SECONDS=2
+    # shellcheck disable=SC2034 # Consumed by sourced wait_for_active_benchmark.
+    BENCHMARK_CELL_DIR="$cell_dir"
+    # shellcheck disable=SC2034 # Consumed by sourced wait_for_active_benchmark.
+    BENCHMARK_OUTPUT_PARENT_IDENTITY="$(benchmark_output_parent_identity "$output")"
+    if wait_for_active_benchmark >/dev/null 2>&1; then
+      printf 'benchmark lifecycle published an invalid %s result\n' "$mutation" >&2
+      return 1
+    fi
+    if [[ -e "$output" || -L "$output" ||
+      -e "${output}.partial" || -L "${output}.partial" ]]; then
+      printf 'benchmark lifecycle retained an invalid %s result or partial\n' "$mutation" >&2
+      return 1
+    fi
+  done
+  start_benchmark_client() {
+    printf '{"status":"passed"' >"${1}.partial"
+    return 7
+  }
+  if launch_benchmark_client "$output" 2 >/dev/null 2>&1; then
+    printf 'benchmark lifecycle accepted a failed client launch\n' >&2
+    return 1
+  fi
+  if [[ -e "$output" || -L "$output" ||
+    -e "${output}.partial" || -L "${output}.partial" ]]; then
+    printf 'benchmark lifecycle retained a failed-launch result or partial\n' >&2
+    return 1
+  fi
+)
+
+test_benchmark_abort_discard_is_exact_and_fail_closed() (
+  local -r cell_dir="$TEST_TMP_DIR/benchmark-abort-cell"
+  local -r outside_output="$TEST_TMP_DIR/benchmark-abort-outside.json"
+  local -r outside_target="$TEST_TMP_DIR/benchmark-abort-symlink-target.txt"
+  local output="$cell_dir/warmup.json"
+  local reaps=0
+
+  reset_options
+  cell_spec getsockopt-hit
+  REPETITIONS=5
+  mkdir -p -- "$cell_dir/measurements"
+  ACTIVE_CELL_DIR="$cell_dir"
+  terminate_active_benchmark() {
+    ((reaps += 1))
+    clear_active_benchmark
+  }
+  arm_test_benchmark_abort() {
+    local -r armed_output="$1"
+
+    BENCHMARK_PID=4242
+    BENCHMARK_IDENTITY='4242 4242 1'
+    BENCHMARK_OUTPUT="$armed_output"
+    BENCHMARK_DURATION_SECONDS=2
+    BENCHMARK_CELL_DIR="$cell_dir"
+    BENCHMARK_OUTPUT_PARENT_IDENTITY="$(benchmark_output_parent_identity "$armed_output")"
+  }
+
+  printf '%s\n' unpublished >"$output.partial"
+  arm_test_benchmark_abort "$output"
+  abort_active_benchmark || {
+    printf 'benchmark abort rejected an exact allowlisted partial\n' >&2
+    return 1
+  }
+  [[ "$reaps" == 1 && -z "$BENCHMARK_PID" && -z "$BENCHMARK_OUTPUT" &&
+    ! -e "$output" && ! -L "$output" &&
+    ! -e "$output.partial" && ! -L "$output.partial" ]] || {
+    printf 'benchmark abort did not snapshot before global clear or remove the exact partial\n' >&2
+    return 1
+  }
+
+  printf '%s\n' preserve-me >"$outside_target"
+  ln -s -- "$outside_target" "$output.partial"
+  arm_test_benchmark_abort "$output"
+  abort_active_benchmark || {
+    printf 'benchmark abort rejected an allowlisted final-component symlink\n' >&2
+    return 1
+  }
+  [[ ! -e "$output.partial" && ! -L "$output.partial" &&
+    "$(<"$outside_target")" == preserve-me ]] || {
+    printf 'benchmark abort followed a partial symlink or retained the link\n' >&2
+    return 1
+  }
+
+  printf '%s\n' outside-sentinel >"$outside_output.partial"
+  arm_test_benchmark_abort "$outside_output"
+  if abort_active_benchmark >/dev/null 2>&1; then
+    printf 'benchmark abort accepted an output outside the active cell\n' >&2
+    return 1
+  fi
+  [[ "$(<"$outside_output.partial")" == outside-sentinel ]] || {
+    printf 'benchmark abort changed an outside sentinel\n' >&2
+    return 1
+  }
+
+  output="$cell_dir/measurements/rep-00.json"
+  printf '%s\n' malformed-sentinel >"$output.partial"
+  arm_test_benchmark_abort "$output"
+  if abort_active_benchmark >/dev/null 2>&1; then
+    printf 'benchmark abort accepted a malformed repetition output\n' >&2
+    return 1
+  fi
+  [[ "$(<"$output.partial")" == malformed-sentinel ]] || {
+    printf 'benchmark abort changed a malformed-path sentinel\n' >&2
+    return 1
+  }
+  rm -f -- "$output.partial"
+
+  output="$cell_dir/warmup.json"
+  mkdir -- "$output.partial"
+  arm_test_benchmark_abort "$output"
+  if abort_active_benchmark >/dev/null 2>&1; then
+    printf 'benchmark abort accepted a directory at the partial path\n' >&2
+    return 1
+  fi
+  [[ -d "$output.partial" && ! -L "$output.partial" ]] || {
+    printf 'benchmark abort changed a refused partial directory\n' >&2
+    return 1
+  }
+  rmdir -- "$output.partial"
+
+  printf '%s\n' identity-sentinel >"$output.partial"
+  arm_test_benchmark_abort "$output"
+  BENCHMARK_OUTPUT_PARENT_IDENTITY='0:0:0:000'
+  if abort_active_benchmark >/dev/null 2>&1; then
+    printf 'benchmark abort accepted output-parent identity drift\n' >&2
+    return 1
+  fi
+  [[ "$(<"$output.partial")" == identity-sentinel ]] || {
+    printf 'benchmark abort changed a parent-identity-drift sentinel\n' >&2
+    return 1
+  }
+  rm -f -- "$output.partial"
+
+  output="$cell_dir/measurements/rep-01.json"
+  write_valid_benchmark_result "$output.partial" 2
+  (exit 0) &
+  BENCHMARK_PID=$!
+  BENCHMARK_IDENTITY=""
+  BENCHMARK_OUTPUT="$output"
+  # shellcheck disable=SC2034 # Consumed by sourced wait_for_active_benchmark.
+  BENCHMARK_DURATION_SECONDS=2
+  # shellcheck disable=SC2034 # Consumed by sourced wait_for_active_benchmark.
+  BENCHMARK_CELL_DIR="$cell_dir"
+  # shellcheck disable=SC2034 # Consumed by sourced wait_for_active_benchmark.
+  BENCHMARK_OUTPUT_PARENT_IDENTITY="$(benchmark_output_parent_identity "$output")"
+  wait_for_active_benchmark || {
+    printf 'benchmark wait rejected a valid atomically publishable result\n' >&2
+    return 1
+  }
+  [[ -f "$output" && ! -L "$output" &&
+    ! -e "$output.partial" && ! -L "$output.partial" ]] &&
+    validate_benchmark_result "$output" 2 || {
+    printf 'benchmark wait did not preserve successful validate-and-move publication\n' >&2
+    return 1
+  }
+)
+
 test_interrupted_measurement_reaps_client_tree() (
-  local -r output="$TEST_TMP_DIR/interrupted-measurement.json"
+  local -r cell_dir="$TEST_TMP_DIR/interrupted-measurement"
+  local -r output="$cell_dir/warmup.json"
   local -r child_pid_file="$TEST_TMP_DIR/interrupted-measurement-child.pid"
   local child_pid=""
   local process_group=""
@@ -5784,6 +6280,9 @@ test_interrupted_measurement_reaps_client_tree() (
   local attempt=0
 
   reset_options
+  mkdir -p -- "$cell_dir/measurements"
+  # shellcheck disable=SC2034 # Consumed by sourced launch_benchmark_client.
+  ACTIVE_CELL_DIR="$cell_dir"
   export BENCHMARK_TEST_CHILD_PID_FILE="$child_pid_file"
   # shellcheck disable=SC2034 # Consumed by sourced start_benchmark_client.
   COMPOSE=(
@@ -5795,7 +6294,7 @@ test_interrupted_measurement_reaps_client_tree() (
     ' benchmark-client
   )
   cleanup_interrupted_measurement() {
-    terminate_active_benchmark || true
+    abort_active_benchmark || true
     if [[ "$child_pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$child_pid" 2>/dev/null; then
       kill -TERM "$child_pid" 2>/dev/null || true
       wait "$child_pid" 2>/dev/null || true
@@ -5828,7 +6327,7 @@ test_interrupted_measurement_reaps_client_tree() (
     printf 'interrupted measurement did not expose its controlled client child PID\n' >&2
     return 1
   }
-  terminate_active_benchmark
+  abort_active_benchmark
   for ((attempt = 0; attempt < 50; attempt++)); do
     if ! kill -0 "$child_pid" 2>/dev/null; then
       child_pid=""
@@ -5840,16 +6339,25 @@ test_interrupted_measurement_reaps_client_tree() (
     printf 'interrupted measurement left its controlled client child running\n' >&2
     return 1
   }
+  [[ ! -e "$output" && ! -L "$output" &&
+    ! -e "$output.partial" && ! -L "$output.partial" ]] || {
+    printf 'interrupted measurement retained a final or partial client result\n' >&2
+    return 1
+  }
 )
 
 test_wait_reaps_client_group_after_leader_exit() (
-  local -r output="$TEST_TMP_DIR/leader-exit.json"
+  local -r cell_dir="$TEST_TMP_DIR/leader-exit"
+  local -r output="$cell_dir/warmup.json"
   local -r child_pid_file="$TEST_TMP_DIR/leader-exit-child.pid"
   local child_pid=""
   local wait_status=0
   local attempt=0
 
   reset_options
+  mkdir -p -- "$cell_dir/measurements"
+  # shellcheck disable=SC2034 # Consumed by sourced launch_benchmark_client.
+  ACTIVE_CELL_DIR="$cell_dir"
   export BENCHMARK_TEST_CHILD_PID_FILE="$child_pid_file"
   # shellcheck disable=SC2034 # Consumed by sourced start_benchmark_client.
   COMPOSE=(
@@ -6374,6 +6882,7 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
   local -r docker_socket="$TEST_TMP_DIR/fake-docker.sock"
   local -r source_tree_manifest="$TEST_TMP_DIR/fake-source-tree.manifest"
   local cell=""
+  local boundary=""
   local command_name=""
   local request=0
   local revision=""
@@ -6401,7 +6910,7 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
     ln -s -- "$TEST_SOURCE" "$fake_bin/$command_name"
   done
   printf '0 0 0\n' >"$diagnostics"
-  printf '0 0 0 0 0 0 0 0\n' >"$bpf_metrics"
+  printf '0 0 0 0 0 0 0 0 0 0 0\n' >"$bpf_metrics"
   if ! PATH="$fake_bin:$PATH" \
     FAKE_CONTAINER_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
     FAKE_BPF_METRICS_FILE="$bpf_metrics" \
@@ -6449,6 +6958,14 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
         reason: null,
         descriptive_data_status: "complete"
       }
+    } and
+    .measurement_scope.exact_owned_cgroupsockopt_program_counters == {
+      status: "available",
+      artifact: "cells/*/bpf-program-runtime.json",
+      retained_cell_artifacts: 6,
+      expected_cell_artifacts: 6,
+      metric: "kernel_reported_program_execution_count_and_cumulative_run_time_deltas",
+      acceptance_evidence: false
     } and
     (.notes | any(contains("passed summary status means the harness completed successfully")))
   ' "$output/summary.json" >/dev/null || {
@@ -6498,6 +7015,188 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
     printf 'hermetic run did not bind Java map samples to the exact OBI process\n' >&2
     return 1
   }
+  for cell in uninstrumented bridge-disabled getsockopt-hit unix-hit getsockopt-w3c getsockopt-helper-idle; do
+    [[ -f "$output/cells/$cell/resources-measurement-baseline/snapshot.json" &&
+      -f "$output/cells/$cell/resources-measurement-end/snapshot.json" &&
+      -f "$output/cells/$cell/bpf-program-runtime.json" ]] || {
+      printf 'hermetic run omitted measurement-boundary artifacts for %s\n' "$cell" >&2
+      return 1
+    }
+    jq -e '
+      .java_diagnostics == {
+        status: "not_collected",
+        reason: "excluded_from_exact_sustained_measurement_counter_window"
+      }
+    ' "$output/cells/$cell/resources-measurement-baseline/snapshot.json" \
+      "$output/cells/$cell/resources-measurement-end/snapshot.json" >/dev/null || return 1
+    for repetition_label in rep-01 rep-02 rep-03 rep-04 rep-05; do
+      jq -e '
+        .latency.histogram_encoding == "sorted_rle_nanos_v1" and
+        .latency.histogram == [{nanos: 1, count: 4}]
+      ' "$output/cells/$cell/measurements/$repetition_label.json" >/dev/null || return 1
+    done
+  done
+  for cell in uninstrumented bridge-disabled unix-hit; do
+    jq -e '
+      .status == "not_applicable" and .acceptance_evidence == false and
+      .scope == "exact_obi_process_open_java_bridge_cgroup_sockopt_program_ids" and
+      .programs == []
+    ' "$output/cells/$cell/bpf-program-runtime.json" >/dev/null || return 1
+    for boundary in resources-measurement-baseline resources-measurement-end; do
+      if [[ "$cell" == uninstrumented ]]; then
+        jq -e '. == {
+          status: "not_applicable", reason: "cell_has_no_obi_process"
+        }' "$output/cells/$cell/$boundary/obi-metrics-fence.json" >/dev/null || return 1
+      else
+        jq -e '. == {
+          status: "not_applicable",
+          reason: "selected_transport_does_not_use_cgroup_sockopt_bridge"
+        }' "$output/cells/$cell/$boundary/obi-metrics-fence.json" >/dev/null || return 1
+        if grep -q '^obi_bpf_probe_' \
+          "$output/cells/$cell/$boundary/obi-metrics.prom"; then
+          printf 'non-getsockopt cell %s unexpectedly required program metric series\n' \
+            "$cell" >&2
+          return 1
+        fi
+      fi
+    done
+  done
+  # Recompute production artifacts with the same sustained workload contract used
+  # by the independently executed fake harness.
+  DURATION_SECONDS=2
+  CONCURRENCY=1
+  REPETITIONS=5
+  for cell in getsockopt-hit getsockopt-w3c getsockopt-helper-idle; do
+    cell_spec "$cell" || return 1
+    validate_exact_owned_cgroup_sockopt_runtime \
+      "$output/cells/$cell/bpf-program-runtime.json" || return 1
+    validate_bpf_probe_collection_fence \
+      "$output/cells/$cell/resources-measurement-baseline/obi-metrics-fence.json" || return 1
+    validate_bpf_probe_collection_fence \
+      "$output/cells/$cell/resources-measurement-end/obi-metrics-fence.json" || return 1
+    jq -e '
+      .confirmation == {
+        required_marker_advances_per_program: 2,
+        separate_scrape_started_after_fence_response: true,
+        retained_confirmation_scrape: true
+      } and
+      all(.programs[];
+        (.observed_fence_collection_passes - .initial_collection_passes) >= 2 and
+        .confirmation_collection_passes >= .observed_fence_collection_passes)
+    ' "$output/cells/$cell/resources-measurement-baseline/obi-metrics-fence.json" \
+      "$output/cells/$cell/resources-measurement-end/obi-metrics-fence.json" \
+      >/dev/null || return 1
+    jq -e '
+      .status == "complete" and .acceptance_evidence == false and
+      .scope == "exact_obi_process_open_java_bridge_cgroup_sockopt_program_ids" and
+      .successful_requests == 20 and
+      (.programs | length) == 7 and
+      ([.programs[].program_id] == [71, 72, 73, 74, 75, 76, 77]) and
+      all(.programs[];
+        .probe_type == "CGroupSockopt" and
+        .delta.executions == 20 and
+        .delta.runtime_nanoseconds == 20000 and
+        .delta.collection_passes > 0) and
+      .totals.executions == 140 and .totals.runtime_nanoseconds == 140000
+    ' "$output/cells/$cell/bpf-program-runtime.json" >/dev/null || return 1
+  done
+  cell_spec getsockopt-hit || return 1
+  cp -- "$output/cells/getsockopt-hit/resources-measurement-end/obi-metrics.prom" \
+    "$TEST_TMP_DIR/owned-runtime-end.prom"
+  printf '%s\n' \
+    'obi_bpf_probe_executions_total{probe_id="71",probe_type="CGroupSockopt",probe_name="obi_java_remote_parent_setsockopt"} 24' \
+    >>"$output/cells/getsockopt-hit/resources-measurement-end/obi-metrics.prom"
+  if validate_exact_owned_cgroup_sockopt_runtime \
+    "$output/cells/getsockopt-hit/bpf-program-runtime.json" >/dev/null 2>&1; then
+    printf 'owned runtime validator accepted a duplicate probe series\n' >&2
+    return 1
+  fi
+  mv -T -- "$TEST_TMP_DIR/owned-runtime-end.prom" \
+    "$output/cells/getsockopt-hit/resources-measurement-end/obi-metrics.prom"
+  cp -- "$output/cells/getsockopt-hit/resources-measurement-end/obi-metrics.prom" \
+    "$TEST_TMP_DIR/owned-runtime-end.prom"
+  printf '%s\n' \
+    'obi_bpf_probe_collection_passes_total{probe_id="71",probe_type="CGroupSockopt",probe_name="obi_java_remote_parent_setsockopt"} 26' \
+    >>"$output/cells/getsockopt-hit/resources-measurement-end/obi-metrics.prom"
+  if validate_exact_owned_cgroup_sockopt_runtime \
+    "$output/cells/getsockopt-hit/bpf-program-runtime.json" >/dev/null 2>&1; then
+    printf 'owned runtime validator accepted a duplicate collection marker series\n' >&2
+    return 1
+  fi
+  mv -T -- "$TEST_TMP_DIR/owned-runtime-end.prom" \
+    "$output/cells/getsockopt-hit/resources-measurement-end/obi-metrics.prom"
+  cp -- "$output/cells/getsockopt-hit/resources-measurement-end/obi-metrics.prom" \
+    "$TEST_TMP_DIR/owned-runtime-end.prom"
+  grep -Fv \
+    'obi_bpf_probe_collection_passes_total{probe_id="77",probe_type="CGroupSockopt",probe_name="obi_java_remote_parent_getsockopt_health"}' \
+    "$TEST_TMP_DIR/owned-runtime-end.prom" \
+    >"$output/cells/getsockopt-hit/resources-measurement-end/obi-metrics.prom"
+  if validate_exact_owned_cgroup_sockopt_runtime \
+    "$output/cells/getsockopt-hit/bpf-program-runtime.json" >/dev/null 2>&1; then
+    printf 'owned runtime validator accepted a missing collection marker series\n' >&2
+    return 1
+  fi
+  mv -T -- "$TEST_TMP_DIR/owned-runtime-end.prom" \
+    "$output/cells/getsockopt-hit/resources-measurement-end/obi-metrics.prom"
+  cp -- "$output/cells/getsockopt-hit/resources-measurement-end/obi-metrics.prom" \
+    "$TEST_TMP_DIR/owned-runtime-end.prom"
+  sed '/obi_bpf_probe_collection_passes_total{probe_id="71"/ s/ [0-9][0-9]*$/ 0/' \
+    "$TEST_TMP_DIR/owned-runtime-end.prom" \
+    >"$output/cells/getsockopt-hit/resources-measurement-end/obi-metrics.prom"
+  if validate_exact_owned_cgroup_sockopt_runtime \
+    "$output/cells/getsockopt-hit/bpf-program-runtime.json" >/dev/null 2>&1; then
+    printf 'owned runtime validator accepted a reset collection marker\n' >&2
+    return 1
+  fi
+  mv -T -- "$TEST_TMP_DIR/owned-runtime-end.prom" \
+    "$output/cells/getsockopt-hit/resources-measurement-end/obi-metrics.prom"
+  cp -- "$output/cells/getsockopt-hit/resources-measurement-end/obi-metrics.prom" \
+    "$TEST_TMP_DIR/owned-runtime-end.prom"
+  sed '/obi_bpf_probe_executions_total{probe_id="71"/ s/ [0-9][0-9]*$/ 0/' \
+    "$TEST_TMP_DIR/owned-runtime-end.prom" \
+    >"$output/cells/getsockopt-hit/resources-measurement-end/obi-metrics.prom"
+  if validate_exact_owned_cgroup_sockopt_runtime \
+    "$output/cells/getsockopt-hit/bpf-program-runtime.json" >/dev/null 2>&1; then
+    printf 'owned runtime validator accepted a reset probe counter\n' >&2
+    return 1
+  fi
+  mv -T -- "$TEST_TMP_DIR/owned-runtime-end.prom" \
+    "$output/cells/getsockopt-hit/resources-measurement-end/obi-metrics.prom"
+  cp -- "$output/cells/getsockopt-hit/resources-measurement-end/obi-metrics.prom" \
+    "$TEST_TMP_DIR/owned-runtime-end.prom"
+  head -c 100 "$TEST_TMP_DIR/owned-runtime-end.prom" \
+    >"$output/cells/getsockopt-hit/resources-measurement-end/obi-metrics.prom"
+  if validate_exact_owned_cgroup_sockopt_runtime \
+    "$output/cells/getsockopt-hit/bpf-program-runtime.json" >/dev/null 2>&1; then
+    printf 'owned runtime validator accepted a truncated probe scrape\n' >&2
+    return 1
+  fi
+  mv -T -- "$TEST_TMP_DIR/owned-runtime-end.prom" \
+    "$output/cells/getsockopt-hit/resources-measurement-end/obi-metrics.prom"
+  cp -- "$output/cells/getsockopt-hit/resources-measurement-end/obi-bpf-fd-ownership.txt" \
+    "$TEST_TMP_DIR/owned-runtime-end.txt"
+  sed 's/^fd=12 prog_id=77$/fd=12 prog_id=78/' \
+    "$TEST_TMP_DIR/owned-runtime-end.txt" \
+    >"$output/cells/getsockopt-hit/resources-measurement-end/obi-bpf-fd-ownership.txt"
+  if validate_exact_owned_cgroup_sockopt_runtime \
+    "$output/cells/getsockopt-hit/bpf-program-runtime.json" >/dev/null 2>&1; then
+    printf 'owned runtime validator accepted an ownership roster drift\n' >&2
+    return 1
+  fi
+  mv -T -- "$TEST_TMP_DIR/owned-runtime-end.txt" \
+    "$output/cells/getsockopt-hit/resources-measurement-end/obi-bpf-fd-ownership.txt"
+  cp -- "$output/cells/getsockopt-hit/resources-measurement-end/obi-metrics-fence.json" \
+    "$TEST_TMP_DIR/owned-runtime-end-fence.json"
+  jq '.programs[0].confirmation_collection_passes += 1' \
+    "$TEST_TMP_DIR/owned-runtime-end-fence.json" \
+    >"$output/cells/getsockopt-hit/resources-measurement-end/obi-metrics-fence.json"
+  if validate_exact_owned_cgroup_sockopt_runtime \
+    "$output/cells/getsockopt-hit/bpf-program-runtime.json" >/dev/null 2>&1; then
+    printf 'owned runtime validator accepted collection-fence identity drift\n' >&2
+    return 1
+  fi
+  mv -T -- "$TEST_TMP_DIR/owned-runtime-end-fence.json" \
+    "$output/cells/getsockopt-hit/resources-measurement-end/obi-metrics-fence.json"
   jq -e '
     .schema_version == 1 and
     .kind == "application-performance-repetition-summary" and
@@ -6522,16 +7221,16 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
         .successful_requests == 4 and
         .failed_requests == 0 and
         .traffic_elapsed_nanos == 2000000000 and
-        .throughput_per_second == 4 and
-        .latency == {p50_nanos: 1, p95_nanos: 2, p99_nanos: 3}
+        .throughput_per_second == 2 and
+        .latency == {p50_nanos: 1, p95_nanos: 1, p99_nanos: 1}
       ) and
       .statistics.successful_requests == {min: 4, median: 4, max: 4} and
       .statistics.failed_requests == {min: 0, median: 0, max: 0} and
       .statistics.traffic_elapsed_nanos == {min: 2000000000, median: 2000000000, max: 2000000000} and
-      .statistics.throughput_per_second == {min: 4, median: 4, max: 4} and
+      .statistics.throughput_per_second == {min: 2, median: 2, max: 2} and
       .statistics.latency.p50_nanos == {min: 1, median: 1, max: 1} and
-      .statistics.latency.p95_nanos == {min: 2, median: 2, max: 2} and
-      .statistics.latency.p99_nanos == {min: 3, median: 3, max: 3}
+      .statistics.latency.p95_nanos == {min: 1, median: 1, max: 1} and
+      .statistics.latency.p99_nanos == {min: 1, median: 1, max: 1}
     )
   ' "$output/variance.json" >/dev/null || {
     printf 'hermetic run did not retain complete per-cell repetition variance\n' >&2
@@ -6712,7 +7411,7 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
     .observed_delta > 0 and
     .fence == {
       required_serial_post_boundary_report_passes: 2,
-      report_is_published_after_each_successful_bpf_counter_pass: true
+      report_is_published_after_each_successful_java_bridge_stats_pass: true
     }
   ' "$output/cells/getsockopt-helper-idle/sustained-helper-idle/metrics-watermark-before.json" \
     "$output/cells/getsockopt-helper-idle/sustained-helper-idle/metrics-watermark-after.json" \
@@ -6774,11 +7473,14 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
   {
     printf '%s\n' obi-metrics java-diagnostics java-diagnostics obi-metrics obi-metrics obi-metrics
     printf '%s\n' direct-java-workload
+    printf '%s\n' obi-metrics obi-metrics obi-metrics obi-metrics
     for ((request = 0; request < 5; request++)); do
       printf '%s\n' direct-java-workload
       printf '%s\n' obi-metrics
     done
-    printf '%s\n' obi-metrics obi-metrics obi-metrics java-diagnostics obi-metrics java-diagnostics \
+    printf '%s\n' obi-metrics obi-metrics obi-metrics obi-metrics obi-metrics obi-metrics \
+      obi-metrics \
+      java-diagnostics obi-metrics java-diagnostics \
       obi-metrics java-diagnostics
   } >"$expected_helper_events"
   cmp -s -- "$expected_helper_events" "$helper_events" || {
@@ -6814,6 +7516,21 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
     return 1
   }
   jq -e '.schema_version == 2 and
+    .measurement_boundary_resource_evidence ==
+      "cells/*/resources-measurement-{baseline,end}/snapshot.json" and
+    .exact_owned_cgroup_sockopt_program_evidence == {
+      artifact: "cells/*/bpf-program-runtime.json",
+      metrics: "cells/*/resources-measurement-{baseline,end}/obi-metrics.prom",
+      ownership_receipts:
+        "cells/*/resources-measurement-{baseline,end}/obi-bpf-fd-ownership.txt",
+      collection_fences:
+        "cells/*/resources-measurement-{baseline,end}/obi-metrics-fence.json",
+      selected_getsockopt_cells: [
+        "getsockopt-hit", "getsockopt-w3c", "getsockopt-helper-idle"
+      ],
+      metric: "kernel_reported_program_execution_count_and_cumulative_run_time_deltas",
+      acceptance_evidence: false
+    } and
     .workload.w3c_headers == false and
     .workload.w3c_headers_by_cell == {
       "uninstrumented": false,
@@ -6968,7 +7685,7 @@ test_complete_mode_fake_run_publishes_resolvable_bounded_evidence() {
     ln -s -- "$TEST_SOURCE" "$fake_bin/$command_name"
   done
   printf '0 0 0\n' >"$diagnostics"
-  printf '0 0 0 0 0 0 0 0\n' >"$bpf_metrics"
+  printf '0 0 0 0 0 0 0 0 0 0 0\n' >"$bpf_metrics"
   if ! PATH="$fake_bin:$PATH" \
     CC="$compiler" \
     MAKEFILES="$TEST_TMP_DIR/nonexistent-hostile.mk" \
@@ -7108,6 +7825,7 @@ main() {
     return 0
   fi
   if [[ "${BENCHMARK_TEST_ONLY:-}" == "council-repairs" ]]; then
+    test_java_bridge_program_allowlist_matches_source
     test_docker_daemon_locality_is_verified_before_execution
     test_manifest_bootstrap_survives_second_locality_query_failure
     test_benchmark_documentation_binds_partial_status_to_mralias_issue
@@ -7124,12 +7842,15 @@ main() {
     return 0
   fi
   if [[ "${BENCHMARK_TEST_ONLY:-}" == "resource-ownership" ]]; then
+    test_java_bridge_program_allowlist_matches_source
     test_bpf_fd_ownership_requires_bound_stable_proc_identity
     test_resource_growth_observations_fail_closed
+    test_obi_metrics_capture_cleans_partial_after_stat_failure
     printf 'benchmark.sh resource ownership tests passed\n'
     return 0
   fi
   test_parser_defaults_and_boundaries
+  test_java_bridge_program_allowlist_matches_source
   test_lifecycle_tool_paths_must_be_absolute_regular
   test_lifecycle_tool_resolution_rejects_relative_paths
   test_dependency_check_reports_only_invalid_lifecycle_tool
@@ -7170,10 +7891,13 @@ main() {
   test_helper_idle_java_diagnostics_require_exact_correction
   test_helper_idle_diagnostics_suppression_is_midpoint_only
   test_helper_idle_bpf_metrics_require_constrained_deltas
+  test_obi_metrics_capture_cleans_partial_after_stat_failure
   test_helper_idle_bpf_fence_requires_two_post_boundary_passes
   test_helper_idle_sustained_rejects_delayed_post_workload_lifecycle
   test_runner_environment_contract_is_exact
   test_failed_measurement_clears_reaped_pid
+  test_invalid_benchmark_result_is_not_published_or_retained
+  test_benchmark_abort_discard_is_exact_and_fail_closed
   test_interrupted_measurement_reaps_client_tree
   test_wait_reaps_client_group_after_leader_exit
   test_failed_identity_capture_reaps_client_group

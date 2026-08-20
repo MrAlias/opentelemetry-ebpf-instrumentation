@@ -6,6 +6,7 @@ package imetrics // import "go.opentelemetry.io/obi/pkg/export/imetrics"
 import (
 	"context"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -45,6 +46,7 @@ type PrometheusReporter struct {
 	buildInfo                        prometheus.Gauge
 	bpfProbeExecutions               *prometheus.CounterVec
 	bpfProbeLatencySum               *prometheus.CounterVec
+	bpfProbeCollectionPasses         *prometheus.CounterVec
 	bpfMapEntries                    *prometheus.GaugeVec
 	bpfMapMaxEntries                 *prometheus.GaugeVec
 	bpfInternalMetricsScrapeInterval time.Duration
@@ -58,13 +60,32 @@ type PrometheusReporter struct {
 
 	queueCapacityRatio *prometheus.GaugeVec
 	javaRemoteParent   *prometheus.CounterVec
+
+	bpfProbeLabelsMu    sync.Mutex
+	bpfProbeLabelLeases map[bpfProbeLabels]uint64
+	bpfMapLabelsMu      sync.Mutex
+	bpfMapLabelLeases   map[bpfMapLabels]uint64
+}
+
+type bpfProbeLabels struct {
+	probeID   string
+	probeType string
+	probeName string
+}
+
+type bpfMapLabels struct {
+	mapID   string
+	mapName string
+	mapType string
 }
 
 func NewPrometheusReporter(cfg *InternalMetricsConfig, manager *connector.PrometheusManager, registry *prometheus.Registry) *PrometheusReporter {
 	internalNames := attributes.NewInternalMetrics(attr.VendorPrefix)
 
 	pr := &PrometheusReporter{
-		connector: manager,
+		connector:           manager,
+		bpfProbeLabelLeases: make(map[bpfProbeLabels]uint64),
+		bpfMapLabelLeases:   make(map[bpfMapLabels]uint64),
 		tracerFlushes: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:                            internalNames.TracerFlushes.Prom,
 			Help:                            "Length of the groups of traces flushed from the eBPF tracer to the next pipeline stage",
@@ -122,6 +143,10 @@ func NewPrometheusReporter(cfg *InternalMetricsConfig, manager *connector.Promet
 		bpfProbeLatencySum: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: attr.VendorPrefix + "_bpf_probe_latency_seconds_total",
 			Help: "Total latency of the BPF probes in seconds",
+		}, []string{"probe_id", "probe_type", "probe_name"}),
+		bpfProbeCollectionPasses: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: attr.VendorPrefix + "_bpf_probe_collection_passes_total",
+			Help: "Successful BPF probe stats collection passes, including zero-delta samples",
 		}, []string{"probe_id", "probe_type", "probe_name"}),
 		bpfMapEntries: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: internalNames.BpfMapEntries.Prom,
@@ -182,6 +207,7 @@ func NewPrometheusReporter(cfg *InternalMetricsConfig, manager *connector.Promet
 		pr.buildInfo,
 		pr.bpfProbeExecutions,
 		pr.bpfProbeLatencySum,
+		pr.bpfProbeCollectionPasses,
 		pr.bpfMapEntries,
 		pr.bpfMapMaxEntries,
 		pr.informerLag,
@@ -268,16 +294,97 @@ func (p *PrometheusReporter) AvoidInstrumentationTraces(serviceName, serviceName
 }
 
 func (p *PrometheusReporter) BpfProbeStats(probeID, probeType, probeName string, count uint64, latencySumSeconds float64, _ map[float64]uint64) {
+	p.bpfProbeLabelsMu.Lock()
+	defer p.bpfProbeLabelsMu.Unlock()
+
 	p.bpfProbeExecutions.WithLabelValues(probeID, probeType, probeName).Add(float64(count))
 	p.bpfProbeLatencySum.WithLabelValues(probeID, probeType, probeName).Add(latencySumSeconds)
 }
 
+func (p *PrometheusReporter) BpfProbeCollection(probeID, probeType, probeName string) {
+	p.bpfProbeLabelsMu.Lock()
+	defer p.bpfProbeLabelsMu.Unlock()
+
+	// Instantiate zero-valued delta series for programs that have been sampled
+	// successfully but have not executed yet. Publish the completion marker last.
+	p.bpfProbeExecutions.WithLabelValues(probeID, probeType, probeName).Add(0)
+	p.bpfProbeLatencySum.WithLabelValues(probeID, probeType, probeName).Add(0)
+	p.bpfProbeCollectionPasses.WithLabelValues(probeID, probeType, probeName).Inc()
+}
+
+func (p *PrometheusReporter) BpfProbeLabelsAcquire(probeID, probeType, probeName string) {
+	p.bpfProbeLabelsMu.Lock()
+	defer p.bpfProbeLabelsMu.Unlock()
+
+	labels := bpfProbeLabels{probeID: probeID, probeType: probeType, probeName: probeName}
+	if p.bpfProbeLabelLeases == nil {
+		p.bpfProbeLabelLeases = make(map[bpfProbeLabels]uint64)
+	}
+	p.bpfProbeLabelLeases[labels]++
+}
+
+func (p *PrometheusReporter) BpfProbeLabelsRelease(probeID, probeType, probeName string) {
+	p.bpfProbeLabelsMu.Lock()
+	defer p.bpfProbeLabelsMu.Unlock()
+
+	labels := bpfProbeLabels{probeID: probeID, probeType: probeType, probeName: probeName}
+	leases, ok := p.bpfProbeLabelLeases[labels]
+	if !ok {
+		return
+	}
+	if leases > 1 {
+		p.bpfProbeLabelLeases[labels] = leases - 1
+		return
+	}
+	delete(p.bpfProbeLabelLeases, labels)
+	labelValues := []string{probeID, probeType, probeName}
+	p.bpfProbeExecutions.DeleteLabelValues(labelValues...)
+	p.bpfProbeLatencySum.DeleteLabelValues(labelValues...)
+	p.bpfProbeCollectionPasses.DeleteLabelValues(labelValues...)
+}
+
 func (p *PrometheusReporter) BpfMapEntries(mapID, mapName, mapType string, entriesTotal int) {
+	p.bpfMapLabelsMu.Lock()
+	defer p.bpfMapLabelsMu.Unlock()
+
 	p.bpfMapEntries.WithLabelValues(mapID, mapName, mapType).Set(float64(entriesTotal))
 }
 
 func (p *PrometheusReporter) BpfMapMaxEntries(mapID, mapName, mapType string, maxEntries int) {
+	p.bpfMapLabelsMu.Lock()
+	defer p.bpfMapLabelsMu.Unlock()
+
 	p.bpfMapMaxEntries.WithLabelValues(mapID, mapName, mapType).Set(float64(maxEntries))
+}
+
+func (p *PrometheusReporter) BpfMapLabelsAcquire(mapID, mapName, mapType string) {
+	p.bpfMapLabelsMu.Lock()
+	defer p.bpfMapLabelsMu.Unlock()
+
+	labels := bpfMapLabels{mapID: mapID, mapName: mapName, mapType: mapType}
+	if p.bpfMapLabelLeases == nil {
+		p.bpfMapLabelLeases = make(map[bpfMapLabels]uint64)
+	}
+	p.bpfMapLabelLeases[labels]++
+}
+
+func (p *PrometheusReporter) BpfMapLabelsRelease(mapID, mapName, mapType string) {
+	p.bpfMapLabelsMu.Lock()
+	defer p.bpfMapLabelsMu.Unlock()
+
+	labels := bpfMapLabels{mapID: mapID, mapName: mapName, mapType: mapType}
+	leases, ok := p.bpfMapLabelLeases[labels]
+	if !ok {
+		return
+	}
+	if leases > 1 {
+		p.bpfMapLabelLeases[labels] = leases - 1
+		return
+	}
+	delete(p.bpfMapLabelLeases, labels)
+	labelValues := []string{mapID, mapName, mapType}
+	p.bpfMapEntries.DeleteLabelValues(labelValues...)
+	p.bpfMapMaxEntries.DeleteLabelValues(labelValues...)
 }
 
 func (p *PrometheusReporter) BpfInternalMetricsScrapeInterval() time.Duration {

@@ -40,8 +40,22 @@ type BPFCollector struct {
 	probeMetrics     func() []ProbeMetrics
 	mapMetrics       func() []BpfMapMetrics
 	closeBPFStats    func()
+	ownedProbeLabels map[probeMetricLabels]struct{}
+	ownedMapLabels   map[mapMetricLabels]struct{}
 	mu               sync.Mutex
 	closed           bool
+}
+
+type probeMetricLabels struct {
+	probeID   string
+	probeType string
+	probeName string
+}
+
+type mapMetricLabels struct {
+	mapID   string
+	mapName string
+	mapType string
 }
 
 type cachedProgram struct {
@@ -147,15 +161,17 @@ func newInternalBPFCollector(ctxInfo *global.ContextInfo, cfg *PrometheusConfig,
 
 func newCollector(ctxInfo *global.ContextInfo, cfg *PrometheusConfig, mpCfg *perapp.GlobalMetricsConfig, registerProm bool) *BPFCollector {
 	c := &BPFCollector{
-		promCfg:         cfg,
-		commonCfg:       mpCfg,
-		internalMetrics: ctxInfo.Metrics,
-		log:             slog.With("component", "prom.BPFCollector"),
-		ctxInfo:         ctxInfo,
-		promConnect:     ctxInfo.Prometheus,
-		progs:           make(map[ebpf.ProgramID]*BPFProgram),
-		programCache:    make(map[ebpf.ProgramID]*cachedProgram),
-		mapCache:        make(map[ebpf.MapID]*cachedMap),
+		promCfg:          cfg,
+		commonCfg:        mpCfg,
+		internalMetrics:  ctxInfo.Metrics,
+		log:              slog.With("component", "prom.BPFCollector"),
+		ctxInfo:          ctxInfo,
+		promConnect:      ctxInfo.Prometheus,
+		progs:            make(map[ebpf.ProgramID]*BPFProgram),
+		programCache:     make(map[ebpf.ProgramID]*cachedProgram),
+		mapCache:         make(map[ebpf.MapID]*cachedMap),
+		ownedProbeLabels: make(map[probeMetricLabels]struct{}),
+		ownedMapLabels:   make(map[mapMetricLabels]struct{}),
 		probeLatencyDesc: prometheus.NewDesc(
 			prometheus.BuildFQName("bpf", "probe", "latency_seconds"),
 			"Latency of the probe in seconds",
@@ -212,6 +228,8 @@ func (bc *BPFCollector) close() {
 		return
 	}
 	bc.closed = true
+	bc.releaseAllOwnedProbeLabels()
+	bc.releaseAllOwnedMapLabels()
 	if bc.closeBPFStats != nil {
 		bc.closeBPFStats()
 		bc.closeBPFStats = nil
@@ -234,29 +252,47 @@ func (bc *BPFCollector) collectInternalMetrics(ctx context.Context) {
 			return
 
 		case <-ticker.C:
-			probeMetrics, mapMetrics := bc.collectMetrics()
-			for _, metric := range probeMetrics {
-				if metric.count == 0 {
-					continue
-				}
-
-				metric.program.updateBuckets(metric.latency, metric.count)
-
-				bc.ctxInfo.Metrics.BpfProbeStats(
-					metric.probeID,
-					metric.probeType,
-					metric.probeName,
-					metric.count,
-					metric.latency*float64(metric.count),
-					metric.program.buckets,
-				)
-			}
-
-			for _, metric := range mapMetrics {
-				bc.ctxInfo.Metrics.BpfMapEntries(metric.mapID, metric.mapName, metric.mapType, int(metric.entries))
-				bc.ctxInfo.Metrics.BpfMapMaxEntries(metric.mapID, metric.mapName, metric.mapType, metric.maxEntries)
-			}
+			bc.collectAndReportInternalMetrics()
 		}
+	}
+}
+
+func (bc *BPFCollector) collectAndReportInternalMetrics() {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+
+	if bc.closed {
+		return
+	}
+	probeMetrics := bc.probeMetrics()
+	mapMetrics := bc.mapMetrics()
+	collectionReporter, reportsCollections :=
+		bc.internalMetrics.(imetrics.BpfProbeCollectionReporter)
+	for _, metric := range probeMetrics {
+		bc.acquireProbeLabels(metric.probeID, metric.probeType, metric.probeName)
+		if metric.count > 0 {
+			metric.program.updateBuckets(metric.latency, metric.count)
+
+			bc.internalMetrics.BpfProbeStats(
+				metric.probeID,
+				metric.probeType,
+				metric.probeName,
+				metric.count,
+				metric.latency*float64(metric.count),
+				metric.program.buckets,
+			)
+		}
+		if reportsCollections {
+			collectionReporter.BpfProbeCollection(
+				metric.probeID, metric.probeType, metric.probeName,
+			)
+		}
+	}
+
+	for _, metric := range mapMetrics {
+		bc.acquireMapLabels(metric.mapID, metric.mapName, metric.mapType)
+		bc.internalMetrics.BpfMapEntries(metric.mapID, metric.mapName, metric.mapType, int(metric.entries))
+		bc.internalMetrics.BpfMapMaxEntries(metric.mapID, metric.mapName, metric.mapType, metric.maxEntries)
 	}
 }
 
@@ -379,9 +415,7 @@ func (bc *BPFCollector) getProbeMetrics() []ProbeMetrics {
 		})
 	}
 
-	if completeWalk {
-		bc.evictMissingPrograms(seen)
-	}
+	bc.reconcileMissingPrograms(seen, completeWalk)
 
 	return probeMetrics
 }
@@ -418,13 +452,90 @@ func supportedProgramType(programType ebpf.ProgramType) bool {
 	}
 }
 
+func (bc *BPFCollector) reconcileMissingPrograms(seen map[ebpf.ProgramID]struct{}, completeWalk bool) {
+	if !completeWalk {
+		return
+	}
+	bc.evictMissingPrograms(seen)
+}
+
 func (bc *BPFCollector) evictMissingPrograms(seen map[ebpf.ProgramID]struct{}) {
 	for id := range bc.programCache {
 		if _, ok := seen[id]; ok {
 			continue
 		}
+		cached := bc.programCache[id]
+		if cached != nil && cached.supported {
+			bc.releaseProbeLabels(cached.probeID, cached.probeType, cached.probeName)
+		}
 		delete(bc.programCache, id)
 		delete(bc.progs, id)
+	}
+}
+
+func (bc *BPFCollector) acquireProbeLabels(probeID, probeType, probeName string) {
+	lifecycleReporter, ok := bc.internalMetrics.(imetrics.BpfProbeLabelLifecycleReporter)
+	if !ok {
+		return
+	}
+	labels := probeMetricLabels{probeID: probeID, probeType: probeType, probeName: probeName}
+	if _, ok := bc.ownedProbeLabels[labels]; ok {
+		return
+	}
+	if bc.ownedProbeLabels == nil {
+		bc.ownedProbeLabels = make(map[probeMetricLabels]struct{})
+	}
+	lifecycleReporter.BpfProbeLabelsAcquire(probeID, probeType, probeName)
+	bc.ownedProbeLabels[labels] = struct{}{}
+}
+
+func (bc *BPFCollector) releaseProbeLabels(probeID, probeType, probeName string) {
+	labels := probeMetricLabels{probeID: probeID, probeType: probeType, probeName: probeName}
+	if _, ok := bc.ownedProbeLabels[labels]; !ok {
+		return
+	}
+	if lifecycleReporter, ok := bc.internalMetrics.(imetrics.BpfProbeLabelLifecycleReporter); ok {
+		lifecycleReporter.BpfProbeLabelsRelease(probeID, probeType, probeName)
+	}
+	delete(bc.ownedProbeLabels, labels)
+}
+
+func (bc *BPFCollector) releaseAllOwnedProbeLabels() {
+	for labels := range bc.ownedProbeLabels {
+		bc.releaseProbeLabels(labels.probeID, labels.probeType, labels.probeName)
+	}
+}
+
+func (bc *BPFCollector) acquireMapLabels(mapID, mapName, mapType string) {
+	lifecycleReporter, ok := bc.internalMetrics.(imetrics.BpfMapLabelLifecycleReporter)
+	if !ok {
+		return
+	}
+	labels := mapMetricLabels{mapID: mapID, mapName: mapName, mapType: mapType}
+	if _, ok := bc.ownedMapLabels[labels]; ok {
+		return
+	}
+	if bc.ownedMapLabels == nil {
+		bc.ownedMapLabels = make(map[mapMetricLabels]struct{})
+	}
+	lifecycleReporter.BpfMapLabelsAcquire(mapID, mapName, mapType)
+	bc.ownedMapLabels[labels] = struct{}{}
+}
+
+func (bc *BPFCollector) releaseMapLabels(mapID, mapName, mapType string) {
+	labels := mapMetricLabels{mapID: mapID, mapName: mapName, mapType: mapType}
+	if _, ok := bc.ownedMapLabels[labels]; !ok {
+		return
+	}
+	if lifecycleReporter, ok := bc.internalMetrics.(imetrics.BpfMapLabelLifecycleReporter); ok {
+		lifecycleReporter.BpfMapLabelsRelease(mapID, mapName, mapType)
+	}
+	delete(bc.ownedMapLabels, labels)
+}
+
+func (bc *BPFCollector) releaseAllOwnedMapLabels() {
+	for labels := range bc.ownedMapLabels {
+		bc.releaseMapLabels(labels.mapID, labels.mapName, labels.mapType)
 	}
 }
 
@@ -493,15 +604,24 @@ func (bc *BPFCollector) getMapMetrics() []BpfMapMetrics {
 		})
 	}
 
-	if completeWalk {
-		for id := range bc.mapCache {
-			if _, ok := seen[id]; !ok {
-				delete(bc.mapCache, id)
-			}
-		}
-	}
+	bc.reconcileMissingMaps(seen, completeWalk)
 
 	return mapMetrics
+}
+
+func (bc *BPFCollector) reconcileMissingMaps(seen map[ebpf.MapID]struct{}, completeWalk bool) {
+	if !completeWalk {
+		return
+	}
+	for id, cached := range bc.mapCache {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		if cached != nil && cached.supported {
+			bc.releaseMapLabels(cached.mapID, cached.mapName, cached.mapType)
+		}
+		delete(bc.mapCache, id)
+	}
 }
 
 func (bc *BPFCollector) cacheMap(id ebpf.MapID) *cachedMap {

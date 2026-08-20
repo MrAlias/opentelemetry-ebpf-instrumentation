@@ -398,6 +398,38 @@ create_failed_acceptance_result_fixture() {
   printf '%s\n' "$result"
 }
 
+set_failed_acceptance_cleanup_stage_fixture() {
+  local -r result="$1"
+  local -r stage="$2"
+  local run_status="$result/run-status.json"
+  local expected="$CASE_ROOT/expected-classification.json"
+  local candidate=""
+  local status_digest=""
+
+  [[ "$stage" == pressure-runtime-cleanup ||
+    "$stage" == pressure-map-cleanup ||
+    "$stage" == pressure-post-shutdown-cleanup ]] || return 1
+  candidate="$result/run-status.cleanup-stage"
+  jq --arg stage "$stage" '
+    .failure_stage = $stage |
+    .failure_line = 0
+  ' "$run_status" >"$candidate" || return 1
+  mv -fT -- "$candidate" "$run_status" || return 1
+  chmod 0644 -- "$run_status" || return 1
+  status_digest="$(sha256sum <"$run_status")" || return 1
+  status_digest="${status_digest%% *}"
+  [[ "$status_digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+
+  candidate="$CASE_ROOT/expected-classification.cleanup-stage"
+  jq -cS --arg stage "$stage" --arg status_digest "$status_digest" '
+    .failure_stage = $stage |
+    .source_line = null |
+    .run_status_sha256 = $status_digest
+  ' "$expected" >"$candidate" || return 1
+  mv -fT -- "$candidate" "$expected" || return 1
+  chmod 0600 -- "$expected"
+}
+
 refresh_failed_run_status_terminals() {
   local -r result="$1"
   local run_status="$result/run-status.json"
@@ -956,6 +988,18 @@ mock_campaign_execute() {
           acceptance-failure-result-mountpoint|\
           acceptance-failure-child-mountpoint|\
           acceptance-failure-child-bind-mount) ;;
+          acceptance-failure-pressure-runtime-cleanup)
+            set_failed_acceptance_cleanup_stage_fixture \
+              "$acceptance_result" pressure-runtime-cleanup || return 98
+            ;;
+          acceptance-failure-pressure-map-cleanup)
+            set_failed_acceptance_cleanup_stage_fixture \
+              "$acceptance_result" pressure-map-cleanup || return 98
+            ;;
+          acceptance-failure-pressure-post-shutdown-cleanup)
+            set_failed_acceptance_cleanup_stage_fixture \
+              "$acceptance_result" pressure-post-shutdown-cleanup || return 98
+            ;;
           acceptance-failure-malformed)
             printf '%s\n' '{malformed-private-status' \
               >"$acceptance_result/run-status.json"
@@ -1652,6 +1696,9 @@ test_acceptance_failure_classification() {
     acceptance-failure-timeout acceptance-failure-interrupted
     acceptance-failure-source-line-zero acceptance-failure-na-prefix
     acceptance-failure-all-terminal
+    acceptance-failure-pressure-runtime-cleanup
+    acceptance-failure-pressure-map-cleanup
+    acceptance-failure-pressure-post-shutdown-cleanup
   )
   local -a unavailable_mutations=(
     acceptance-failure-malformed acceptance-failure-duplicate-key

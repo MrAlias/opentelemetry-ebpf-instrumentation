@@ -77,7 +77,9 @@ readonly -a ACCEPTANCE_FAILURE_STAGES=(
   primary-w3c-fault-recovery primary-generation-mismatch-recovery
   unix-generation-mismatch-recovery permanent-absence-recovery
   primary-live-fd-security-recovery temporary-cleanup compose-cleanup
-  project-guard-handoff signal evidence-publication project-guard-status
+  pressure-runtime-cleanup pressure-map-cleanup
+  pressure-post-shutdown-cleanup project-guard-handoff signal
+  evidence-publication project-guard-status
 )
 
 # This is the exact public counter schema accepted by run.sh for a sealed Java

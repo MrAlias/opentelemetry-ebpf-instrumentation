@@ -1594,6 +1594,30 @@ main() {
   reseal_cell "$directory"
   expect_failure duplicate-metric-tuple "$mutated"
 
+  copy_mutation "$fixture" admission-overload mutated
+  directory="$mutated/cells/otel-getsockopt-info"
+  printf '%s\n' \
+    'obi_java_remote_parent_operations_total{operation="handoff_admission",status="overload",transport="tcp"} 1' \
+    >>"$directory/phases/w3c-after/obi-metrics.prom"
+  json_update_sorted "$directory/obi-metric-pairs/w3c.json" '
+    .series += [{transport:"tcp",operation:"handoff_admission",status:"overload",before:"0",after:"1",delta:"1"}] |
+    .series |= sort_by(.transport,.operation,.status)
+  '
+  reseal_cell "$directory"
+  expect_failure nonpressure-admission-overload "$mutated"
+
+  copy_mutation "$fixture" admission-ambiguous mutated
+  directory="$mutated/cells/otel-getsockopt-info"
+  printf '%s\n' \
+    'obi_java_remote_parent_operations_total{operation="handoff_admission",status="ambiguous",transport="tcp"} 1' \
+    >>"$directory/phases/w3c-after/obi-metrics.prom"
+  json_update_sorted "$directory/obi-metric-pairs/w3c.json" '
+    .series += [{transport:"tcp",operation:"handoff_admission",status:"ambiguous",before:"0",after:"1",delta:"1"}] |
+    .series |= sort_by(.transport,.operation,.status)
+  '
+  reseal_cell "$directory"
+  expect_failure nonpressure-admission-ambiguous "$mutated"
+
   copy_mutation "$fixture" identity mutated
   directory="$mutated/cells/otel-getsockopt-info"
   json_update_sorted "$directory/phases/w3c-before/obi-identity.json" '.host_pid="01"'

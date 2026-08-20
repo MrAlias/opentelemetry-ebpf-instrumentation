@@ -19,6 +19,7 @@ source "$TEST_SCRIPT_DIR/../run.sh"
 TEST_TMP_DIR=""
 HARNESS_OWNED_TEST_TMP_DIR=""
 HARNESS_OWNED_TEST_TMP_IDENTITY=""
+HARNESS_OWNED_TEST_TMP_BASHPID=""
 
 validated_harness_test_tmp_identity() {
   local -r candidate="$1"
@@ -48,11 +49,13 @@ register_harness_test_tmp_dir() {
   local identity=""
 
   [[ -z "$TEST_TMP_DIR" && -z "$HARNESS_OWNED_TEST_TMP_DIR" &&
-    -z "$HARNESS_OWNED_TEST_TMP_IDENTITY" ]] || return 1
+    -z "$HARNESS_OWNED_TEST_TMP_IDENTITY" &&
+    -z "$HARNESS_OWNED_TEST_TMP_BASHPID" ]] || return 1
   identity="$(validated_harness_test_tmp_identity "$candidate")" || return 1
   TEST_TMP_DIR="$candidate"
   HARNESS_OWNED_TEST_TMP_DIR="$candidate"
   HARNESS_OWNED_TEST_TMP_IDENTITY="$identity"
+  HARNESS_OWNED_TEST_TMP_BASHPID="$BASHPID"
 }
 
 cleanup_test() {
@@ -60,6 +63,8 @@ cleanup_test() {
 
   [[ -n "${TEST_TMP_DIR:-}" && -n "${HARNESS_OWNED_TEST_TMP_DIR:-}" &&
     -n "${HARNESS_OWNED_TEST_TMP_IDENTITY:-}" &&
+    -n "${HARNESS_OWNED_TEST_TMP_BASHPID:-}" &&
+    "$BASHPID" == "$HARNESS_OWNED_TEST_TMP_BASHPID" &&
     "$TEST_TMP_DIR" == "$HARNESS_OWNED_TEST_TMP_DIR" ]] || return 0
   observed_identity="$(
     validated_harness_test_tmp_identity "$HARNESS_OWNED_TEST_TMP_DIR"
@@ -8405,214 +8410,36 @@ test_bridge_inject_attempt_total_is_reason_agnostic() {
   fi
 }
 
-test_pressure_monitor_uses_prefill_baseline() {
-  local -i required_completion_timeout="$((
-    (PRESSURE_MONITOR_METRICS_TIMEOUT_SECONDS * 2) +
-    PRESSURE_MONITOR_POLL_INTERVAL_SECONDS +
-    PRESSURE_MONITOR_COMPLETION_SLACK_SECONDS
-  ))"
-
-  if ((PRESSURE_MONITOR_COMPLETION_SLACK_SECONDS <= 0 ||
-    PRESSURE_MONITOR_COMPLETION_TIMEOUT_SECONDS < required_completion_timeout)); then
-    printf 'pressure monitor completion timeout does not cover the next bounded sample\n' >&2
-    return 1
-  fi
-
-  (
-    RESULT_DIR="$TEST_TMP_DIR/pressure-monitor-failure"
-    mkdir -p -- "$RESULT_DIR"
-    PRESSURE_MAP_ID=41
-    PRESSURE_MAP_MAX_ENTRIES=10
-    PRESSURE_MAP_BASELINE_ENTRIES=7
-    PRESSURE_INJECT_TARGET=5
-    SELECTED_TRANSPORT=getsockopt
-    PRESSURE_MONITOR_OUTPUT="$RESULT_DIR/monitor.log"
-    : >"$PRESSURE_MONITOR_OUTPUT"
-    fetch_obi_metrics() {
-      printf '%s\n' \
-        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 7' >"$1"
-    }
-    if (monitor_map_pressure); then
-      printf 'pressure monitor accepted occupancy at the pre-fill baseline\n' >&2
-      return 1
-    fi
-    grep -Fq 'status=failed reason=occupancy map_id=41 baseline=7 max_entries=10 actual=7' \
-      "$PRESSURE_MONITOR_OUTPUT"
-  )
-
-  (
-    RESULT_DIR="$TEST_TMP_DIR/pressure-monitor-overflow"
-    mkdir -p -- "$RESULT_DIR"
-    PRESSURE_MAP_ID=41
-    PRESSURE_MAP_MAX_ENTRIES=10
-    PRESSURE_MAP_BASELINE_ENTRIES=7
-    PRESSURE_INJECT_TARGET=5
-    SELECTED_TRANSPORT=getsockopt
-    PRESSURE_MONITOR_OUTPUT="$RESULT_DIR/monitor.log"
-    : >"$PRESSURE_MONITOR_OUTPUT"
-    fetch_obi_metrics() {
-      printf '%s\n' \
-        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 18446744073709551625' >"$1"
-    }
-    if (monitor_map_pressure); then
-      printf 'pressure monitor accepted an overflowing occupancy value\n' >&2
-      return 1
-    fi
-    grep -Fq 'actual=18446744073709551625' "$PRESSURE_MONITOR_OUTPUT"
-  )
-
-  (
-    RESULT_DIR="$TEST_TMP_DIR/pressure-monitor-traffic-overshoot"
-    mkdir -p -- "$RESULT_DIR"
-    PRESSURE_MAP_ID=41
-    PRESSURE_MAP_MAX_ENTRIES=10
-    PRESSURE_MAP_BASELINE_ENTRIES=7
-    PRESSURE_INJECT_TARGET=5
-    PRESSURE_MONITOR_OUTPUT="$RESULT_DIR/monitor.log"
-    : >"$PRESSURE_MONITOR_OUTPUT"
-    fetch_obi_metrics() {
-      printf '%s\n' \
-        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 9' \
-        'obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} 6' >"$1"
-    }
-    if monitor_map_pressure; then
-      printf 'pressure monitor accepted more inject outcomes than requests\n' >&2
-      return 1
-    fi
-    grep -Fq 'reason=traffic-count operation=inject transport=tcp actual=6 target=5' \
-      "$PRESSURE_MONITOR_OUTPUT"
-  )
-
-  (
-    local fetch_calls=0
-
-    RESULT_DIR="$TEST_TMP_DIR/pressure-monitor-report-only"
-    mkdir -p -- "$RESULT_DIR"
-    PRESSURE_MAP_ID=41
-    PRESSURE_MAP_MAX_ENTRIES=10
-    PRESSURE_MAP_BASELINE_ENTRIES=7
-    PRESSURE_INJECT_TARGET=5
-    PRESSURE_MONITOR_OUTPUT="$RESULT_DIR/monitor.log"
-    : >"$PRESSURE_MONITOR_OUTPUT"
-    fetch_obi_metrics() {
-      fetch_calls="$((fetch_calls + 1))"
-      if ((fetch_calls < 3)); then
-        printf '%s\n' \
-          'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 9' \
-          'obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} 4' \
-          "obi_java_remote_parent_operations_total{operation=\"report\",status=\"valid\",transport=\"tcp\"} $fetch_calls" >"$1"
-      else
-        printf '%s\n' \
-          'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 7' \
-          'obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} 4' \
-          'obi_java_remote_parent_operations_total{operation="report",status="valid",transport="tcp"} 3' >"$1"
-      fi
-    }
-    if monitor_map_pressure; then
-      printf 'pressure monitor treated report growth as traffic completion\n' >&2
-      return 1
-    fi
-    if grep -q '^status=traffic-complete ' "$PRESSURE_MONITOR_OUTPUT"; then
-      printf 'pressure monitor published terminal evidence before inject completion\n' >&2
-      return 1
-    fi
-    grep -Fq 'status=failed reason=occupancy' "$PRESSURE_MONITOR_OUTPUT"
-  )
-
-  (
-    RESULT_DIR="$TEST_TMP_DIR/pressure-monitor-success"
-    mkdir -p -- "$RESULT_DIR"
-    PRESSURE_LABEL="pressure-test"
-    PRESSURE_MAP_ID=41
-    PRESSURE_MAP_MAX_ENTRIES=10
-    PRESSURE_MAP_BASELINE_ENTRIES=7
-    PRESSURE_INJECT_TARGET=5
-    SELECTED_TRANSPORT=getsockopt
-    fetch_obi_metrics() {
-      printf '%s\n' \
-        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 9' \
-        'obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} 4' \
-        'obi_java_remote_parent_operations_total{operation="inject",status="ambiguous",transport="tcp"} 1' >"$1"
-    }
-    start_map_pressure_monitor
-    local monitor_pid="$PRESSURE_MONITOR_PID"
-    stop_map_pressure_monitor
-    if kill -0 "$monitor_pid" 2>/dev/null; then
-      printf 'pressure monitor was not terminated and reaped\n' >&2
-      return 1
-    fi
-    grep -Fq 'status=pressured ' "$PRESSURE_MONITOR_OUTPUT"
-    grep -Fq 'status=traffic-complete ' "$PRESSURE_MONITOR_OUTPUT"
-    [[ -f "$PRESSURE_MONITOR_FINAL_OUTPUT" ]]
-  )
-
-  (
-    RESULT_DIR="$TEST_TMP_DIR/pressure-monitor-incomplete"
-    mkdir -p -- "$RESULT_DIR"
-    true &
-    PRESSURE_MONITOR_PID=$!
-    PRESSURE_MONITOR_OUTPUT="$RESULT_DIR/monitor.log"
-    PRESSURE_MONITOR_FINAL_OUTPUT="$RESULT_DIR/terminal.prom"
-    printf '%s\n' \
-      'status=pressured observed_at=2026-01-01T00:00:00Z map_id=41 baseline=7 max_entries=10 entries=9' \
-      >"$PRESSURE_MONITOR_OUTPUT"
-    if stop_map_pressure_monitor; then
-      printf 'pressure monitor accepted evidence without bridge-traffic completion\n' >&2
-      return 1
-    fi
-  )
-
-  (
-    local fetch_calls=0
-    local fixture_inject_total=4
-
-    RESULT_DIR="$TEST_TMP_DIR/pressure-monitor-stop-race"
-    mkdir -p -- "$RESULT_DIR"
-    PRESSURE_LABEL="pressure-test"
-    PRESSURE_MAP_ID=41
-    PRESSURE_MAP_MAX_ENTRIES=10
-    PRESSURE_MAP_BASELINE_ENTRIES=7
-    PRESSURE_INJECT_TARGET=5
-    SELECTED_TRANSPORT=getsockopt
-    fetch_obi_metrics() {
-      fetch_calls="$((fetch_calls + 1))"
-      if ((fetch_calls > 1)); then
-        fixture_inject_total=5
-      fi
-      printf '%s\n' \
-        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 9' \
-        "obi_java_remote_parent_operations_total{operation=\"inject\",status=\"valid\",transport=\"tcp\"} $fixture_inject_total" >"$1"
-    }
-    start_map_pressure_monitor
-    stop_map_pressure_monitor
-    grep -Fq 'status=traffic-complete ' "$PRESSURE_MONITOR_OUTPUT"
-    [[ -f "$PRESSURE_MONITOR_FINAL_OUTPUT" ]]
-  )
-}
-
 pressure_prepare_result() {
   local -r token_base="$1"
 
-  printf '{"status":"passed","mode":"prepare","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":10,"process_map_id":42,"process_pid":101,"process_namespace":202,"token_base":%s,"touched":0}\n' \
-    "$token_base"
-}
-
-resolve_map_pressure_java_identity() {
-  printf '%064d 303 2026-08-13T00:00:00Z 101 202\n' 0
+  printf '{"status":"passed","mode":"prepare","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":%d,"process_map_id":42,"process_pid":101,"process_namespace":202,"token_base":%s,"synthetic_pid":0,"synthetic_namespace":0,"touched":0}\n' \
+    "$PRESSURE_EXPECTED_MAP_CAPACITY" "$token_base"
 }
 
 pressure_fill_result() {
   local -r token_base="$1"
+  local -r touched="${2:-$PRESSURE_EXPECTED_MAP_CAPACITY}"
 
-  printf '{"status":"passed","mode":"fill","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":10,"process_map_id":42,"process_pid":101,"process_namespace":202,"token_base":%s,"touched":10,"capacity_rejected_entries":1,"verified_present_entries":10}\n' \
-    "$token_base"
+  printf '{"status":"passed","mode":"fill","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":%d,"process_map_id":42,"process_pid":101,"process_namespace":202,"token_base":%s,"synthetic_pid":0,"synthetic_namespace":0,"touched":%s,"capacity_rejected_entries":1,"verified_present_entries":%s,"content_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","verified_absent_entries":1}\n' \
+    "$PRESSURE_EXPECTED_MAP_CAPACITY" "$token_base" "$touched" "$touched"
+}
+
+pressure_verify_result() {
+  local -r token_base="$1"
+
+  printf '{"status":"passed","mode":"verify","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":%d,"process_map_id":42,"process_pid":101,"process_namespace":202,"token_base":%s,"synthetic_pid":0,"synthetic_namespace":0,"touched":0,"verified_present_entries":%d,"content_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","verified_absent_entries":1}\n' \
+    "$PRESSURE_EXPECTED_MAP_CAPACITY" "$token_base" \
+    "$PRESSURE_EXPECTED_MAP_CAPACITY"
 }
 
 pressure_cleanup_result() {
   local -r token_base="$1"
+  local -r touched="${2:-$PRESSURE_EXPECTED_MAP_CAPACITY}"
 
-  printf '{"status":"passed","mode":"cleanup","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":10,"process_map_id":0,"process_pid":101,"process_namespace":202,"token_base":%s,"touched":10,"cleanup_verified":true,"verified_absent_entries":11}\n' \
-    "$token_base"
+  printf '{"status":"passed","mode":"cleanup","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":%d,"process_map_id":0,"process_pid":101,"process_namespace":202,"token_base":%s,"synthetic_pid":0,"synthetic_namespace":0,"touched":%s,"cleanup_verified":true,"verified_absent_entries":%d}\n' \
+    "$PRESSURE_EXPECTED_MAP_CAPACITY" "$token_base" "$touched" \
+    "$((PRESSURE_EXPECTED_MAP_CAPACITY + 1))"
 }
 
 pressure_state_result() {
@@ -8633,37 +8460,3130 @@ pressure_state_result() {
   fi
 }
 
+pressure_test_reset_lifecycle_state() {
+  pressure_transaction_state_is_empty || {
+    printf 'pressure test reset refused live transaction state\n' >&2
+    return 1
+  }
+  [[ -z "$PRESSURE_TRANSACTION_OWNER_BASHPID" &&
+    -z "$PRESSURE_TRANSACTION_RUNTIME_PARENT_FD" &&
+    -z "$PRESSURE_TRANSACTION_RESULT_PARENT_FD" &&
+    -z "$PRESSURE_TRANSACTION_CONTROL_PARENT_FD" &&
+    -z "$PRESSURE_TRANSACTION_RUNTIME_PARENT_IDENTITY" &&
+    -z "$PRESSURE_TRANSACTION_RESULT_PARENT_IDENTITY" &&
+    -z "$PRESSURE_TRANSACTION_CONTROL_PARENT_IDENTITY" ]] || {
+    printf 'pressure test reset refused live parent authority\n' >&2
+    return 1
+  }
+
+  PRESSURE_ACTIVE=false
+  PRESSURE_MAP_ID=""
+  PRESSURE_MAP_MAX_ENTRIES=""
+  PRESSURE_MAP_BASELINE_ENTRIES=""
+  PRESSURE_CAPACITY_REJECTED_ENTRIES=""
+  PRESSURE_VERIFIED_PRESENT_ENTRIES=""
+  PRESSURE_VERIFIED_ABSENT_ENTRIES=""
+  PRESSURE_CONTENT_SHA256=""
+  PRESSURE_VERIFY_STATUS=not-run
+  PRESSURE_TOUCHED_ENTRIES=""
+  PRESSURE_CLEANUP_ATTEMPT=0
+  PRESSURE_CONTROL_LIVE_DIR=""
+  PRESSURE_CONTROL_LIVE_IDENTITY=""
+  PRESSURE_CONTROL_SESSION=""
+  PRESSURE_CONTROL_DEADLINE=0
+  PRESSURE_CONTROL_READY_IDENTITY=""
+  PRESSURE_CONTROL_RELEASE_IDENTITY=""
+  PRESSURE_CONTROL_REMOVAL_STATUS=not-run
+  PRESSURE_SCENARIO_CONTAINER_NAME=""
+  PRESSURE_SCENARIO_CONTAINER_ID=""
+  PRESSURE_SCENARIO_CONTAINER_IDENTITY=""
+  PRESSURE_SCENARIO_RUNNING_INSPECTION_JSON=""
+  PRESSURE_SCENARIO_TERMINAL_INSPECTION_JSON=""
+  PRESSURE_SCENARIO_WAIT_EXIT_CODE=""
+  PRESSURE_SCENARIO_EXPECTED_CMD_JSON=""
+  PRESSURE_SCENARIO_OUTPUT=""
+  PRESSURE_SCENARIO_STDERR=""
+  PRESSURE_SCENARIO_LAUNCH_STDERR=""
+  PRESSURE_SCENARIO_LAUNCH_STDERR_IDENTITY=""
+  PRESSURE_SCENARIO_LAUNCH_STDERR_REMOVAL_STATUS=not-run
+  PRESSURE_SCENARIO_TRANSACTION_ID=""
+  PRESSURE_SCENARIO_LOG_TRANSACTION_ID=""
+  PRESSURE_SCENARIO_LOGS_CAPTURED=false
+  PRESSURE_SCENARIO_REMOVAL_STATUS=not-run
+  PRESSURE_TRACECHECK_IMAGE_ID=""
+  PRESSURE_HELPER_CONTAINER_NAME=""
+  PRESSURE_HELPER_CONTAINER_ID=""
+  PRESSURE_HELPER_CONTAINER_IDENTITY=""
+  PRESSURE_HELPER_EXPECTED_CMD_JSON=""
+  PRESSURE_HELPER_OUTPUT=""
+  PRESSURE_HELPER_STDERR=""
+  PRESSURE_HELPER_LAUNCH_STDERR=""
+  PRESSURE_HELPER_LAUNCH_STDERR_IDENTITY=""
+  PRESSURE_HELPER_LAUNCH_STDERR_REMOVAL_STATUS=not-run
+  PRESSURE_HELPER_TRANSACTION_ID=""
+  PRESSURE_HELPER_LOG_TRANSACTION_ID=""
+  PRESSURE_CLEANUP_TRANSACTION_ID=""
+  PRESSURE_RELEASE_TRANSACTION_ID=""
+  PRESSURE_CONTROL_EVIDENCE_TRANSACTION_ID=""
+  PRESSURE_INSPECTION_TRANSACTION_ID=""
+  PRESSURE_CONTAINER_INSPECTIONS_TRANSACTION_ID=""
+  PRESSURE_BARRIER_STATUS_TRANSACTION_ID=""
+  PRESSURE_MAP_STATE_TRANSACTION_ID=""
+  PRESSURE_CONTAINER_INSPECTIONS_REFERENCE=""
+  PRESSURE_CONTAINER_INSPECTIONS_SHA256=""
+  PRESSURE_CONTAINER_INSPECTIONS_SIZE_BYTES=""
+  PRESSURE_CONTAINER_INSPECTIONS_RUNTIME_STATUS=not-run
+  PRESSURE_HELPER_LOGS_CAPTURED=false
+  PRESSURE_HELPER_REMOVAL_STATUS=not-run
+  PRESSURE_HELPER_COMPLETION_RECEIPT=""
+  PRESSURE_CLEANUP_SAFETY_RECEIPT=""
+  PRESSURE_CLEANUP_DELETION_STAGE=not-run
+  PRESSURE_CLEANUP_DELETION_ATTEMPT=0
+  PRESSURE_CLEANUP_DELETION_COMMAND_STATUS=not-run
+  PRESSURE_CLEANUP_DELETION_ATTEMPT_OPEN=false
+  PRESSURE_CLEANUP_ATTEMPT_TARGET=0
+  PRESSURE_CLEANUP_RECOVERY_READY=not-run
+  PRESSURE_CLEANUP_DEADLINE=0
+  PRESSURE_CLEANUP_DELETION_PROOF=""
+  PRESSURE_CLEANUP_DELETION_PROOF_SHA256=""
+  PRESSURE_CLEANUP_DELETION_STDERR=""
+  PRESSURE_CLEANUP_DELETION_STDERR_SHA256=""
+  PRESSURE_CLEANUP_DELETION_TOUCHED=""
+  PRESSURE_SEED=""
+  PRESSURE_LABEL=""
+  PRESSURE_PROCESS_MAP_ID=""
+  PRESSURE_PROCESS_PID=""
+  PRESSURE_PROCESS_NAMESPACE=""
+  PRESSURE_TOKEN_BASE=""
+  PRESSURE_JAVA_IDENTITY=""
+  PRESSURE_BARRIER_RUNTIME_STATUS=not-run
+
+  PRESSURE_TRANSACTION_CREATE_PATH=""
+  PRESSURE_TRANSACTION_CREATE_KEY=""
+  PRESSURE_TRANSACTION_CREATE_TX_ID=""
+  PRESSURE_TRANSACTION_CREATE_STATUS=""
+  PRESSURE_TRANSACTION_CREATE_FD=""
+  PRESSURE_TRANSACTION_CREATE_IDENTITY=""
+  PRESSURE_TRANSACTION_NOCLOBBER_WAS_SET=""
+  PRESSURE_TRANSACTION_UMASK_WAS=""
+  PRESSURE_TRANSACTION_VARREDIR_CLOSE_WAS_SET=""
+  # NEXT_TX_ID is deliberately process-monotonic. A sourced test must never
+  # make an old transaction identifier reusable.
+}
+
+pressure_test_shell_option_fingerprint() {
+  local noglob=false
+  local noclobber=false
+  local nullglob=false
+  local dotglob=false
+  local failglob=false
+  local varredir_close=false
+  local caller_umask=""
+
+  [[ "$-" == *f* ]] && noglob=true
+  [[ "$-" == *C* ]] && noclobber=true
+  shopt -q nullglob && nullglob=true
+  shopt -q dotglob && dotglob=true
+  shopt -q failglob && failglob=true
+  shopt -q varredir_close && varredir_close=true
+  caller_umask="$(umask)" || return $?
+  [[ "$caller_umask" =~ ^[0-7]{4}$ ]] || return 1
+  printf '%s:%s:%s:%s:%s:%s:%s:%q\n' \
+    "$noglob" "$noclobber" "$nullglob" "$dotglob" "$failglob" \
+    "$varredir_close" "$caller_umask" "${GLOBIGNORE-}"
+}
+
+pressure_test_prepare_runtime() {
+  local -r directory="$1"
+
+  RESULT_DIR="$directory"
+  RUNTIME_DIR="$RESULT_DIR/runtime"
+  mkdir -p -- "$RESULT_DIR" "$RUNTIME_DIR"
+  chmod 0700 -- "$RESULT_DIR" "$RUNTIME_DIR"
+  PROJECT_GUARD_HELD=true
+  PRESSURE_TRACECHECK_IMAGE_ID="sha256:$(printf '1%.0s' {1..64})"
+}
+
+pressure_test_pin_runtime() {
+  local -r deadline="${1:-$((SECONDS + 30))}"
+
+  pressure_pin_transaction_parents "$deadline"
+}
+
+pressure_test_prepare_control_directory() {
+  local -r deadline="${1:-$((SECONDS + 30))}"
+  local control_anchor=""
+
+  pressure_transaction_owner_shell_matches || return 1
+  PRESSURE_CONTROL_SESSION=00112233445566778899aabbccddeeff
+  PRESSURE_CONTROL_LIVE_DIR="$RUNTIME_DIR/.pressure-control.$PRESSURE_CONTROL_SESSION"
+  pressure_transaction_path_is_allowed \
+    "$PRESSURE_CONTROL_LIVE_DIR" "" control_anchor || return 1
+  mkdir -m 0700 -- "$control_anchor"
+  PRESSURE_CONTROL_LIVE_IDENTITY="$(
+    stat -Lc '%d:%i:%u:%a' -- "$control_anchor"
+  )"
+  PRESSURE_CONTROL_REMOVAL_STATUS=active
+  pressure_pin_transaction_control_parent "$deadline"
+}
+
+pressure_test_teardown_runtime() {
+  local -r deadline="${1:-$((SECONDS + 30))}"
+
+  pressure_transaction_owner_shell_matches || return 1
+  pressure_reconcile_active_transaction_create "$deadline" || return $?
+  cleanup_pressure_transaction_files "$deadline" || return $?
+  if [[ -n "$PRESSURE_CONTROL_LIVE_DIR" ]]; then
+    cleanup_pressure_control_live_directory "$deadline" || return $?
+  fi
+  cleanup_pressure_transaction_files "$deadline" || return $?
+  pressure_transaction_state_is_empty || return 1
+  pressure_unpin_transaction_parents "$deadline" || return $?
+  PROJECT_GUARD_HELD=false
+}
+
+pressure_test_publish_helper_completion_receipt() {
+  local -r mode="$1"
+  local -r output="$2"
+  local -r stderr_output="$3"
+  local -r status="$4"
+  local -r deadline="$5"
+  local invocation_json=""
+  shift 5
+
+  [[ "$(pressure_helper_mode_from_arguments "$@")" == "$mode" ]] || return 1
+  invocation_json="$(pressure_command_json "$deadline" "$@")" || return $?
+  PRESSURE_HELPER_COMPLETION_RECEIPT="$(
+    pressure_build_helper_completion_receipt \
+      "$mode" "$invocation_json" "$output" "$stderr_output" \
+      "$status" "$deadline"
+  )" || return $?
+}
+
+test_pressure_transaction_parent_authority_and_fd_retirement() {
+  (
+    local -r directory="$TEST_TMP_DIR/pressure-parent-authority"
+    local -r deadline="$((SECONDS + 90))"
+    local runtime_identity=""
+    local result_identity=""
+    local control_identity=""
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$directory"
+    pressure_test_pin_runtime "$deadline"
+    runtime_identity="$PRESSURE_TRANSACTION_RUNTIME_PARENT_IDENTITY"
+    result_identity="$PRESSURE_TRANSACTION_RESULT_PARENT_IDENTITY"
+    [[ "$runtime_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:[0-7]{3,4}:[1-9][0-9]*$ &&
+      "$result_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:[0-7]{3,4}:[1-9][0-9]*$ ]]
+
+    unset control_key || true
+    pressure_test_prepare_control_directory "$deadline"
+    control_identity="$PRESSURE_TRANSACTION_CONTROL_PARENT_IDENTITY"
+    [[ ! -v control_key && "$control_identity" =~ \
+      ^[0-9]+:[1-9][0-9]*:$EUID:[0-7]{3,4}:[1-9][0-9]*$ ]]
+    # Creating and deleting a child changes directory nlink on some filesystems;
+    # it must not invalidate the stored immutable parent identity.
+    : >"$PRESSURE_CONTROL_LIVE_DIR/ready"
+    chmod 0600 -- "$PRESSURE_CONTROL_LIVE_DIR/ready"
+    pressure_transaction_parent_identity_matches \
+      "$PRESSURE_CONTROL_LIVE_DIR/ready" "$deadline"
+    command rm -- "$PRESSURE_CONTROL_LIVE_DIR/ready"
+    [[ "$PRESSURE_TRANSACTION_CONTROL_PARENT_IDENTITY" == "$control_identity" ]]
+    pressure_transaction_parent_identity_matches \
+      "$PRESSURE_CONTROL_LIVE_DIR/release" "$deadline"
+
+    chmod 0755 -- "$RESULT_DIR"
+    if pressure_transaction_parent_identity_matches \
+      "$RESULT_DIR/result" "$deadline" >/dev/null 2>&1; then
+      printf 'parent authority accepted a mode-mutated directory\n' >&2
+      return 1
+    fi
+    chmod 0700 -- "$RESULT_DIR"
+    pressure_transaction_parent_identity_matches "$RESULT_DIR/result" "$deadline"
+
+    for path in \
+      "$RESULT_DIR/." "$RESULT_DIR/.." "$RESULT_DIR/sub/path" \
+      "$TEST_TMP_DIR/outside"; do
+      if pressure_transaction_target_path_is_allowed "$path" >/dev/null 2>&1; then
+        printf 'parent authority accepted invalid target: %s\n' "$path" >&2
+        return 1
+      fi
+    done
+    cleanup_pressure_control_live_directory "$deadline"
+    pressure_test_teardown_runtime "$deadline"
+  )
+
+  (
+    local -r directory="$TEST_TMP_DIR/pressure-parent-lexical-aba"
+    local -r held="$TEST_TMP_DIR/pressure-parent-lexical-aba-held"
+    local -r deadline="$((SECONDS + 90))"
+    local candidate=""
+    local candidate_anchor=""
+    local tx_id=""
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$directory"
+    pressure_test_pin_runtime "$deadline"
+    command mv -- "$RESULT_DIR" "$held"
+    mkdir -m 0700 -- "$RESULT_DIR"
+    mkdir -m 0700 -- "$RUNTIME_DIR"
+    candidate="$RESULT_DIR/.pressure-lexical-aba"
+    pressure_tx_begin tx_id
+    pressure_create_owned_candidate \
+      "$candidate" 600 "$deadline" "$deadline" "$tx_id"
+    [[ -f "$held/.pressure-lexical-aba" &&
+      ! -e "$RESULT_DIR/.pressure-lexical-aba" ]]
+    pressure_remove_registered_candidate "$candidate" "$deadline"
+    [[ ! -e "$held/.pressure-lexical-aba" ]]
+    if pressure_unpin_transaction_parents "$deadline" >/dev/null 2>&1; then
+      printf 'parent unpin accepted a lexical ancestor replacement\n' >&2
+      return 1
+    fi
+    command rmdir -- "$RUNTIME_DIR" "$RESULT_DIR"
+    command mv -- "$held" "$RESULT_DIR"
+    pressure_test_teardown_runtime "$deadline"
+  )
+
+  (
+    local -r directory="$TEST_TMP_DIR/pressure-parent-fd-reuse"
+    local -r deadline="$((SECONDS + 90))"
+    local result_fd=""
+    local result_identity=""
+    local reused_fd=""
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$directory"
+    pressure_test_pin_runtime "$deadline"
+    result_fd="$PRESSURE_TRANSACTION_RESULT_PARENT_FD"
+    result_identity="$PRESSURE_TRANSACTION_RESULT_PARENT_IDENTITY"
+    exec {result_fd}<&-
+    exec {reused_fd}</dev/null
+    [[ "$reused_fd" == "$PRESSURE_TRANSACTION_RESULT_PARENT_FD" ]]
+    if pressure_transaction_parent_identity_matches \
+      "$RESULT_DIR/result" "$deadline" >/dev/null 2>&1; then
+      printf 'parent authority accepted a reused descriptor number\n' >&2
+      return 1
+    fi
+    if pressure_unpin_transaction_parents "$deadline" >/dev/null 2>&1; then
+      printf 'parent unpin closed an unauthenticated reused descriptor\n' >&2
+      return 1
+    fi
+    [[ -e "/proc/$BASHPID/fd/$reused_fd" ]]
+    exec {reused_fd}<&-
+    PRESSURE_TRANSACTION_RESULT_PARENT_FD="closed:$result_identity"
+    pressure_unpin_transaction_parents "$deadline"
+    [[ -z "$PRESSURE_TRANSACTION_OWNER_BASHPID" ]]
+  )
+
+  local parent_role=""
+  local parent_transition=""
+  for parent_role in result runtime control; do
+    for parent_transition in closing closed; do
+      (
+        local -r directory="$TEST_TMP_DIR/pressure-parent-${parent_role}-${parent_transition}"
+        local -r deadline="$((SECONDS + 90))"
+        local -r fd_variable="PRESSURE_TRANSACTION_${parent_role^^}_PARENT_FD"
+        local -r identity_variable="PRESSURE_TRANSACTION_${parent_role^^}_PARENT_IDENTITY"
+        local fd=""
+        local identity=""
+
+        pressure_test_reset_lifecycle_state
+        pressure_test_prepare_runtime "$directory"
+        pressure_test_pin_runtime "$deadline"
+        if [[ "$parent_role" == control ]]; then
+          pressure_test_prepare_control_directory "$deadline"
+          cleanup_pressure_control_live_directory "$deadline"
+        fi
+        fd="${!fd_variable}"
+        identity="${!identity_variable}"
+        [[ "$fd" =~ ^[0-9]+$ && -e "/proc/$BASHPID/fd/$fd" &&
+          "$identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:[0-7]{3,4}:[1-9][0-9]*$ ]]
+        if [[ "$parent_transition" == closing ]]; then
+          printf -v "$fd_variable" 'closing:%s:%s' "$fd" "$identity"
+        else
+          exec {fd}<&-
+          printf -v "$fd_variable" 'closed:%s' "$identity"
+        fi
+        pressure_unpin_transaction_parents "$deadline"
+        [[ -z "$PRESSURE_TRANSACTION_OWNER_BASHPID" &&
+          -z "$PRESSURE_TRANSACTION_RESULT_PARENT_FD" &&
+          -z "$PRESSURE_TRANSACTION_RUNTIME_PARENT_FD" &&
+          -z "$PRESSURE_TRANSACTION_CONTROL_PARENT_FD" ]]
+      )
+    done
+  done
+}
+
+test_pressure_transaction_o_excl_settings_and_foreign_winner() {
+  local noclobber_state=""
+  local varredir_state=""
+  local caller_umask=""
+  local requested_mode=""
+
+  for noclobber_state in off on; do
+    for varredir_state in off on; do
+      for caller_umask in 0022 0077; do
+        for requested_mode in 600 644; do
+          (
+            local -r case_id="${noclobber_state}-${varredir_state}-${caller_umask}-${requested_mode}"
+            local -r directory="$TEST_TMP_DIR/pressure-o-excl-${noclobber_state}-${varredir_state}-${caller_umask}-${requested_mode}"
+            local -r deadline="$((SECONDS + 90))"
+            local candidate=""
+            local foreign_candidate=""
+            local tx_id=""
+            local foreign_tx_id=""
+            local before_options=""
+            local after_options=""
+            local foreign_anchor=""
+            local injected=false
+
+            pressure_test_reset_lifecycle_state
+            pressure_test_prepare_runtime "$directory"
+            pressure_test_pin_runtime "$deadline"
+            if [[ "$noclobber_state" == on ]]; then
+              set -o noclobber
+            else
+              set +o noclobber
+            fi
+            if [[ "$varredir_state" == on ]]; then
+              shopt -s varredir_close
+            else
+              shopt -u varredir_close
+            fi
+            umask "$caller_umask"
+            before_options="$(pressure_test_shell_option_fingerprint)"
+
+            candidate="$RESULT_DIR/.pressure-create-$case_id"
+            pressure_tx_begin tx_id
+            pressure_create_owned_candidate \
+              "$candidate" "$requested_mode" "$deadline" "$deadline" "$tx_id"
+            [[ "$(stat -Lc '%a' -- "$candidate")" == "$requested_mode" ]]
+            pressure_remove_registered_candidate "$candidate" "$deadline"
+            pressure_tx_finish_if_empty "$tx_id"
+
+            foreign_candidate="$RESULT_DIR/.pressure-foreign-$case_id"
+            pressure_transaction_path_is_allowed \
+              "$foreign_candidate" "" foreign_anchor
+            pressure_tx_begin foreign_tx_id
+            shopt() {
+              if [[ "$1" == -q && "${2:-}" == varredir_close &&
+                "$injected" == false ]]; then
+                printf 'foreign-winner\n' >"$foreign_anchor"
+                chmod "$requested_mode" -- "$foreign_anchor"
+                injected=true
+              fi
+              builtin shopt "$@"
+            }
+            if pressure_create_owned_candidate \
+              "$foreign_candidate" "$requested_mode" "$deadline" "$deadline" \
+              "$foreign_tx_id" >/dev/null 2>&1; then
+              printf 'O_EXCL accepted an injected foreign winner: %s\n' \
+                "$case_id" >&2
+              return 1
+            fi
+            [[ "$injected" == true && "$(<"$foreign_candidate")" == foreign-winner &&
+              -z "$PRESSURE_TRANSACTION_CREATE_TX_ID" &&
+              -z "${PRESSURE_TRANSACTION_TX_STATES[$foreign_tx_id]:-}" ]]
+            after_options="$(pressure_test_shell_option_fingerprint)"
+            [[ "$after_options" == "$before_options" ]] || {
+              printf 'O_EXCL changed caller settings: before=%q after=%q\n' \
+                "$before_options" "$after_options" >&2
+              return 1
+            }
+            command rm -- "$foreign_candidate"
+            pressure_test_teardown_runtime "$deadline"
+          )
+        done
+      done
+    done
+  done
+}
+
+test_pressure_transaction_group_commit_interleaving_and_aba() {
+  (
+    local -r directory="$TEST_TMP_DIR/pressure-tx-interleaved"
+    local -r deadline="$((SECONDS + 120))"
+    local tx_a=""
+    local tx_b=""
+    local candidate_a=""
+    local candidate_b=""
+    local target_a="$directory/target-a"
+    local target_b="$directory/target-b"
+    local identity_a=""
+    local identity_b=""
+    local before_next=0
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$directory"
+    pressure_test_pin_runtime "$deadline"
+    before_next="$PRESSURE_TRANSACTION_NEXT_TX_ID"
+    candidate_a="$RESULT_DIR/.pressure-interleaved-a"
+    candidate_b="$RESULT_DIR/.pressure-interleaved-b"
+    pressure_tx_begin tx_a
+    pressure_tx_begin tx_b
+    pressure_create_owned_candidate \
+      "$candidate_a" 644 "$deadline" "$deadline" "$tx_a"
+    pressure_create_owned_candidate \
+      "$candidate_b" 644 "$deadline" "$deadline" "$tx_b"
+    move_owned_candidate_no_clobber \
+      "$candidate_a" "$target_a" "$deadline" "$deadline" identity_a "$tx_a"
+    move_owned_candidate_no_clobber \
+      "$candidate_b" "$target_b" "$deadline" "$deadline" identity_b "$tx_b"
+    pressure_commit_moved_candidates \
+      "$deadline" "$candidate_b" "$target_b" "$identity_b"
+    [[ -f "$target_b" && -f "$target_a" &&
+      "${PRESSURE_TRANSACTION_TX_STATES[$tx_a]:-}" == open &&
+      -z "${PRESSURE_TRANSACTION_TX_STATES[$tx_b]:-}" ]]
+    pressure_commit_moved_candidates \
+      "$deadline" "$candidate_a" "$target_a" "$identity_a"
+    [[ -f "$target_a" && -f "$target_b" &&
+      "$PRESSURE_TRANSACTION_NEXT_TX_ID" -ge "$((before_next + 2))" ]]
+    pressure_test_teardown_runtime "$deadline"
+  )
+
+  (
+    local -r directory="$TEST_TMP_DIR/pressure-tx-grouped"
+    local -r deadline="$((SECONDS + 120))"
+    local tx_id=""
+    local candidate=""
+    local target=""
+    local identity=""
+    local -a candidates=()
+    local -a targets=()
+    local -a identities=()
+    local -a commit_arguments=()
+    local -i index=0
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$directory"
+    pressure_test_pin_runtime "$deadline"
+    pressure_tx_begin tx_id
+    for index in 1 2 3; do
+      candidate="$RESULT_DIR/.pressure-grouped-$index"
+      target="$RESULT_DIR/grouped-$index"
+      pressure_create_owned_candidate \
+        "$candidate" 644 "$deadline" "$deadline" "$tx_id"
+      move_owned_candidate_no_clobber \
+        "$candidate" "$target" "$deadline" "$deadline" identity "$tx_id"
+      candidates+=("$candidate")
+      targets+=("$target")
+      identities+=("$identity")
+      commit_arguments+=("$candidate" "$target" "$identity")
+    done
+    pressure_commit_moved_candidates "$deadline" "${commit_arguments[@]}"
+    for index in 0 1 2; do
+      [[ -f "${targets[$index]}" && ! -e "${candidates[$index]}" ]]
+    done
+    pressure_transaction_state_is_empty
+    pressure_test_teardown_runtime "$deadline"
+  )
+
+  (
+    local -r directory="$TEST_TMP_DIR/pressure-tx-double-claim"
+    local -r deadline="$((SECONDS + 120))"
+    local target="$directory/shared-target"
+    local tx_a=""
+    local tx_b=""
+    local candidate_a=""
+    local candidate_b=""
+    local identity_a=""
+    local identity_b=""
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$directory"
+    pressure_test_pin_runtime "$deadline"
+    candidate_a="$RESULT_DIR/.pressure-double-a"
+    candidate_b="$RESULT_DIR/.pressure-double-b"
+    pressure_tx_begin tx_a
+    pressure_tx_begin tx_b
+    pressure_create_owned_candidate \
+      "$candidate_a" 600 "$deadline" "$deadline" "$tx_a"
+    pressure_create_owned_candidate \
+      "$candidate_b" 600 "$deadline" "$deadline" "$tx_b"
+    move_owned_candidate_no_clobber \
+      "$candidate_a" "$target" "$deadline" "$deadline" identity_a "$tx_a"
+    if move_owned_candidate_no_clobber \
+      "$candidate_b" "$target" "$deadline" "$deadline" identity_b "$tx_b" \
+      >/dev/null 2>&1; then
+      printf 'transaction layer accepted a double target claim\n' >&2
+      return 1
+    fi
+    [[ -f "$target" && -f "$candidate_b" ]]
+    pressure_cleanup_tx "$tx_a" "$deadline"
+    pressure_cleanup_tx "$tx_b" "$deadline"
+    [[ ! -e "$target" && ! -e "$candidate_a" && ! -e "$candidate_b" ]]
+    pressure_test_teardown_runtime "$deadline"
+  )
+
+  (
+    local -r directory="$TEST_TMP_DIR/pressure-tx-exact-set"
+    local -r deadline="$((SECONDS + 120))"
+    local tx_id=""
+    local candidate_a=""
+    local candidate_b=""
+    local target_a="$directory/target-a"
+    local identity_a=""
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$directory"
+    pressure_test_pin_runtime "$deadline"
+    candidate_a="$RESULT_DIR/.pressure-exact-a"
+    candidate_b="$RESULT_DIR/.pressure-exact-b"
+    pressure_tx_begin tx_id
+    pressure_create_owned_candidate \
+      "$candidate_a" 644 "$deadline" "$deadline" "$tx_id"
+    pressure_create_owned_candidate \
+      "$candidate_b" 644 "$deadline" "$deadline" "$tx_id"
+    move_owned_candidate_no_clobber \
+      "$candidate_a" "$target_a" "$deadline" "$deadline" identity_a "$tx_id"
+    if pressure_commit_moved_candidates \
+      "$deadline" "$candidate_a" "$target_a" "$identity_a" \
+      >/dev/null 2>&1; then
+      printf 'transaction commit omitted an open owned candidate\n' >&2
+      return 1
+    fi
+    pressure_cleanup_tx "$tx_id" "$deadline"
+    [[ ! -e "$target_a" && ! -e "$candidate_a" && ! -e "$candidate_b" ]]
+    pressure_test_teardown_runtime "$deadline"
+  )
+
+  (
+    local -r directory="$TEST_TMP_DIR/pressure-tx-path-aba"
+    local -r deadline="$((SECONDS + 120))"
+    local tx_id=""
+    local candidate=""
+    local owned="$directory/owned-inode"
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$directory"
+    pressure_test_pin_runtime "$deadline"
+    candidate="$RESULT_DIR/.pressure-candidate-aba"
+    pressure_tx_begin tx_id
+    pressure_create_owned_candidate \
+      "$candidate" 600 "$deadline" "$deadline" "$tx_id"
+    command mv -- "$candidate" "$owned"
+    printf 'foreign\n' >"$candidate"
+    chmod 0600 -- "$candidate"
+    if pressure_remove_registered_candidate \
+      "$candidate" "$deadline" >/dev/null 2>&1; then
+      printf 'candidate cleanup accepted a pathname ABA\n' >&2
+      return 1
+    fi
+    [[ "$(<"$candidate")" == foreign && -f "$owned" ]]
+    command rm -- "$candidate"
+    command mv -- "$owned" "$candidate"
+    pressure_cleanup_tx "$tx_id" "$deadline"
+    pressure_test_teardown_runtime "$deadline"
+  )
+
+  (
+    local -r directory="$TEST_TMP_DIR/pressure-tx-owner"
+    local -r deadline="$((SECONDS + 120))"
+    local tx_id=""
+    local candidate=""
+    local before=""
+    local after=""
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$directory"
+    pressure_test_pin_runtime "$deadline"
+    candidate="$RESULT_DIR/.pressure-owner"
+    pressure_tx_begin tx_id
+    pressure_create_owned_candidate \
+      "$candidate" 600 "$deadline" "$deadline" "$tx_id"
+    pressure_transaction_cleanup_fingerprint before
+    if (pressure_remove_registered_candidate "$candidate" "$deadline") \
+      >/dev/null 2>&1; then
+      printf 'child BASHPID mutated parent transaction state\n' >&2
+      return 1
+    fi
+    pressure_transaction_cleanup_fingerprint after
+    [[ "$after" == "$before" && -f "$candidate" ]]
+    pressure_cleanup_tx "$tx_id" "$deadline"
+    pressure_test_teardown_runtime "$deadline"
+  )
+}
+
+test_pressure_transaction_deadline_and_commit_windows() {
+  (
+    local -r directory="$TEST_TMP_DIR/pressure-tx-deadline-pre"
+    local -r deadline="$((SECONDS + 60))"
+    local tx_id=""
+    local candidate=""
+    local expired_deadline=""
+    local status=0
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$directory"
+    pressure_test_pin_runtime "$deadline"
+    candidate="$RESULT_DIR/.pressure-deadline-pre"
+    pressure_tx_begin tx_id
+    if ((SECONDS == 0)); then
+      SECONDS=1
+    fi
+    expired_deadline="$SECONDS"
+    if pressure_create_owned_candidate \
+      "$candidate" 600 "$expired_deadline" "$deadline" "$tx_id" \
+      >/dev/null 2>&1; then
+      printf 'candidate creation ignored an exhausted work deadline\n' >&2
+      return 1
+    else
+      status=$?
+    fi
+    [[ "$status" -eq 124 && ! -e "$candidate" &&
+      -z "$PRESSURE_TRANSACTION_CREATE_TX_ID" ]]
+    pressure_cleanup_tx "$tx_id" "$deadline"
+    pressure_test_teardown_runtime "$deadline"
+  )
+
+  (
+    local -r directory="$TEST_TMP_DIR/pressure-tx-deadline-move"
+    local -r work_deadline="$((SECONDS + 20))"
+    local -r cleanup_deadline="$((SECONDS + 90))"
+    local candidate=""
+    local target="$directory/target"
+    local tx_id=""
+    local identity=""
+    local status=0
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$directory"
+    pressure_test_pin_runtime "$cleanup_deadline"
+    candidate="$RESULT_DIR/.pressure-deadline-move"
+    pressure_tx_begin tx_id
+    pressure_create_owned_candidate \
+      "$candidate" 600 "$work_deadline" "$cleanup_deadline" "$tx_id"
+    eval "$(declare -f pressure_move_registered_inode_no_clobber | \
+      sed '1s/pressure_move_registered_inode_no_clobber/pressure_test_original_deadline_move/')"
+    pressure_move_registered_inode_no_clobber() {
+      pressure_test_original_deadline_move "$@" || return $?
+      SECONDS="$work_deadline"
+    }
+    if move_owned_candidate_no_clobber \
+      "$candidate" "$target" "$work_deadline" "$cleanup_deadline" \
+      identity "$tx_id" >/dev/null 2>&1; then
+      printf 'candidate move ignored post-rename deadline exhaustion\n' >&2
+      return 1
+    else
+      status=$?
+    fi
+    [[ "$status" -eq 124 && ! -e "$target" && ! -e "$candidate" ]]
+    pressure_transaction_state_is_empty
+    pressure_test_teardown_runtime "$cleanup_deadline"
+  )
+
+  (
+    local -r directory="$TEST_TMP_DIR/pressure-tx-committed-interruption"
+    local -r deadline="$((SECONDS + 120))"
+    local candidate=""
+    local target="$directory/target"
+    local tx_id=""
+    local identity=""
+    local drain_calls=0
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$directory"
+    pressure_test_pin_runtime "$deadline"
+    candidate="$RESULT_DIR/.pressure-committed-interruption"
+    pressure_tx_begin tx_id
+    pressure_create_owned_candidate \
+      "$candidate" 644 "$deadline" "$deadline" "$tx_id"
+    move_owned_candidate_no_clobber \
+      "$candidate" "$target" "$deadline" "$deadline" identity "$tx_id"
+    eval "$(declare -f pressure_drain_committed_member | \
+      sed '1s/pressure_drain_committed_member/pressure_test_original_drain_committed_member/')"
+    pressure_drain_committed_member() {
+      ((drain_calls += 1))
+      if ((drain_calls == 1)); then
+        return 83
+      fi
+      pressure_test_original_drain_committed_member "$@"
+    }
+    if pressure_commit_moved_candidates \
+      "$deadline" "$candidate" "$target" "$identity" \
+      >/dev/null 2>&1; then
+      printf 'commit ignored an injected post-commit drain interruption\n' >&2
+      return 1
+    fi
+    [[ -f "$target" &&
+      "${PRESSURE_TRANSACTION_TX_STATES[$tx_id]:-}" == draining ]]
+    cleanup_pressure_transaction_files "$deadline"
+    [[ -f "$target" ]]
+    pressure_transaction_state_is_empty
+    pressure_test_teardown_runtime "$deadline"
+  )
+}
+
+test_pressure_transaction_restart_crosslinks_and_descriptor_aba() {
+  local create_boundary=""
+
+  for create_boundary in \
+    tx-only path key reserved noclobber umask varredir settings-saved; do
+    (
+      local -r directory="$TEST_TMP_DIR/pressure-create-tear-$create_boundary"
+      local -r deadline="$((SECONDS + 90))"
+      local candidate=""
+      local key=""
+      local tx_id=""
+
+      pressure_test_reset_lifecycle_state
+      pressure_test_prepare_runtime "$directory"
+      pressure_test_pin_runtime "$deadline"
+      candidate="$RESULT_DIR/.pressure-create-tear-$create_boundary"
+      pressure_transaction_path_is_allowed "$candidate" key
+      pressure_tx_begin tx_id
+      PRESSURE_TRANSACTION_CREATE_TX_ID="$tx_id"
+      case "$create_boundary" in
+        tx-only) ;;
+        path) PRESSURE_TRANSACTION_CREATE_PATH="$candidate" ;;
+        key)
+          PRESSURE_TRANSACTION_CREATE_PATH="$candidate"
+          PRESSURE_TRANSACTION_CREATE_KEY="$key"
+          ;;
+        reserved)
+          PRESSURE_TRANSACTION_CREATE_PATH="$candidate"
+          PRESSURE_TRANSACTION_CREATE_KEY="$key"
+          PRESSURE_TRANSACTION_CREATE_STATUS=reserved
+          ;;
+        noclobber|umask|varredir|settings-saved)
+          PRESSURE_TRANSACTION_CREATE_PATH="$candidate"
+          PRESSURE_TRANSACTION_CREATE_KEY="$key"
+          PRESSURE_TRANSACTION_CREATE_STATUS=settings-saved
+          case "$create_boundary" in
+            noclobber) PRESSURE_TRANSACTION_NOCLOBBER_WAS_SET=false ;;
+            umask) PRESSURE_TRANSACTION_UMASK_WAS=0022 ;;
+            varredir) PRESSURE_TRANSACTION_VARREDIR_CLOSE_WAS_SET=false ;;
+            settings-saved)
+              PRESSURE_TRANSACTION_NOCLOBBER_WAS_SET=false
+              PRESSURE_TRANSACTION_UMASK_WAS=0022
+              PRESSURE_TRANSACTION_VARREDIR_CLOSE_WAS_SET=false
+              ;;
+          esac
+          ;;
+        *) return 1 ;;
+      esac
+      pressure_abort_transaction_create "$deadline"
+      pressure_transaction_state_is_empty
+      [[ -z "$PRESSURE_TRANSACTION_CREATE_TX_ID" && ! -e "$candidate" ]]
+      pressure_test_teardown_runtime "$deadline"
+    )
+  done
+
+  (
+    local -r directory="$TEST_TMP_DIR/pressure-create-fd-open"
+    local -r deadline="$((SECONDS + 90))"
+    local candidate=""
+    local anchor=""
+    local key=""
+    local tx_id=""
+    local descriptor=""
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$directory"
+    pressure_test_pin_runtime "$deadline"
+    candidate="$RESULT_DIR/.pressure-create-fd-open"
+    pressure_transaction_path_is_allowed "$candidate" key anchor
+    pressure_tx_begin tx_id
+    exec {descriptor}>"$anchor"
+    chmod 0600 -- "/proc/$BASHPID/fd/$descriptor"
+    PRESSURE_TRANSACTION_CREATE_TX_ID="$tx_id"
+    PRESSURE_TRANSACTION_CREATE_PATH="$candidate"
+    PRESSURE_TRANSACTION_CREATE_KEY="$key"
+    PRESSURE_TRANSACTION_CREATE_STATUS="fd-open-unverified"
+    PRESSURE_TRANSACTION_CREATE_FD="$descriptor"
+    pressure_abort_transaction_create "$deadline"
+    pressure_transaction_state_is_empty
+    [[ ! -e "$candidate" && ! -e "/proc/$BASHPID/fd/$descriptor" ]]
+    pressure_test_teardown_runtime "$deadline"
+  )
+
+  (
+    local -r directory="$TEST_TMP_DIR/pressure-create-identity-crosslink"
+    local -r deadline="$((SECONDS + 90))"
+    local candidate=""
+    local key=""
+    local tx_id=""
+    local stable=""
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$directory"
+    pressure_test_pin_runtime "$deadline"
+    candidate="$RESULT_DIR/.pressure-create-identity-crosslink"
+    pressure_tx_begin tx_id
+    pressure_create_owned_candidate \
+      "$candidate" 600 "$deadline" "$deadline" "$tx_id"
+    pressure_registered_candidate_key "$candidate" key
+    stable="${PRESSURE_TRANSACTION_FILE_IDENTITIES[$key]}"
+    PRESSURE_TRANSACTION_CREATE_TX_ID="$tx_id"
+    PRESSURE_TRANSACTION_CREATE_PATH="$candidate"
+    PRESSURE_TRANSACTION_CREATE_KEY="$key"
+    PRESSURE_TRANSACTION_CREATE_STATUS=registered
+    PRESSURE_TRANSACTION_CREATE_IDENTITY="999999:${stable#*:}"
+    if pressure_abort_transaction_create "$deadline" >/dev/null 2>&1; then
+      printf 'create recovery accepted a mismatched registered identity\n' >&2
+      return 1
+    fi
+    [[ -f "$candidate" &&
+      "${PRESSURE_TRANSACTION_FILE_IDENTITIES[$key]}" == "$stable" ]]
+    PRESSURE_TRANSACTION_CREATE_IDENTITY="$stable"
+    pressure_abort_transaction_create "$deadline"
+    pressure_transaction_state_is_empty
+    [[ ! -e "$candidate" ]]
+    pressure_test_teardown_runtime "$deadline"
+  )
+
+  (
+    local -r directory="$TEST_TMP_DIR/pressure-retiring-crosslink"
+    local -r deadline="$((SECONDS + 90))"
+    local candidate=""
+    local key=""
+    local tx_id=""
+    local stable=""
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$directory"
+    pressure_test_pin_runtime "$deadline"
+    candidate="$RESULT_DIR/.pressure-retiring-crosslink"
+    pressure_tx_begin tx_id
+    pressure_create_owned_candidate \
+      "$candidate" 600 "$deadline" "$deadline" "$tx_id"
+    pressure_registered_candidate_key "$candidate" key
+    stable="${PRESSURE_TRANSACTION_FILE_IDENTITIES[$key]}"
+    command rm -- "$candidate"
+    PRESSURE_TRANSACTION_CANDIDATE_STATES["$key"]=closing
+    PRESSURE_TRANSACTION_FILE_IDENTITIES["$key"]="retiring:999:${stable#*:}"
+    if pressure_finalize_retiring_candidate \
+      "$candidate" "$deadline" >/dev/null 2>&1; then
+      printf 'retiring candidate accepted a mismatched stable identity\n' >&2
+      return 1
+    fi
+    [[ -n "${PRESSURE_TRANSACTION_FILE_DESCRIPTORS[$key]:-}" ]]
+    PRESSURE_TRANSACTION_FILE_IDENTITIES["$key"]="retiring:$stable"
+    pressure_finalize_retiring_candidate "$candidate" "$deadline"
+    pressure_transaction_state_is_empty
+    pressure_test_teardown_runtime "$deadline"
+  )
+
+  (
+    local -r directory="$TEST_TMP_DIR/pressure-retired-crosslink"
+    local -r deadline="$((SECONDS + 90))"
+    local candidate=""
+    local key=""
+    local tx_id=""
+    local stable=""
+    local descriptor=""
+    local descriptor_path=""
+    local closed_identity=""
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$directory"
+    pressure_test_pin_runtime "$deadline"
+    candidate="$RESULT_DIR/.pressure-retired-crosslink"
+    pressure_tx_begin tx_id
+    pressure_create_owned_candidate \
+      "$candidate" 644 "$deadline" "$deadline" "$tx_id"
+    pressure_registered_candidate_key "$candidate" key
+    stable="${PRESSURE_TRANSACTION_FILE_IDENTITIES[$key]}"
+    descriptor="${PRESSURE_TRANSACTION_FILE_DESCRIPTORS[$key]}"
+    descriptor_path="/proc/$BASHPID/fd/$descriptor"
+    command rm -- "$candidate"
+    closed_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$descriptor_path")"
+    PRESSURE_TRANSACTION_CANDIDATE_STATES["$key"]=gone
+    PRESSURE_TRANSACTION_FILE_IDENTITIES["$key"]="retired:$stable"
+    PRESSURE_TRANSACTION_FILE_DESCRIPTORS["$key"]="closing:$descriptor:999:${closed_identity#*:}"
+    if pressure_finalize_retired_candidate \
+      "$candidate" "$deadline" >/dev/null 2>&1; then
+      printf 'retired candidate accepted a mismatched closing identity\n' >&2
+      return 1
+    fi
+    [[ -e "$descriptor_path" ]]
+    PRESSURE_TRANSACTION_FILE_DESCRIPTORS["$key"]="closing:$descriptor:$closed_identity"
+    pressure_finalize_retired_candidate "$candidate" "$deadline"
+    pressure_transaction_state_is_empty
+    pressure_test_teardown_runtime "$deadline"
+  )
+
+  (
+    local -r directory="$TEST_TMP_DIR/pressure-candidate-fd-aba"
+    local -r deadline="$((SECONDS + 90))"
+    local candidate=""
+    local key=""
+    local tx_id=""
+    local descriptor=""
+    local backup=""
+    local reused=""
+    local restored=""
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$directory"
+    pressure_test_pin_runtime "$deadline"
+    shopt -u varredir_close
+    candidate="$RESULT_DIR/.pressure-candidate-fd-aba"
+    pressure_tx_begin tx_id
+    pressure_create_owned_candidate \
+      "$candidate" 600 "$deadline" "$deadline" "$tx_id"
+    pressure_registered_candidate_key "$candidate" key
+    descriptor="${PRESSURE_TRANSACTION_FILE_DESCRIPTORS[$key]}"
+    exec {backup}<&"$descriptor"
+    exec {descriptor}<&-
+    exec {reused}</dev/null
+    [[ "$reused" == "$descriptor" ]]
+    if pressure_registered_candidate_identity_matches \
+      "$candidate" "$deadline" >/dev/null 2>&1; then
+      printf 'candidate authority accepted a reused descriptor number\n' >&2
+      return 1
+    fi
+    [[ -f "$candidate" ]]
+    exec {reused}<&-
+    exec {restored}<&"$backup"
+    [[ "$restored" == "$descriptor" ]]
+    exec {backup}<&-
+    pressure_cleanup_tx "$tx_id" "$deadline"
+    pressure_test_teardown_runtime "$deadline"
+  )
+
+  (
+    local -r directory="$TEST_TMP_DIR/pressure-target-aba"
+    local -r deadline="$((SECONDS + 90))"
+    local candidate=""
+    local target="$directory/target"
+    local owned_target="$directory/owned-target"
+    local tx_id=""
+    local identity=""
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$directory"
+    pressure_test_pin_runtime "$deadline"
+    candidate="$RESULT_DIR/.pressure-target-aba"
+    pressure_tx_begin tx_id
+    pressure_create_owned_candidate \
+      "$candidate" 600 "$deadline" "$deadline" "$tx_id"
+    move_owned_candidate_no_clobber \
+      "$candidate" "$target" "$deadline" "$deadline" identity "$tx_id"
+    command mv -- "$target" "$owned_target"
+    printf 'foreign\n' >"$target"
+    chmod 0600 -- "$target"
+    if pressure_cleanup_tx "$tx_id" "$deadline" >/dev/null 2>&1; then
+      printf 'transaction rollback accepted a target pathname ABA\n' >&2
+      return 1
+    fi
+    [[ "$(<"$target")" == foreign && -f "$owned_target" ]]
+    command rm -- "$target"
+    command mv -- "$owned_target" "$target"
+    pressure_cleanup_tx "$tx_id" "$deadline"
+    [[ ! -e "$target" ]]
+    pressure_test_teardown_runtime "$deadline"
+  )
+}
+
+pressure_test_container_inspection() {
+  local -r kind="$1"
+  local -r state="$2"
+  local -r container_id="$3"
+  local -r container_name="$4"
+  local -r command_json="$5"
+  local runner_gid=""
+  local user=""
+  local service=""
+  local entrypoint=""
+  local network_mode=""
+  local privileged=false
+  local running=false
+  local host_pid=0
+  local exit_code=0
+  local started_at=0001-01-01T00:00:00Z
+  local finished_at=0001-01-01T00:00:00Z
+  local state_error=""
+
+  case "$kind" in
+    scenario)
+      runner_gid="$(id -g)" || return $?
+      user="$EUID:$runner_gid"
+      service=scenario
+      entrypoint=/trace-scenario
+      network_mode=host
+      ;;
+    helper)
+      user=0:0
+      service=map-pressure
+      entrypoint=/map-pressure
+      network_mode=none
+      privileged=true
+      ;;
+    *) return 1 ;;
+  esac
+  case "$state" in
+    running)
+      running=true
+      host_pid=123
+      started_at=2026-08-19T00:00:00.000000001Z
+      ;;
+    exited)
+      exit_code=23
+      started_at=2026-08-19T00:00:00.000000001Z
+      finished_at=2026-08-19T00:01:00.000000001Z
+      ;;
+    created)
+      state_error="start failed"
+      ;;
+    *) return 1 ;;
+  esac
+
+  jq -cn \
+    --arg id "$container_id" \
+    --arg name "/$container_name" \
+    --arg user "$user" \
+    --arg project "$PROJECT_NAME" \
+    --arg owner "$PROJECT_SENTINEL_VALUE" \
+    --arg image_reference "$PRESSURE_TRACECHECK_IMAGE_REFERENCE" \
+    --arg image_id "$PRESSURE_TRACECHECK_IMAGE_ID" \
+    --arg service "$service" \
+    --arg entrypoint "$entrypoint" \
+    --arg network_mode "$network_mode" \
+    --arg state "$state" \
+    --arg started_at "$started_at" \
+    --arg finished_at "$finished_at" \
+    --arg state_error "$state_error" \
+    --arg mount_source "$PRESSURE_CONTROL_LIVE_DIR" \
+    --arg mount_destination "$PRESSURE_CONTROL_CONTAINER_DIR" \
+    --argjson cmd "$command_json" \
+    --argjson running "$running" \
+    --argjson host_pid "$host_pid" \
+    --argjson exit_code "$exit_code" \
+    --argjson privileged "$privileged" \
+    --arg kind "$kind" '
+      {
+        attach_stdin: false,
+        cmd: $cmd,
+        dead: false,
+        entrypoint: [$entrypoint],
+        error: $state_error,
+        exit_code: $exit_code,
+        finished_at: $finished_at,
+        host_pid: $host_pid,
+        id: $id,
+        image_id: $image_id,
+        image_reference: $image_reference,
+        mounts: (
+          if $kind == "scenario" then [{
+            Type: "bind",
+            Source: $mount_source,
+            Destination: $mount_destination,
+            RW: true
+          }] else [] end
+        ),
+        name: $name,
+        network_mode: $network_mode,
+        oom_killed: false,
+        oneoff_label: "True",
+        open_stdin: false,
+        owner_label: $owner,
+        path: $entrypoint,
+        pid_mode: "",
+        privileged: $privileged,
+        project_label: $project,
+        restart_count: 0,
+        restart_policy: "no",
+        running: $running,
+        service_label: $service,
+        started_at: $started_at,
+        state_status: $state,
+        stdin_once: false,
+        tty: false,
+        user: $user
+      }
+    '
+}
+
+pressure_test_prepare_scenario_inspection_state() {
+  local -r directory="$1"
+  local -r deadline="$2"
+  local -r label="${3:-pressure}"
+  local -r container_id="$(printf 'a%.0s' {1..64})"
+  local raw_inspection=""
+
+  pressure_test_reset_lifecycle_state
+  pressure_test_prepare_runtime "$directory"
+  pressure_test_pin_runtime "$deadline"
+  pressure_test_prepare_control_directory "$deadline"
+  PRESSURE_LABEL="$label"
+  PRESSURE_SCENARIO_CONTAINER_ID="$container_id"
+  PRESSURE_SCENARIO_CONTAINER_NAME="$PROJECT_NAME-pressure-scenario"
+  PRESSURE_SCENARIO_EXPECTED_CMD_JSON="$(
+    pressure_command_json "$deadline" --scenario pressure
+  )"
+  PRESSURE_SCENARIO_CONTAINER_IDENTITY="$container_id|123|2026-08-19T00:00:00.000000001Z|$EUID:$(id -g)"
+  raw_inspection="$(pressure_test_container_inspection \
+    scenario running "$container_id" "$PRESSURE_SCENARIO_CONTAINER_NAME" \
+    "$PRESSURE_SCENARIO_EXPECTED_CMD_JSON")" || return $?
+  pressure_normalize_scenario_container_inspection \
+    "$raw_inspection" running "$deadline" \
+    PRESSURE_SCENARIO_RUNNING_INSPECTION_JSON || return $?
+  raw_inspection="$(pressure_test_container_inspection \
+    scenario exited "$container_id" "$PRESSURE_SCENARIO_CONTAINER_NAME" \
+    "$PRESSURE_SCENARIO_EXPECTED_CMD_JSON" | jq -c '.exit_code = 0')" || return $?
+  pressure_normalize_scenario_container_inspection \
+    "$raw_inspection" stopped "$deadline" \
+    PRESSURE_SCENARIO_TERMINAL_INSPECTION_JSON || return $?
+  PRESSURE_SCENARIO_WAIT_EXIT_CODE=0
+  PRESSURE_CONTAINER_INSPECTIONS_RUNTIME_STATUS="terminal-captured"
+}
+
+pressure_test_assert_nul_arguments() {
+  local -r observed_file="$1"
+  shift
+  local -a pressure_observed_arguments=()
+  local -a pressure_expected_arguments=("$@")
+  local -i index=0
+
+  mapfile -d '' -t pressure_observed_arguments <"$observed_file" || return 1
+  [[ "${#pressure_observed_arguments[@]}" -eq \
+    "${#pressure_expected_arguments[@]}" ]] || return 1
+  for ((index = 0; index < ${#pressure_expected_arguments[@]}; index++)); do
+    [[ "${pressure_observed_arguments[index]}" == \
+      "${pressure_expected_arguments[index]}" ]] || {
+      printf 'argv mismatch at %d: observed=%q expected=%q\n' \
+        "$index" "${pressure_observed_arguments[index]}" \
+        "${pressure_expected_arguments[index]}" >&2
+      return 1
+    }
+  done
+}
+
+test_pressure_container_inspection_artifact_publication_is_exact() {
+  (
+    local -r directory="$TEST_TMP_DIR/pressure-container-inspections"
+    local -r deadline="$((SECONDS + 90))"
+    local -r reference=map-pressure-pressure-container-inspections.json
+    local expected_payload=""
+    local first_identity=""
+    local first_digest=""
+    local descriptor=""
+    local container_descriptor=""
+    local original_terminal=""
+    local unchanged=unchanged
+
+    pressure_test_prepare_scenario_inspection_state \
+      "$directory" "$deadline" pressure
+    pressure_expected_scenario_container_inspections_json \
+      pressure "$deadline" expected_payload
+    [[ "$expected_payload" == "$(jq -cS . <<<"$expected_payload")" &&
+      "$expected_payload" != *"$RESULT_DIR"* &&
+      "$expected_payload" != *"$RUNTIME_DIR"* &&
+      "$expected_payload" != *"$PRESSURE_CONTROL_LIVE_DIR"* ]]
+    jq -e \
+      --arg session "$PRESSURE_CONTROL_SESSION" \
+      --arg source_leaf ".pressure-control.$PRESSURE_CONTROL_SESSION" '
+        keys == ["running", "scenario_label", "schema", "session",
+          "status", "terminal", "wait_exit_code"] and
+        .schema == "pressure-scenario-container-inspections-v1" and
+        .scenario_label == "pressure" and .session == $session and
+        .status == "passed" and .wait_exit_code == 0 and
+        .running.mount.source_leaf == $source_leaf and
+        .terminal.mount.source_leaf == $source_leaf and
+        (.running | del(.state)) == (.terminal | del(.state)) and
+        .running.state.status == "running" and
+        .terminal.state.status == "exited"
+      ' <<<"$expected_payload" >/dev/null
+
+    publish_pressure_scenario_container_inspections pressure "$deadline"
+    [[ "$PRESSURE_CONTAINER_INSPECTIONS_REFERENCE" == "$reference" &&
+      "$PRESSURE_CONTAINER_INSPECTIONS_RUNTIME_STATUS" == retained &&
+      "$PRESSURE_CONTAINER_INSPECTIONS_SHA256" =~ ^[0-9a-f]{64}$ &&
+      "$PRESSURE_CONTAINER_INSPECTIONS_SIZE_BYTES" == \
+        "$(stat -Lc '%s' -- "$RESULT_DIR/$reference")" &&
+      "$(stat -Lc '%a' -- "$RESULT_DIR/$reference")" == 600 &&
+      "$(<"$RESULT_DIR/$reference")" == "$expected_payload" &&
+      -z "$PRESSURE_CONTAINER_INSPECTIONS_TRANSACTION_ID" ]]
+    first_identity="$(stat -Lc '%d:%i' -- "$RESULT_DIR/$reference")"
+    first_digest="$PRESSURE_CONTAINER_INSPECTIONS_SHA256"
+    pressure_scenario_container_inspections_descriptor \
+      pressure "$deadline" descriptor container_descriptor
+    jq -e \
+      --arg reference "$reference" \
+      --arg sha256 "$PRESSURE_CONTAINER_INSPECTIONS_SHA256" \
+      --argjson size_bytes "$PRESSURE_CONTAINER_INSPECTIONS_SIZE_BYTES" '
+        . == {
+          reference: $reference,
+          sha256: $sha256,
+          size_bytes: $size_bytes
+        }
+      ' <<<"$descriptor" >/dev/null
+    jq -e \
+      --arg id "$PRESSURE_SCENARIO_CONTAINER_ID" \
+      --arg user "$EUID:$(id -g)" '
+        .id == $id and .host_pid == "123" and
+        .started_at == "2026-08-19T00:00:00.000000001Z" and
+        .user == $user
+      ' <<<"$container_descriptor" >/dev/null
+    if pressure_scenario_container_inspections_descriptor \
+      pressure "$deadline" descriptor descriptor >/dev/null 2>&1; then
+      printf 'inspection descriptor accepted aliased outvars\n' >&2
+      return 1
+    fi
+    publish_pressure_scenario_container_inspections pressure "$deadline"
+    [[ "$(stat -Lc '%d:%i' -- "$RESULT_DIR/$reference")" == \
+        "$first_identity" &&
+      "$PRESSURE_CONTAINER_INSPECTIONS_SHA256" == "$first_digest" &&
+      -z "$PRESSURE_CONTAINER_INSPECTIONS_TRANSACTION_ID" ]]
+
+    original_terminal="$PRESSURE_SCENARIO_TERMINAL_INSPECTION_JSON"
+    PRESSURE_SCENARIO_TERMINAL_INSPECTION_JSON="$(jq -cS \
+      '.config.path = "/different"' <<<"$original_terminal")"
+    if pressure_expected_scenario_container_inspections_json \
+      pressure "$deadline" unchanged >/dev/null 2>&1; then
+      printf 'inspection artifact accepted running/terminal identity drift\n' >&2
+      return 1
+    fi
+    [[ "$unchanged" == unchanged ]]
+    PRESSURE_SCENARIO_TERMINAL_INSPECTION_JSON="$original_terminal"
+    pressure_test_teardown_runtime "$deadline"
+  )
+
+  (
+    local -r directory="$TEST_TMP_DIR/pressure-container-inspections-race"
+    local -r deadline="$((SECONDS + 90))"
+    local -r target="$directory/map-pressure-pressure-container-inspections.json"
+
+    pressure_test_prepare_scenario_inspection_state \
+      "$directory" "$deadline" pressure
+    eval "$(declare -f pressure_move_registered_inode_no_clobber | \
+      sed '1s/pressure_move_registered_inode_no_clobber/pressure_test_original_inspection_move_no_clobber/')"
+    pressure_move_registered_inode_no_clobber() {
+      local -r target_anchor="$3"
+      if [[ "${target_anchor##*/}" == "${target##*/}" &&
+        ! -e "$target_anchor" ]]; then
+        printf '{"foreign":true}\n' >"$target_anchor"
+        chmod 0600 -- "$target_anchor"
+      fi
+      pressure_test_original_inspection_move_no_clobber "$@"
+    }
+
+    if publish_pressure_scenario_container_inspections \
+      pressure "$deadline" >/dev/null 2>&1; then
+      printf 'inspection artifact overwrote a concurrent foreign target\n' >&2
+      return 1
+    fi
+    [[ "$(<"$target")" == '{"foreign":true}' &&
+      "$PRESSURE_CONTAINER_INSPECTIONS_RUNTIME_STATUS" == terminal-captured &&
+      -z "$PRESSURE_CONTAINER_INSPECTIONS_REFERENCE" &&
+      -z "$PRESSURE_CONTAINER_INSPECTIONS_SHA256" &&
+      -z "$PRESSURE_CONTAINER_INSPECTIONS_SIZE_BYTES" &&
+      -z "$PRESSURE_CONTAINER_INSPECTIONS_TRANSACTION_ID" &&
+      ! -e "$RESULT_DIR/.pressure-container-inspections-$PRESSURE_CONTROL_SESSION" ]]
+    pressure_transaction_state_is_empty
+    command rm -- "$target"
+    pressure_test_teardown_runtime "$deadline"
+  )
+}
+
+test_pressure_barrier_binds_container_inspection_descriptor() {
+  (
+    local -r directory="$TEST_TMP_DIR/pressure-container-inspection-barrier"
+    local -r deadline="$((SECONDS + 120))"
+    local -r result="$directory/scenario-pressure.json"
+    local -r scenario_status="$directory/scenario-pressure-status.json"
+    local -r barrier="$directory/map-pressure-pressure-barrier-status.json"
+    local descriptor=""
+    local container_descriptor=""
+    local -i admission_maximum=0
+
+    pressure_test_prepare_scenario_inspection_state \
+      "$directory" "$deadline" pressure
+    publish_pressure_scenario_container_inspections pressure "$deadline"
+    pressure_scenario_container_inspections_descriptor \
+      pressure "$deadline" descriptor container_descriptor
+
+    pressure_control_payload "$PRESSURE_CONTROL_READY_FILE" \
+      >"$RESULT_DIR/map-pressure-pressure-barrier-ready.txt"
+    pressure_control_payload "$PRESSURE_CONTROL_RELEASE_FILE" \
+      >"$RESULT_DIR/map-pressure-pressure-barrier-release.txt"
+    chmod 0600 -- \
+      "$RESULT_DIR/map-pressure-pressure-barrier-ready.txt" \
+      "$RESULT_DIR/map-pressure-pressure-barrier-release.txt"
+    pressure_fill_result 700 >"$RESULT_DIR/map-pressure-pressure-fill.json"
+    pressure_verify_result 700 >"$RESULT_DIR/map-pressure-pressure-verify.json"
+    chmod 0644 -- \
+      "$RESULT_DIR/map-pressure-pressure-fill.json" \
+      "$RESULT_DIR/map-pressure-pressure-verify.json"
+    printf '{"request_count":2}\n' >"$result"
+    admission_maximum="$(pressure_admission_max_events 2)"
+    jq -cS -n \
+      --argjson inspections "$descriptor" \
+      --argjson admission_maximum "$admission_maximum" '
+        {
+          pressure_correlation: {
+            barrier_reference: "map-pressure-pressure-barrier-status.json",
+            bridge: {
+              handoff_admission_outcome_counts: {
+                ambiguous: 0,
+                maximum: $admission_maximum,
+                overload: 1
+              }
+            },
+            container_inspections: $inspections,
+            trace: {
+              exact_hit_count: 1,
+              explicit_root_count: 1,
+              unresolved_count: 0,
+              wrong_parent_count: 0
+            }
+          },
+          result: "scenario-pressure.json",
+          scenario: "pressure",
+          status: "passed"
+        }
+      ' >"$scenario_status"
+    chmod 0644 -- "$result" "$scenario_status"
+
+    PRESSURE_MAP_ID=41
+    PRESSURE_MAP_MAX_ENTRIES="$PRESSURE_EXPECTED_MAP_CAPACITY"
+    PRESSURE_MAP_BASELINE_ENTRIES=0
+    PRESSURE_CAPACITY_REJECTED_ENTRIES=1
+    PRESSURE_VERIFIED_PRESENT_ENTRIES="$PRESSURE_EXPECTED_MAP_CAPACITY"
+    PRESSURE_VERIFIED_ABSENT_ENTRIES=1
+    PRESSURE_CONTENT_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    PRESSURE_TOUCHED_ENTRIES="$PRESSURE_EXPECTED_MAP_CAPACITY"
+    PRESSURE_PROCESS_MAP_ID=42
+    PRESSURE_PROCESS_PID=101
+    PRESSURE_PROCESS_NAMESPACE=202
+    PRESSURE_TOKEN_BASE=700
+    PRESSURE_VERIFY_STATUS=passed
+    PRESSURE_BARRIER_RUNTIME_STATUS=retained
+
+    finalize_pressure_barrier_status pressure "$result" "$scenario_status"
+    [[ "$PRESSURE_BARRIER_RUNTIME_STATUS" == finalized &&
+      -z "$PRESSURE_BARRIER_STATUS_TRANSACTION_ID" &&
+      "$(stat -Lc '%a' -- "$barrier")" == 644 ]]
+    jq -e \
+      --argjson descriptor "$descriptor" \
+      --argjson container "$container_descriptor" '
+        .schema == "pressure-traffic-barrier-v1" and
+        .status == "passed" and
+        .container_inspections == $descriptor and
+        .container == $container and
+        .container_inspections.reference ==
+          "map-pressure-pressure-container-inspections.json" and
+        (.container_inspections.sha256 | test("^[0-9a-f]{64}$")) and
+        .container_inspections.size_bytes >= 1
+      ' "$barrier" >/dev/null
+    pressure_transaction_state_is_empty
+    pressure_test_teardown_runtime "$deadline"
+  )
+}
+
+test_pressure_container_identity_states_are_exact() {
+  (
+    local -r scenario_id="$(printf 'a%.0s' {1..64})"
+    local -r helper_id="$(printf 'b%.0s' {1..64})"
+    local scenario_state=running
+    local helper_state=running
+    local inspection_filter='.'
+    local scenario_identity=""
+    local scenario_snapshot=""
+    local helper_identity=""
+    local deadline=0
+    local mutation=""
+    local inspection=""
+    local -a scenario_mutations=(
+      '.id = "bad"'
+      '.name = "/wrong"'
+      '.user = "999999:999999"'
+      '.project_label = "wrong"'
+      '.service_label = "map-pressure"'
+      '.oneoff_label = "False"'
+      '.owner_label = "wrong"'
+      '.image_reference = "wrong"'
+      '.image_id = "sha256:bad"'
+      '.entrypoint = ["/wrong"]'
+      '.path = "/wrong"'
+      '.cmd += ["extra"]'
+      '.network_mode = "none"'
+      '.pid_mode = "host"'
+      '.privileged = true'
+      '.attach_stdin = true'
+      '.open_stdin = true'
+      '.stdin_once = true'
+      '.tty = true'
+      '.restart_count = 1'
+      '.restart_policy = "always"'
+      '.error = "unexpected"'
+      '.oom_killed = true'
+      '.dead = true'
+      '.mounts = []'
+      '.mounts[0].Type = "volume"'
+      '.mounts[0].Source = "/wrong"'
+      '.mounts[0].Destination = "/wrong"'
+      '.mounts[0].RW = false'
+      '.running = false'
+      '.state_status = "created"'
+      '.finished_at = "2026-08-19T00:01:00Z"'
+      '.host_pid = 0'
+      '.started_at = "0001-01-01T00:00:00Z"'
+      '.exit_code = 256'
+    )
+    local -a helper_mutations=(
+      '.id = "bad"'
+      '.name = "/wrong"'
+      '.user = "999999:999999"'
+      '.project_label = "wrong"'
+      '.service_label = "scenario"'
+      '.oneoff_label = "False"'
+      '.owner_label = "wrong"'
+      '.image_reference = "wrong"'
+      '.image_id = "sha256:bad"'
+      '.entrypoint = ["/wrong"]'
+      '.path = "/wrong"'
+      '.cmd += ["extra"]'
+      '.network_mode = "host"'
+      '.pid_mode = "host"'
+      '.privileged = false'
+      '.attach_stdin = true'
+      '.open_stdin = true'
+      '.stdin_once = true'
+      '.tty = true'
+      '.restart_count = 1'
+      '.restart_policy = "always"'
+      '.error = "unexpected"'
+      '.oom_killed = true'
+      '.dead = true'
+      '.mounts = [{"Type":"bind","Source":"/tmp/x","Destination":"/tmp/y","RW":true}]'
+      '.running = false'
+      '.state_status = "created"'
+      '.finished_at = "2026-08-19T00:01:00Z"'
+      '.host_pid = 0'
+      '.started_at = "0001-01-01T00:00:00Z"'
+      '.exit_code = 256'
+    )
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$TEST_TMP_DIR/pressure-identity-states"
+    deadline="$((SECONDS + 30))"
+    pressure_test_pin_runtime "$deadline"
+    pressure_test_prepare_control_directory "$deadline"
+    PRESSURE_SCENARIO_CONTAINER_NAME="$PROJECT_NAME-pressure-scenario"
+    PRESSURE_SCENARIO_EXPECTED_CMD_JSON="$(
+      pressure_command_json "$deadline" --scenario pressure
+    )"
+    PRESSURE_HELPER_CONTAINER_NAME="$PROJECT_NAME-pressure-helper"
+    PRESSURE_HELPER_EXPECTED_CMD_JSON="$(
+      pressure_command_json "$deadline" --mode prepare
+    )"
+    pressure_container_inspection_json() {
+      local -r reference="$1"
+      local -r output_variable="$3"
+      local normalized=""
+      if [[ "$reference" == "$scenario_id" ]]; then
+        inspection="$(pressure_test_container_inspection \
+          scenario "$scenario_state" "$scenario_id" \
+          "$PRESSURE_SCENARIO_CONTAINER_NAME" \
+          "$PRESSURE_SCENARIO_EXPECTED_CMD_JSON")" || return $?
+      elif [[ "$reference" == "$helper_id" ]]; then
+        inspection="$(pressure_test_container_inspection \
+          helper "$helper_state" "$helper_id" \
+          "$PRESSURE_HELPER_CONTAINER_NAME" \
+          "$PRESSURE_HELPER_EXPECTED_CMD_JSON")" || return $?
+      else
+        return 1
+      fi
+      normalized="$(jq -c "$inspection_filter" <<<"$inspection")" || return $?
+      printf -v "$output_variable" '%s' "$normalized"
+    }
+
+    pressure_scenario_container_identity \
+      "$scenario_id" running "$deadline" scenario_identity scenario_snapshot
+    pressure_helper_container_identity \
+      "$helper_id" running "$deadline" helper_identity
+    [[ "$scenario_identity" == \
+      "$scenario_id|123|2026-08-19T00:00:00.000000001Z|$EUID:$(id -g)" ]]
+    [[ "$helper_identity" == \
+      "$helper_id|123|2026-08-19T00:00:00.000000001Z|0:0" ]]
+    jq -e \
+      --arg id "$scenario_id" \
+      --arg source_leaf ".pressure-control.$PRESSURE_CONTROL_SESSION" '
+        .identity.id == $id and
+        .mount == {
+          destination: "/run/obi-demo/pressure-control",
+          rw: true,
+          source_leaf: $source_leaf,
+          type: "bind"
+        } and
+        .state.running == true and .state.status == "running" and
+        .state.exit_code == 0 and
+        .state.finished_at == "0001-01-01T00:00:00Z"
+      ' <<<"$scenario_snapshot" >/dev/null
+    [[ "$scenario_snapshot" == "$(jq -cS . <<<"$scenario_snapshot")" &&
+      "$scenario_snapshot" != *"$PRESSURE_CONTROL_LIVE_DIR"* ]]
+    if pressure_scenario_container_identity \
+      "$scenario_id" any "$deadline" scenario_identity scenario_snapshot \
+      >/dev/null 2>&1; then
+      printf 'scenario identity exported an ambiguous-state snapshot\n' >&2
+      return 1
+    fi
+
+    for mutation in "${scenario_mutations[@]}"; do
+      inspection_filter="$mutation"
+      if pressure_scenario_container_identity \
+        "$scenario_id" running "$deadline" scenario_identity >/dev/null 2>&1; then
+        printf 'scenario identity accepted mutation: %s\n' "$mutation" >&2
+        return 1
+      fi
+    done
+    inspection_filter='.'
+    for mutation in "${helper_mutations[@]}"; do
+      inspection_filter="$mutation"
+      if pressure_helper_container_identity \
+        "$helper_id" running "$deadline" helper_identity >/dev/null 2>&1; then
+        printf 'helper identity accepted mutation: %s\n' "$mutation" >&2
+        return 1
+      fi
+    done
+    inspection_filter='.'
+
+    scenario_state=exited
+    helper_state=exited
+    pressure_scenario_container_identity \
+      "$scenario_id" stopped "$deadline" scenario_identity scenario_snapshot
+    pressure_scenario_container_identity \
+      "$scenario_id" any "$deadline" scenario_identity
+    pressure_helper_container_identity \
+      "$helper_id" stopped "$deadline" helper_identity
+    pressure_helper_container_identity \
+      "$helper_id" any "$deadline" helper_identity
+    jq -e '
+      .state.running == false and .state.status == "exited" and
+      .state.host_pid == 0 and .state.exit_code == 23
+    ' <<<"$scenario_snapshot" >/dev/null
+
+    for mutation in \
+      '.running = true' \
+      '.state_status = "running"' \
+      '.host_pid = 1' \
+      '.finished_at = "0001-01-01T00:00:00Z"' \
+      '.started_at = "0001-01-01T00:00:00Z"' \
+      '.error = "unexpected"'; do
+      inspection_filter="$mutation"
+      if pressure_scenario_container_identity \
+          "$scenario_id" stopped "$deadline" scenario_identity >/dev/null 2>&1 ||
+        pressure_helper_container_identity \
+          "$helper_id" stopped "$deadline" helper_identity >/dev/null 2>&1; then
+        printf 'stopped identity accepted mutation: %s\n' "$mutation" >&2
+        return 1
+      fi
+    done
+    inspection_filter='.'
+
+    scenario_state=created
+    helper_state=created
+    if pressure_scenario_container_identity \
+      "$scenario_id" any "$deadline" scenario_identity >/dev/null 2>&1; then
+      printf 'scenario identity accepted created state outside cleanup\n' >&2
+      return 1
+    fi
+    if pressure_helper_container_identity \
+      "$helper_id" any "$deadline" helper_identity >/dev/null 2>&1; then
+      printf 'helper identity accepted created state outside cleanup\n' >&2
+      return 1
+    fi
+    pressure_scenario_container_identity \
+      "$scenario_id" cleanup "$deadline" scenario_identity
+    [[ "$scenario_identity" == \
+      "$scenario_id|0|0001-01-01T00:00:00Z|$EUID:$(id -g)" ]]
+    pressure_helper_container_identity \
+      "$helper_id" cleanup "$deadline" helper_identity
+    [[ "$helper_identity" == \
+      "$helper_id|0|0001-01-01T00:00:00Z|0:0" ]]
+    for mutation in \
+      '.running = true' \
+      '.state_status = "exited"' \
+      '.host_pid = 1' \
+      '.exit_code = 1' \
+      '.started_at = "2026-08-19T00:00:00Z"' \
+      '.finished_at = "2026-08-19T00:01:00Z"'; do
+      inspection_filter="$mutation"
+      if pressure_scenario_container_identity \
+          "$scenario_id" cleanup "$deadline" scenario_identity >/dev/null 2>&1 ||
+        pressure_helper_container_identity \
+          "$helper_id" cleanup "$deadline" helper_identity >/dev/null 2>&1; then
+        printf 'created cleanup identity accepted mutation: %s\n' \
+          "$mutation" >&2
+        return 1
+      fi
+    done
+  )
+}
+
+test_pressure_detached_launch_argv_is_exact() {
+  (
+    local -r container_id="$(printf '4%.0s' {1..64})"
+    local -r captured="$TEST_TMP_DIR/pressure-scenario-launch.argv"
+    local -r session=00112233445566778899aabbccddeeff
+    local runner_gid=""
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$TEST_TMP_DIR/pressure-scenario-argv"
+    COMPOSE=(fake-compose --project-name pressure-test)
+    runner_gid="$(id -g)"
+    prepare_pressure_control_runtime() {
+      PRESSURE_CONTROL_DEADLINE="$1"
+      pressure_test_pin_runtime "$1" || return $?
+      pressure_test_prepare_control_directory "$1" || return $?
+      PRESSURE_SCENARIO_CONTAINER_NAME="$PROJECT_NAME-pressure-scenario-${session:0:12}"
+      PRESSURE_SCENARIO_REMOVAL_STATUS="name-reserved"
+      PRESSURE_TRACECHECK_IMAGE_ID="sha256:$(printf '9%.0s' {1..64})"
+      PRESSURE_BARRIER_RUNTIME_STATUS=prepared
+    }
+    run_pressure_bounded() {
+      local -r deadline="$1"
+      local -r maximum="$2"
+      shift 2
+
+      [[ "$deadline" -gt "$SECONDS" && "$maximum" -gt 0 ]] || return 124
+      command "$@"
+    }
+    run_pressure_bounded_captured() {
+      local -r deadline="$1"
+      local -r maximum="$2"
+      local -r stdout_path="$3"
+      local -r stdout_cap="$4"
+      local -r stderr_path="$5"
+      local -r stderr_cap="$6"
+      shift 6
+
+      [[ "$deadline" -gt "$SECONDS" && "$maximum" -gt 0 &&
+        "$stdout_cap" -gt 0 && "$stderr_cap" -gt 0 &&
+        "$1" == fake-compose ]] || return 124
+      printf '%s\0' "$@" >"$captured"
+      printf '%s\n' "$container_id" >"$stdout_path"
+      : >"$stderr_path"
+    }
+    pressure_scenario_container_identity() {
+      printf -v "$4" '%s|123|2026-08-19T00:00:00.000000000Z|%s:%s' \
+        "$container_id" "$EUID" "$runner_gid"
+    }
+    wait_for_pressure_scenario_ready() {
+      PRESSURE_BARRIER_RUNTIME_STATUS=ready
+    }
+
+    start_pressure_scenario_barrier \
+      "$RESULT_DIR/scenario-pressure.json" \
+      "$RESULT_DIR/scenario-pressure.stderr.log" \
+      --scenario pressure --requests 128
+    pressure_test_assert_nul_arguments "$captured" \
+      fake-compose --project-name pressure-test run \
+      --detach --no-deps --no-TTY --interactive=false \
+      --name "$PROJECT_NAME-pressure-scenario-${session:0:12}" \
+      --user "$EUID:$runner_gid" \
+      --volume "$RUNTIME_DIR/.pressure-control.$session:$PRESSURE_CONTROL_CONTAINER_DIR:rw" \
+      scenario --scenario pressure --requests 128 \
+      --pressure-control-dir "$PRESSURE_CONTROL_CONTAINER_DIR" \
+      --pressure-control-session "$session" \
+      --pressure-control-timeout "${PRESSURE_CONTROL_RELEASE_TIMEOUT_SECONDS}s"
+    jq -e --arg session "$session" \
+      --arg timeout "${PRESSURE_CONTROL_RELEASE_TIMEOUT_SECONDS}s" '
+        . == [
+          "--scenario", "pressure", "--requests", "128",
+          "--pressure-control-dir", "/run/obi-demo/pressure-control",
+          "--pressure-control-session", $session,
+          "--pressure-control-timeout", $timeout
+        ]
+      ' <<<"$PRESSURE_SCENARIO_EXPECTED_CMD_JSON" >/dev/null
+  )
+
+  (
+    local -r container_id="$(printf '5%.0s' {1..64})"
+    local -r captured="$TEST_TMP_DIR/pressure-helper-launch.argv"
+    local -r expected_cmd_capture="$TEST_TMP_DIR/pressure-helper-command.json"
+    local -r PRESSURE_HELPER_OUTER_DEADLINE="$((SECONDS + 60))"
+    local -r PRESSURE_HELPER_OPERATION_DEADLINE="$((SECONDS + 30))"
+    local command_hash=""
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$TEST_TMP_DIR/pressure-helper-argv"
+    pressure_test_pin_runtime "$((SECONDS + 30))"
+    COMPOSE=(fake-compose --project-name pressure-test)
+    run_pressure_bounded() {
+      local -r deadline="$1"
+      local -r maximum="$2"
+      shift 2
+
+      [[ "$deadline" -gt "$SECONDS" && "$maximum" -gt 0 ]] || return 124
+      command "$@"
+    }
+    run_pressure_bounded_captured() {
+      local -r deadline="$1"
+      local -r maximum="$2"
+      local -r stdout_path="$3"
+      local -r stdout_cap="$4"
+      local -r stderr_path="$5"
+      local -r stderr_cap="$6"
+      shift 6
+
+      [[ "$deadline" -gt "$SECONDS" && "$maximum" -gt 0 &&
+        "$stdout_cap" -gt 0 && "$stderr_cap" -gt 0 &&
+        "$1" == fake-compose ]] || return 124
+      printf '%s\0' "$@" >"$captured"
+      printf '%s\n' "$container_id" >"$stdout_path"
+      : >"$stderr_path"
+    }
+    pressure_helper_container_identity() {
+      printf '%s\n' "$PRESSURE_HELPER_EXPECTED_CMD_JSON" \
+        >"$expected_cmd_capture"
+      printf -v "$4" '%s|123|2026-08-19T00:00:00.000000000Z|0:0' \
+        "$container_id"
+    }
+    wait_for_pressure_helper_terminal() {
+      printf '0\n'
+    }
+    capture_pressure_helper_logs() {
+      pressure_prepare_result 700 >"$PRESSURE_HELPER_OUTPUT"
+      : >"$PRESSURE_HELPER_STDERR"
+      chmod 0644 -- "$PRESSURE_HELPER_OUTPUT" "$PRESSURE_HELPER_STDERR"
+      PRESSURE_HELPER_LOGS_CAPTURED=true
+    }
+    remove_pressure_helper_container() {
+      PRESSURE_HELPER_REMOVAL_STATUS=absence-proved
+    }
+
+    run_map_pressure_helper_detached \
+      "$RESULT_DIR/helper.json" "$RESULT_DIR/helper.stderr.log" \
+      30 --token-base 700 --mode prepare >/dev/null
+    command_hash="$(printf '%s\n' helper.json | sha256sum)" || return $?
+    command_hash="${command_hash%% *}"
+    [[ "$command_hash" =~ ^[0-9a-f]{64}$ ]] || return 1
+    pressure_test_assert_nul_arguments "$captured" \
+      fake-compose --project-name pressure-test run \
+      --detach --no-deps --no-TTY --interactive=false \
+      --name "$PROJECT_NAME-pressure-helper-${command_hash:0:12}" \
+      --user 0:0 map-pressure --token-base 700 --mode prepare
+    jq -e '
+      . == ["--token-base", "700", "--mode", "prepare"]
+    ' "$expected_cmd_capture" >/dev/null
+  )
+}
+
+test_pressure_detached_launch_failures_are_cleanup_owned() {
+  (
+    local -r container_id="$(printf 'c%.0s' {1..64})"
+    local -r image_id="sha256:$(printf '9%.0s' {1..64})"
+    local -r present="$TEST_TMP_DIR/pressure-malformed-scenario.present"
+    local -r removed="$TEST_TMP_DIR/pressure-malformed-scenario.removed"
+    local start_status=0
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$TEST_TMP_DIR/pressure-malformed-scenario"
+    PRESSURE_TRACECHECK_IMAGE_ID=""
+    COMPOSE=(fake-compose)
+    run_pressure_bounded() {
+      shift 2
+      case "$1" in
+        bash|stat|chmod|jq|id|sync|rmdir) command "$@"; return ;;
+      esac
+      case " $* " in
+        *' openssl rand -hex 16 '*)
+          printf '00112233445566778899aabbccddeeff\n'
+          ;;
+        *' mkdir -m 0700 -- '*)
+          command "$@"
+          ;;
+        *' docker image inspect '*)
+          printf '%s\n' "$image_id"
+          ;;
+        *' mktemp '*|*' stat -Lc '*|*' chmod 0600 '*)
+          command "$@"
+          ;;
+        *' fake-compose run '*)
+          : >"$present"
+          printf '%s\nextra\n' "$container_id"
+          ;;
+        *' docker container rm '*)
+          rm -f -- "$present"
+          : >"$removed"
+          ;;
+        *' docker container inspect '*)
+          if [[ -e "$present" ]]; then
+            printf '%s\n' "$container_id"
+          else
+            printf 'Error: No such container: %s\n' "$container_id" >&2
+            return 1
+          fi
+          ;;
+        *' docker container ls '*)
+          if [[ "$PRESSURE_BARRIER_RUNTIME_STATUS" == prepared &&
+            ! -e "$removed" ]]; then
+            printf '%s\n' "$container_id"
+          fi
+          ;;
+        *) return 64 ;;
+      esac
+    }
+    pressure_container_inspection_json() {
+      local -r output_variable="$3"
+      local inspection_json=""
+      [[ -e "$present" ]] || return 1
+      inspection_json="$(pressure_test_container_inspection \
+        scenario created "$container_id" \
+        "$PRESSURE_SCENARIO_CONTAINER_NAME" \
+        "$PRESSURE_SCENARIO_EXPECTED_CMD_JSON")" || return $?
+      printf -v "$output_variable" '%s' "$inspection_json"
+    }
+
+    if start_pressure_scenario_barrier \
+      "$RESULT_DIR/scenario-pressure.json" \
+      "$RESULT_DIR/scenario-pressure.stderr.log" \
+      --scenario pressure >/dev/null 2>&1; then
+      printf 'scenario launch accepted ID plus trailing output\n' >&2
+      return 1
+    else
+      start_status=$?
+    fi
+    ((start_status != 0))
+    [[ -z "$PRESSURE_SCENARIO_CONTAINER_ID" &&
+      -n "$PRESSURE_SCENARIO_CONTAINER_NAME" && -e "$present" ]]
+    cleanup_pressure_scenario_runtime
+    [[ ! -e "$present" &&
+      -z "$PRESSURE_SCENARIO_CONTAINER_ID" &&
+      -z "$PRESSURE_SCENARIO_CONTAINER_NAME" &&
+      "$PRESSURE_BARRIER_RUNTIME_STATUS" == not-run ]]
+  )
+
+  (
+    local -r container_id="$(printf 'd%.0s' {1..64})"
+    local -r present="$TEST_TMP_DIR/pressure-transient-helper.present"
+    local -r inspection_count="$TEST_TMP_DIR/pressure-transient-helper.inspect"
+    local helper_status=0
+    local count=0
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$TEST_TMP_DIR/pressure-transient-helper"
+    pressure_test_pin_runtime "$((SECONDS + 60))"
+    COMPOSE=(fake-compose)
+    printf '0\n' >"$inspection_count"
+    run_pressure_bounded() {
+      shift 2
+      case "$1" in
+        bash|stat|chmod|jq|id|sync|sha256sum|sed|env) command "$@"; return ;;
+      esac
+      case " $* " in
+        *' mktemp '*|*' stat -Lc '*|*' chmod 0600 '*)
+          command "$@"
+          ;;
+        *' fake-compose run '*)
+          : >"$present"
+          printf '%s\n' "$container_id"
+          ;;
+        *' docker container rm '*)
+          rm -f -- "$present"
+          ;;
+        *' docker container inspect '*)
+          if [[ -e "$present" ]]; then
+            printf '%s\n' "$container_id"
+          else
+            printf 'Error response from daemon: No such container: %s\n' \
+              "$container_id" >&2
+            return 1
+          fi
+          ;;
+        *' docker container ls '*)
+          [[ -e "$present" ]] && printf '%s\n' "$container_id"
+          return 0
+          ;;
+        *) return 64 ;;
+      esac
+    }
+    pressure_container_inspection_json() {
+      local -r output_variable="$3"
+      local inspection_json=""
+      count="$(<"$inspection_count")"
+      ((count += 1))
+      printf '%d\n' "$count" >"$inspection_count"
+      if ((count == 1)); then
+        return 73
+      fi
+      [[ -e "$present" ]] || return 1
+      inspection_json="$(pressure_test_container_inspection \
+        helper created "$container_id" \
+        "$PRESSURE_HELPER_CONTAINER_NAME" \
+        "$PRESSURE_HELPER_EXPECTED_CMD_JSON")" || return $?
+      printf -v "$output_variable" '%s' "$inspection_json"
+    }
+
+    if run_map_pressure_helper \
+      "$RESULT_DIR/helper.json" "$RESULT_DIR/helper.stderr.log" \
+      30 --mode prepare >/dev/null 2>&1; then
+      printf 'helper ignored its first inspection failure\n' >&2
+      return 1
+    else
+      helper_status=$?
+    fi
+    [[ "$helper_status" -eq 73 && ! -e "$present" &&
+      "$(<"$inspection_count")" -ge 2 &&
+      -z "$PRESSURE_HELPER_CONTAINER_ID" &&
+      -z "$PRESSURE_HELPER_CONTAINER_NAME" ]]
+  )
+
+  (
+    local -r container_id="$(printf '6%.0s' {1..64})"
+    local -r present="$TEST_TMP_DIR/pressure-launch-overflow.present"
+    local -r removed="$TEST_TMP_DIR/pressure-launch-overflow.removed"
+    local helper_status=0
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$TEST_TMP_DIR/pressure-launch-overflow"
+    pressure_test_pin_runtime "$((SECONDS + 60))"
+    COMPOSE=(fake-compose)
+    run_pressure_bounded() {
+      shift 2
+      case "$1" in
+        bash|stat|chmod|jq|id|sync|sha256sum|sed|env) command "$@"; return ;;
+      esac
+      case " $* " in
+        *' mktemp '*|*' stat -Lc '*|*' chmod 0600 '*)
+          command "$@"
+          ;;
+        *' fake-compose run '*)
+          : >"$present"
+          printf '%s\n' "$container_id"
+          awk -v maximum="$((PRESSURE_HELPER_STDERR_MAX_BYTES + 32))" \
+            'BEGIN { for (i = 0; i < maximum; i++) printf "e" }' >&2
+          ;;
+        *' docker container rm '*)
+          rm -f -- "$present"
+          : >"$removed"
+          ;;
+        *' docker container inspect '*)
+          if [[ -e "$present" ]]; then
+            printf '%s\n' "$container_id"
+          else
+            printf 'Error: No such container: %s\n' "$container_id" >&2
+            return 1
+          fi
+          ;;
+        *' docker container ls '*)
+          [[ ! -e "$removed" ]] && printf '%s\n' "$container_id"
+          return 0
+          ;;
+        *) return 64 ;;
+      esac
+    }
+    pressure_container_inspection_json() {
+      local -r output_variable="$3"
+      local inspection_json=""
+      [[ -e "$present" ]] || return 1
+      inspection_json="$(pressure_test_container_inspection \
+        helper created "$container_id" \
+        "$PRESSURE_HELPER_CONTAINER_NAME" \
+        "$PRESSURE_HELPER_EXPECTED_CMD_JSON")" || return $?
+      printf -v "$output_variable" '%s' "$inspection_json"
+    }
+
+    if run_map_pressure_helper \
+      "$RESULT_DIR/helper.json" "$RESULT_DIR/helper.stderr.log" \
+      30 --mode prepare >/dev/null 2>&1; then
+      printf 'helper accepted over-limit detached-launch stderr\n' >&2
+      return 1
+    else
+      helper_status=$?
+    fi
+    [[ "$helper_status" -eq 153 && ! -e "$present" &&
+      -z "$PRESSURE_HELPER_CONTAINER_ID" &&
+      -z "$PRESSURE_HELPER_CONTAINER_NAME" &&
+      -z "$PRESSURE_HELPER_LAUNCH_STDERR" ]]
+    [[ -z "$(find "$RUNTIME_DIR" -maxdepth 1 \
+      -name '.pressure-helper-launch-*' -print -quit)" ]]
+  )
+}
+
+test_pressure_container_absence_is_strict() {
+  (
+    local -r container_id="$(printf 'e%.0s' {1..64})"
+    local -r container_name="$PROJECT_NAME-pressure-helper"
+    local response_mode=missing
+    local deadline=0
+
+    run_pressure_bounded() {
+      shift 2
+      if [[ "$1" == sleep ]]; then
+        SECONDS="$((SECONDS + 1))"
+        return 0
+      fi
+      case " $* " in
+        *' docker container inspect '*)
+          case "$response_mode" in
+            missing|inventory)
+              printf 'Error: No such container: %s\n' "$container_id" >&2
+              return 1
+              ;;
+            api-error)
+              printf 'Error response from daemon: permission denied\n' >&2
+              return 125
+              ;;
+            present)
+              printf '%s\n' "$container_id"
+              ;;
+          esac
+          ;;
+        *' docker container ls '*)
+          if [[ "$response_mode" == inventory &&
+            " $* " == *" name=^/$container_name$ "* ]]; then
+            printf '%s|%s|%s|map-pressure|%s\n' \
+              "$container_id" "$container_name" \
+              "$PROJECT_NAME" "$PROJECT_SENTINEL_VALUE"
+          fi
+          ;;
+        *) return 64 ;;
+      esac
+    }
+
+    pressure_container_is_absent \
+      "$container_id" "$container_name" "$((SECONDS + 2))"
+    response_mode=api-error
+    if pressure_container_is_absent \
+      "$container_id" "$container_name" "$((SECONDS + 2))" \
+      >/dev/null 2>&1; then
+      printf 'container absence accepted a Docker API error\n' >&2
+      return 1
+    fi
+    response_mode=inventory
+    deadline="$((SECONDS + 1))"
+    if pressure_container_is_absent \
+      "$container_id" "$container_name" "$deadline" >/dev/null 2>&1; then
+      printf 'container absence ignored a matching name inventory\n' >&2
+      return 1
+    fi
+    response_mode=present
+    deadline="$((SECONDS + 1))"
+    if pressure_container_is_absent \
+      "$container_id" "$container_name" "$deadline" >/dev/null 2>&1; then
+      printf 'container absence ignored a successful inspection\n' >&2
+      return 1
+    fi
+  )
+}
+
+test_pressure_running_cleanup_waits_for_stopped_proof() {
+  (
+    local -r container_id="$(printf 'f%.0s' {1..64})"
+    local -r terminal="$TEST_TMP_DIR/pressure-removal-terminal"
+    local -r events="$TEST_TMP_DIR/pressure-removal-events"
+    local -r started_at=2026-08-19T00:00:00.000000000Z
+    local deadline=0
+
+    pressure_test_reset_lifecycle_state
+    deadline="$((SECONDS + 30))"
+    PRESSURE_HELPER_CONTAINER_ID="$container_id"
+    PRESSURE_HELPER_CONTAINER_NAME="$PROJECT_NAME-pressure-helper"
+    PRESSURE_HELPER_CONTAINER_IDENTITY="$container_id|123|$started_at|0:0"
+    PRESSURE_HELPER_EXPECTED_CMD_JSON="$(
+      pressure_command_json "$deadline" --mode fill
+    )"
+    PRESSURE_HELPER_OUTPUT="$TEST_TMP_DIR/pressure-removal.stdout"
+    PRESSURE_HELPER_STDERR="$TEST_TMP_DIR/pressure-removal.stderr"
+    pressure_helper_cleanup_identity_matches() {
+      printf 'identity-cleanup\n' >>"$events"
+    }
+    pressure_container_inspection_json() {
+      local -r output_variable="$3"
+      local inspection_json=""
+      if [[ -e "$terminal" ]]; then
+        printf 'inspect-exited\n' >>"$events"
+        inspection_json='{"running":false,"state_status":"exited","exit_code":137}'
+      else
+        printf 'inspect-running\n' >>"$events"
+        inspection_json='{"running":true,"state_status":"running","exit_code":0}'
+      fi
+      printf -v "$output_variable" '%s' "$inspection_json"
+    }
+    pressure_helper_container_identity() {
+      printf 'identity-%s\n' "$2" >>"$events"
+      printf -v "$4" '%s|0|%s|0:0' \
+        "$container_id" 2026-08-19T00:01:00.000000000Z
+    }
+    capture_pressure_helper_logs() {
+      printf 'capture-logs\n' >>"$events"
+      PRESSURE_HELPER_LOGS_CAPTURED=true
+    }
+    pressure_container_is_absent() {
+      printf 'absence\n' >>"$events"
+    }
+    run_pressure_bounded() {
+      local -r maximum_wait="$2"
+      shift 2
+      case " $* " in
+        *' docker container kill '*)
+          printf 'kill\n' >>"$events"
+          ;;
+        *' docker container wait '*)
+          printf 'wait:%s\n' "$maximum_wait" >>"$events"
+          : >"$terminal"
+          printf '137\n'
+          ;;
+        *' docker container rm '*)
+          printf 'remove\n' >>"$events"
+          ;;
+        *) return 64 ;;
+      esac
+    }
+
+    remove_pressure_helper_container "$deadline"
+    [[ "$(<"$events")" == $'identity-cleanup\ninspect-running\nkill\nwait:10\ninspect-exited\nidentity-stopped\nidentity-cleanup\ncapture-logs\nremove\nabsence' ]] || {
+      printf 'running helper cleanup did not prove stopped state before logs/removal:\n' >&2
+      sed -n 'p' "$events" >&2
+      return 1
+    }
+  )
+}
+
+test_pressure_log_overflow_still_removes_helper() {
+  (
+    local -r container_id="$(printf '1%.0s' {1..64})"
+    local -r removed="$TEST_TMP_DIR/pressure-overflow.removed"
+    local helper_status=0
+    local stdout_size=""
+    local stderr_size=""
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$TEST_TMP_DIR/pressure-overflow"
+    pressure_test_pin_runtime "$((SECONDS + 60))"
+    COMPOSE=(fake-compose)
+    run_pressure_bounded() {
+      shift 2
+      case "$1" in
+        bash|stat|chmod|jq|id|sync|sha256sum|sed|head|cat|env) command "$@"; return ;;
+      esac
+      case " $* " in
+        *' mktemp '*|*' stat -Lc '*|*' chmod 0600 '*)
+          command "$@"
+          ;;
+        *' fake-compose run '*)
+          printf '%s\n' "$container_id"
+          ;;
+        *' docker logs '*)
+          awk -v maximum="$((PRESSURE_RESULT_MAX_BYTES + 32))" \
+            'BEGIN { for (i = 0; i < maximum; i++) printf "o" }'
+          awk -v maximum="$((PRESSURE_HELPER_STDERR_MAX_BYTES + 32))" \
+            'BEGIN { for (i = 0; i < maximum; i++) printf "e" }' >&2
+          ;;
+        *' docker container rm '*)
+          : >"$removed"
+          ;;
+        *) return 64 ;;
+      esac
+    }
+    pressure_helper_container_identity() {
+      printf -v "$4" '%s|123|2026-08-19T00:00:00.000000000Z|0:0' \
+        "$container_id"
+    }
+    pressure_helper_cleanup_identity_matches() {
+      return 0
+    }
+    pressure_container_inspection_json() {
+      printf -v "$3" '%s' \
+        '{"running":false,"state_status":"exited","exit_code":0}'
+    }
+    pressure_container_is_absent() {
+      [[ -e "$removed" ]]
+    }
+    wait_for_pressure_helper_terminal() {
+      printf '0\n'
+    }
+
+    if run_map_pressure_helper \
+      "$RESULT_DIR/helper.json" "$RESULT_DIR/helper.stderr.log" \
+      30 --mode fill >/dev/null 2>&1; then
+      printf 'helper accepted over-limit captured logs\n' >&2
+      return 1
+    else
+      helper_status=$?
+    fi
+    [[ "$helper_status" -eq 153 && -e "$removed" ]]
+    stdout_size="$(stat -c '%s' -- "$RESULT_DIR/helper.json")"
+    stderr_size="$(stat -c '%s' -- "$RESULT_DIR/helper.stderr.log")"
+    ((stdout_size <= PRESSURE_RESULT_MAX_BYTES))
+    ((stderr_size <= PRESSURE_HELPER_STDERR_MAX_BYTES))
+    [[ -z "$PRESSURE_HELPER_CONTAINER_ID" &&
+      -z "$PRESSURE_HELPER_CONTAINER_NAME" &&
+      -z "$PRESSURE_HELPER_LAUNCH_STDERR" ]]
+  )
+}
+
+test_pressure_repeat_state_guards_are_complete() {
+  local -a scenario_variables=(
+    PRESSURE_CONTROL_LIVE_DIR
+    PRESSURE_CONTROL_LIVE_IDENTITY
+    PRESSURE_CONTROL_SESSION
+    PRESSURE_CONTROL_DEADLINE
+    PRESSURE_CONTROL_READY_IDENTITY
+    PRESSURE_CONTROL_RELEASE_IDENTITY
+    PRESSURE_CONTROL_REMOVAL_STATUS
+    PRESSURE_SCENARIO_CONTAINER_NAME
+    PRESSURE_SCENARIO_CONTAINER_ID
+    PRESSURE_SCENARIO_CONTAINER_IDENTITY
+    PRESSURE_SCENARIO_RUNNING_INSPECTION_JSON
+    PRESSURE_SCENARIO_TERMINAL_INSPECTION_JSON
+    PRESSURE_SCENARIO_WAIT_EXIT_CODE
+    PRESSURE_SCENARIO_EXPECTED_CMD_JSON
+    PRESSURE_SCENARIO_OUTPUT
+    PRESSURE_SCENARIO_STDERR
+    PRESSURE_SCENARIO_LAUNCH_STDERR
+    PRESSURE_SCENARIO_LAUNCH_STDERR_IDENTITY
+    PRESSURE_SCENARIO_LAUNCH_STDERR_REMOVAL_STATUS
+    PRESSURE_SCENARIO_TRANSACTION_ID
+    PRESSURE_SCENARIO_LOG_TRANSACTION_ID
+    PRESSURE_SCENARIO_LOGS_CAPTURED
+    PRESSURE_SCENARIO_REMOVAL_STATUS
+    PRESSURE_HELPER_CONTAINER_NAME
+    PRESSURE_HELPER_CONTAINER_ID
+    PRESSURE_HELPER_CONTAINER_IDENTITY
+    PRESSURE_HELPER_EXPECTED_CMD_JSON
+    PRESSURE_HELPER_OUTPUT
+    PRESSURE_HELPER_STDERR
+    PRESSURE_HELPER_LAUNCH_STDERR
+    PRESSURE_HELPER_LAUNCH_STDERR_IDENTITY
+    PRESSURE_HELPER_LAUNCH_STDERR_REMOVAL_STATUS
+    PRESSURE_HELPER_TRANSACTION_ID
+    PRESSURE_HELPER_LOG_TRANSACTION_ID
+    PRESSURE_CLEANUP_TRANSACTION_ID
+    PRESSURE_RELEASE_TRANSACTION_ID
+    PRESSURE_CONTROL_EVIDENCE_TRANSACTION_ID
+    PRESSURE_INSPECTION_TRANSACTION_ID
+    PRESSURE_CONTAINER_INSPECTIONS_TRANSACTION_ID
+    PRESSURE_BARRIER_STATUS_TRANSACTION_ID
+    PRESSURE_MAP_STATE_TRANSACTION_ID
+    PRESSURE_CONTAINER_INSPECTIONS_REFERENCE
+    PRESSURE_CONTAINER_INSPECTIONS_SHA256
+    PRESSURE_CONTAINER_INSPECTIONS_SIZE_BYTES
+    PRESSURE_CONTAINER_INSPECTIONS_RUNTIME_STATUS
+    PRESSURE_HELPER_LOGS_CAPTURED
+    PRESSURE_HELPER_REMOVAL_STATUS
+    PRESSURE_HELPER_COMPLETION_RECEIPT
+    PRESSURE_CLEANUP_SAFETY_RECEIPT
+    PRESSURE_TRACECHECK_IMAGE_ID
+    PRESSURE_TRANSACTION_OWNER_BASHPID
+    PRESSURE_TRANSACTION_RUNTIME_PARENT_FD
+    PRESSURE_TRANSACTION_RESULT_PARENT_FD
+    PRESSURE_TRANSACTION_CONTROL_PARENT_FD
+    PRESSURE_TRANSACTION_RUNTIME_PARENT_IDENTITY
+    PRESSURE_TRANSACTION_RESULT_PARENT_IDENTITY
+    PRESSURE_TRANSACTION_CONTROL_PARENT_IDENTITY
+    PRESSURE_BARRIER_RUNTIME_STATUS
+  )
+  local -a helper_variables=(
+    PRESSURE_HELPER_CONTAINER_NAME
+    PRESSURE_HELPER_CONTAINER_ID
+    PRESSURE_HELPER_CONTAINER_IDENTITY
+    PRESSURE_HELPER_EXPECTED_CMD_JSON
+    PRESSURE_HELPER_OUTPUT
+    PRESSURE_HELPER_STDERR
+    PRESSURE_HELPER_LAUNCH_STDERR
+    PRESSURE_HELPER_LAUNCH_STDERR_IDENTITY
+    PRESSURE_HELPER_LAUNCH_STDERR_REMOVAL_STATUS
+    PRESSURE_HELPER_TRANSACTION_ID
+    PRESSURE_HELPER_LOG_TRANSACTION_ID
+    PRESSURE_INSPECTION_TRANSACTION_ID
+    PRESSURE_CONTAINER_INSPECTIONS_TRANSACTION_ID
+    PRESSURE_HELPER_LOGS_CAPTURED
+    PRESSURE_HELPER_REMOVAL_STATUS
+    PRESSURE_HELPER_COMPLETION_RECEIPT
+    PRESSURE_CLEANUP_SAFETY_RECEIPT
+  )
+  local variable=""
+
+  for variable in "${scenario_variables[@]}"; do
+    (
+      local marker="$TEST_TMP_DIR/pressure-scenario-guard-$variable.called"
+      local value=stale
+
+      pressure_test_reset_lifecycle_state
+      pressure_test_prepare_runtime \
+        "$TEST_TMP_DIR/pressure-scenario-guard-$variable"
+      PRESSURE_TRACECHECK_IMAGE_ID=""
+      case "$variable" in
+        PRESSURE_CONTROL_DEADLINE) value=1 ;;
+        PRESSURE_CONTROL_REMOVAL_STATUS) value=active ;;
+        PRESSURE_SCENARIO_LOGS_CAPTURED|PRESSURE_HELPER_LOGS_CAPTURED)
+          value=true
+          ;;
+        PRESSURE_SCENARIO_LAUNCH_STDERR_REMOVAL_STATUS|\
+          PRESSURE_HELPER_LAUNCH_STDERR_REMOVAL_STATUS)
+          value=removal-pending
+          ;;
+        PRESSURE_SCENARIO_REMOVAL_STATUS|PRESSURE_HELPER_REMOVAL_STATUS)
+          value=container-present
+          ;;
+        PRESSURE_CONTAINER_INSPECTIONS_RUNTIME_STATUS) value=prepared ;;
+        PRESSURE_*_TRANSACTION_ID) value=tx-1 ;;
+        PRESSURE_HELPER_COMPLETION_RECEIPT|PRESSURE_CLEANUP_SAFETY_RECEIPT)
+          value='{"stale":true}'
+          ;;
+        PRESSURE_TRANSACTION_OWNER_BASHPID) value=1 ;;
+        PRESSURE_TRANSACTION_*_PARENT_FD) value=9 ;;
+        PRESSURE_TRANSACTION_*_PARENT_IDENTITY) value=1:2:3:700:4 ;;
+        PRESSURE_BARRIER_RUNTIME_STATUS) value=prepared ;;
+      esac
+      printf -v "$variable" '%s' "$value"
+      run_pressure_bounded() {
+        : >"$marker"
+        return 97
+      }
+      if prepare_pressure_control_runtime "$((SECONDS + 30))" \
+        >/dev/null 2>&1; then
+        printf 'scenario repeat guard ignored %s\n' "$variable" >&2
+        return 1
+      fi
+      [[ ! -e "$marker" ]]
+    )
+  done
+
+  for variable in "${helper_variables[@]}"; do
+    (
+      local marker="$TEST_TMP_DIR/pressure-helper-guard-$variable.called"
+      local value=stale
+
+      pressure_test_reset_lifecycle_state
+      pressure_test_prepare_runtime \
+        "$TEST_TMP_DIR/pressure-helper-guard-$variable"
+      case "$variable" in
+        PRESSURE_HELPER_LOGS_CAPTURED) value=true ;;
+        PRESSURE_HELPER_LAUNCH_STDERR_REMOVAL_STATUS)
+          value=removal-pending
+          ;;
+        PRESSURE_HELPER_REMOVAL_STATUS) value=container-present ;;
+        PRESSURE_*_TRANSACTION_ID) value=tx-1 ;;
+        PRESSURE_HELPER_COMPLETION_RECEIPT|PRESSURE_CLEANUP_SAFETY_RECEIPT)
+          value='{"stale":true}'
+          ;;
+      esac
+      printf -v "$variable" '%s' "$value"
+      run_pressure_bounded() {
+        : >"$marker"
+        return 97
+      }
+      if run_map_pressure_helper_detached \
+        "$RESULT_DIR/helper.json" "$RESULT_DIR/helper.stderr.log" \
+        30 --mode prepare >/dev/null 2>&1; then
+        printf 'helper repeat guard ignored %s\n' "$variable" >&2
+        return 1
+      fi
+      [[ ! -e "$marker" ]]
+    )
+  done
+}
+
+test_pressure_deadline_budget_is_shared_and_bounded() {
+  local -r expected_release_budget="$((
+    30 + (2 * 40) + (2 * 60) + 10 + 15
+  ))"
+
+  [[ "$PRESSURE_CONTROL_READY_TIMEOUT_SECONDS" -eq 30 &&
+    "$PRESSURE_JAVA_IDENTITY_TIMEOUT_SECONDS" -eq 40 &&
+    "$PRESSURE_HELPER_TIMEOUT_SECONDS" -eq 60 &&
+    "$PRESSURE_CONTROL_PUBLICATION_TIMEOUT_SECONDS" -eq 10 &&
+    "$PRESSURE_CONTROL_SCHEDULING_SLACK_SECONDS" -eq 15 &&
+    "$PRESSURE_CONTROL_RELEASE_TIMEOUT_SECONDS" -eq \
+      "$expected_release_budget" ]] || {
+    printf 'pressure pre-release budget no longer covers every bounded stage\n' >&2
+    return 1
+  }
+
+  (
+    local -r deadline_log="$TEST_TMP_DIR/pressure-prepare-deadlines"
+    local -r image_id="sha256:$(printf '7%.0s' {1..64})"
+    local start_seconds=0
+    local control_deadline=0
+    local ready_deadline=0
+    local -a invocations=()
+    local invocation=""
+    local observed_deadline=""
+    local observed_maximum=""
+    local observed_command=""
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$TEST_TMP_DIR/pressure-prepare-deadline"
+    PRESSURE_TRACECHECK_IMAGE_ID=""
+    run_pressure_bounded() {
+      local -r deadline="$1"
+      local -r maximum="$2"
+      local serialized_command=""
+      shift 2
+      printf -v serialized_command '%q ' "$@"
+      serialized_command="${serialized_command% }"
+      printf '%s\t%s\t%s\n' \
+        "$deadline" "$maximum" "$serialized_command" >>"$deadline_log"
+      case "$1" in
+        bash|stat|id) command "$@"; return ;;
+      esac
+      case " $* " in
+        *' openssl rand -hex 16 '*)
+          printf '00112233445566778899aabbccddeeff\n'
+          ;;
+        *' mkdir -m 0700 -- '*)
+          command "$@"
+          ;;
+        *' docker image inspect '*)
+          printf '%s\n' "$image_id"
+          ;;
+        *' docker container ls '*)
+          return 0
+          ;;
+        *) return 64 ;;
+      esac
+    }
+
+    start_seconds="$SECONDS"
+    control_deadline="$((start_seconds + expected_release_budget))"
+    ready_deadline="$((start_seconds + PRESSURE_CONTROL_READY_TIMEOUT_SECONDS))"
+    unset control_key
+    prepare_pressure_control_runtime "$control_deadline" "$ready_deadline"
+    mapfile -t invocations <"$deadline_log"
+    [[ "${#invocations[@]}" -eq 12 &&
+      "$PRESSURE_CONTROL_DEADLINE" -eq "$control_deadline" &&
+      "$PRESSURE_BARRIER_RUNTIME_STATUS" == prepared &&
+      ! -v control_key ]]
+    for invocation in "${invocations[@]}"; do
+      IFS=$'\t' read -r observed_deadline observed_maximum \
+        observed_command <<<"$invocation"
+      [[ "$observed_deadline" -eq "$ready_deadline" &&
+        "$observed_maximum" =~ ^(5|10)$ &&
+        -n "$observed_command" ]]
+    done
+    [[ "${invocations[0]}" == "$ready_deadline"$'\t5\tbash -c '* &&
+      "${invocations[1]}" == "$ready_deadline"$'\t5\tbash -c '* &&
+      "${invocations[2]}" == "$ready_deadline"$'\t5\tbash -c '* &&
+      "${invocations[3]}" == "$ready_deadline"$'\t5\tbash -c '* &&
+      "${invocations[4]}" == \
+        "$ready_deadline"$'\t5\topenssl rand -hex 16' &&
+      "${invocations[5]}" == \
+        "$ready_deadline"$'\t5\tmkdir -m 0700 -- '* &&
+      "${invocations[6]}" == \
+        "$ready_deadline"$'\t5\tstat -Lc %d:%i:%u:%a -- '* &&
+      "${invocations[7]}" == "$ready_deadline"$'\t5\tbash -c '* &&
+      "${invocations[8]}" == "$ready_deadline"$'\t5\tbash -c '* &&
+      "${invocations[9]}" == "$ready_deadline"$'\t5\tid -g' &&
+      "${invocations[10]}" == \
+        "$ready_deadline"$'\t10\tdocker image inspect '* &&
+      "${invocations[11]}" == \
+        "$ready_deadline"$'\t10\tdocker container ls '* ]]
+  )
+
+  (
+    local -r container_id="$(printf '2%.0s' {1..64})"
+    local -r deadline_observations="$TEST_TMP_DIR/pressure-deadline-observed"
+    local start_seconds=0
+    local runner_gid=""
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$TEST_TMP_DIR/pressure-deadline"
+    COMPOSE=(fake-compose)
+    runner_gid="$(id -g)"
+    prepare_pressure_control_runtime() {
+      PRESSURE_CONTROL_DEADLINE="$1"
+      pressure_test_pin_runtime "$2" || return $?
+      pressure_test_prepare_control_directory "$2" || return $?
+      PRESSURE_SCENARIO_CONTAINER_NAME="$PROJECT_NAME-pressure-scenario"
+      PRESSURE_BARRIER_RUNTIME_STATUS=prepared
+      printf 'control=%s\n' "$1" >>"$deadline_observations"
+      printf 'ready-stage=%s\n' "$2" >>"$deadline_observations"
+    }
+    run_pressure_bounded() {
+      printf 'launch=%s:%s\n' "$1" "$2" >>"$deadline_observations"
+      shift 2
+      command "$@"
+    }
+    run_pressure_bounded_captured() {
+      local -r deadline="$1"
+      local -r maximum="$2"
+      local -r stdout_path="$3"
+      local -r stderr_path="$5"
+      shift 6
+      printf 'launch=%s:%s\n' \
+        "$deadline" "$maximum" >>"$deadline_observations"
+      printf '%s\n' "$container_id" >"$stdout_path"
+      : >"$stderr_path"
+    }
+    pressure_scenario_container_identity() {
+      printf 'inspect=%s\n' "$3" >>"$deadline_observations"
+      printf -v "$4" '%s|123|2026-08-19T00:00:00.000000000Z|%s:%s' \
+        "$container_id" "$EUID" "$runner_gid"
+    }
+    wait_for_pressure_scenario_ready() {
+      printf 'ready=%s\n' "$1" >>"$deadline_observations"
+      PRESSURE_BARRIER_RUNTIME_STATUS=ready
+    }
+
+    start_seconds="$SECONDS"
+    start_pressure_scenario_barrier \
+      "$RESULT_DIR/scenario-pressure.json" \
+      "$RESULT_DIR/scenario-pressure.stderr.log" \
+      --scenario pressure
+    grep -Fq "control=$((start_seconds + expected_release_budget))" \
+      "$deadline_observations"
+    grep -Fq \
+      "ready-stage=$((start_seconds + PRESSURE_CONTROL_READY_TIMEOUT_SECONDS))" \
+      "$deadline_observations"
+    grep -Fq \
+      "launch=$((start_seconds + PRESSURE_CONTROL_READY_TIMEOUT_SECONDS)):15" \
+      "$deadline_observations"
+    grep -Fq \
+      "inspect=$((start_seconds + PRESSURE_CONTROL_READY_TIMEOUT_SECONDS))" \
+      "$deadline_observations"
+    grep -Fq "ready=$((start_seconds + PRESSURE_CONTROL_READY_TIMEOUT_SECONDS))" \
+      "$deadline_observations"
+    jq -e --arg timeout "${expected_release_budget}s" '
+      index("--pressure-control-timeout") as $index |
+      ($index | type == "number") and .[$index + 1] == $timeout
+    ' <<<"$PRESSURE_SCENARIO_EXPECTED_CMD_JSON" >/dev/null
+  )
+
+  (
+    local -r container_id="$(printf '3%.0s' {1..64})"
+    local -r traffic_observation="$TEST_TMP_DIR/pressure-traffic-deadline"
+    local start_seconds=0
+    local observed_deadline=""
+    local observed_wait=""
+
+    pressure_test_reset_lifecycle_state
+    PRESSURE_LABEL=pressure
+    PRESSURE_BARRIER_RUNTIME_STATUS=released
+    PRESSURE_SCENARIO_CONTAINER_ID="$container_id"
+    PRESSURE_SCENARIO_CONTAINER_NAME="$PROJECT_NAME-pressure-scenario"
+    PRESSURE_SCENARIO_CONTAINER_IDENTITY="$container_id|123|2026-08-19T00:00:00Z|0:0"
+    PRESSURE_SCENARIO_RUNNING_INSPECTION_JSON='{"state":{"status":"running"}}'
+    PRESSURE_CONTAINER_INSPECTIONS_RUNTIME_STATUS="running-captured"
+    pressure_scenario_cleanup_identity_matches() {
+      return 0
+    }
+    wait_for_pressure_scenario_terminal() {
+      printf '%s %s\n' "$1" "$2" >"$traffic_observation"
+      printf -v "$3" '%s' 0
+      printf -v "$4" '%s' '{"state":{"exit_code":0,"status":"exited"}}'
+    }
+    capture_pressure_scenario_logs() {
+      PRESSURE_SCENARIO_LOGS_CAPTURED=true
+    }
+    publish_pressure_scenario_container_inspections() {
+      [[ "$1" == pressure && "$2" -gt "$SECONDS" ]]
+      PRESSURE_CONTAINER_INSPECTIONS_RUNTIME_STATUS=retained
+    }
+    remove_pressure_scenario_container() {
+      return 0
+    }
+    cleanup_pressure_scenario_launch_stderr() {
+      return 0
+    }
+
+    start_seconds="$SECONDS"
+    wait_for_pressure_scenario_container
+    read -r observed_deadline observed_wait <"$traffic_observation"
+    [[ "$observed_wait" -eq \
+      "$((PRESSURE_TRAFFIC_TIMEOUT_SECONDS +
+        PRESSURE_TRAFFIC_COMPLETION_GRACE_SECONDS))" ]]
+    [[ "$observed_deadline" -eq \
+      "$((start_seconds + PRESSURE_TRAFFIC_TIMEOUT_SECONDS +
+        PRESSURE_TRAFFIC_COMPLETION_GRACE_SECONDS +
+        PRESSURE_TRAFFIC_FINALIZATION_TIMEOUT_SECONDS))" ]]
+  )
+}
+
+test_pressure_scenario_terminal_wait_outvars_are_exact() {
+  (
+    local -r container_id="$(printf 'e%.0s' {1..64})"
+    local -r deadline="$((SECONDS + 30))"
+    local expected_exit=17
+    local inspected_exit=17
+    local observed_wait=sentinel
+    local observed_snapshot=sentinel
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$TEST_TMP_DIR/pressure-terminal-outvars"
+    pressure_test_pin_runtime "$deadline"
+    pressure_test_prepare_control_directory "$deadline"
+    PRESSURE_SCENARIO_CONTAINER_ID="$container_id"
+    PRESSURE_SCENARIO_CONTAINER_NAME="$PROJECT_NAME-pressure-scenario"
+    PRESSURE_SCENARIO_CONTAINER_IDENTITY="$container_id|123|2026-08-19T00:00:00Z|$EUID:$(id -g)"
+    PRESSURE_SCENARIO_EXPECTED_CMD_JSON="$(
+      pressure_command_json "$deadline" --scenario pressure
+    )"
+    wait_for_pressure_container_exit_code() {
+      [[ "$1" == "$container_id" && "$2" == "$deadline" && "$3" == 10 ]]
+      printf '%s\n' "$expected_exit"
+    }
+    pressure_scenario_container_identity() {
+      [[ "$1" == "$container_id" && "$2" == stopped &&
+        "$3" == "$deadline" && "$#" -eq 5 ]]
+      printf -v "$4" '%s' "$PRESSURE_SCENARIO_CONTAINER_IDENTITY"
+      printf -v "$5" '{"state":{"exit_code":%s,"status":"exited"}}' \
+        "$inspected_exit"
+    }
+    pressure_scenario_cleanup_identity_matches() {
+      [[ "$1" == "$deadline" ]]
+    }
+
+    wait_for_pressure_scenario_terminal \
+      "$deadline" 10 observed_wait observed_snapshot
+    [[ "$observed_wait" == 17 &&
+      "$(jq -r '.state.exit_code' <<<"$observed_snapshot")" == 17 ]]
+
+    inspected_exit=18
+    observed_wait="unchanged-wait"
+    observed_snapshot="unchanged-snapshot"
+    if wait_for_pressure_scenario_terminal \
+      "$deadline" 10 observed_wait observed_snapshot >/dev/null 2>&1; then
+      printf 'scenario terminal wait accepted an inspection/wait mismatch\n' >&2
+      return 1
+    fi
+    [[ "$observed_wait" == unchanged-wait &&
+      "$observed_snapshot" == unchanged-snapshot ]]
+    if wait_for_pressure_scenario_terminal \
+      "$deadline" 10 observed_wait observed_wait >/dev/null 2>&1; then
+      printf 'scenario terminal wait accepted aliased outvars\n' >&2
+      return 1
+    fi
+
+    PRESSURE_SCENARIO_CONTAINER_ID=""
+    PRESSURE_SCENARIO_CONTAINER_IDENTITY=""
+    PRESSURE_SCENARIO_CONTAINER_NAME=""
+    PRESSURE_SCENARIO_EXPECTED_CMD_JSON=""
+    pressure_test_teardown_runtime "$deadline"
+  )
+}
+
+test_pressure_scenario_wait_orders_artifact_before_removal() {
+  local expected_exit=""
+
+  for expected_exit in 0 23; do
+    (
+      local -r container_id="$(printf 'd%.0s' {1..64})"
+      local -r directory="$TEST_TMP_DIR/pressure-wait-artifact-$expected_exit"
+      local -r events="$TEST_TMP_DIR/pressure-wait-artifact-$expected_exit.events"
+      local artifact=""
+      local status=0
+      local publish_calls=0
+      local removal_calls=0
+
+      pressure_test_reset_lifecycle_state
+      pressure_test_prepare_runtime "$directory"
+      artifact="$RESULT_DIR/map-pressure-pressure-container-inspections.json"
+      PRESSURE_LABEL=pressure
+      PRESSURE_BARRIER_RUNTIME_STATUS=released
+      PRESSURE_SCENARIO_CONTAINER_ID="$container_id"
+      PRESSURE_SCENARIO_CONTAINER_NAME="$PROJECT_NAME-pressure-scenario"
+      PRESSURE_SCENARIO_CONTAINER_IDENTITY="$container_id|123|2026-08-19T00:00:00Z|0:0"
+      PRESSURE_SCENARIO_RUNNING_INSPECTION_JSON='{"state":{"status":"running"}}'
+      PRESSURE_CONTAINER_INSPECTIONS_RUNTIME_STATUS="running-captured"
+      pressure_scenario_cleanup_identity_matches() {
+        return 0
+      }
+      wait_for_pressure_scenario_terminal() {
+        printf 'wait\n' >>"$events"
+        printf -v "$3" '%s' "$expected_exit"
+        printf -v "$4" '{"state":{"exit_code":%s,"status":"exited"}}' \
+          "$expected_exit"
+      }
+      capture_pressure_scenario_logs() {
+        printf 'logs\n' >>"$events"
+        PRESSURE_SCENARIO_LOGS_CAPTURED=true
+      }
+      publish_pressure_scenario_container_inspections() {
+        ((publish_calls += 1))
+        [[ "$expected_exit" == 0 && "$removal_calls" -eq 0 &&
+          "$PRESSURE_CONTAINER_INSPECTIONS_RUNTIME_STATUS" == \
+            terminal-captured ]]
+        printf 'publish\n' >>"$events"
+        printf '{}\n' >"$artifact"
+        chmod 0600 -- "$artifact"
+        PRESSURE_CONTAINER_INSPECTIONS_REFERENCE=map-pressure-pressure-container-inspections.json
+        PRESSURE_CONTAINER_INSPECTIONS_SHA256="$(sha256sum -- "$artifact")"
+        PRESSURE_CONTAINER_INSPECTIONS_SHA256="${PRESSURE_CONTAINER_INSPECTIONS_SHA256%% *}"
+        PRESSURE_CONTAINER_INSPECTIONS_SIZE_BYTES="$(stat -Lc '%s' -- "$artifact")"
+        PRESSURE_CONTAINER_INSPECTIONS_RUNTIME_STATUS=retained
+      }
+      remove_pressure_scenario_container() {
+        ((removal_calls += 1))
+        if [[ "$expected_exit" == 0 ]]; then
+          [[ "$publish_calls" -eq 1 &&
+            "$PRESSURE_CONTAINER_INSPECTIONS_RUNTIME_STATUS" == retained &&
+            -f "$artifact" && ! -L "$artifact" ]]
+        else
+          [[ "$publish_calls" -eq 0 &&
+            "$PRESSURE_CONTAINER_INSPECTIONS_RUNTIME_STATUS" == \
+              terminal-captured ]]
+        fi
+        printf 'remove\n' >>"$events"
+        PRESSURE_SCENARIO_REMOVAL_STATUS=absence-proved
+      }
+      cleanup_pressure_scenario_launch_stderr() {
+        [[ "$removal_calls" -eq 1 ]]
+        printf 'launch-cleanup\n' >>"$events"
+      }
+
+      if wait_for_pressure_scenario_container; then
+        status=0
+      else
+        status=$?
+      fi
+      [[ "$status" == "$expected_exit" && "$removal_calls" -eq 1 &&
+        "$PRESSURE_BARRIER_RUNTIME_STATUS" == reaped ]]
+      if [[ "$expected_exit" == 0 ]]; then
+        [[ "$publish_calls" -eq 1 &&
+          -f "$artifact" && ! -L "$artifact" &&
+          "$(<"$events")" == $'wait\nlogs\npublish\nremove\nlaunch-cleanup' ]]
+      else
+        [[ "$publish_calls" -eq 0 &&
+          ! -e "$artifact" && ! -L "$artifact" &&
+          -z "$PRESSURE_CONTAINER_INSPECTIONS_REFERENCE" &&
+          -z "$PRESSURE_CONTAINER_INSPECTIONS_SHA256" &&
+          -z "$PRESSURE_CONTAINER_INSPECTIONS_SIZE_BYTES" &&
+          "$(<"$events")" == $'wait\nlogs\nremove\nlaunch-cleanup' ]] &&
+          pressure_scenario_terminal_failure_receipt_matches "$status"
+      fi
+    )
+  done
+}
+
+test_pressure_scenario_terminal_failure_receipt_is_exact() {
+  (
+    local mutation=""
+
+    set_valid_receipt() {
+      PRESSURE_SCENARIO_WAIT_EXIT_CODE=23
+      PRESSURE_BARRIER_RUNTIME_STATUS=reaped
+      PRESSURE_SCENARIO_REMOVAL_STATUS=absence-proved
+      PRESSURE_CONTAINER_INSPECTIONS_RUNTIME_STATUS='terminal-captured'
+      PRESSURE_SCENARIO_LOGS_CAPTURED=true
+      PRESSURE_SCENARIO_RUNNING_INSPECTION_JSON='{"state":"running"}'
+      PRESSURE_SCENARIO_TERMINAL_INSPECTION_JSON='{"state":"exited"}'
+    }
+
+    set_valid_receipt
+    pressure_scenario_terminal_failure_receipt_matches 23 || return 1
+    for mutation in zero noncanonical status-mismatch barrier removal \
+      inspection logs running-snapshot terminal-snapshot; do
+      set_valid_receipt
+      case "$mutation" in
+        zero)
+          if pressure_scenario_terminal_failure_receipt_matches 0; then
+            return 1
+          fi
+          continue
+          ;;
+        noncanonical)
+          PRESSURE_SCENARIO_WAIT_EXIT_CODE=023
+          if pressure_scenario_terminal_failure_receipt_matches 023; then
+            return 1
+          fi
+          continue
+          ;;
+        status-mismatch) PRESSURE_SCENARIO_WAIT_EXIT_CODE=24 ;;
+        barrier) PRESSURE_BARRIER_RUNTIME_STATUS=released ;;
+        removal) PRESSURE_SCENARIO_REMOVAL_STATUS=container-present ;;
+        inspection) PRESSURE_CONTAINER_INSPECTIONS_RUNTIME_STATUS='running-captured' ;;
+        logs) PRESSURE_SCENARIO_LOGS_CAPTURED=false ;;
+        running-snapshot) PRESSURE_SCENARIO_RUNNING_INSPECTION_JSON="" ;;
+        terminal-snapshot) PRESSURE_SCENARIO_TERMINAL_INSPECTION_JSON="" ;;
+      esac
+      if pressure_scenario_terminal_failure_receipt_matches 23; then
+        printf 'terminal pressure receipt accepted mutation %s\n' \
+          "$mutation" >&2
+        return 1
+      fi
+    done
+  )
+}
+
+test_pressure_bounded_stdin_and_wall_deadline_are_distinct() {
+  (
+    local -r payload='{"pressure":"owned"}'
+    local bounded_output=""
+    local status=0
+    local started=0
+    local elapsed=0
+
+    if printf '%s\n' "$payload" | run_pressure_bounded \
+      "$((SECONDS + 5))" 5 bash -c 'IFS= read -r value && printf "%s\n" "$value"' \
+      >/dev/null 2>&1; then
+      printf 'null-stdin pressure wrapper inherited caller input\n' >&2
+      return 1
+    fi
+    bounded_output="$(printf '%s\n' "$payload" | run_pressure_bounded_with_stdin \
+      "$((SECONDS + 5))" 5 bash -c 'IFS= read -r value; printf "%s\n" "$value"')"
+    [[ "$bounded_output" == "$payload" ]] || {
+      printf 'stdin-preserving pressure wrapper discarded pinned input\n' >&2
+      return 1
+    }
+
+    started="$SECONDS"
+    if run_pressure_bounded "$((started + 4))" 4 \
+      bash -c 'trap "" TERM; while :; do :; done' >/dev/null 2>&1; then
+      printf 'pressure deadline accepted a TERM-ignoring command\n' >&2
+      return 1
+    else
+      status=$?
+    fi
+    elapsed="$((SECONDS - started))"
+    [[ "$status" -eq 137 && "$elapsed" -ge 3 && "$elapsed" -le 5 ]] || {
+      printf 'pressure deadline status/elapsed mismatch: status=%s elapsed=%s\n' \
+        "$status" "$elapsed" >&2
+      return 1
+    }
+  )
+}
+
+test_pressure_helper_lifecycle_splits_work_and_cleanup_deadlines_and_distinguishes_wait_status() {
+  (
+    local -r container_id="$(printf '6%.0s' {1..64})"
+    local -r helper_events="$TEST_TMP_DIR/pressure-helper-shared-deadline.events"
+    local -i expected_deadline=0
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$TEST_TMP_DIR/pressure-helper-shared-deadline"
+    pressure_test_pin_runtime "$((SECONDS + 60))"
+    COMPOSE=(fake-compose)
+    expected_deadline="$((SECONDS + 20))"
+    local -r PRESSURE_HELPER_OPERATION_DEADLINE="$expected_deadline"
+    local -r PRESSURE_HELPER_OUTER_DEADLINE="$((SECONDS + 30))"
+    pressure_command_json() {
+      printf 'command:%s\n' "$1" >>"$helper_events"
+      shift
+      jq -cn --args '$ARGS.positional' -- "$@"
+    }
+    run_pressure_bounded() {
+      local -r deadline="$1"
+      shift 2
+      printf 'bounded:%s:%s\n' "$deadline" "$1" >>"$helper_events"
+      command "$@"
+    }
+    run_pressure_bounded_captured() {
+      local -r deadline="$1"
+      local -r stdout_output="$3"
+      local -r stderr_output="$5"
+      printf 'launch:%s\n' "$deadline" >>"$helper_events"
+      printf '%s\n' "$container_id" >"$stdout_output"
+      : >"$stderr_output"
+    }
+    pressure_helper_container_identity() {
+      printf 'identity:%s:%s\n' "$2" "$3" >>"$helper_events"
+      printf -v "$4" '%s|123|2026-08-19T00:00:00.000000000Z|0:0' \
+        "$container_id"
+    }
+    wait_for_pressure_helper_terminal() {
+      printf 'wait:%s:%s\n' "$1" "$2" >>"$helper_events"
+      printf '0\n'
+    }
+    capture_pressure_helper_logs() {
+      printf 'logs:%s\n' "$1" >>"$helper_events"
+      pressure_prepare_result 700 >"$PRESSURE_HELPER_OUTPUT"
+      : >"$PRESSURE_HELPER_STDERR"
+      chmod 0644 -- "$PRESSURE_HELPER_OUTPUT" "$PRESSURE_HELPER_STDERR"
+      PRESSURE_HELPER_LOGS_CAPTURED=true
+    }
+    remove_pressure_helper_container() {
+      printf 'remove:%s\n' "$1" >>"$helper_events"
+      PRESSURE_HELPER_REMOVAL_STATUS=absence-proved
+    }
+    eval "$(declare -f cleanup_pressure_helper_launch_stderr | \
+      sed '1s/cleanup_pressure_helper_launch_stderr/pressure_test_original_cleanup_pressure_helper_launch_stderr/')"
+    cleanup_pressure_helper_launch_stderr() {
+      printf 'launch-cleanup:%s\n' "$2" >>"$helper_events"
+      pressure_test_original_cleanup_pressure_helper_launch_stderr "$@"
+    }
+
+    run_map_pressure_helper_detached \
+      "$RESULT_DIR/helper.json" "$RESULT_DIR/helper.stderr.log" \
+      30 --mode prepare >/dev/null
+    awk -F: -v work="$expected_deadline" \
+      -v cleanup="$PRESSURE_HELPER_OUTER_DEADLINE" '
+      /^(command|bounded|launch|identity|wait|logs|remove|launch-cleanup):/ {
+        deadline = ($1 == "identity" ? $3 : $2)
+        if ($1 == "logs" || $1 == "remove" || $1 == "launch-cleanup") {
+          if (deadline != cleanup) exit 1
+        } else if (deadline != work && deadline != cleanup) exit 1
+        seen[$1]++
+      }
+      END {
+        for (key in seen) total++
+        if (total < 8) exit 1
+      }
+    ' "$helper_events"
+  )
+
+  (
+    local -r container_id="$(printf '7%.0s' {1..64})"
+    local mode=cli-timeout
+    local value=""
+    local status=0
+
+    run_pressure_bounded() {
+      if [[ "$mode" == cli-timeout ]]; then
+        return 124
+      fi
+      printf '124\n'
+    }
+    if value="$(wait_for_pressure_container_exit_code \
+      "$container_id" "$((SECONDS + 10))" 5)"; then
+      printf 'Docker wait CLI timeout was accepted as workload status\n' >&2
+      return 1
+    else
+      status=$?
+    fi
+    [[ "$status" -eq 124 && -z "$value" ]]
+    mode=workload-124
+    value="$(wait_for_pressure_container_exit_code \
+      "$container_id" "$((SECONDS + 10))" 5)"
+    [[ "$value" == 124 ]]
+  )
+}
+
+test_pressure_helper_quiesces_before_map_cleanup() {
+  (
+    local -r events="$TEST_TMP_DIR/pressure-runtime-map-cleanup.events"
+    local -r deadline="$((SECONDS + 60))"
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$TEST_TMP_DIR/pressure-runtime-map-cleanup"
+    pressure_test_pin_runtime "$deadline"
+    PRESSURE_ACTIVE=true
+    PRESSURE_CLEANUP_DEADLINE="$deadline"
+    PRESSURE_TRACECHECK_IMAGE_ID="sha256:$(printf '7%.0s' {1..64})"
+    PRESSURE_BARRIER_RUNTIME_STATUS=failed
+    PRESSURE_HELPER_CONTAINER_ID="$(printf '4%.0s' {1..64})"
+    PRESSURE_HELPER_CONTAINER_NAME="$PROJECT_NAME-pressure-helper"
+    PRESSURE_HELPER_CONTAINER_IDENTITY="$PRESSURE_HELPER_CONTAINER_ID|123|2026-08-19T00:00:00Z|0:0"
+    PRESSURE_HELPER_REMOVAL_STATUS=container-present
+    PRESSURE_SCENARIO_CONTAINER_ID="$(printf '5%.0s' {1..64})"
+    PRESSURE_SCENARIO_CONTAINER_NAME="$PROJECT_NAME-pressure-scenario"
+    PRESSURE_SCENARIO_CONTAINER_IDENTITY="$PRESSURE_SCENARIO_CONTAINER_ID|123|2026-08-19T00:00:00Z|$EUID:$(id -g)"
+    PRESSURE_SCENARIO_REMOVAL_STATUS=container-present
+    cleanup_pressure_helper_runtime() {
+      printf 'helper\n' >>"$events"
+      PRESSURE_HELPER_CONTAINER_ID=""
+      PRESSURE_HELPER_CONTAINER_IDENTITY=""
+      PRESSURE_HELPER_CONTAINER_NAME=""
+      PRESSURE_HELPER_REMOVAL_STATUS=not-run
+    }
+    remove_pressure_scenario_container() {
+      printf 'scenario\n' >>"$events"
+      PRESSURE_SCENARIO_REMOVAL_STATUS=absence-proved
+    }
+    cleanup_map_pressure() {
+      printf 'map\n' >>"$events"
+      PRESSURE_ACTIVE=false
+    }
+
+    cleanup_pressure_scenario_runtime "$deadline"
+    cleanup_map_pressure_with_retries
+    [[ "$(<"$events")" == $'helper\nscenario\nmap' &&
+      -z "$PRESSURE_HELPER_CONTAINER_ID" &&
+      -z "$PRESSURE_SCENARIO_CONTAINER_ID" &&
+      -z "$PRESSURE_TRACECHECK_IMAGE_ID" &&
+      "$PRESSURE_BARRIER_RUNTIME_STATUS" == not-run ]]
+  )
+
+  (
+    local -r image_id="sha256:$(printf '7%.0s' {1..64})"
+    local -r deadline="$((SECONDS + 60))"
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$TEST_TMP_DIR/pressure-failed-runtime-cleanup"
+    pressure_test_pin_runtime "$deadline"
+    PRESSURE_ACTIVE=true
+    PRESSURE_CLEANUP_DEADLINE="$deadline"
+    PRESSURE_TRACECHECK_IMAGE_ID="$image_id"
+    PRESSURE_BARRIER_RUNTIME_STATUS=failed
+    cleanup_pressure_scenario_runtime "$deadline"
+    [[ "$PRESSURE_ACTIVE" == true &&
+      "$PRESSURE_TRACECHECK_IMAGE_ID" == "$image_id" &&
+      "$PRESSURE_BARRIER_RUNTIME_STATUS" == failed ]]
+    PRESSURE_ACTIVE=false
+    complete_failed_pressure_runtime_cleanup
+    [[ -z "$PRESSURE_TRACECHECK_IMAGE_ID" &&
+      "$PRESSURE_BARRIER_RUNTIME_STATUS" == not-run ]]
+  )
+}
+
+test_pressure_runtime_cleanup_drains_container_inspection_transaction_role() {
+  (
+    local -r directory="$TEST_TMP_DIR/pressure-inspection-role-cleanup"
+    local -r deadline="$((SECONDS + 60))"
+    local candidate=""
+    local tx_id=""
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$directory"
+    pressure_test_pin_runtime "$deadline"
+    PRESSURE_CONTROL_SESSION=00112233445566778899aabbccddeeff
+    PRESSURE_CONTAINER_INSPECTIONS_RUNTIME_STATUS="terminal-captured"
+    candidate="$RESULT_DIR/.pressure-container-inspections-$PRESSURE_CONTROL_SESSION"
+    pressure_tx_begin PRESSURE_CONTAINER_INSPECTIONS_TRANSACTION_ID
+    tx_id="$PRESSURE_CONTAINER_INSPECTIONS_TRANSACTION_ID"
+    pressure_create_owned_candidate \
+      "$candidate" 600 "$deadline" "$deadline" "$tx_id"
+    printf '{"interrupted":true}\n' >"$candidate"
+    [[ -f "$candidate" &&
+      "${PRESSURE_TRANSACTION_TX_STATES[$tx_id]:-}" == open ]]
+
+    cleanup_pressure_scenario_runtime "$deadline"
+    [[ ! -e "$candidate" && ! -L "$candidate" &&
+      -z "$PRESSURE_CONTAINER_INSPECTIONS_TRANSACTION_ID" &&
+      -z "$PRESSURE_CONTROL_SESSION" &&
+      "$PRESSURE_CONTAINER_INSPECTIONS_RUNTIME_STATUS" == not-run &&
+      -z "$PRESSURE_TRANSACTION_OWNER_BASHPID" ]]
+    pressure_transaction_state_is_empty
+  )
+}
+
 test_pressure_state_uses_baseline_and_retains_steady_recovery() {
   (
-    RESULT_DIR="$TEST_TMP_DIR/pressure-state"
-    mkdir -p -- "$RESULT_DIR"
+    local -r cleanup_deadline="$((SECONDS + 60))"
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$TEST_TMP_DIR/pressure-state"
+    pressure_test_pin_runtime "$cleanup_deadline"
     PRESSURE_MAP_ID=41
     PRESSURE_MAP_MAX_ENTRIES=10
     PRESSURE_MAP_BASELINE_ENTRIES=7
-    sleep() {
-      return 0
-    }
-    fetch_obi_metrics() {
+    run_pressure_bounded_captured() {
+      local -r stdout_path="$3"
+      local -r stderr_path="$5"
+      shift 6
+      [[ "$1" == curl ]] || return 64
       printf '%s\n' \
-        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 8' >"$1"
+        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 8' >"$stdout_path"
+      : >"$stderr_path"
     }
-    wait_for_pressure_map_state pressured "$RESULT_DIR/pressured.prom" 1 1 1
+    wait_for_pressure_map_state \
+      pressured "$RESULT_DIR/pressured.prom" 10 1 1 "$cleanup_deadline"
     grep -Fq '} 8' "$RESULT_DIR/pressured.prom"
+    PRESSURE_MAP_STATE_TRANSACTION_ID=""
+    pressure_test_teardown_runtime "$cleanup_deadline"
   )
 
   (
     local fetch_count=0
     local entries=0
+    local -r cleanup_deadline="$((SECONDS + 60))"
 
-    RESULT_DIR="$TEST_TMP_DIR/pressure-recovery"
-    mkdir -p -- "$RESULT_DIR"
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$TEST_TMP_DIR/pressure-recovery"
+    pressure_test_pin_runtime "$cleanup_deadline"
     PRESSURE_MAP_ID=41
     PRESSURE_MAP_MAX_ENTRIES=10
     PRESSURE_MAP_BASELINE_ENTRIES=2
-    sleep() {
-      return 0
+    run_pressure_bounded() {
+      local -r deadline="$1"
+      shift 2
+      ((deadline > SECONDS)) || return 124
+      if [[ "$1" == sleep ]]; then
+        SECONDS="$((SECONDS + 1))"
+        return 0
+      fi
+      command "$@"
     }
-    fetch_obi_metrics() {
+    run_pressure_bounded_captured() {
+      local -r stdout_path="$3"
+      local -r stderr_path="$5"
+      shift 6
+      [[ "$1" == curl ]] || return 64
       ((fetch_count += 1))
       case "$fetch_count" in
         1) entries=3 ;;
@@ -8672,9 +11592,11 @@ test_pressure_state_uses_baseline_and_retains_steady_recovery() {
         *) entries=2 ;;
       esac
       printf 'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash",sample="%d"} %s\n' \
-        "$fetch_count" "$entries" >"$1"
+        "$fetch_count" "$entries" >"$stdout_path"
+      : >"$stderr_path"
     }
-    wait_for_pressure_map_state recovered "$RESULT_DIR/recovered.prom" 5 2 5
+    wait_for_pressure_map_state \
+      recovered "$RESULT_DIR/recovered.prom" 10 2 5 "$cleanup_deadline"
     [[ "$fetch_count" -eq 5 ]] || {
       printf 'steady recovery did not require consecutive baseline samples\n' >&2
       return 1
@@ -8684,27 +11606,39 @@ test_pressure_state_uses_baseline_and_retains_steady_recovery() {
     grep -Fq 'sample="5"' "$RESULT_DIR/recovered-sample-02.prom"
     grep -Eq '^attempt=3 .* matched=false consecutive=0$' \
       "$RESULT_DIR/recovered-samples.log"
+    PRESSURE_MAP_STATE_TRANSACTION_ID=""
+    pressure_test_teardown_runtime "$cleanup_deadline"
   )
 }
 
 test_pressure_state_has_attempt_and_wall_clock_bounds() {
   (
     local fetch_count=0
+    local -r cleanup_deadline="$((SECONDS + 90))"
 
-    RESULT_DIR="$TEST_TMP_DIR/pressure-attempt-bound"
-    mkdir -p -- "$RESULT_DIR"
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$TEST_TMP_DIR/pressure-attempt-bound"
+    pressure_test_pin_runtime "$cleanup_deadline"
     PRESSURE_MAP_ID=41
     PRESSURE_MAP_MAX_ENTRIES=10
     PRESSURE_MAP_BASELINE_ENTRIES=2
-    sleep() {
-      return 0
+    run_pressure_bounded() {
+      local -r deadline="$1"
+      shift 2
+      ((deadline > SECONDS)) || return 124
+      if [[ "$1" == sleep ]]; then
+        SECONDS="$((SECONDS + 1))"
+        return 0
+      fi
+      command "$@"
     }
-    fetch_obi_metrics() {
+    run_pressure_bounded_captured() {
       ((fetch_count += 1))
       return 1
     }
     if wait_for_pressure_map_state \
-      recovered "$RESULT_DIR/recovered.prom" 60 2 3 >/dev/null 2>&1; then
+      recovered "$RESULT_DIR/recovered.prom" 60 2 3 "$cleanup_deadline" \
+      >/dev/null 2>&1; then
       printf 'pressure state ignored its attempt cap\n' >&2
       return 1
     fi
@@ -8712,24 +11646,38 @@ test_pressure_state_has_attempt_and_wall_clock_bounds() {
       printf 'pressure state attempt cap used %d fetches, wanted 3\n' "$fetch_count" >&2
       return 1
     }
+    PRESSURE_MAP_STATE_TRANSACTION_ID=""
+    pressure_test_teardown_runtime "$cleanup_deadline"
   )
 
   (
     local -i started=0
     local -i elapsed=0
+    local -r cleanup_deadline="$((SECONDS + 60))"
 
-    RESULT_DIR="$TEST_TMP_DIR/pressure-deadline-bound"
-    mkdir -p -- "$RESULT_DIR"
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$TEST_TMP_DIR/pressure-deadline-bound"
+    pressure_test_pin_runtime "$cleanup_deadline"
     PRESSURE_MAP_ID=41
     PRESSURE_MAP_MAX_ENTRIES=10
     PRESSURE_MAP_BASELINE_ENTRIES=2
-    fetch_obi_metrics() {
-      command sleep "$2"
+    run_pressure_bounded() {
+      local -r deadline="$1"
+      shift 2
+      if [[ "$1" == sleep ]]; then
+        SECONDS="$((SECONDS + 1))"
+        return 0
+      fi
+      ((deadline > SECONDS)) || return 124
+      command "$@"
+    }
+    run_pressure_bounded_captured() {
       return 1
     }
     started="$SECONDS"
     if wait_for_pressure_map_state \
-      recovered "$RESULT_DIR/recovered.prom" 2 2 10 >/dev/null 2>&1; then
+      recovered "$RESULT_DIR/recovered.prom" 2 2 10 "$cleanup_deadline" \
+      >/dev/null 2>&1; then
       printf 'pressure deadline accepted unavailable metrics\n' >&2
       return 1
     fi
@@ -8738,506 +11686,1024 @@ test_pressure_state_has_attempt_and_wall_clock_bounds() {
       printf 'pressure deadline elapsed %d seconds, wanted 2-3\n' "$elapsed" >&2
       return 1
     }
+    PRESSURE_MAP_STATE_TRANSACTION_ID=""
+    pressure_test_teardown_runtime "$cleanup_deadline"
   )
 }
 
 test_pressure_state_fails_closed_on_evidence_write_error() {
   (
-    RESULT_DIR="$TEST_TMP_DIR/pressure-evidence-write"
-    mkdir -p -- "$RESULT_DIR"
+    local -r cleanup_deadline="$((SECONDS + 60))"
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$TEST_TMP_DIR/pressure-evidence-write"
+    pressure_test_pin_runtime "$cleanup_deadline"
     PRESSURE_MAP_ID=41
     PRESSURE_MAP_MAX_ENTRIES=10
     PRESSURE_MAP_BASELINE_ENTRIES=2
-    fetch_obi_metrics() {
+    run_pressure_bounded_captured() {
+      local -r stdout_path="$3"
+      local -r stderr_path="$5"
+      shift 6
+      [[ "$1" == curl ]] || return 64
       printf '%s\n' \
-        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 3' >"$1"
+        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 3' >"$stdout_path"
+      : >"$stderr_path"
     }
-    install() {
-      return 1
+    eval "$(declare -f pressure_copy_owned_candidate | \
+      sed '1s/pressure_copy_owned_candidate/pressure_test_original_copy_owned_candidate/')"
+    pressure_copy_owned_candidate() {
+      if [[ "$2" == "$RESULT_DIR/.pressure-output-pressured.prom" ]]; then
+        return 74
+      fi
+      pressure_test_original_copy_owned_candidate "$@"
     }
     if wait_for_pressure_map_state \
-      pressured "$RESULT_DIR/pressured.prom" 1 1 1 >/dev/null 2>&1; then
-      printf 'pressure state accepted a failed evidence install\n' >&2
+      pressured "$RESULT_DIR/pressured.prom" 2 1 1 "$cleanup_deadline" \
+      >/dev/null 2>&1; then
+      printf 'pressure state accepted a failed transactional copy\n' >&2
       return 1
     fi
+    [[ ! -e "$RESULT_DIR/pressured.prom" ]]
+    PRESSURE_MAP_STATE_TRANSACTION_ID=""
+    pressure_test_teardown_runtime "$cleanup_deadline"
   )
 }
 
-test_map_pressure_prepare_fill_cleanup_transaction() {
-  (
-    local -r token_base="18446744073709551605"
-    local -r command_log="$TEST_TMP_DIR/pressure-transaction.commands"
-    local -r state_log="$TEST_TMP_DIR/pressure-transaction.states"
+pressure_test_initialize_cleanup_state() {
+  local -r directory="$1"
+  local -r touched="${2:-}"
 
-    RESULT_DIR="$TEST_TMP_DIR/pressure-transaction"
-    mkdir -p -- "$RESULT_DIR"
-    COMPOSE=(fake-compose)
-    SCENARIO_SEED=1
-    printf '%s\n' \
-      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 7' \
-      'obi_bpf_map_entries_total{map_id="43",map_name="jrp_handoff_mut",map_type="hash"} 0' \
-      'obi_bpf_map_entries_total{map_id="99",map_name="java_remote_par",map_type="hash"} 0' \
-      'obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} 3' \
-      >"$RESULT_DIR/before.prom"
-    SELECTED_TRANSPORT=getsockopt
-    run_bounded() {
-      printf '%s\n' "$*" >>"$command_log"
-      case " $* " in
-        *' --mode prepare '*) pressure_prepare_result "$token_base" ;;
-        *' --mode fill '*) pressure_fill_result "$token_base" ;;
-        *' --mode cleanup '*) pressure_cleanup_result "$token_base" ;;
-        *) return 64 ;;
-      esac
-    }
-    wait_for_pressure_map_state() {
-      printf '%s\n' "$*" >>"$state_log"
-      pressure_state_result "$@"
-    }
-    start_map_pressure_monitor() {
-      return 0
-    }
-
-    SELECTED_TRANSPORT=getsockopt
-    start_map_pressure pressure-test "$RESULT_DIR/before.prom" 5 >/dev/null
-    [[ "$PRESSURE_INJECT_TARGET" == "8" ]] || return 1
-    [[ "$PRESSURE_ACTIVE" == "true" && \
-      "$PRESSURE_MAP_BASELINE_ENTRIES" == "7" && \
-      "$PRESSURE_PROCESS_MAP_ID" == "42" && \
-      "$PRESSURE_TOKEN_BASE" == "$token_base" && \
-      "$PRESSURE_TOUCHED_ENTRIES" == "10" && \
-      "$PRESSURE_CAPACITY_REJECTED_ENTRIES" == "1" && \
-      "$PRESSURE_VERIFIED_PRESENT_ENTRIES" == "10" ]] || {
-      printf 'map-pressure start did not retain its prepared identity and fill evidence\n' >&2
-      return 1
-    }
-    cleanup_map_pressure >/dev/null
-    [[ "$PRESSURE_ACTIVE" == "false" ]] || {
-      printf 'verified map-pressure cleanup did not clear active state\n' >&2
-      return 1
-    }
-    [[ "$(wc -l <"$command_log")" -eq 3 ]]
-    sed -n '1p' "$command_log" | grep -Fq -- \
-      '--process-pid 101 --process-namespace 202 --seed 1 --mode prepare'
-    sed -n '2p' "$command_log" | grep -Fq -- \
-      "--map-id 41 --expected-max-entries 10 --expected-process-map-id 42 --process-pid 101 --process-namespace 202 --token-base $token_base --seed 1 --mode fill"
-    sed -n '3p' "$command_log" | grep -Fq -- \
-      "--map-id 41 --expected-max-entries 10 --process-pid 101 --process-namespace 202 --token-base $token_base --seed 1 --mode cleanup"
-    grep -Fq 'pressured ' "$state_log"
-    grep -Fq 'recovered ' "$state_log"
-    [[ -f "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01.json" && \
-      -f "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01.stderr.log" && \
-      -f "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01.status" && \
-      -f "$RESULT_DIR/map-pressure-pressure-test-cleanup.json" ]]
-    grep -Fq 'validation_status=passed' \
-      "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01.status"
-    grep -Fq 'recovery_status=passed' \
-      "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01.status"
-  )
+  pressure_test_reset_lifecycle_state
+  pressure_test_prepare_runtime "$directory"
+  pressure_test_pin_runtime "$((SECONDS + PRESSURE_CLEANUP_DEADLINE_SECONDS))"
+  PRESSURE_ACTIVE=true
+  PRESSURE_MAP_ID=41
+  PRESSURE_MAP_MAX_ENTRIES="$PRESSURE_EXPECTED_MAP_CAPACITY"
+  PRESSURE_MAP_BASELINE_ENTRIES=0
+  PRESSURE_CAPACITY_REJECTED_ENTRIES=1
+  PRESSURE_VERIFIED_PRESENT_ENTRIES="$touched"
+  PRESSURE_VERIFIED_ABSENT_ENTRIES=1
+  PRESSURE_CONTENT_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  PRESSURE_VERIFY_STATUS=not-run
+  PRESSURE_TOUCHED_ENTRIES="$touched"
+  PRESSURE_CLEANUP_ATTEMPT=0
+  PRESSURE_CLEANUP_DEADLINE="$((SECONDS + PRESSURE_CLEANUP_DEADLINE_SECONDS))"
+  PRESSURE_CLEANUP_DELETION_PROOF=""
+  PRESSURE_CLEANUP_DELETION_PROOF_SHA256=""
+  PRESSURE_CLEANUP_DELETION_STDERR=""
+  PRESSURE_CLEANUP_DELETION_STDERR_SHA256=""
+  PRESSURE_CLEANUP_DELETION_TOUCHED=""
+  PRESSURE_SEED=1
+  PRESSURE_LABEL=pressure
+  PRESSURE_PROCESS_MAP_ID=42
+  PRESSURE_PROCESS_PID=101
+  PRESSURE_PROCESS_NAMESPACE=202
+  PRESSURE_TOKEN_BASE=700
+  PRESSURE_JAVA_IDENTITY="$(printf '0%.0s' {1..64}) 303 2026-08-13T00:00:00Z 101 202"
+  PRESSURE_BARRIER_RUNTIME_STATUS=ready
 }
 
-test_map_pressure_pre_mutation_failures_do_not_fill() {
+test_map_pressure_partial_fill_is_cleanup_owned() {
   (
-    local -r command_log="$TEST_TMP_DIR/pressure-bad-prepare.commands"
+    local -r token_base=700
+    local -r partial_touched="$((PRESSURE_EXPECTED_MAP_CAPACITY - 1))"
+    local -r command_log="$TEST_TMP_DIR/pressure-partial-fill.commands"
+    local start_status=0
+    local output=""
+    local stderr_output=""
 
-    RESULT_DIR="$TEST_TMP_DIR/pressure-bad-prepare"
-    mkdir -p -- "$RESULT_DIR"
-    COMPOSE=(fake-compose)
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$TEST_TMP_DIR/pressure-partial-fill"
+    pressure_test_pin_runtime "$((SECONDS + PRESSURE_CONTROL_RELEASE_TIMEOUT_SECONDS))"
     SCENARIO_SEED=1
+    PRESSURE_CONTROL_DEADLINE="$((SECONDS + PRESSURE_CONTROL_RELEASE_TIMEOUT_SECONDS))"
+    PRESSURE_BARRIER_RUNTIME_STATUS=ready
     printf '%s\n' \
-      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 7' \
-      >"$RESULT_DIR/before.prom"
-    run_bounded() {
-      printf '%s\n' "$*" >>"$command_log"
-      pressure_prepare_result 700
-      pressure_prepare_result 701
-    }
-
-    SELECTED_TRANSPORT=getsockopt
-    if start_map_pressure pressure-test "$RESULT_DIR/before.prom" 1 >/dev/null 2>&1; then
-      printf 'map-pressure start accepted duplicate prepare records\n' >&2
-      return 1
-    fi
-    [[ "$PRESSURE_ACTIVE" == "false" && "$(wc -l <"$command_log")" -eq 1 ]]
-    if grep -Fq -- '--mode fill' "$command_log" || \
-      grep -Fq -- '--mode cleanup' "$command_log"; then
-      printf 'map-pressure mutated state after invalid prepare evidence\n' >&2
-      return 1
-    fi
-  )
-
-  (
-    local -r command_log="$TEST_TMP_DIR/pressure-replaced-container.commands"
-    local -r identity_marker="$TEST_TMP_DIR/pressure-replaced-container.identity"
-
-    RESULT_DIR="$TEST_TMP_DIR/pressure-replaced-container"
-    mkdir -p -- "$RESULT_DIR"
-    COMPOSE=(fake-compose)
-    SCENARIO_SEED=1
-    printf '%s\n' \
-      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 7' \
+      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 0' \
       >"$RESULT_DIR/before.prom"
     resolve_map_pressure_java_identity() {
-      if [[ ! -e "$identity_marker" ]]; then
-        : >"$identity_marker"
-        printf '%064d 303 2026-08-13T00:00:00Z 101 202\n' 0
-      else
-        printf '%064d 404 2026-08-13T00:01:00Z 101 202\n' 1
-      fi
+      printf '%064d 303 2026-08-13T00:00:00Z 101 202\n' 0
     }
-    run_bounded() {
-      printf '%s\n' "$*" >>"$command_log"
-      pressure_prepare_result 700
-    }
-
-    SELECTED_TRANSPORT=getsockopt
-    if start_map_pressure pressure-test "$RESULT_DIR/before.prom" 1 >/dev/null 2>&1; then
-      printf 'map-pressure start accepted a replaced controlled JVM container\n' >&2
-      return 1
-    fi
-    [[ "$PRESSURE_ACTIVE" == "false" && "$(wc -l <"$command_log")" -eq 1 ]]
-    if grep -Fq -- '--mode fill' "$command_log" || \
-      grep -Fq -- '--mode cleanup' "$command_log"; then
-      printf 'map-pressure mutated state after controlled JVM replacement\n' >&2
-      return 1
-    fi
-  )
-
-  (
-    local -r command_log="$TEST_TMP_DIR/pressure-missing-baseline.commands"
-
-    RESULT_DIR="$TEST_TMP_DIR/pressure-missing-baseline"
-    mkdir -p -- "$RESULT_DIR"
-    COMPOSE=(fake-compose)
-    SCENARIO_SEED=1
-    printf '%s\n' \
-      'obi_bpf_map_entries_total{map_id="99",map_name="java_remote_par",map_type="hash"} 7' \
-      >"$RESULT_DIR/before.prom"
-    run_bounded() {
-      printf '%s\n' "$*" >>"$command_log"
-      pressure_prepare_result 700
-    }
-
-    SELECTED_TRANSPORT=getsockopt
-    if start_map_pressure pressure-test "$RESULT_DIR/before.prom" 1 >/dev/null 2>&1; then
-      printf 'map-pressure start accepted a missing exact-map baseline\n' >&2
-      return 1
-    fi
-    [[ "$PRESSURE_ACTIVE" == "false" && "$(wc -l <"$command_log")" -eq 1 ]]
-    if grep -Fq -- '--mode fill' "$command_log" || \
-      grep -Fq -- '--mode cleanup' "$command_log"; then
-      printf 'map-pressure mutated state without an exact-map baseline\n' >&2
-      return 1
-    fi
-  )
-}
-
-test_map_pressure_fill_failure_uses_prepared_cleanup_identity() {
-  (
-    local -r token_base="18446744073709551605"
-    local -r command_log="$TEST_TMP_DIR/pressure-fill-failure.commands"
-    local start_status=0
-
-    RESULT_DIR="$TEST_TMP_DIR/pressure-fill-failure"
-    mkdir -p -- "$RESULT_DIR"
-    COMPOSE=(fake-compose)
-    SCENARIO_SEED=1
-    printf '%s\n' \
-      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 7' \
-      >"$RESULT_DIR/before.prom"
-    run_bounded() {
-      printf '%s\n' "$*" >>"$command_log"
+    run_map_pressure_helper() {
+      local mode=""
+      local -a helper_arguments=()
+      output="$1"
+      stderr_output="$2"
+      shift 3
+      helper_arguments=("$@")
+      : >"$stderr_output"
       case " $* " in
-        *' --mode prepare '*) pressure_prepare_result "$token_base" ;;
-        *' --mode fill '*) printf 'fill interrupted\n' >&2; return 23 ;;
-        *' --mode cleanup '*) pressure_cleanup_result "$token_base" ;;
+        *' --mode prepare '*)
+          mode=prepare
+          printf 'prepare\n' >>"$command_log"
+          pressure_prepare_result "$token_base" >"$output"
+          ;;
+        *' --mode fill '*)
+          mode=fill
+          printf 'fill\n' >>"$command_log"
+          pressure_fill_result "$token_base" "$partial_touched" >"$output"
+          ;;
+        *' --mode cleanup '*)
+          mode=cleanup
+          printf 'cleanup\n' >>"$command_log"
+          pressure_cleanup_result "$token_base" "$partial_touched" >"$output"
+          ;;
         *) return 64 ;;
       esac
+      chmod 0644 -- "$output" "$stderr_output"
+      pressure_test_publish_helper_completion_receipt \
+        "$mode" "$output" "$stderr_output" 0 \
+        "$PRESSURE_CONTROL_DEADLINE" "${helper_arguments[@]}"
     }
     wait_for_pressure_map_state() {
       pressure_state_result "$@"
     }
 
-    SELECTED_TRANSPORT=getsockopt
-    if start_map_pressure pressure-test "$RESULT_DIR/before.prom" 1 >/dev/null 2>&1; then
-      printf 'map-pressure start accepted a failed fill command\n' >&2
+    if start_map_pressure pressure "$RESULT_DIR/before.prom" \
+      >/dev/null 2>&1; then
+      printf 'map pressure accepted a partial fill\n' >&2
       return 1
     else
       start_status=$?
     fi
-    [[ "$start_status" -eq 23 && "$PRESSURE_ACTIVE" == "false" ]]
-    sed -n '3p' "$command_log" | grep -Fq -- \
-      "--map-id 41 --expected-max-entries 10 --process-pid 101 --process-namespace 202 --token-base $token_base --seed 1 --mode cleanup"
-    grep -Fq 'fill interrupted' "$RESULT_DIR/map-pressure-pressure-test-fill.stderr.log"
-  )
-
-  (
-    local -r token_base="18446744073709551605"
-    local -r command_log="$TEST_TMP_DIR/pressure-fill-mismatch.commands"
-
-    RESULT_DIR="$TEST_TMP_DIR/pressure-fill-mismatch"
-    mkdir -p -- "$RESULT_DIR"
-    COMPOSE=(fake-compose)
-    SCENARIO_SEED=1
-    printf '%s\n' \
-      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 7' \
-      >"$RESULT_DIR/before.prom"
-    run_bounded() {
-      printf '%s\n' "$*" >>"$command_log"
-      case " $* " in
-        *' --mode prepare '*) pressure_prepare_result "$token_base" ;;
-        *' --mode fill '*) pressure_fill_result 700 ;;
-        *' --mode cleanup '*) pressure_cleanup_result "$token_base" ;;
-        *) return 64 ;;
-      esac
-    }
-    wait_for_pressure_map_state() {
-      pressure_state_result "$@"
-    }
-
-    SELECTED_TRANSPORT=getsockopt
-    if start_map_pressure pressure-test "$RESULT_DIR/before.prom" 1 >/dev/null 2>&1; then
-      printf 'map-pressure start accepted mismatched fill identity\n' >&2
+    ((start_status != 0))
+    [[ "$PRESSURE_ACTIVE" == true && -z "$PRESSURE_TOUCHED_ENTRIES" ]]
+    if cleanup_map_pressure_with_retries >/dev/null 2>&1; then
+      printf 'partial-fill cleanup was promoted as acceptance evidence\n' >&2
       return 1
     fi
-    [[ "$PRESSURE_ACTIVE" == "false" && "$(wc -l <"$command_log")" -eq 3 ]]
+    [[ "$PRESSURE_ACTIVE" == false &&
+      "$PRESSURE_CLEANUP_DELETION_STAGE" == cleanup-only-complete &&
+      -z "$PRESSURE_CLEANUP_DELETION_PROOF" &&
+      "$(<"$command_log")" == $'prepare\nfill\ncleanup' ]]
+    jq -e --argjson touched "$partial_touched" \
+      '.mode == "cleanup" and .touched == $touched' \
+      "$RESULT_DIR/map-pressure-pressure-cleanup-attempt-01.json" >/dev/null
+    [[ ! -e "$RESULT_DIR/map-pressure-pressure-cleanup.json" &&
+      ! -e "$RESULT_DIR/map-pressure-pressure-cleanup-attempt-01.status" ]]
   )
 }
 
-test_map_pressure_cleanup_retries_keep_immutable_artifacts() {
+test_map_pressure_cleanup_latch_is_atomic_and_reused() {
   (
-    local -r token_base="18446744073709551605"
-    local cleanup_calls=0
-
-    RESULT_DIR="$TEST_TMP_DIR/pressure-cleanup-retry"
-    mkdir -p -- "$RESULT_DIR"
-    COMPOSE=(fake-compose)
-    SCENARIO_SEED=1
-    printf '%s\n' \
-      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 7' \
-      >"$RESULT_DIR/before.prom"
-    run_bounded() {
-      case " $* " in
-        *' --mode prepare '*) pressure_prepare_result "$token_base" ;;
-        *' --mode fill '*) pressure_fill_result "$token_base" ;;
-        *' --mode cleanup '*)
-          ((cleanup_calls += 1))
-          case "$cleanup_calls" in
-            1)
-              printf 'transient cleanup failure\n' >&2
-              return 23
-              ;;
-            2)
-              pressure_cleanup_result 700
-              ;;
-            *)
-              pressure_cleanup_result "$token_base"
-              ;;
-          esac
-          ;;
-        *) return 64 ;;
-      esac
-    }
-    wait_for_pressure_map_state() {
-      pressure_state_result "$@"
-    }
-    start_map_pressure_monitor() {
-      return 0
-    }
-
-    SELECTED_TRANSPORT=getsockopt
-    start_map_pressure pressure-test "$RESULT_DIR/before.prom" 1 >/dev/null
-    cleanup_map_pressure_with_retries >/dev/null 2>&1
-    [[ "$PRESSURE_ACTIVE" == "false" && "$PRESSURE_CLEANUP_ATTEMPT" -eq 3 ]]
-    grep -Fq 'command_status=23' \
-      "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01.status"
-    grep -Fq 'validation_status=not-run' \
-      "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01.status"
-    grep -Fq '"token_base":700' \
-      "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-02.json"
-    grep -Fq 'validation_status=failed' \
-      "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-02.status"
-    grep -Fq "\"token_base\":$token_base" \
-      "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-03.json"
-    grep -Fq 'validation_status=passed' \
-      "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-03.status"
-    grep -Fq "\"token_base\":$token_base" \
-      "$RESULT_DIR/map-pressure-pressure-test-cleanup.json"
-  )
-
-  (
-    local helper_called=false
-
-    RESULT_DIR="$TEST_TMP_DIR/pressure-cleanup-exhausted"
-    mkdir -p -- "$RESULT_DIR"
-    PRESSURE_ACTIVE=true
-    PRESSURE_CLEANUP_ATTEMPT="$PRESSURE_CLEANUP_MAX_ATTEMPTS"
-    PRESSURE_MONITOR_PID=""
-    run_map_pressure_helper() {
-      helper_called=true
-    }
-    if cleanup_map_pressure_with_retries >/dev/null 2>&1; then
-      printf 'map-pressure cleanup exceeded its attempt cap\n' >&2
-      return 1
-    fi
-    [[ "$helper_called" == "false" && "$PRESSURE_ACTIVE" == "true" ]]
-  )
-
-  (
-    local -r token_base="700"
+    local -r sha_failure_marker="$TEST_TMP_DIR/pressure-latch-sha-failed"
+    local helper_calls=0
     local recovery_calls=0
+    local output=""
+    local stderr_output=""
+    local digest=""
 
-    RESULT_DIR="$TEST_TMP_DIR/pressure-cleanup-recovery-failure"
-    mkdir -p -- "$RESULT_DIR"
-    COMPOSE=(fake-compose)
-    SCENARIO_SEED=1
-    printf '%s\n' \
-      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 7' \
-      >"$RESULT_DIR/before.prom"
-    run_bounded() {
-      case " $* " in
-        *' --mode prepare '*) pressure_prepare_result "$token_base" ;;
-        *' --mode fill '*) pressure_fill_result "$token_base" ;;
-        *' --mode cleanup '*) pressure_cleanup_result "$token_base" ;;
-        *) return 64 ;;
-      esac
+    pressure_test_initialize_cleanup_state \
+      "$TEST_TMP_DIR/pressure-cleanup-latch"
+    run_map_pressure_helper() {
+      local -a helper_arguments=("${@:4}")
+      output="$1"
+      stderr_output="$2"
+      ((helper_calls += 1))
+      pressure_cleanup_result 700 >"$output"
+      : >"$stderr_output"
+      chmod 0644 -- "$output" "$stderr_output"
+      pressure_test_publish_helper_completion_receipt \
+        cleanup "$output" "$stderr_output" 0 \
+        "$PRESSURE_CLEANUP_DEADLINE" "${helper_arguments[@]}"
     }
     wait_for_pressure_map_state() {
-      if [[ "$1" == "recovered" ]]; then
-        ((recovery_calls += 1))
-        pressure_state_result "$@"
-        if ((recovery_calls == 1)); then
-          return 37
-        fi
-        return 0
-      fi
+      ((recovery_calls += 1))
       pressure_state_result "$@"
-    }
-    start_map_pressure_monitor() {
-      return 0
-    }
-
-    SELECTED_TRANSPORT=getsockopt
-    start_map_pressure pressure-test "$RESULT_DIR/before.prom" 1 >/dev/null
-    cleanup_map_pressure_with_retries >/dev/null 2>&1
-    [[ "$PRESSURE_ACTIVE" == "false" && "$PRESSURE_CLEANUP_ATTEMPT" -eq 2 ]]
-    grep -Fq 'command_status=0' \
-      "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01.status"
-    grep -Fq 'validation_status=passed' \
-      "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01.status"
-    grep -Fq 'recovery_status=failed' \
-      "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01.status"
-    [[ -f "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01-recovered-sample-01.prom" && \
-      -f "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01-recovered-sample-02.prom" && \
-      -f "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01-recovered-samples.log" ]]
-    grep -Fq 'recovery_status=passed' \
-      "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-02.status"
-    grep -Fq 'cleanup-attempt-02-recovered.prom' \
-      "$RESULT_DIR/map-pressure-pressure-test-recovered.prom"
-  )
-
-  (
-    local -r token_base="700"
-    local cleanup_status=0
-
-    RESULT_DIR="$TEST_TMP_DIR/pressure-cleanup-recovery-exhausted"
-    mkdir -p -- "$RESULT_DIR"
-    COMPOSE=(fake-compose)
-    SCENARIO_SEED=1
-    printf '%s\n' \
-      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 7' \
-      >"$RESULT_DIR/before.prom"
-    run_bounded() {
-      case " $* " in
-        *' --mode prepare '*) pressure_prepare_result "$token_base" ;;
-        *' --mode fill '*) pressure_fill_result "$token_base" ;;
-        *' --mode cleanup '*) pressure_cleanup_result "$token_base" ;;
-        *) return 64 ;;
-      esac
-    }
-    wait_for_pressure_map_state() {
-      pressure_state_result "$@"
-      if [[ "$1" == "recovered" ]]; then
+      if ((recovery_calls == 1)); then
         return 37
       fi
     }
-    start_map_pressure_monitor() {
-      return 0
+    eval "$(declare -f sha256_file | \
+      sed '1s/sha256_file/pressure_test_original_sha256_file/')"
+    sha256_file() {
+      local resolved_path=""
+      resolved_path="$(readlink -f -- "$1")" || return $?
+      if [[ "$resolved_path" == \
+          "$RESULT_DIR/map-pressure-pressure-cleanup-attempt-01.stderr.log" &&
+        ! -e "$sha_failure_marker" ]]; then
+        [[ -z "$PRESSURE_CLEANUP_DELETION_PROOF" &&
+          -z "$PRESSURE_CLEANUP_DELETION_PROOF_SHA256" &&
+          -z "$PRESSURE_CLEANUP_DELETION_STDERR" &&
+          -z "$PRESSURE_CLEANUP_DELETION_STDERR_SHA256" &&
+          -z "$PRESSURE_CLEANUP_DELETION_TOUCHED" ]] || return 99
+        : >"$sha_failure_marker"
+        return 83
+      fi
+      pressure_test_original_sha256_file "$@"
     }
 
-    SELECTED_TRANSPORT=getsockopt
-    start_map_pressure pressure-test "$RESULT_DIR/before.prom" 1 >/dev/null
-    if cleanup_map_pressure_with_retries >/dev/null 2>&1; then
-      printf 'map-pressure cleanup accepted exhausted recovery failures\n' >&2
+    cleanup_map_pressure_with_retries >/dev/null 2>&1
+    [[ -e "$sha_failure_marker" &&
+      "$helper_calls" -eq 1 &&
+      "$recovery_calls" -eq 2 &&
+      "$PRESSURE_CLEANUP_ATTEMPT" -eq 2 &&
+      "$PRESSURE_ACTIVE" == false ]]
+    [[ "$PRESSURE_CLEANUP_DELETION_PROOF" == \
+      "$RESULT_DIR/map-pressure-pressure-cleanup-attempt-01.json" ]]
+    grep -Fxq 'deletion_reused=false' \
+      "$RESULT_DIR/map-pressure-pressure-cleanup-attempt-01.status"
+    grep -Fxq 'recovery_status=failed' \
+      "$RESULT_DIR/map-pressure-pressure-cleanup-attempt-01.status"
+    grep -Fxq 'deletion_command_status=not-run' \
+      "$RESULT_DIR/map-pressure-pressure-cleanup-attempt-02.status"
+    grep -Fxq 'deletion_reused=true' \
+      "$RESULT_DIR/map-pressure-pressure-cleanup-attempt-02.status"
+    grep -Fxq \
+      'deletion_proof_reference=map-pressure-pressure-cleanup-attempt-01.json' \
+      "$RESULT_DIR/map-pressure-pressure-cleanup-attempt-02.status"
+    cmp -s -- \
+      "$RESULT_DIR/map-pressure-pressure-cleanup-attempt-01.json" \
+      "$RESULT_DIR/map-pressure-pressure-cleanup.json"
+  )
+}
+
+test_map_pressure_interrupted_helper_receipt_is_not_forged() {
+  local stale_mode=""
+
+  # These are the exact signal windows after a successful role helper has
+  # quiesced and published its receipt, but before its caller consumes it.
+  for stale_mode in prepare fill verify; do
+    (
+      local -r directory="$TEST_TMP_DIR/pressure-interrupted-helper-$stale_mode"
+      local -r stale_output="$directory/map-pressure-pressure-$stale_mode.json"
+      local -r stale_stderr="$directory/map-pressure-pressure-$stale_mode.stderr.log"
+      local helper_calls=0
+      local helper_output=""
+      local helper_stderr=""
+      local -a helper_arguments=()
+
+      pressure_test_initialize_cleanup_state \
+        "$directory" "$PRESSURE_EXPECTED_MAP_CAPACITY"
+      printf '{"mode":"%s","status":"passed"}\n' "$stale_mode" \
+        >"$stale_output"
+      : >"$stale_stderr"
+      chmod 0644 -- "$stale_output" "$stale_stderr"
+      pressure_test_publish_helper_completion_receipt \
+        "$stale_mode" "$stale_output" "$stale_stderr" 0 \
+        "$PRESSURE_CLEANUP_DEADLINE" --seed 1 --mode "$stale_mode"
+      run_map_pressure_helper() {
+        helper_output="$1"
+        helper_stderr="$2"
+        helper_arguments=("${@:4}")
+        ((helper_calls += 1))
+        pressure_cleanup_result 700 "$PRESSURE_EXPECTED_MAP_CAPACITY" \
+          >"$helper_output"
+        : >"$helper_stderr"
+        chmod 0644 -- "$helper_output" "$helper_stderr"
+        pressure_test_publish_helper_completion_receipt \
+          cleanup "$helper_output" "$helper_stderr" 0 \
+          "$PRESSURE_CLEANUP_DEADLINE" "${helper_arguments[@]}"
+      }
+      wait_for_pressure_map_state() {
+        pressure_state_result "$@"
+      }
+
+      cleanup_map_pressure
+      [[ "$PRESSURE_ACTIVE" == false && "$helper_calls" -eq 1 &&
+        "$PRESSURE_CLEANUP_DELETION_STAGE" == proof-ready &&
+        "$PRESSURE_CLEANUP_DELETION_COMMAND_STATUS" == 0 &&
+        -z "$PRESSURE_HELPER_COMPLETION_RECEIPT" &&
+        -z "$PRESSURE_CLEANUP_SAFETY_RECEIPT" ]]
+      pressure_test_teardown_runtime "$PRESSURE_CLEANUP_DEADLINE"
+    )
+  done
+
+  (
+    local -r directory="$TEST_TMP_DIR/pressure-receipt-validation"
+    local -r output="$directory/map-pressure-pressure-cleanup-attempt-01.json"
+    local -r stderr_output="$directory/map-pressure-pressure-cleanup-attempt-01.stderr.log"
+    local receipt=""
+    local mutated=""
+    local status=""
+    local -a arguments=(
+      --map-id 41 --expected-max-entries "$PRESSURE_EXPECTED_MAP_CAPACITY"
+      --process-pid 101 --process-namespace 202 --token-base 700 --seed 1
+      --mode cleanup
+    )
+
+    pressure_test_initialize_cleanup_state \
+      "$directory" "$PRESSURE_EXPECTED_MAP_CAPACITY"
+    pressure_cleanup_result 700 "$PRESSURE_EXPECTED_MAP_CAPACITY" >"$output"
+    : >"$stderr_output"
+    chmod 0644 -- "$output" "$stderr_output"
+    pressure_test_publish_helper_completion_receipt \
+      cleanup "$output" "$stderr_output" 23 \
+      "$PRESSURE_CLEANUP_DEADLINE" "${arguments[@]}"
+    receipt="$PRESSURE_HELPER_COMPLETION_RECEIPT"
+    status="$(pressure_helper_completion_receipt_status_from_receipt \
+      "$receipt" cleanup "$output" "$stderr_output" \
+      "$PRESSURE_CLEANUP_DEADLINE" "${arguments[@]}")"
+    [[ "$status" == 23 ]]
+
+    if pressure_helper_completion_receipt_status_from_receipt \
+      "$receipt" cleanup "$output" "$stderr_output" \
+      "$PRESSURE_CLEANUP_DEADLINE" \
+      "${arguments[@]:0:${#arguments[@]}-4}" --seed 2 --mode cleanup \
+      >/dev/null 2>&1; then
+      printf 'cleanup receipt accepted a different invocation\n' >&2
       return 1
-    else
-      cleanup_status=$?
     fi
-    [[ "$cleanup_status" -eq 37 && \
-      "$PRESSURE_ACTIVE" == "true" && \
-      "$PRESSURE_CLEANUP_ATTEMPT" -eq "$PRESSURE_CLEANUP_MAX_ATTEMPTS" ]]
-    [[ -f "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-03.json" && \
-      -f "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-03.status" ]]
-    [[ ! -e "$RESULT_DIR/map-pressure-pressure-test-cleanup.json" && \
-      ! -e "$RESULT_DIR/map-pressure-pressure-test-cleanup.stderr.log" && \
-      ! -e "$RESULT_DIR/map-pressure-pressure-test-recovered.prom" && \
-      ! -e "$RESULT_DIR/map-pressure-pressure-test-recovered-sample-01.prom" && \
-      ! -e "$RESULT_DIR/map-pressure-pressure-test-recovered-sample-02.prom" && \
-      ! -e "$RESULT_DIR/map-pressure-pressure-test-recovered-samples.log" ]]
+    for mutated in \
+      "$(jq -cS '.status = 256' <<<"$receipt")" \
+      "$(jq -cS '.output.path = "/wrong"' <<<"$receipt")" \
+      '{"malformed":true}'; do
+      if pressure_helper_completion_receipt_status_from_receipt \
+        "$mutated" cleanup "$output" "$stderr_output" \
+        "$PRESSURE_CLEANUP_DEADLINE" "${arguments[@]}" \
+        >/dev/null 2>&1; then
+        printf 'cleanup receipt accepted malformed or mismatched authority\n' >&2
+        return 1
+      fi
+    done
+    PRESSURE_CLEANUP_SAFETY_RECEIPT="$receipt"
+    PRESSURE_HELPER_COMPLETION_RECEIPT=""
+    if pressure_helper_completion_receipt_status \
+      cleanup "$output" "$stderr_output" "$PRESSURE_CLEANUP_DEADLINE" \
+      "${arguments[@]}" >/dev/null 2>&1; then
+      printf 'safety-only receipt leaked into acceptance authority\n' >&2
+      return 1
+    fi
+    [[ "$(pressure_helper_completion_receipt_status_from_receipt \
+      "$PRESSURE_CLEANUP_SAFETY_RECEIPT" cleanup "$output" "$stderr_output" \
+      "$PRESSURE_CLEANUP_DEADLINE" "${arguments[@]}")" == 23 ]]
+    PRESSURE_CLEANUP_SAFETY_RECEIPT=""
+    pressure_test_teardown_runtime "$PRESSURE_CLEANUP_DEADLINE"
   )
 
   (
-    local -r token_base="700"
-    local cleanup_calls=0
-    local cleanup_status=0
+    local -r directory="$TEST_TMP_DIR/pressure-receipt-status-tear"
+    local -r output="$directory/map-pressure-pressure-cleanup-attempt-01.json"
+    local -r stderr_output="$directory/map-pressure-pressure-cleanup-attempt-01.stderr.log"
+    local helper_calls=0
+    local -a arguments=(
+      --map-id 41 --expected-max-entries "$PRESSURE_EXPECTED_MAP_CAPACITY"
+      --process-pid 101 --process-namespace 202 --token-base 700 --seed 1
+      --mode cleanup
+    )
 
-    RESULT_DIR="$TEST_TMP_DIR/pressure-cleanup-monitor-failure"
-    mkdir -p -- "$RESULT_DIR"
-    COMPOSE=(fake-compose)
-    SCENARIO_SEED=1
-    printf '%s\n' \
-      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 7' \
-      >"$RESULT_DIR/before.prom"
-    run_bounded() {
-      case " $* " in
-        *' --mode prepare '*) pressure_prepare_result "$token_base" ;;
-        *' --mode fill '*) pressure_fill_result "$token_base" ;;
-        *' --mode cleanup '*)
-          ((cleanup_calls += 1))
-          if ((cleanup_calls == 1)); then
-            return 23
-          fi
-          pressure_cleanup_result "$token_base"
-          ;;
-        *) return 64 ;;
-      esac
+    pressure_test_initialize_cleanup_state \
+      "$directory" "$PRESSURE_EXPECTED_MAP_CAPACITY"
+    PRESSURE_CLEANUP_ATTEMPT=1
+    PRESSURE_CLEANUP_DELETION_ATTEMPT=1
+    PRESSURE_CLEANUP_DELETION_ATTEMPT_OPEN=true
+    PRESSURE_CLEANUP_DELETION_STAGE=started
+    PRESSURE_CLEANUP_DELETION_COMMAND_STATUS=0
+    pressure_cleanup_result 700 "$PRESSURE_EXPECTED_MAP_CAPACITY" >"$output"
+    : >"$stderr_output"
+    chmod 0644 -- "$output" "$stderr_output"
+    pressure_test_publish_helper_completion_receipt \
+      cleanup "$output" "$stderr_output" 0 \
+      "$PRESSURE_CLEANUP_DEADLINE" "${arguments[@]}"
+    run_map_pressure_helper() {
+      ((helper_calls += 1))
+      return 99
     }
     wait_for_pressure_map_state() {
       pressure_state_result "$@"
     }
-    start_map_pressure_monitor() {
-      return 0
-    }
-    stop_map_pressure_monitor() {
-      PRESSURE_MONITOR_PID=""
-      return 29
+
+    cleanup_map_pressure
+    [[ "$helper_calls" -eq 0 && "$PRESSURE_ACTIVE" == false &&
+      -z "$PRESSURE_HELPER_COMPLETION_RECEIPT" &&
+      "$PRESSURE_CLEANUP_DELETION_STAGE" == proof-ready ]]
+    pressure_test_teardown_runtime "$PRESSURE_CLEANUP_DEADLINE"
+  )
+}
+
+test_map_pressure_successful_deletion_is_never_reissued() {
+  local failure_kind=""
+
+  for failure_kind in validation status publication; do
+    (
+      local -r directory="$TEST_TMP_DIR/pressure-one-shot-$failure_kind"
+      local -r failure_marker="$directory/failure-injected"
+      local helper_calls=0
+      local output=""
+      local stderr_output=""
+
+      pressure_test_initialize_cleanup_state \
+        "$directory" "$PRESSURE_EXPECTED_MAP_CAPACITY"
+      run_map_pressure_helper() {
+        local -a helper_arguments=("${@:4}")
+        output="$1"
+        stderr_output="$2"
+        ((helper_calls += 1))
+        pressure_cleanup_result 700 >"$output"
+        : >"$stderr_output"
+        chmod 0644 -- "$output" "$stderr_output"
+        pressure_test_publish_helper_completion_receipt \
+          cleanup "$output" "$stderr_output" 0 \
+          "$PRESSURE_CLEANUP_DEADLINE" "${helper_arguments[@]}"
+      }
+      wait_for_pressure_map_state() {
+        pressure_state_result "$@"
+      }
+
+      case "$failure_kind" in
+        validation)
+          eval "$(declare -f validate_pressure_cleanup_deletion | \
+            sed '1s/validate_pressure_cleanup_deletion/original_validate_pressure_cleanup_deletion/')"
+          validate_pressure_cleanup_deletion() {
+            if [[ ! -e "$failure_marker" ]]; then
+              : >"$failure_marker"
+              return 83
+            fi
+            original_validate_pressure_cleanup_deletion "$@"
+          }
+          ;;
+        status)
+          eval "$(declare -f record_pressure_cleanup_status | \
+            sed '1s/record_pressure_cleanup_status/original_record_pressure_cleanup_status/')"
+          record_pressure_cleanup_status() {
+            if [[ ! -e "$failure_marker" ]]; then
+              : >"$failure_marker"
+              return 84
+            fi
+            original_record_pressure_cleanup_status "$@"
+          }
+          ;;
+        publication)
+          eval "$(declare -f publish_owned_file_idempotent_no_clobber | \
+            sed '1s/publish_owned_file_idempotent_no_clobber/original_publish_owned_file_idempotent_no_clobber/')"
+          publish_owned_file_idempotent_no_clobber() {
+            if [[ ! -e "$failure_marker" ]]; then
+              : >"$failure_marker"
+              return 85
+            fi
+            original_publish_owned_file_idempotent_no_clobber "$@"
+          }
+          ;;
+        *) return 1 ;;
+      esac
+
+      cleanup_map_pressure_with_retries >/dev/null 2>&1
+      [[ -e "$failure_marker" && "$helper_calls" -eq 1 &&
+        "$PRESSURE_ACTIVE" == false &&
+        "$PRESSURE_CLEANUP_DELETION_STAGE" == proof-ready &&
+        "$PRESSURE_CLEANUP_DELETION_ATTEMPT" -eq 1 &&
+        "$PRESSURE_CLEANUP_DELETION_PROOF" == \
+          "$RESULT_DIR/map-pressure-pressure-cleanup-attempt-01.json" ]]
+      cmp -s -- "$PRESSURE_CLEANUP_DELETION_PROOF" \
+        "$RESULT_DIR/map-pressure-pressure-cleanup.json"
+    )
+  done
+}
+
+test_map_pressure_cleanup_only_transition_ordering_is_restartable() {
+  (
+    local -r directory="$TEST_TMP_DIR/pressure-cleanup-only-preparing"
+    local helper_calls=0
+    local output=""
+    local stderr_output=""
+
+    pressure_test_initialize_cleanup_state \
+      "$directory" "$PRESSURE_EXPECTED_MAP_CAPACITY"
+    PRESSURE_CLEANUP_DELETION_STAGE=cleanup-only-preparing
+    PRESSURE_CLEANUP_ATTEMPT=1
+    PRESSURE_CLEANUP_ATTEMPT_TARGET=1
+    PRESSURE_CLEANUP_DELETION_ATTEMPT_OPEN=true
+    run_map_pressure_helper() {
+      local -a helper_arguments=("${@:4}")
+      output="$1"
+      stderr_output="$2"
+      ((helper_calls += 1))
+      pressure_cleanup_result 700 "$PRESSURE_EXPECTED_MAP_CAPACITY" \
+        >"$output"
+      : >"$stderr_output"
+      chmod 0644 -- "$output" "$stderr_output"
+      pressure_test_publish_helper_completion_receipt \
+        cleanup "$output" "$stderr_output" 0 \
+        "$PRESSURE_CLEANUP_DEADLINE" "${helper_arguments[@]}"
     }
 
-    SELECTED_TRANSPORT=getsockopt
-    start_map_pressure pressure-test "$RESULT_DIR/before.prom" 1 >/dev/null
-    PRESSURE_MONITOR_PID=123
-    if cleanup_map_pressure_with_retries >/dev/null 2>&1; then
-      printf 'map-pressure cleanup erased a monitor failure during retry\n' >&2
+    if complete_pressure_cleanup_only_after_interruption >/dev/null 2>&1; then
+      printf 'cleanup-only safety repair became acceptance evidence\n' >&2
+      return 1
+    fi
+    [[ "$helper_calls" -eq 1 && "$PRESSURE_CLEANUP_ATTEMPT" -eq 1 &&
+      "$PRESSURE_CLEANUP_ATTEMPT_TARGET" -eq 0 &&
+      "$PRESSURE_CLEANUP_DELETION_ATTEMPT_OPEN" == true &&
+      "$PRESSURE_CLEANUP_DELETION_STAGE" == cleanup-only-complete &&
+      "$PRESSURE_ACTIVE" == false &&
+      -z "$PRESSURE_HELPER_COMPLETION_RECEIPT" &&
+      -z "$PRESSURE_CLEANUP_SAFETY_RECEIPT" ]]
+    cleanup_map_pressure
+    [[ "$helper_calls" -eq 1 &&
+      "$PRESSURE_CLEANUP_DELETION_STAGE" == cleanup-only-complete ]]
+    pressure_test_teardown_runtime "$PRESSURE_CLEANUP_DEADLINE"
+  )
+
+  (
+    local -r directory="$TEST_TMP_DIR/pressure-cleanup-only-maximum"
+    local helper_calls=0
+
+    pressure_test_initialize_cleanup_state \
+      "$directory" "$PRESSURE_EXPECTED_MAP_CAPACITY"
+    PRESSURE_CLEANUP_DELETION_STAGE=cleanup-only-preparing
+    PRESSURE_CLEANUP_ATTEMPT="$PRESSURE_CLEANUP_MAX_ATTEMPTS"
+    PRESSURE_CLEANUP_ATTEMPT_TARGET=0
+    PRESSURE_CLEANUP_DELETION_ATTEMPT_OPEN=false
+    run_map_pressure_helper() {
+      ((helper_calls += 1))
+      return 99
+    }
+
+    if complete_pressure_cleanup_only_after_interruption >/dev/null 2>&1; then
+      printf 'cleanup-only preparation exceeded its attempt maximum\n' >&2
+      return 1
+    fi
+    [[ "$helper_calls" -eq 0 &&
+      "$PRESSURE_CLEANUP_ATTEMPT" -eq "$PRESSURE_CLEANUP_MAX_ATTEMPTS" &&
+      "$PRESSURE_CLEANUP_ATTEMPT_TARGET" -eq 0 &&
+      "$PRESSURE_CLEANUP_DELETION_ATTEMPT_OPEN" == false &&
+      "$PRESSURE_CLEANUP_DELETION_STAGE" == cleanup-only-preparing &&
+      "$PRESSURE_ACTIVE" == true ]]
+  )
+
+  (
+    local -r directory="$TEST_TMP_DIR/pressure-cleanup-only-terminal"
+    local helper_calls=0
+
+    pressure_test_initialize_cleanup_state \
+      "$directory" "$PRESSURE_EXPECTED_MAP_CAPACITY"
+    PRESSURE_CLEANUP_DELETION_STAGE=cleanup-only-completing
+    PRESSURE_CLEANUP_SAFETY_RECEIPT='{"safety":"durable"}'
+    run_map_pressure_helper() {
+      ((helper_calls += 1))
+      return 99
+    }
+
+    if complete_pressure_cleanup_only_after_interruption >/dev/null 2>&1; then
+      printf 'cleanup-only completing tear became acceptance evidence\n' >&2
+      return 1
+    fi
+    [[ "$helper_calls" -eq 0 && "$PRESSURE_ACTIVE" == false &&
+      "$PRESSURE_CLEANUP_DELETION_STAGE" == cleanup-only-complete &&
+      -z "$PRESSURE_CLEANUP_SAFETY_RECEIPT" ]]
+    complete_pressure_cleanup_only_after_interruption
+    [[ "$helper_calls" -eq 0 && "$PRESSURE_ACTIVE" == false &&
+      "$PRESSURE_CLEANUP_DELETION_STAGE" == cleanup-only-complete ]]
+    pressure_test_teardown_runtime "$PRESSURE_CLEANUP_DEADLINE"
+  )
+}
+
+test_pressure_publication_is_no_clobber_and_cleans_temporaries() {
+  (
+    local -r directory="$TEST_TMP_DIR/pressure-publish-race"
+    local -r source="$directory/source"
+    local -r target="$directory/target"
+    local source_digest=""
+    local -r deadline="$((SECONDS + 60))"
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$directory"
+    pressure_test_pin_runtime "$deadline"
+    printf 'owned\n' >"$source"
+    chmod 0644 -- "$source"
+    source_digest="$(sha256_file "$source" "$deadline")"
+    eval "$(declare -f pressure_move_registered_inode_no_clobber | \
+      sed '1s/pressure_move_registered_inode_no_clobber/pressure_test_original_move_registered_inode_no_clobber/')"
+    pressure_move_registered_inode_no_clobber() {
+      local -r target_anchor="$3"
+      if [[ "${target_anchor##*/}" == "${target##*/}" &&
+        ! -e "$target_anchor" ]]; then
+        printf 'competitor\n' >"$target_anchor"
+        chmod 0644 -- "$target_anchor"
+      fi
+      pressure_test_original_move_registered_inode_no_clobber "$@"
+    }
+
+    if publish_owned_file_no_clobber \
+      "$source" "$target" 0644 "$deadline" "$deadline" \
+      >/dev/null 2>&1; then
+      printf 'owned publication accepted the GNU mv -n no-op race\n' >&2
+      return 1
+    fi
+    [[ "$(<"$target")" == competitor &&
+      "$(sha256_file "$source" "$deadline")" == "$source_digest" ]]
+    [[ -z "$(find "$directory" -maxdepth 1 \
+      -name '.pressure-publish-target' -print -quit)" ]]
+    pressure_test_teardown_runtime "$deadline"
+  )
+
+  (
+    local -r container_id="$(printf '8%.0s' {1..64})"
+    local -r target_name="$PRESSURE_CONTROL_RELEASE_FILE"
+    local target=""
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$TEST_TMP_DIR/pressure-release-race"
+    PRESSURE_CONTROL_DEADLINE="$((SECONDS + 30))"
+    pressure_test_pin_runtime "$PRESSURE_CONTROL_DEADLINE"
+    pressure_test_prepare_control_directory "$PRESSURE_CONTROL_DEADLINE"
+    PRESSURE_SCENARIO_CONTAINER_ID="$container_id"
+    PRESSURE_SCENARIO_CONTAINER_NAME="$PROJECT_NAME-pressure-scenario"
+    PRESSURE_SCENARIO_CONTAINER_IDENTITY="$container_id|123|2026-08-19T00:00:00Z|0:0"
+    PRESSURE_BARRIER_RUNTIME_STATUS=ready
+    pressure_fill_result 700 >"$RESULT_DIR/fill.json"
+    chmod 0644 -- "$RESULT_DIR/fill.json"
+    pressure_scenario_container_identity() {
+      printf -v "$4" '%s' "$PRESSURE_SCENARIO_CONTAINER_IDENTITY"
+    }
+    target="$PRESSURE_CONTROL_LIVE_DIR/$target_name"
+    eval "$(declare -f pressure_move_registered_inode_no_clobber | \
+      sed '1s/pressure_move_registered_inode_no_clobber/pressure_test_original_release_move_registered_inode_no_clobber/')"
+    pressure_move_registered_inode_no_clobber() {
+      local -r target_anchor="$3"
+      if [[ "${target_anchor##*/}" == "$target_name" && ! -e "$target_anchor" ]]; then
+        printf 'competitor\n' >"$target_anchor"
+        chmod 0600 -- "$target_anchor"
+      fi
+      pressure_test_original_release_move_registered_inode_no_clobber "$@"
+    }
+
+    if publish_pressure_scenario_release \
+      "$RESULT_DIR/fill.json" >/dev/null 2>&1; then
+      printf 'pressure release accepted the GNU mv -n no-op race\n' >&2
+      return 1
+    fi
+    [[ "$(<"$target")" == competitor &&
+      "$PRESSURE_BARRIER_RUNTIME_STATUS" == ready ]]
+    [[ -z "$(find "$PRESSURE_CONTROL_LIVE_DIR" -maxdepth 1 \
+      -name ".pressure-release-$PRESSURE_CONTROL_SESSION" -print -quit)" ]]
+  )
+
+  (
+    local -r directory="$TEST_TMP_DIR/pressure-status-chmod-failure"
+    local -r output="$directory/map-pressure-pressure-cleanup-attempt-01.json"
+    local -r stderr_output="$directory/map-pressure-pressure-cleanup-attempt-01.stderr.log"
+    local -r status_output="$directory/map-pressure-pressure-cleanup-attempt-01.status"
+
+    local -r deadline="$((SECONDS + 60))"
+    local candidate_path=""
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$directory"
+    pressure_test_pin_runtime "$deadline"
+    PRESSURE_BARRIER_RUNTIME_STATUS=failed
+    pressure_cleanup_result 700 >"$output"
+    : >"$stderr_output"
+    chmod 0644 -- "$output" "$stderr_output"
+    run_pressure_bounded() {
+      local -r operation_deadline="$1"
+      shift 2
+      ((operation_deadline > SECONDS)) || return 124
+      if [[ "$1" == chmod ]]; then
+        candidate_path="$(readlink -f -- "${@: -1}")" || return $?
+        if [[ "$candidate_path" == \
+          "$RESULT_DIR/.pressure-status-${status_output##*/}" ]]; then
+          return 74
+        fi
+      fi
+      command "$@"
+    }
+
+    if record_pressure_cleanup_status \
+      "$status_output" false 23 not-run not-run \
+      "$output" "$stderr_output" none "$deadline" >/dev/null 2>&1; then
+      printf 'cleanup status ignored candidate chmod failure\n' >&2
+      return 1
+    fi
+    [[ ! -e "$status_output" &&
+      -z "$(find "$directory" -maxdepth 1 \
+        -name ".pressure-status-${status_output##*/}" -print -quit)" ]]
+    pressure_test_teardown_runtime "$deadline"
+  )
+
+  (
+    local -r canonical="$TEST_TMP_DIR/pressure-canonical-race/map-pressure-pressure-cleanup.json"
+    local output=""
+    local stderr_output=""
+
+    pressure_test_initialize_cleanup_state \
+      "$TEST_TMP_DIR/pressure-canonical-race" \
+      "$PRESSURE_EXPECTED_MAP_CAPACITY"
+    run_map_pressure_helper() {
+      local -a helper_arguments=("${@:4}")
+      output="$1"
+      stderr_output="$2"
+      pressure_cleanup_result 700 >"$output"
+      : >"$stderr_output"
+      chmod 0644 -- "$output" "$stderr_output"
+      pressure_test_publish_helper_completion_receipt \
+        cleanup "$output" "$stderr_output" 0 \
+        "$PRESSURE_CLEANUP_DEADLINE" "${helper_arguments[@]}"
+    }
+    wait_for_pressure_map_state() {
+      pressure_state_result "$@"
+    }
+    eval "$(declare -f publish_owned_file_idempotent_no_clobber | \
+      sed '1s/publish_owned_file_idempotent_no_clobber/pressure_test_original_idempotent_publish/')"
+    publish_owned_file_idempotent_no_clobber() {
+      local -r target="$2"
+      if [[ "$target" == "$canonical" && ! -e "$target" ]]; then
+        printf 'competitor\n' >"$target"
+        chmod 0644 -- "$target"
+        return 29
+      fi
+      pressure_test_original_idempotent_publish "$@"
+    }
+
+    if cleanup_map_pressure >/dev/null 2>&1; then
+      printf 'canonical cleanup accepted a concurrent target\n' >&2
+      return 1
+    fi
+    [[ "$PRESSURE_ACTIVE" == true && "$(<"$canonical")" == competitor ]]
+    [[ ! -e "$RESULT_DIR/map-pressure-pressure-recovered.prom" &&
+      ! -e "$RESULT_DIR/map-pressure-pressure-recovered-sample-01.prom" &&
+      ! -e "$RESULT_DIR/map-pressure-pressure-recovered-sample-02.prom" &&
+      ! -e "$RESULT_DIR/map-pressure-pressure-recovered-samples.log" &&
+      ! -e "$RESULT_DIR/map-pressure-pressure-cleanup.stderr.log" &&
+      ! -e "$RESULT_DIR/map-pressure-pressure-cleanup-attempt-01.status" ]]
+  )
+}
+
+test_pressure_release_publication_deadline_is_hard() {
+  (
+    local -r container_id="$(printf '7%.0s' {1..64})"
+    local -r deadline_log="$TEST_TMP_DIR/pressure-publication-deadlines"
+    local -r overrun_marker="$TEST_TMP_DIR/pressure-publication-overrun"
+    local publish_status=0
+    local start_seconds=0
+    local publication_deadline=0
+    local work_deadline=0
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$TEST_TMP_DIR/pressure-publication-deadline"
+    PRESSURE_CONTROL_DEADLINE="$((SECONDS + 60))"
+    pressure_test_pin_runtime "$PRESSURE_CONTROL_DEADLINE"
+    pressure_test_prepare_control_directory "$PRESSURE_CONTROL_DEADLINE"
+    PRESSURE_SCENARIO_CONTAINER_ID="$container_id"
+    PRESSURE_SCENARIO_CONTAINER_NAME="$PROJECT_NAME-pressure-scenario"
+    PRESSURE_SCENARIO_CONTAINER_IDENTITY="$container_id|123|2026-08-19T00:00:00Z|0:0"
+    PRESSURE_BARRIER_RUNTIME_STATUS=ready
+    pressure_fill_result 700 >"$RESULT_DIR/fill.json"
+    chmod 0644 -- "$RESULT_DIR/fill.json"
+    pressure_scenario_container_identity() {
+      printf -v "$4" '%s' "$PRESSURE_SCENARIO_CONTAINER_IDENTITY"
+    }
+    run_pressure_bounded() {
+      local -r deadline="$1"
+      local -r maximum="$2"
+      local serialized_command=""
+      shift 2
+
+      printf -v serialized_command '%q ' "$@"
+      serialized_command="${serialized_command% }"
+      printf '%s\t%s\t%s\n' \
+        "$deadline" "$maximum" "$serialized_command" >>"$deadline_log"
+      ((deadline > SECONDS)) || return 124
+      if [[ "$1" == sync && ! -e "$overrun_marker" ]]; then
+        : >"$overrun_marker"
+        SECONDS="$deadline"
+        return 124
+      fi
+      command "$@"
+    }
+
+    start_seconds="$SECONDS"
+    publication_deadline="$((start_seconds +
+      PRESSURE_CONTROL_PUBLICATION_TIMEOUT_SECONDS))"
+    work_deadline="$((publication_deadline -
+      PRESSURE_TRANSACTION_CLEANUP_RESERVE_SECONDS))"
+    if publish_pressure_scenario_release \
+      "$RESULT_DIR/fill.json" >/dev/null 2>&1; then
+      printf 'release publication ignored its hard deadline\n' >&2
+      return 1
+    else
+      publish_status=$?
+    fi
+    [[ "$publish_status" -eq 124 && -e "$overrun_marker" &&
+      "$PRESSURE_BARRIER_RUNTIME_STATUS" == ready &&
+      "$PRESSURE_CONTROL_RELEASE_IDENTITY" == "" &&
+      -z "$PRESSURE_RELEASE_TRANSACTION_ID" &&
+      "$SECONDS" -eq "$work_deadline" ]]
+    pressure_transaction_state_is_empty
+    awk -F '\t' -v work="$work_deadline" -v cleanup="$publication_deadline" '
+      NF != 3 || $2 < 3 || $2 > 5 { exit 1 }
+      $1 == work {
+        if (cleanup_seen) exit 1
+        work_seen++
+        if ($3 ~ /^sync /) work_sync++
+        next
+      }
+      $1 == cleanup { cleanup_seen++; next }
+      { exit 1 }
+      END {
+        if (work_seen < 4 || work_sync != 1 || cleanup_seen < 1) exit 1
+      }
+    ' "$deadline_log"
+    cleanup_pressure_control_live_directory "$PRESSURE_CONTROL_DEADLINE"
+    [[ -z "$PRESSURE_CONTROL_LIVE_DIR" &&
+      "$PRESSURE_CONTROL_REMOVAL_STATUS" == not-run ]]
+  )
+}
+
+test_pressure_control_cleanup_resumes_every_removal_boundary() {
+  (
+    local -r first_failure="$TEST_TMP_DIR/pressure-control-rm-failed"
+    local -r deadline="$((SECONDS + 60))"
+    local -r foreign_name=.release.ABC123
+    local cleanup_status=0
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$TEST_TMP_DIR/pressure-control-rm-resume"
+    pressure_test_pin_runtime "$deadline"
+    pressure_test_prepare_control_directory "$deadline"
+    pressure_control_payload "$PRESSURE_CONTROL_READY_FILE" \
+      >"$PRESSURE_CONTROL_LIVE_DIR/$PRESSURE_CONTROL_READY_FILE"
+    pressure_control_payload "$PRESSURE_CONTROL_RELEASE_FILE" \
+      >"$PRESSURE_CONTROL_LIVE_DIR/$PRESSURE_CONTROL_RELEASE_FILE"
+    printf 'foreign\n' >"$PRESSURE_CONTROL_LIVE_DIR/$foreign_name"
+    chmod 0600 -- "$PRESSURE_CONTROL_LIVE_DIR"/* \
+      "$PRESSURE_CONTROL_LIVE_DIR/$foreign_name"
+
+    if cleanup_pressure_control_live_directory "$deadline" \
+      >/dev/null 2>&1; then
+      printf 'control cleanup accepted an unauthorized residue name\n' >&2
+      return 1
+    fi
+    [[ "$(<"$PRESSURE_CONTROL_LIVE_DIR/$foreign_name")" == foreign ]]
+    command rm -- "$PRESSURE_CONTROL_LIVE_DIR/$foreign_name"
+    printf 'recognized\n' \
+      >"$PRESSURE_CONTROL_LIVE_DIR/.pressure-release-$PRESSURE_CONTROL_SESSION"
+    chmod 0600 -- \
+      "$PRESSURE_CONTROL_LIVE_DIR/.pressure-release-$PRESSURE_CONTROL_SESSION"
+    run_pressure_bounded() {
+      local -r operation_deadline="$1"
+      shift 2
+      ((operation_deadline > SECONDS)) || return 124
+      if [[ "$1" == rm && "${*: -1}" == \
+          */.pressure-release-"$PRESSURE_CONTROL_SESSION" &&
+        ! -e "$first_failure" ]]; then
+        command "$@" || return $?
+        : >"$first_failure"
+        return 73
+      fi
+      command "$@"
+    }
+
+    if cleanup_pressure_control_live_directory "$deadline"; then
+      printf 'control cleanup ignored a post-removal interruption\n' >&2
       return 1
     else
       cleanup_status=$?
     fi
-    [[ "$cleanup_status" -eq 29 && \
-      "$PRESSURE_MONITOR_STATUS" -eq 29 && \
-      "$PRESSURE_ACTIVE" == "false" && \
-      "$PRESSURE_CLEANUP_ATTEMPT" -eq 2 ]]
-    grep -Fq 'monitor_status=29' \
-      "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-02.status"
+    [[ "$cleanup_status" -eq 73 && -e "$first_failure" &&
+      "$PRESSURE_CONTROL_REMOVAL_STATUS" == leaves-removal-pending &&
+      -d "$PRESSURE_CONTROL_LIVE_DIR" ]]
+    cleanup_pressure_control_live_directory "$deadline"
+    [[ -z "$PRESSURE_CONTROL_LIVE_DIR" &&
+      -z "$PRESSURE_CONTROL_LIVE_IDENTITY" &&
+      "$PRESSURE_CONTROL_REMOVAL_STATUS" == not-run ]]
+    pressure_test_teardown_runtime "$deadline"
   )
+
+  (
+    local -r first_failure="$TEST_TMP_DIR/pressure-control-rmdir-failed"
+    local -r deadline="$((SECONDS + 60))"
+    local cleanup_status=0
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$TEST_TMP_DIR/pressure-control-rmdir-resume"
+    pressure_test_pin_runtime "$deadline"
+    pressure_test_prepare_control_directory "$deadline"
+    run_pressure_bounded() {
+      local -r operation_deadline="$1"
+      shift 2
+      ((operation_deadline > SECONDS)) || return 124
+      if [[ "$1" == rmdir && ! -e "$first_failure" ]]; then
+        command "$@" || return $?
+        : >"$first_failure"
+        return 74
+      fi
+      command "$@"
+    }
+
+    if cleanup_pressure_control_live_directory "$deadline"; then
+      printf 'control cleanup ignored a post-rmdir interruption\n' >&2
+      return 1
+    else
+      cleanup_status=$?
+    fi
+    [[ "$cleanup_status" -eq 74 && -e "$first_failure" &&
+      "$PRESSURE_CONTROL_REMOVAL_STATUS" == directory-removal-pending &&
+      ! -e "$PRESSURE_CONTROL_LIVE_DIR" ]]
+    cleanup_pressure_control_live_directory "$deadline"
+    [[ -z "$PRESSURE_CONTROL_LIVE_DIR" &&
+      -z "$PRESSURE_CONTROL_LIVE_IDENTITY" &&
+      "$PRESSURE_CONTROL_REMOVAL_STATUS" == not-run ]]
+    pressure_test_teardown_runtime "$deadline"
+  )
+
+  (
+    local before_options=""
+    local after_options=""
+    local -r deadline="$((SECONDS + 60))"
+
+    pressure_test_reset_lifecycle_state
+    pressure_test_prepare_runtime "$TEST_TMP_DIR/pressure-control-options"
+    pressure_test_pin_runtime "$deadline"
+    pressure_test_prepare_control_directory "$deadline"
+    pressure_control_payload "$PRESSURE_CONTROL_READY_FILE" \
+      >"$PRESSURE_CONTROL_LIVE_DIR/$PRESSURE_CONTROL_READY_FILE"
+    chmod 0600 -- \
+      "$PRESSURE_CONTROL_LIVE_DIR/$PRESSURE_CONTROL_READY_FILE"
+    set -f
+    shopt -u nullglob dotglob
+    shopt -s failglob
+    shopt -s varredir_close
+    set -o noclobber
+    umask 0077
+    GLOBIGNORE='*.caller-owned'
+    before_options="$(pressure_test_shell_option_fingerprint)"
+    cleanup_pressure_control_live_directory "$deadline"
+    after_options="$(pressure_test_shell_option_fingerprint)"
+    [[ "$after_options" == "$before_options" &&
+      -z "$PRESSURE_CONTROL_LIVE_DIR" &&
+      "$PRESSURE_CONTROL_REMOVAL_STATUS" == not-run ]] || {
+      printf 'control cleanup changed caller glob state: before=%q after=%q\n' \
+        "$before_options" "$after_options" >&2
+      return 1
+    }
+    pressure_test_teardown_runtime "$deadline"
+  )
+}
+
+test_pressure_retention_rejects_ready_release_replacement() {
+  local replace_name=""
+
+  for replace_name in ready release; do
+    (
+      local -r container_id="$(printf '5%.0s' {1..64})"
+      local -r label=pressure-run-01
+      local -r directory="$TEST_TMP_DIR/pressure-retain-replace-$replace_name"
+      local -r replacement_marker="$directory/replaced"
+      local source=""
+      local destination=""
+      local replacement=""
+      local -r deadline="$((SECONDS + 60))"
+
+      pressure_test_reset_lifecycle_state
+      pressure_test_prepare_runtime "$directory"
+      pressure_test_pin_runtime "$deadline"
+      pressure_test_prepare_control_directory "$deadline"
+      PRESSURE_SCENARIO_CONTAINER_ID="$container_id"
+      PRESSURE_SCENARIO_CONTAINER_NAME="$PROJECT_NAME-pressure-scenario"
+      pressure_control_payload "$PRESSURE_CONTROL_READY_FILE" \
+        >"$PRESSURE_CONTROL_LIVE_DIR/$PRESSURE_CONTROL_READY_FILE"
+      pressure_control_payload "$PRESSURE_CONTROL_RELEASE_FILE" \
+        >"$PRESSURE_CONTROL_LIVE_DIR/$PRESSURE_CONTROL_RELEASE_FILE"
+      chmod 0600 -- "$PRESSURE_CONTROL_LIVE_DIR"/{ready,release}
+      PRESSURE_CONTROL_READY_IDENTITY="$(
+        pressure_control_live_file_identity \
+          "$PRESSURE_CONTROL_READY_FILE" "$deadline"
+      )"
+      PRESSURE_CONTROL_RELEASE_IDENTITY="$(
+        pressure_control_live_file_identity \
+          "$PRESSURE_CONTROL_RELEASE_FILE" "$deadline"
+      )"
+      PRESSURE_BARRIER_RUNTIME_STATUS=reaped
+      pressure_container_is_absent() {
+        return 0
+      }
+      run_pressure_bounded() {
+        local -r operation_deadline="$1"
+        shift 2
+        ((operation_deadline > SECONDS)) || return 124
+        if [[ "$1" == cp ]]; then
+          source="$(readlink -f -- "${@: -2:1}")" || return $?
+          destination="${*: -1}"
+        fi
+        command "$@" || return $?
+        if [[ "$source" == "$PRESSURE_CONTROL_LIVE_DIR/$replace_name" &&
+          ! -e "$replacement_marker" ]]; then
+          replacement="$source.replacement"
+          pressure_control_payload "$replace_name" >"$replacement"
+          command chmod 0600 -- "$replacement"
+          command mv -f -- "$replacement" "$source"
+          : >"$replacement_marker"
+        fi
+      }
+
+      if retain_pressure_control_evidence "$label" >/dev/null 2>&1; then
+        printf 'pressure retention accepted replacement of %s during copy\n' \
+          "$replace_name" >&2
+        return 1
+      fi
+      [[ -n "$destination" && -e "$replacement_marker" &&
+        -f "$PRESSURE_CONTROL_LIVE_DIR/ready" &&
+        -f "$PRESSURE_CONTROL_LIVE_DIR/release" ]]
+      [[ ! -e "$RESULT_DIR/map-pressure-$label-barrier-ready.txt" &&
+        ! -e "$RESULT_DIR/map-pressure-$label-barrier-release.txt" ]]
+      [[ -z "$(find "$RESULT_DIR" -maxdepth 1 \
+        \( -name ".pressure-ready-$PRESSURE_CONTROL_SESSION" -o \
+          -name ".pressure-release-retain-$PRESSURE_CONTROL_SESSION" \) \
+        -print -quit)" ]]
+    )
+  done
 }
 
 test_map_pressure_result_contract_is_single_record_and_exact() {
@@ -9245,7 +12711,7 @@ test_map_pressure_result_contract_is_single_record_and_exact() {
 
   pressure_prepare_result 700 >"$output"
   pressure_result_has_contract "$output" prepare
-  [[ "$(pressure_result_uint "$output" token_base)" == "700" ]]
+  [[ "$(pressure_result_uint "$output" token_base)" == 700 ]]
 
   pressure_prepare_result 700 >>"$output"
   if pressure_result_has_contract "$output" prepare; then
@@ -9266,163 +12732,6 @@ test_map_pressure_result_contract_is_single_record_and_exact() {
     printf 'map-pressure contract accepted wrong static map identity\n' >&2
     return 1
   fi
-}
-
-test_map_pressure_helper_capture_preserves_status_and_streams() {
-  (
-    local -r output="$TEST_TMP_DIR/pressure-helper.stdout"
-    local -r stderr_output="$TEST_TMP_DIR/pressure-helper.stderr"
-    local helper_status=0
-
-    RESULT_DIR="$TEST_TMP_DIR"
-    COMPOSE=(fake-compose)
-    run_bounded() {
-      printf 'complete stdout\n'
-      printf 'complete stderr\n' >&2
-      return 23
-    }
-    if run_map_pressure_helper \
-      "$output" "$stderr_output" 5 --mode prepare >/dev/null 2>&1; then
-      printf 'map-pressure helper capture lost the command failure\n' >&2
-      return 1
-    else
-      helper_status=$?
-    fi
-    [[ "$helper_status" -eq 23 ]]
-    [[ "$(<"$output")" == "complete stdout" ]]
-    [[ "$(<"$stderr_output")" == "complete stderr" ]]
-  )
-
-  (
-    local -r call_marker="$TEST_TMP_DIR/pressure-helper-open.called"
-    local helper_status=0
-
-    RESULT_DIR="$TEST_TMP_DIR"
-    COMPOSE=(fake-compose)
-    run_bounded() {
-      : >"$call_marker"
-    }
-    if run_map_pressure_helper \
-      "$TEST_TMP_DIR/missing/stdout" \
-      "$TEST_TMP_DIR/missing/stderr" \
-      5 \
-      --mode prepare >/dev/null 2>&1; then
-      printf 'map-pressure helper ignored a capture-open failure\n' >&2
-      return 1
-    else
-      helper_status=$?
-    fi
-    ((helper_status != 0))
-    [[ ! -e "$call_marker" ]]
-  )
-}
-
-test_map_pressure_canonical_promotion_rolls_back_partial_files() {
-  (
-    local -r token_base="700"
-    local destination=""
-
-    RESULT_DIR="$TEST_TMP_DIR/pressure-cleanup-promotion-failure"
-    mkdir -p -- "$RESULT_DIR"
-    COMPOSE=(fake-compose)
-    SCENARIO_SEED=1
-    printf '%s\n' \
-      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 7' \
-      >"$RESULT_DIR/before.prom"
-    run_bounded() {
-      case " $* " in
-        *' --mode prepare '*) pressure_prepare_result "$token_base" ;;
-        *' --mode fill '*) pressure_fill_result "$token_base" ;;
-        *' --mode cleanup '*) pressure_cleanup_result "$token_base" ;;
-        *) return 64 ;;
-      esac
-    }
-    wait_for_pressure_map_state() {
-      pressure_state_result "$@"
-    }
-    start_map_pressure_monitor() {
-      return 0
-    }
-    install() {
-      destination="${!#}"
-      if [[ "$destination" == "$RESULT_DIR/map-pressure-pressure-test-cleanup.stderr.log" ]]; then
-        printf 'partial\n' >"$destination"
-        return 1
-      fi
-      command install "$@"
-    }
-
-    SELECTED_TRANSPORT=getsockopt
-    start_map_pressure pressure-test "$RESULT_DIR/before.prom" 1 >/dev/null
-    if cleanup_map_pressure >/dev/null 2>&1; then
-      printf 'map-pressure cleanup accepted a partial canonical promotion\n' >&2
-      return 1
-    fi
-    [[ "$PRESSURE_ACTIVE" == "true" ]]
-    [[ ! -e "$RESULT_DIR/map-pressure-pressure-test-cleanup.json" && \
-      ! -e "$RESULT_DIR/map-pressure-pressure-test-cleanup.stderr.log" && \
-      ! -e "$RESULT_DIR/map-pressure-pressure-test-recovered.prom" && \
-      ! -e "$RESULT_DIR/map-pressure-pressure-test-recovered-sample-01.prom" && \
-      ! -e "$RESULT_DIR/map-pressure-pressure-test-recovered-sample-02.prom" && \
-      ! -e "$RESULT_DIR/map-pressure-pressure-test-recovered-samples.log" ]]
-    [[ -f "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01.json" && \
-      -f "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01.status" ]]
-  )
-
-  (
-    local -r token_base="700"
-    local destination=""
-
-    RESULT_DIR="$TEST_TMP_DIR/pressure-recovery-promotion-failure"
-    mkdir -p -- "$RESULT_DIR"
-    COMPOSE=(fake-compose)
-    SCENARIO_SEED=1
-    printf '%s\n' \
-      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 7' \
-      >"$RESULT_DIR/before.prom"
-    run_bounded() {
-      case " $* " in
-        *' --mode prepare '*) pressure_prepare_result "$token_base" ;;
-        *' --mode fill '*) pressure_fill_result "$token_base" ;;
-        *' --mode cleanup '*) pressure_cleanup_result "$token_base" ;;
-        *) return 64 ;;
-      esac
-    }
-    wait_for_pressure_map_state() {
-      pressure_state_result "$@"
-    }
-    start_map_pressure_monitor() {
-      return 0
-    }
-    install() {
-      destination="${!#}"
-      if [[ "$destination" == "$RESULT_DIR/map-pressure-pressure-test-recovered-sample-02.prom" ]]; then
-        printf 'partial\n' >"$destination"
-        return 1
-      fi
-      command install "$@"
-    }
-
-    SELECTED_TRANSPORT=getsockopt
-    start_map_pressure pressure-test "$RESULT_DIR/before.prom" 1 >/dev/null
-    if cleanup_map_pressure >/dev/null 2>&1; then
-      printf 'map-pressure cleanup accepted a partial recovery promotion\n' >&2
-      return 1
-    fi
-    [[ "$PRESSURE_ACTIVE" == "true" ]]
-    [[ ! -e "$RESULT_DIR/map-pressure-pressure-test-cleanup.json" && \
-      ! -e "$RESULT_DIR/map-pressure-pressure-test-cleanup.stderr.log" && \
-      ! -e "$RESULT_DIR/map-pressure-pressure-test-recovered.prom" && \
-      ! -e "$RESULT_DIR/map-pressure-pressure-test-recovered-sample-01.prom" && \
-      ! -e "$RESULT_DIR/map-pressure-pressure-test-recovered-sample-02.prom" && \
-      ! -e "$RESULT_DIR/map-pressure-pressure-test-recovered-samples.log" ]]
-    [[ -f "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01-recovered.prom" && \
-      -f "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01-recovered-sample-01.prom" && \
-      -f "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01-recovered-sample-02.prom" && \
-      -f "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01-recovered-samples.log" ]]
-    grep -Fq 'recovery_status=failed' \
-      "$RESULT_DIR/map-pressure-pressure-test-cleanup-attempt-01.status"
-  )
 }
 
 test_bridge_take_count_includes_cancelled_request() {
@@ -9473,7 +12782,13 @@ test_bridge_take_count_includes_cancelled_request() {
 }
 
 test_pressure_scenario_counts_are_unique_and_bounded() {
-  local -r result="$TEST_TMP_DIR/pressure-scenario-result.json"
+  local result=""
+  local -r deadline="$((SECONDS + 60))"
+
+  pressure_test_reset_lifecycle_state
+  pressure_test_prepare_runtime "$TEST_TMP_DIR/pressure-scenario-counts"
+  pressure_test_pin_runtime "$deadline"
+  result="$RESULT_DIR/pressure-scenario-result.json"
 
   cat >"$result" <<'EOF'
 {
@@ -9485,40 +12800,50 @@ test_pressure_scenario_counts_are_unique_and_bounded() {
   }
 }
 EOF
-  [[ "$(pressure_scenario_count "$result" exact_hit_count)" == "127" &&
-    "$(pressure_scenario_count "$result" explicit_root_count)" == "1" &&
-    "$(pressure_scenario_count "$result" wrong_parent_count)" == "0" &&
-    "$(pressure_scenario_count "$result" unresolved_count)" == "0" ]] || {
+  [[ "$(pressure_scenario_count \
+      "$result" exact_hit_count 128 "$deadline")" == "127" &&
+    "$(pressure_scenario_count \
+      "$result" explicit_root_count 128 "$deadline")" == "1" &&
+    "$(pressure_scenario_count \
+      "$result" wrong_parent_count 128 "$deadline")" == "0" &&
+    "$(pressure_scenario_count \
+      "$result" unresolved_count 128 "$deadline")" == "0" ]] || {
     printf 'pressure scenario result counts were not parsed exactly\n' >&2
     return 1
   }
-  if pressure_scenario_count "$result" absent_count >/dev/null 2>&1; then
+  if pressure_scenario_count \
+    "$result" absent_count 128 "$deadline" >/dev/null 2>&1; then
     printf 'pressure scenario result accepted a missing count\n' >&2
     return 1
   fi
   sed -i 's/"unresolved_count": 0/"unresolved_count": 1.0/' "$result"
-  if pressure_scenario_count "$result" unresolved_count >/dev/null 2>&1; then
+  if pressure_scenario_count \
+    "$result" unresolved_count 128 "$deadline" >/dev/null 2>&1; then
     printf 'pressure scenario result accepted a nondecimal count\n' >&2
     return 1
   fi
   sed -i 's/"unresolved_count": 1.0/"unresolved_count": 0/' "$result"
 
   printf '  "explicit_root_count": 1,\n' >>"$result"
-  if pressure_scenario_count "$result" explicit_root_count >/dev/null 2>&1; then
+  if pressure_scenario_count \
+    "$result" explicit_root_count 128 "$deadline" >/dev/null 2>&1; then
     printf 'pressure scenario result accepted a duplicate count\n' >&2
     return 1
   fi
   sed -i '$d' "$result"
   sed -i 's/"wrong_parent_count": 0/"wrong_parent_count": -1/' "$result"
-  if pressure_scenario_count "$result" wrong_parent_count >/dev/null 2>&1; then
+  if pressure_scenario_count \
+    "$result" wrong_parent_count 128 "$deadline" >/dev/null 2>&1; then
     printf 'pressure scenario result accepted a negative count\n' >&2
     return 1
   fi
   sed -i 's/"wrong_parent_count": -1/"wrong_parent_count": 129/' "$result"
-  if pressure_scenario_count "$result" wrong_parent_count 128 >/dev/null 2>&1; then
+  if pressure_scenario_count \
+    "$result" wrong_parent_count 128 "$deadline" >/dev/null 2>&1; then
     printf 'pressure scenario result accepted a count above the request bound\n' >&2
     return 1
   fi
+  pressure_test_teardown_runtime "$deadline"
 }
 
 test_concurrency_overlap_reconciliation_is_exact() {
@@ -10286,6 +13611,8 @@ obi_java_remote_parent_operations_total{operation="candidate",status="valid",tra
 obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} before=2 after=3 delta=1
 obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} before=2 after=3 delta=1
 obi_java_remote_parent_operations_total{operation="handoff",status="valid",transport="tcp"} before=0 after=1 delta=1
+obi_java_remote_parent_operations_total{operation="handoff_admission",status="overload",transport="tcp"} before=0 after=1 delta=1
+obi_java_remote_parent_operations_total{operation="handoff_admission",status="ambiguous",transport="tcp"} before=0 after=0 delta=0
 obi_java_remote_parent_operations_total{operation="take",status="missing",transport="getsockopt"} before=0 after=0 delta=0
 obi_java_remote_parent_operations_total{operation="negotiate",status="missing",transport="getsockopt"} before=7 after=11 delta=4
 obi_java_remote_parent_operations_total{operation="cleanup",status="valid",transport="tcp"} before=0 after=9 delta=9
@@ -10328,6 +13655,8 @@ obi_java_remote_parent_operations_total{operation="candidate",status="valid",tra
 obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} before=0 after=1 delta=1
 obi_java_remote_parent_operations_total{operation="stage",status="overload",transport="tcp"} before=0 after=1 delta=1
 obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} before=0 after=1 delta=1
+obi_java_remote_parent_operations_total{operation="handoff_admission",status="overload",transport="tcp"} before=0 after=1 delta=1
+obi_java_remote_parent_operations_total{operation="handoff_admission",status="ambiguous",transport="tcp"} before=0 after=0 delta=0
 EOF
   pressure_bridge_reconciliation "$stage_delta" getsockopt 1 1 2 >/dev/null || {
     printf 'pressure bridge rejected a reason-coded stage failure\n' >&2
@@ -10340,6 +13669,8 @@ obi_java_remote_parent_operations_total{operation="candidate",status="valid",tra
 obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} before=0 after=2 delta=2
 obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} before=0 after=1 delta=1
 obi_java_remote_parent_operations_total{operation="take",status="stale",transport="getsockopt"} before=0 after=1 delta=1
+obi_java_remote_parent_operations_total{operation="handoff_admission",status="overload",transport="tcp"} before=0 after=1 delta=1
+obi_java_remote_parent_operations_total{operation="handoff_admission",status="ambiguous",transport="tcp"} before=0 after=0 delta=0
 EOF
   pressure_bridge_reconciliation "$take_delta" getsockopt 1 1 2 >/dev/null || {
     printf 'pressure bridge rejected a reason-coded retrieval failure\n' >&2
@@ -10353,6 +13684,8 @@ obi_java_remote_parent_operations_total{operation="candidate",status="valid",tra
 obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} before=0 after=1 delta=1
 obi_java_remote_parent_operations_total{operation="take",status="valid",transport="unix"} before=0 after=1 delta=1
 obi_java_remote_parent_operations_total{operation="take",status="missing",transport="unix"} before=0 after=1 delta=1
+obi_java_remote_parent_operations_total{operation="handoff_admission",status="overload",transport="tcp"} before=0 after=1 delta=1
+obi_java_remote_parent_operations_total{operation="handoff_admission",status="ambiguous",transport="tcp"} before=0 after=0 delta=0
 EOF
   reconciliation="$(pressure_bridge_reconciliation "$unix_delta" unix 1 1 2)" || {
     printf 'pressure bridge rejected Unix retrieval after an upstream drop\n' >&2
@@ -10369,6 +13702,89 @@ EOF
   if pressure_bridge_reconciliation \
     "$unix_delta" unix 1 1 2 >/dev/null 2>&1; then
     printf 'pressure bridge accepted BPF handoffs for Unix retrieval\n' >&2
+    return 1
+  fi
+}
+
+test_pressure_admission_is_positive_bounded_and_request_scaled() {
+  local -r delta="$TEST_TMP_DIR/pressure-admission.delta"
+  local -r exact_delta="$TEST_TMP_DIR/pressure-admission-all-exact.delta"
+  local reconciliation=""
+
+  cat >"$delta" <<'EOF'
+obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} before=0 after=1 delta=1
+obi_java_remote_parent_operations_total{operation="inject",status="ambiguous",transport="tcp"} before=0 after=1 delta=1
+obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} before=0 after=1 delta=1
+obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} before=0 after=1 delta=1
+obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} before=0 after=1 delta=1
+obi_java_remote_parent_operations_total{operation="handoff_admission",status="overload",transport="tcp"} before=0 after=1 delta=1
+EOF
+  reconciliation="$(pressure_bridge_reconciliation \
+    "$delta" getsockopt 1 1 2)" || return 1
+  [[ "$reconciliation" == *'"handoff_admission_outcome_counts":{"overload":1,"ambiguous":0,"maximum":18}'* ]]
+
+  sed -i \
+    '/operation="handoff_admission",status="overload"/s/after=1 delta=1$/after=0 delta=0/' \
+    "$delta"
+  if pressure_bridge_reconciliation \
+    "$delta" getsockopt 1 1 2 >/dev/null 2>&1; then
+    printf 'pressure bridge accepted zero capacity admissions\n' >&2
+    return 1
+  fi
+  sed -i \
+    '/operation="handoff_admission",status="overload"/s/after=0 delta=0/after=19 delta=19/' \
+    "$delta"
+  if pressure_bridge_reconciliation \
+    "$delta" getsockopt 1 1 2 >/dev/null 2>&1; then
+    printf 'pressure bridge accepted capacity admissions above the default bound\n' >&2
+    return 1
+  fi
+  sed -i \
+    '/operation="handoff_admission",status="overload"/s/after=19 delta=19/after=1 delta=1/' \
+    "$delta"
+  printf '%s\n' \
+    'obi_java_remote_parent_operations_total{operation="handoff_admission",status="ambiguous",transport="tcp"} before=0 after=1 delta=1' \
+    >>"$delta"
+  if pressure_bridge_reconciliation \
+    "$delta" getsockopt 1 1 2 >/dev/null 2>&1; then
+    printf 'pressure bridge accepted an ambiguous admission failure\n' >&2
+    return 1
+  fi
+  sed -i '/operation="handoff_admission",status="ambiguous"/d' "$delta"
+  pressure_bridge_reconciliation \
+    "$delta" getsockopt 1 1 2 >/dev/null || {
+    printf 'pressure bridge rejected producer-shaped absent ambiguous series\n' >&2
+    return 1
+  }
+  printf '%s\n' \
+    'obi_java_remote_parent_operations_total{operation="handoff_admission",status="ambiguous",transport="tcp"} before=0 after=0 delta=0' \
+    >>"$delta"
+  pressure_bridge_reconciliation \
+    "$delta" getsockopt 1 1 2 >/dev/null || {
+    printf 'pressure bridge rejected an optional zero ambiguous series\n' >&2
+    return 1
+  }
+
+  cat >"$exact_delta" <<'EOF'
+obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} before=0 after=1 delta=1
+obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} before=0 after=1 delta=1
+obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} before=0 after=1 delta=1
+obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} before=0 after=1 delta=1
+obi_java_remote_parent_operations_total{operation="handoff_admission",status="overload",transport="tcp"} before=0 after=1 delta=1
+EOF
+  if pressure_bridge_reconciliation \
+    "$exact_delta" getsockopt 1 0 1 >/dev/null 2>&1; then
+    printf 'pressure bridge accepted an all-exact result without a root\n' >&2
+    return 1
+  fi
+
+  [[ "$(pressure_admission_max_events 1)" == 9 &&
+    "$(pressure_admission_max_events 128)" == 1152 &&
+    "$(pressure_admission_max_events 129)" == 1161 &&
+    "$(pressure_admission_max_events 1000)" == 9000 ]] || return 1
+  if pressure_admission_max_events 0 >/dev/null 2>&1 ||
+    pressure_admission_max_events 1001 >/dev/null 2>&1; then
+    printf 'pressure admission bound accepted an invalid request count\n' >&2
     return 1
   fi
 }
@@ -14388,6 +17804,7 @@ test_pre_stop_diagnostics_failure_does_not_stop_obi() {
 
   (
     BRIDGE_RUNNING=true
+    SELECTED_TRANSPORT=getsockopt
     flush_bridge_metric_boundary() {
       return 1
     }
@@ -14397,22 +17814,30 @@ test_pre_stop_diagnostics_failure_does_not_stop_obi() {
     run_bounded() {
       printf 'stop:%s\n' "$*" >>"$calls"
     }
+    invalidate_selected_transport() {
+      printf 'invalidate\n' >>"$calls"
+      SELECTED_TRANSPORT=""
+    }
 
     if stop_obi_for_no_state_control w3c-fault "$baseline" >/dev/null 2>&1; then
       return 1
     fi
-    [[ "$BRIDGE_RUNNING" == "true" ]]
+    [[ "$BRIDGE_RUNNING" == "true" &&
+      "$SELECTED_TRANSPORT" == getsockopt ]]
   ) || {
     printf 'OBI stop proceeded after the diagnostics boundary failed\n' >&2
     return 1
   }
-  [[ ! -e "$calls" ]] || {
-    printf 'OBI stop side effects ran after the diagnostics boundary failed\n' >&2
+  [[ -f "$calls" &&
+    "$(<"$calls")" == "evidence:w3c-fault-obi-pre-stop" ]] || {
+    printf 'OBI stop crossed the pre-stop evidence boundary after diagnostics failed\n' >&2
     return 1
   }
+  : >"$calls"
 
   (
     BRIDGE_RUNNING=true
+    SELECTED_TRANSPORT=getsockopt
     flush_bridge_metric_boundary() {
       return 0
     }
@@ -14422,19 +17847,25 @@ test_pre_stop_diagnostics_failure_does_not_stop_obi() {
     run_bounded() {
       printf 'stop:%s\n' "$*" >>"$calls"
     }
+    invalidate_selected_transport() {
+      printf 'invalidate\n' >>"$calls"
+      SELECTED_TRANSPORT=""
+    }
 
     if stop_obi_for_no_state_control w3c-fault "$baseline" >/dev/null 2>&1; then
       return 1
     fi
-    [[ "$BRIDGE_RUNNING" == "true" ]]
+    [[ "$BRIDGE_RUNNING" == "true" &&
+      "$SELECTED_TRANSPORT" == getsockopt ]]
   ) || {
     printf 'OBI stop accepted a missing diagnostics baseline artifact\n' >&2
     return 1
   }
-  [[ ! -e "$calls" ]] || {
-    printf 'OBI stop side effects ran without a diagnostics baseline artifact\n' >&2
+  [[ "$(<"$calls")" == "evidence:w3c-fault-obi-pre-stop" ]] || {
+    printf 'OBI stop crossed the pre-stop evidence boundary without diagnostics\n' >&2
     return 1
   }
+  : >"$calls"
 
   mkdir -p -- "${baseline%/*}"
   write_diagnostics_fixture "$baseline" 0 0 0 0 0 0
@@ -14452,6 +17883,19 @@ test_pre_stop_diagnostics_failure_does_not_stop_obi() {
     }
     capture_phase_evidence() {
       printf 'evidence:%s\n' "$1" >>"$calls"
+    }
+    record_obi_metric_pair() {
+      printf 'pair:%s:%s:%s:%s:%s\n' \
+        "$1" "$2" "$3" "$4" "$5" >>"$calls"
+      printf 'metric-pair.json\n'
+    }
+    obi_metric_pair_evidence_json_from_reference() {
+      printf 'pair-evidence:%s\n' "$1" >>"$calls"
+    }
+    invalidate_selected_transport() {
+      printf 'invalidate\n' >>"$calls"
+      SELECTED_TRANSPORT=""
+      command rm -f -- "$RESULT_DIR/java-transport-configuration.txt"
     }
     run_bounded() {
       printf 'stop:%s\n' "$*" >>"$calls"
@@ -14474,8 +17918,10 @@ test_pre_stop_diagnostics_failure_does_not_stop_obi() {
     printf 'OBI stop failure retained stale current-generation bridge state\n' >&2
     return 1
   fi
-  grep -Fqx 'evidence:w3c-fault-obi-running' "$calls"
-  grep -Fq 'stop:60 docker compose stop --timeout 30 obi' "$calls"
+  [[ "$(<"$calls")" == $'evidence:w3c-fault-obi-pre-stop\nevidence:w3c-fault-obi-running\npair:w3c-fault-pre-stop:w3c-fault-obi-pre-stop:w3c-fault-obi-running:same_process:w3c-fault-obi-running\npair-evidence:metric-pair.json\ninvalidate\nstop:60 docker compose stop --timeout 30 obi' ]] || {
+    printf 'OBI stop failure crossed a post-stop evidence boundary\n' >&2
+    return 1
+  }
 
   printf 'current\n' >"$result_dir/java-transport-configuration.txt"
   if (
@@ -14491,6 +17937,8 @@ test_pre_stop_diagnostics_failure_does_not_stop_obi() {
     capture_phase_evidence() {
       return 0
     }
+    record_obi_metric_pair() { printf 'metric-pair.json\n'; }
+    obi_metric_pair_evidence_json_from_reference() { return 0; }
     rm() {
       return 29
     }
@@ -14524,7 +17972,6 @@ test_stopped_obi_boundary_binds_same_phase_java_diagnostics() {
   local -r result_dir="$TEST_TMP_DIR/stopped-obi-terminal-boundary"
   local -r unavailable_dir="$TEST_TMP_DIR/stopped-obi-terminal-unavailable"
   local -r calls="$result_dir/calls"
-  local -r unavailable_record="$unavailable_dir/record-called"
   local -r container_id="8888888888888888888888888888888888888888888888888888888888888888"
   local -r started_at="2026-08-17T00:00:00.000000000Z"
 
@@ -14576,7 +18023,7 @@ test_stopped_obi_boundary_binds_same_phase_java_diagnostics() {
     [[ "$BRIDGE_RUNNING" == false && -z "$SELECTED_TRANSPORT" &&
       "$(active_stopped_obi_metric_pair_reference)" == \
         obi-metric-pairs/terminal-stop-obi-stopped.json ]] || return 1
-    [[ "$(<"$calls")" == $'running:terminal-stop-obi-running\ninvalidate\nstop:60 docker compose stop --timeout 30 obi\nstopped:terminal-stop-obi-stopped:phases/terminal-stop-obi-running/obi-identity.json\njava:terminal-stop-obi-stopped' ]] || return 1
+    [[ "$(<"$calls")" == $'running:terminal-stop-obi-pre-stop\nrunning:terminal-stop-obi-running\ninvalidate\nstop:60 docker compose stop --timeout 30 obi\nstopped:terminal-stop-obi-stopped:phases/terminal-stop-obi-running/obi-identity.json\njava:terminal-stop-obi-stopped' ]] || return 1
 
     mkdir -p -- "$RESULT_DIR/phases/final"
     write_diagnostics_fixture \
@@ -14602,6 +18049,8 @@ test_stopped_obi_boundary_binds_same_phase_java_diagnostics() {
   }
 
   (
+    local -a pair_files=()
+
     RESULT_DIR="$unavailable_dir"
     SCENARIO=fail-open
     TRANSPORT=getsockopt
@@ -14613,7 +18062,12 @@ test_stopped_obi_boundary_binds_same_phase_java_diagnostics() {
     initialize_obi_metric_boundary_index || return 1
     begin_obi_metric_boundary fail-open || return 1
     flush_bridge_metric_boundary() { return 0; }
-    capture_phase_evidence() { return 0; }
+    capture_phase_evidence() {
+      write_obi_running_identity_fixture \
+        "$RESULT_DIR" "$1" "$container_id" "$started_at"
+      write_obi_metric_pair_fixture \
+        "$RESULT_DIR" "$1" getsockopt take valid 4 1
+    }
     invalidate_selected_transport() { SELECTED_TRANSPORT=""; }
     run_bounded() { return 0; }
     capture_obi_stopped_attestation() { return 0; }
@@ -14621,16 +18075,18 @@ test_stopped_obi_boundary_binds_same_phase_java_diagnostics() {
       mkdir -p -- "$RESULT_DIR/phases/$1"
       printf 'unavailable\n' >"$RESULT_DIR/phases/$1/java-diagnostics.txt"
     }
-    record_obi_metric_pair() {
-      : >"$unavailable_record"
-    }
-
     if stop_obi_for_no_state_control unavailable-stop >/dev/null 2>&1; then
       return 1
     fi
-    [[ ! -e "$unavailable_record" ]] || return 1
+    mapfile -t pair_files < <(find \
+      "$RESULT_DIR/obi-metric-pairs" -mindepth 1 -maxdepth 1 \
+      -type f -printf '%f\n' | LC_ALL=C sort)
+    [[ "${#pair_files[@]}" -eq 1 &&
+      "${pair_files[0]}" == unavailable-stop-pre-stop.json ]] || return 1
     jq -e '
       .boundaries[0].state == "active" and
+      ([.boundaries[0].captures[] |
+        select(.id == "unavailable-stop-pre-stop")][-1].state == "captured") and
       ([.boundaries[0].captures[] | select(.kind == "pair")][-1] |
         .id == "unavailable-stop-obi-stopped" and .state == "planned")
     ' "$RESULT_DIR/obi-metric-boundary-index.json" >/dev/null
@@ -15423,16 +18879,18 @@ test_pressure_scenario_reconciles_roots_with_bridge_and_java_counts() {
         "$RESULT_DIR" "$1" getsockopt take valid 0 0
     }
     start_map_pressure() {
-      [[ "$1" == "pressure" && "$3" == "10" ]] || return 1
+      [[ "$1" == "pressure" ]] || return 1
       PRESSURE_ACTIVE=true
     }
     cleanup_map_pressure_with_retries() {
       PRESSURE_ACTIVE=false
     }
-    run_bounded() {
-      cat <<'EOF'
+    start_pressure_scenario_barrier() {
+      local -r output="$1"
+      cat >"$output" <<'EOF'
 {
   "status": "passed",
+  "request_count": 10,
   "pressure_correlation": {
     "exact_hit_count": 7,
     "explicit_root_count": 3,
@@ -15442,6 +18900,25 @@ test_pressure_scenario_reconciles_roots_with_bridge_and_java_counts() {
 }
 EOF
     }
+    publish_pressure_scenario_release() { return 0; }
+    wait_for_pressure_scenario_container() { return 0; }
+    retain_pressure_control_evidence() {
+      PRESSURE_BARRIER_RUNTIME_STATUS=retained
+      PRESSURE_SCENARIO_REMOVAL_STATUS=absence-proved
+      PRESSURE_CONTROL_REMOVAL_STATUS=not-run
+      PRESSURE_CONTROL_LIVE_DIR=""
+      PRESSURE_CONTROL_LIVE_IDENTITY=""
+    }
+    pressure_helper_runtime_state_is_empty() { return 0; }
+    verify_map_pressure_after_traffic() { return 0; }
+    pressure_scenario_container_inspections_descriptor() {
+      printf -v "$3" '%s' '{}'
+      printf -v "$4" '%s' '{}'
+    }
+    finalize_pressure_barrier_status() { return 0; }
+    reset_pressure_scenario_control_state() { return 0; }
+    record_obi_metric_pair() { printf 'metric-pair.json\n'; }
+    obi_metric_pair_evidence_json_from_reference() { printf '{}\n'; }
     wait_for_bridge_metrics_quiescent() {
       printf 'wait:%s:%s\n' "$1" "$2" >>"$call_log"
     }
@@ -15453,7 +18930,7 @@ EOF
       [[ "$2" == "getsockopt" && "$3" == "7" && "$4" == "3" && "$5" == "10" ]] || \
         return 1
       printf '%s\n' \
-        '{"transport":"getsockopt","retrieval_valid_count":7,"upstream_failure_count":3,"retrieval_failure_count":0,"upstream_failure_reason_counts":{"ambiguous":3}}'
+        '{"transport":"getsockopt","retrieval_valid_count":7,"upstream_failure_count":3,"retrieval_failure_count":0,"upstream_failure_reason_counts":{"missing":0,"stale":0,"ambiguous":0,"malformed":0,"overload":3,"segmented":0},"retrieval_failure_reason_counts":{"missing":0,"stale":0,"unsupported":0,"malformed":0,"version_mismatch":0,"ambiguous":0,"unauthorized":0,"already_consumed":0,"timeout":0,"overload":0,"transport_error":0,"disabled":0}}'
     }
     write_java_diagnostics_delta() {
       : >"$3"
@@ -15514,16 +18991,18 @@ test_pressure_unix_scenario_uses_strict_already_consumed_reconciliation() {
         "$RESULT_DIR" "$1" unix take valid 0 0
     }
     start_map_pressure() {
-      [[ "$1" == "pressure" && "$3" == "128" ]] || return 1
+      [[ "$1" == "pressure" ]] || return 1
       PRESSURE_ACTIVE=true
     }
     cleanup_map_pressure_with_retries() {
       PRESSURE_ACTIVE=false
     }
-    run_bounded() {
-      cat <<'EOF'
+    start_pressure_scenario_barrier() {
+      local -r output="$1"
+      cat >"$output" <<'EOF'
 {
   "status": "passed",
+  "request_count": 128,
   "pressure_correlation": {
     "exact_hit_count": 126,
     "explicit_root_count": 2,
@@ -15533,10 +19012,29 @@ test_pressure_unix_scenario_uses_strict_already_consumed_reconciliation() {
 }
 EOF
     }
+    publish_pressure_scenario_release() { return 0; }
+    wait_for_pressure_scenario_container() { return 0; }
+    retain_pressure_control_evidence() {
+      PRESSURE_BARRIER_RUNTIME_STATUS=retained
+      PRESSURE_SCENARIO_REMOVAL_STATUS=absence-proved
+      PRESSURE_CONTROL_REMOVAL_STATUS=not-run
+      PRESSURE_CONTROL_LIVE_DIR=""
+      PRESSURE_CONTROL_LIVE_IDENTITY=""
+    }
+    pressure_helper_runtime_state_is_empty() { return 0; }
+    verify_map_pressure_after_traffic() { return 0; }
+    pressure_scenario_container_inspections_descriptor() {
+      printf -v "$3" '%s' '{}'
+      printf -v "$4" '%s' '{}'
+    }
+    finalize_pressure_barrier_status() { return 0; }
+    reset_pressure_scenario_control_state() { return 0; }
+    record_obi_metric_pair() { printf 'metric-pair.json\n'; }
+    obi_metric_pair_evidence_json_from_reference() { printf '{}\n'; }
     wait_for_bridge_metrics_quiescent() { :; }
     write_metrics_delta() { : >"$3"; }
     pressure_bridge_reconciliation() {
-      printf '%s\n' '{"transport":"unix","retrieval_valid_count":126,"retrieval_failure_count":2,"retrieval_failure_reason_counts":{"missing":0,"stale":0,"unsupported":0,"malformed":0,"version_mismatch":0,"ambiguous":0,"unauthorized":0,"already_consumed":2,"timeout":0,"overload":0,"transport_error":0,"disabled":0}}'
+      printf '%s\n' '{"transport":"unix","retrieval_valid_count":126,"upstream_failure_count":2,"retrieval_failure_count":2,"upstream_failure_reason_counts":{"missing":0,"stale":0,"ambiguous":0,"malformed":0,"overload":2,"segmented":0},"retrieval_failure_reason_counts":{"missing":0,"stale":0,"unsupported":0,"malformed":0,"version_mismatch":0,"ambiguous":0,"unauthorized":0,"already_consumed":2,"timeout":0,"overload":0,"transport_error":0,"disabled":0}}'
     }
     write_java_diagnostics_delta() { : >"$3"; }
     assert_pressure_unix_already_consumed_diagnostics_delta() {
@@ -15564,10 +19062,14 @@ EOF
 }
 
 test_pressure_failure_retains_wrong_parent_counts_and_cleans_up() {
-  local -r result_dir="$TEST_TMP_DIR/scenario-pressure-wrong-parent"
-  local scenario_status=0
+  local result_dir=""
+  local receipt_barrier=""
 
-  if (
+  run_failure_case() (
+    local -r result_dir="$1"
+    local -r receipt_barrier="$2"
+    local scenario_status=0
+
     RESULT_DIR="$result_dir"
     mkdir -p -- "$RESULT_DIR"
     BRIDGE_RUNNING=true
@@ -15600,10 +19102,12 @@ test_pressure_failure_retains_wrong_parent_counts_and_cleans_up() {
     cleanup_map_pressure_with_retries() {
       PRESSURE_ACTIVE=false
     }
-    run_bounded() {
-      cat <<'EOF'
+    start_pressure_scenario_barrier() {
+      local -r output="$1"
+      cat >"$output" <<'EOF'
 {
   "status": "failed",
+  "request_count": 10,
   "pressure_correlation": {
     "exact_hit_count": 7,
     "explicit_root_count": 2,
@@ -15612,10 +19116,32 @@ test_pressure_failure_retains_wrong_parent_counts_and_cleans_up() {
   }
 }
 EOF
+    }
+    publish_pressure_scenario_release() { return 0; }
+    wait_for_pressure_scenario_container() {
+      PRESSURE_SCENARIO_WAIT_EXIT_CODE=17
+      PRESSURE_BARRIER_RUNTIME_STATUS="$receipt_barrier"
+      PRESSURE_SCENARIO_REMOVAL_STATUS=absence-proved
+      PRESSURE_CONTAINER_INSPECTIONS_RUNTIME_STATUS='terminal-captured'
+      PRESSURE_SCENARIO_LOGS_CAPTURED=true
+      PRESSURE_SCENARIO_RUNNING_INSPECTION_JSON='{"state":"running"}'
+      PRESSURE_SCENARIO_TERMINAL_INSPECTION_JSON='{"state":"exited"}'
       return 17
+    }
+    retain_pressure_control_evidence() { return 1; }
+    cleanup_pressure_scenario_runtime() {
+      PRESSURE_SCENARIO_WAIT_EXIT_CODE=""
+      PRESSURE_BARRIER_RUNTIME_STATUS=failed
+      PRESSURE_SCENARIO_REMOVAL_STATUS=not-run
+      PRESSURE_CONTAINER_INSPECTIONS_RUNTIME_STATUS=not-run
+      PRESSURE_SCENARIO_LOGS_CAPTURED=false
+      PRESSURE_SCENARIO_RUNNING_INSPECTION_JSON=""
+      PRESSURE_SCENARIO_TERMINAL_INSPECTION_JSON=""
     }
     wait_for_bridge_metrics_quiescent() { :; }
     write_metrics_delta() { : >"$3"; }
+    record_obi_metric_pair() { printf 'metric-pair.json\n'; }
+    obi_metric_pair_evidence_json_from_reference() { printf '{}\n'; }
     pressure_bridge_reconciliation() {
       printf '%s\n' \
         '{"transport":"getsockopt","retrieval_valid_count":8,"upstream_failure_count":2,"retrieval_failure_count":0}'
@@ -15629,9 +19155,11 @@ EOF
       scenario_status=$?
     fi
     [[ "$scenario_status" == "17" && "$PRESSURE_ACTIVE" == "false" ]]
-  ); then
-    :
-  else
+  )
+
+  result_dir="$TEST_TMP_DIR/scenario-pressure-wrong-parent"
+  receipt_barrier=reaped
+  if ! run_failure_case "$result_dir" "$receipt_barrier"; then
     printf 'pressure wrong-parent failure did not retain status or clean up\n' >&2
     return 1
   fi
@@ -15641,6 +19169,22 @@ EOF
   }
   grep -Fq '"wrong_parent_count":1' "$result_dir/scenario-pressure-status.json" || {
     printf 'pressure wrong-parent count was not retained\n' >&2
+    return 1
+  }
+
+  result_dir="$TEST_TMP_DIR/scenario-pressure-unreaped"
+  receipt_barrier=released
+  if ! run_failure_case "$result_dir" "$receipt_barrier"; then
+    printf 'unreaped pressure failure did not retain status or clean up\n' >&2
+    return 1
+  fi
+  grep -Fq '"exit_status": 17' "$result_dir/scenario-pressure-status.json" || {
+    printf 'unreaped pressure failure lost its command status\n' >&2
+    return 1
+  }
+  grep -Fq '"pressure_correlation": null' \
+    "$result_dir/scenario-pressure-status.json" || {
+    printf 'unreaped pressure failure retained unauthenticated counts\n' >&2
     return 1
   }
 }
@@ -15677,7 +19221,19 @@ test_pressure_empty_result_fails_closed_and_cleans_up() {
     cleanup_map_pressure_with_retries() {
       PRESSURE_ACTIVE=false
     }
-    run_bounded() { :; }
+    start_pressure_scenario_barrier() {
+      : >"$1"
+    }
+    publish_pressure_scenario_release() { return 0; }
+    wait_for_pressure_scenario_container() { return 0; }
+    retain_pressure_control_evidence() {
+      PRESSURE_BARRIER_RUNTIME_STATUS=retained
+      PRESSURE_SCENARIO_REMOVAL_STATUS=absence-proved
+      PRESSURE_CONTROL_REMOVAL_STATUS=not-run
+      PRESSURE_CONTROL_LIVE_DIR=""
+      PRESSURE_CONTROL_LIVE_IDENTITY=""
+    }
+    pressure_helper_runtime_state_is_empty() { return 0; }
     write_metrics_delta() { : >"$3"; }
 
     if run_scenario pressure >/dev/null 2>&1; then
@@ -16499,10 +20055,43 @@ EOF
 
 test_compose_commands_close_stdin() {
   local -r runner="$TEST_SCRIPT_DIR/../run.sh"
+  local -r captured_probe="$TEST_TMP_DIR/pressure-captured-stdin-probe"
+  local -r captured_stdout="$TEST_TMP_DIR/pressure-captured-stdin.stdout"
+  local -r captured_stderr="$TEST_TMP_DIR/pressure-captured-stdin.stderr"
   local logical_commands=""
   local command=""
   local prefix=""
+  local captured_status=0
   local -a compose_commands=()
+
+  cat >"$captured_probe" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+if IFS= read -r unexpected; then
+  printf 'unexpected stdin: %s\n' "$unexpected" >&2
+  exit 64
+fi
+printf 'captured-stdout\n'
+printf 'captured-stderr\n' >&2
+exit 23
+EOF
+  chmod 0755 "$captured_probe"
+  if printf 'must-not-reach-pressure-command\n' |
+    run_pressure_bounded_captured \
+      "$((SECONDS + 5))" 5 \
+      "$captured_stdout" 4096 \
+      "$captured_stderr" 4096 \
+      "$captured_probe"; then
+    captured_status=0
+  else
+    captured_status=$?
+  fi
+  [[ "$captured_status" -eq 23 &&
+    "$(<"$captured_stdout")" == captured-stdout &&
+    "$(<"$captured_stderr")" == captured-stderr ]] || {
+    printf 'captured pressure wrapper inherited caller stdin\n' >&2
+    return 1
+  }
 
   logical_commands="$(awk '
     {
@@ -16536,7 +20125,7 @@ test_compose_commands_close_stdin() {
 
   for command in "${compose_commands[@]}"; do
     prefix="${command%%\"\$\{COMPOSE\[@\]\}\"*}"
-    if [[ "$prefix" =~ (^|[[:space:]])(run_bounded|run_logged_bounded|capture_optional_command)[[:space:]] ]]; then
+    if [[ "$prefix" =~ (^|[[:space:]])(run_bounded|run_logged_bounded|capture_optional_command|run_pressure_bounded_captured)[[:space:]] ]]; then
       continue
     fi
     if [[ "$prefix" =~ (^|[[:space:]])timeout[[:space:]] && "$command" == *"</dev/null"* ]]; then
@@ -27736,6 +31325,7 @@ test_obi_metric_pair_is_bounded_exact_and_mutation_sensitive() {
   local -r meaningful_dir="$TEST_TMP_DIR/obi-metric-pair-meaningful"
   local -r sort_dir="$TEST_TMP_DIR/obi-metric-pair-sort"
   local -r collision_dir="$TEST_TMP_DIR/obi-metric-pair-collision"
+  local -r admission_dir="$TEST_TMP_DIR/obi-metric-pair-admission"
   local -r first_id="1111111111111111111111111111111111111111111111111111111111111111"
   local -r second_id="2222222222222222222222222222222222222222222222222222222222222222"
   local -r first_started="2026-08-17T00:00:00.000000000Z"
@@ -27743,7 +31333,7 @@ test_obi_metric_pair_is_bounded_exact_and_mutation_sensitive() {
 
   mkdir -p -- "$same_dir" "$replaced_dir" "$stopped_dir" \
     "$mutation_dir" "$binding_dir" "$meaningful_dir" "$sort_dir" \
-    "$collision_dir"
+    "$collision_dir" "$admission_dir"
   write_obi_running_identity_fixture \
     "$same_dir" exact-before "$first_id" "$first_started"
   write_obi_running_identity_fixture \
@@ -27989,6 +31579,82 @@ test_obi_metric_pair_is_bounded_exact_and_mutation_sensitive() {
     return 1
   }
 
+  (
+    local boundary=""
+    local status=""
+
+    RESULT_DIR="$admission_dir"
+    for boundary in helper-attach-rejection disabled stopped-pre-stop; do
+      for status in overload ambiguous; do
+        write_obi_running_identity_fixture \
+          "$RESULT_DIR" "$boundary-before" "$first_id" "$first_started"
+        write_obi_running_identity_fixture \
+          "$RESULT_DIR" "$boundary-after" "$first_id" "$first_started"
+        write_obi_metric_pair_fixture \
+          "$RESULT_DIR" "$boundary-before" tcp handoff_admission "$status" 0 0
+        write_obi_metric_pair_fixture \
+          "$RESULT_DIR" "$boundary-after" tcp handoff_admission "$status" 1 0
+        if build_obi_metric_pair_payload \
+          "$boundary" "$boundary-before" "$boundary-after" same_process \
+          >/dev/null 2>&1; then
+          return 1
+        fi
+        write_obi_metric_pair_fixture \
+          "$RESULT_DIR" "$boundary-after" tcp handoff_admission "$status" 0 0
+        build_obi_metric_pair_payload \
+          "$boundary" "$boundary-before" "$boundary-after" same_process \
+          >/dev/null || return 1
+      done
+    done
+
+    write_obi_running_identity_fixture \
+      "$RESULT_DIR" replaced-admission-before "$first_id" "$first_started"
+    write_obi_running_identity_fixture \
+      "$RESULT_DIR" replaced-admission-after "$second_id" "$second_started"
+    write_obi_metric_pair_fixture \
+      "$RESULT_DIR" replaced-admission-before tcp handoff_admission overload 0 0
+    write_obi_metric_pair_fixture \
+      "$RESULT_DIR" replaced-admission-after tcp handoff_admission overload 1 0
+    if build_obi_metric_pair_payload \
+      replaced-admission replaced-admission-before replaced-admission-after \
+      process_replaced >/dev/null 2>&1; then
+      return 1
+    fi
+    write_obi_metric_pair_fixture \
+      "$RESULT_DIR" replaced-admission-after tcp handoff_admission overload 0 0
+    build_obi_metric_pair_payload \
+      replaced-admission replaced-admission-before replaced-admission-after \
+      process_replaced >/dev/null || return 1
+
+    write_obi_running_identity_fixture \
+      "$RESULT_DIR" pressure-before "$first_id" "$first_started"
+    write_obi_running_identity_fixture \
+      "$RESULT_DIR" pressure-after "$first_id" "$first_started"
+    write_obi_metric_pair_fixture \
+      "$RESULT_DIR" pressure-before tcp handoff_admission overload 0 0
+    write_obi_metric_pair_fixture \
+      "$RESULT_DIR" pressure-after tcp handoff_admission overload 5 0
+    build_obi_metric_pair_payload \
+      pressure pressure-before pressure-after same_process >/dev/null || return 1
+    printf '%s\n' \
+      'obi_java_remote_parent_operations_total{operation="handoff_admission",status="ambiguous",transport="tcp"} 1' \
+      >>"$RESULT_DIR/phases/pressure-after/obi-metrics.prom"
+    bind_obi_running_identity_fixture "$RESULT_DIR" pressure-after || return 1
+    if build_obi_metric_pair_payload \
+      pressure pressure-before pressure-after same_process >/dev/null 2>&1; then
+      return 1
+    fi
+    sed -i \
+      '/operation="handoff_admission",status="ambiguous"/s/} 1$/} 0/' \
+      "$RESULT_DIR/phases/pressure-after/obi-metrics.prom"
+    bind_obi_running_identity_fixture "$RESULT_DIR" pressure-after || return 1
+    build_obi_metric_pair_payload \
+      pressure pressure-before pressure-after same_process >/dev/null
+  ) || {
+    printf 'OBI metric pairs did not isolate admission deltas to pressure\n' >&2
+    return 1
+  }
+
   write_obi_running_identity_fixture \
     "$sort_dir" sort-before "$first_id" "$first_started"
   write_obi_running_identity_fixture \
@@ -28098,6 +31764,11 @@ test_obi_metric_pair_exact_maximum_fits() {
   local boundary=""
   local before_phase=""
   local after_phase=""
+  local expected_series=0
+
+  expected_series="$((${#transports[@]} * ${#operations[@]} *
+    ${#statuses[@]} + 2))"
+  [[ "$expected_series" -eq 794 ]] || return 1
 
   printf -v boundary 'm%063d' 0
   printf -v before_phase 'b%063d' 0
@@ -28124,6 +31795,14 @@ test_obi_metric_pair_exact_maximum_fits() {
       done
     done
   done
+  for metric_status in overload ambiguous; do
+    printf 'obi_java_remote_parent_operations_total{transport="tcp",operation="handoff_admission",status="%s"} %s\n' \
+      "$metric_status" "$MAX_UINT64_DECIMAL" \
+      >>"$result_dir/phases/$before_phase/obi-metrics.prom"
+    printf 'obi_java_remote_parent_operations_total{operation="handoff_admission",status="%s",transport="tcp"} %s\n' \
+      "$metric_status" "$MAX_UINT64_DECIMAL" \
+      >>"$result_dir/phases/$after_phase/obi-metrics.prom"
+  done
   printf 'obi_instrumentation_errors_total{error_type="attaching_java_agent",process_name="java"} %s\n' \
     1 \
     >>"$result_dir/phases/$before_phase/obi-metrics.prom"
@@ -28140,13 +31819,14 @@ test_obi_metric_pair_exact_maximum_fits() {
     RUN_STATUS=failed
     ACCEPTANCE_EVIDENCE=false
     ACCEPTANCE_EVIDENCE_REASON=targeted-scenario
-    FAILURE_STAGE=maximum-metric-pair
+    FAILURE_STAGE='maximum-metric-pair'
     FAILURE_LINE=17
     initialize_obi_metric_boundary_index || return 1
     begin_obi_metric_boundary basic || return 1
     payload="$(build_obi_metric_pair_payload \
       "$boundary" "$before_phase" "$after_phase" same_process)" || return 1
-    [[ "$(jq -r '.series | length' <<<"$payload")" == 792 ]] || return 1
+    [[ "$(jq -r '.series | length' <<<"$payload")" == \
+      "$expected_series" ]] || return 1
     [[ "$(jq -er '.series[0].before' <<<"$payload")" == 1 &&
       "$(jq -er '.series[0].after' <<<"$payload")" == "$MAX_UINT64_DECIMAL" &&
       "$(jq -er '.series[0].delta' <<<"$payload")" == \
@@ -28163,14 +31843,16 @@ test_obi_metric_pair_exact_maximum_fits() {
     [[ "$(stat -Lc '%s' -- "$RESULT_DIR/terminal-obi-metrics.json")" -le \
       "$OBI_METRIC_PAIR_MAX_BYTES" ]] || return 1
     jq -e --slurpfile terminal "$RESULT_DIR/terminal-obi-metrics.json" \
-      --arg boundary "$boundary" '
+      --arg boundary "$boundary" \
+      --argjson expected_series "$expected_series" '
         .obi_metric_evidence == $terminal[0] and
         .obi_metric_evidence.available == true and
         .obi_metric_evidence.pair.boundary == $boundary and
-        (.obi_metric_evidence.pair.series | length) == 792
+        (.obi_metric_evidence.pair.series | length) == $expected_series
       ' "$RESULT_DIR/run-status.json" >/dev/null
   ) || {
-    printf 'the worst-case 792-series uint64 pair did not survive terminal sealing\n' >&2
+    printf 'the worst-case %s-series uint64 pair did not survive terminal sealing\n' \
+      "$expected_series" >&2
     return 1
   }
 }
@@ -36000,7 +39682,7 @@ test_pid_reuse_static_overlay_and_build_wiring_are_exact() {
     printf 'PID reuse image build lost a tested fixture binary\n' >&2
     return 1
   fi
-  if ! grep -Fq 'javaRemoteParentPollInterval            = 10 * time.Second' \
+  if ! grep -Eq '^[[:space:]]*javaRemoteParentPollInterval[[:space:]]*=[[:space:]]*10 \* time\.Second$' \
       "$production_source" || \
     ! grep -Fq 'productionCleanupSweepInterval = 10 * time.Second' \
       "$controller_source" || \
@@ -36823,7 +40505,7 @@ test_obi_metric_boundary_journal_reference_budget_and_plan_are_bounded() {
           .boundaries[-1].id == "uninstrumented"
         ' "$RESULT_DIR/obi-metric-boundary-index.json" >/dev/null || return 1
       obi_metric_boundary_index_payload full >/dev/null
-    ) || return 1
+    )
   done
 
   (
@@ -38056,6 +41738,104 @@ test_obi_metric_boundary_journal_freeze_intent_orders_writers() {
   )
 }
 
+pressure_test_run_fresh_sourced_group() {
+  local -r group_name="$1"
+  local test_name=""
+  local status=0
+  shift
+
+  (($# > 0)) || return 1
+  for test_name in "$@"; do
+    printf '%s: running focused test: %s\n' \
+      "$group_name" "$test_name" >&2
+    if bash -c '
+      set -Eeuo pipefail
+
+      test_script="$1"
+      test_name="$2"
+      source "$test_script"
+
+      test_tmp_parent="${TMPDIR:-/tmp}"
+      [[ "$test_tmp_parent" == /* && -d "$test_tmp_parent" &&
+        ! -L "$test_tmp_parent" ]] || exit 1
+      test_tmp_parent="$(cd -- "$test_tmp_parent" && pwd -P)" || exit 1
+      case "$test_tmp_parent" in
+        /|"$TEST_REPOSITORY_ROOT"|"$TEST_REPOSITORY_ROOT"/*) exit 1 ;;
+      esac
+      test_tmp_candidate="$(mktemp -d \
+        "$test_tmp_parent/obi-apache-java-https-test.XXXXXX")" || exit $?
+      register_harness_test_tmp_dir "$test_tmp_candidate" || exit 1
+      docker_guard_dir="$TEST_TMP_DIR/no-docker"
+      mkdir -m 0700 -- "$docker_guard_dir" || exit $?
+      ln -s -- /bin/false "$docker_guard_dir/docker" || exit $?
+      ln -s -- /bin/false "$docker_guard_dir/docker-compose" || exit $?
+      PATH="$docker_guard_dir:$PATH"
+      export PATH
+
+      declare -F "$test_name" >/dev/null || {
+        printf "unknown focused test: %s\n" "$test_name" >&2
+        exit 1
+      }
+      "$test_name"
+    ' bash "$TEST_SCRIPT_DIR/run_test.sh" "$test_name"; then
+      :
+    else
+      status=$?
+      printf '%s: focused test failed: %s (status %s)\n' \
+        "$group_name" "$test_name" "$status" >&2
+      return "$status"
+    fi
+  done
+}
+
+test_pressure_transaction_authority_fresh_sourced_group() {
+  pressure_test_run_fresh_sourced_group transaction-authority \
+    test_pressure_transaction_parent_authority_and_fd_retirement \
+    test_pressure_transaction_o_excl_settings_and_foreign_winner \
+    test_pressure_transaction_group_commit_interleaving_and_aba \
+    test_pressure_transaction_deadline_and_commit_windows \
+    test_pressure_transaction_restart_crosslinks_and_descriptor_aba
+}
+
+test_pressure_runtime_lifecycle_fresh_sourced_group() {
+  pressure_test_run_fresh_sourced_group runtime-lifecycle \
+    test_pressure_container_inspection_artifact_publication_is_exact \
+    test_pressure_barrier_binds_container_inspection_descriptor \
+    test_pressure_container_identity_states_are_exact \
+    test_pressure_detached_launch_argv_is_exact \
+    test_pressure_detached_launch_failures_are_cleanup_owned \
+    test_pressure_container_absence_is_strict \
+    test_pressure_running_cleanup_waits_for_stopped_proof \
+    test_pressure_log_overflow_still_removes_helper \
+    test_pressure_repeat_state_guards_are_complete \
+    test_pressure_deadline_budget_is_shared_and_bounded \
+    test_pressure_scenario_terminal_wait_outvars_are_exact \
+    test_pressure_scenario_wait_orders_artifact_before_removal \
+    test_pressure_scenario_terminal_failure_receipt_is_exact \
+    test_pressure_bounded_stdin_and_wall_deadline_are_distinct \
+    test_pressure_helper_lifecycle_splits_work_and_cleanup_deadlines_and_distinguishes_wait_status \
+    test_pressure_helper_quiesces_before_map_cleanup \
+    test_pressure_runtime_cleanup_drains_container_inspection_transaction_role \
+    test_pressure_state_uses_baseline_and_retains_steady_recovery \
+    test_pressure_state_has_attempt_and_wall_clock_bounds \
+    test_pressure_state_fails_closed_on_evidence_write_error \
+    test_pressure_release_publication_deadline_is_hard \
+    test_pressure_control_cleanup_resumes_every_removal_boundary \
+    test_pressure_retention_rejects_ready_release_replacement \
+    test_pressure_scenario_counts_are_unique_and_bounded
+}
+
+test_pressure_map_one_shot_fresh_sourced_group() {
+  pressure_test_run_fresh_sourced_group map-one-shot \
+    test_map_pressure_partial_fill_is_cleanup_owned \
+    test_map_pressure_cleanup_latch_is_atomic_and_reused \
+    test_map_pressure_interrupted_helper_receipt_is_not_forged \
+    test_map_pressure_successful_deletion_is_never_reissued \
+    test_map_pressure_cleanup_only_transition_ordering_is_restartable \
+    test_pressure_publication_is_no_clobber_and_cleans_temporaries \
+    test_map_pressure_result_contract_is_single_record_and_exact
+}
+
 main() {
   local test_tmp_parent="${TMPDIR:-/tmp}"
   local test_tmp_candidate=""
@@ -38196,19 +41976,10 @@ main() {
   test_primary_security_quiescence_restores_policy
   test_bridge_take_attempt_total_is_transport_scoped
   test_bridge_inject_attempt_total_is_reason_agnostic
-  test_pressure_monitor_uses_prefill_baseline
-  test_pressure_state_uses_baseline_and_retains_steady_recovery
-  test_pressure_state_has_attempt_and_wall_clock_bounds
-  test_pressure_state_fails_closed_on_evidence_write_error
-  test_map_pressure_prepare_fill_cleanup_transaction
-  test_map_pressure_pre_mutation_failures_do_not_fill
-  test_map_pressure_fill_failure_uses_prepared_cleanup_identity
-  test_map_pressure_cleanup_retries_keep_immutable_artifacts
-  test_map_pressure_result_contract_is_single_record_and_exact
-  test_map_pressure_helper_capture_preserves_status_and_streams
-  test_map_pressure_canonical_promotion_rolls_back_partial_files
+  test_pressure_transaction_authority_fresh_sourced_group
+  test_pressure_runtime_lifecycle_fresh_sourced_group
+  test_pressure_map_one_shot_fresh_sourced_group
   test_bridge_take_count_includes_cancelled_request
-  test_pressure_scenario_counts_are_unique_and_bounded
   test_concurrency_overlap_reconciliation_is_exact
   test_tls_boundary_reconciliation_binds_exact_parents_to_record_evidence
   test_reason_coded_scenario_reconciliation_is_exact
@@ -38216,6 +41987,7 @@ main() {
   test_coalesced_bridge_metrics_follow_explicit_outcome
   test_timeout_cancellation_metrics_follow_explicit_outcome
   test_pressure_bridge_reconciliation_preserves_failure_reasons
+  test_pressure_admission_is_positive_bounded_and_request_scaled
   test_primary_security_metrics_are_explicitly_scoped
   test_primary_security_identity_requires_same_cgroup_and_nonroot_user
   test_primary_security_probe_is_not_self_certifying

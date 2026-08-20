@@ -28,8 +28,8 @@ check_dependencies() {
   local -a missing=()
   local command_name=""
 
-  for command_name in awk chmod cp find git grep jq mkdir mktemp mountpoint mv \
-    readlink rm sed sha256sum sort stat truncate; do
+  for command_name in awk chmod cmp cp find git grep id jq mkdir mktemp \
+    mountpoint mv readlink rm sed sha256sum sort stat tail truncate; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
       missing+=("$command_name")
     fi
@@ -124,6 +124,16 @@ replace_json_file() {
   shift 2
 
   jq "$@" "$filter" "$file" >"$candidate"
+  mv -- "$candidate" "$file"
+}
+
+replace_canonical_json_file() {
+  local -r file="$1"
+  local -r filter="$2"
+  local -r candidate="$file.tmp"
+  shift 2
+
+  jq -cS "$@" "$filter" "$file" >"$candidate"
   mv -- "$candidate" "$file"
 }
 
@@ -2117,6 +2127,8 @@ write_raw_v3_scenario_result_fixture() {
       '
       ;;
     pressure)
+      # jq's $index is an internal binding, not a shell expansion.
+      # shellcheck disable=SC2016
       replace_json_file "$bundle/scenario-$scenario.json" '
         .cases |= (to_entries | map(
           .key as $index | .value |
@@ -2142,6 +2154,8 @@ write_raw_v3_scenario_result_fixture() {
       '
       ;;
     timeout-retry)
+      # jq's $case is an internal binding, not a shell expansion.
+      # shellcheck disable=SC2016
       replace_json_file "$bundle/scenario-$scenario.json" '
         .cases[0] as $case |
         .faults = [{
@@ -2168,6 +2182,8 @@ write_raw_v3_scenario_result_fixture() {
       '
       ;;
     handoff)
+      # jq's $faults and $index are internal bindings.
+      # shellcheck disable=SC2016
       replace_json_file "$bundle/scenario-$scenario.json" '
         ["none", "cancel", "reject", "timeout"] as $faults |
         .cases |= (to_entries | map(
@@ -2181,6 +2197,8 @@ write_raw_v3_scenario_result_fixture() {
       '
       ;;
     coalesced-bridge)
+      # jq's $root and $markers are internal bindings.
+      # shellcheck disable=SC2016
       replace_json_file "$bundle/scenario-$scenario.json" '
         . as $root |
         ($root.cases | map(.request.marker)) as $markers |
@@ -2501,6 +2519,7 @@ write_raw_receive_fixture() {
 write_raw_v3_scenario_status_fixture() {
   local -r bundle="$1"
   local -r scenario="$2"
+  local -r pressure_contract_version="${3:-0}"
   local reconciliation='null'
   local receive='null'
   local pressure='null'
@@ -2512,7 +2531,8 @@ write_raw_v3_scenario_status_fixture() {
       ;;
     pressure)
       reconciliation='null'
-      pressure="$(jq -c '{
+      pressure="$(jq -c --argjson contract_version \
+        "$pressure_contract_version" '({
         trace: .pressure_correlation,
         bridge: {
           transport: "getsockopt",
@@ -2521,6 +2541,9 @@ write_raw_v3_scenario_status_fixture() {
             stage: .pressure_correlation.exact_hit_count,
             retrieval: .pressure_correlation.exact_hit_count},
           auxiliary_outcome_counts: {handoff: 0},
+          handoff_admission_outcome_counts: {
+            overload: 5, ambiguous: 0, maximum: 1152
+          },
           retrieval_valid_count: .pressure_correlation.exact_hit_count,
           upstream_failure_count: .pressure_correlation.explicit_root_count,
           retrieval_failure_count: 0,
@@ -2539,8 +2562,17 @@ write_raw_v3_scenario_status_fixture() {
           take_valid_count: .pressure_correlation.exact_hit_count,
           attributable_absence_count: .pressure_correlation.explicit_root_count,
           diagnostic_self_miss_count: 1
+        },
+        barrier_reference: "map-pressure-pressure-barrier-status.json",
+        container_inspections: {
+          reference: "map-pressure-pressure-container-inspections.json",
+          sha256: ("0" * 64),
+          size_bytes: 1
         }
-      }' "$bundle/scenario-$scenario.json")"
+      } | if $contract_version == 1 then . else
+        del(.bridge.handoff_admission_outcome_counts, .barrier_reference,
+          .container_inspections)
+      end)' "$bundle/scenario-$scenario.json")"
       ;;
     timeout-retry)
       reconciliation="$(jq -c '.faults[0]' \
@@ -2585,10 +2617,12 @@ write_raw_v3_scenario_status_fixture() {
 write_raw_v3_stress_phase_authority_fixture() {
   local -r bundle="$1"
   local -r scenario="$2"
+  local -r pressure_contract_version="${3:-0}"
   local -r container_id='0000000000000000000000000000000000000000000000000000000000000001'
   local -r started_at='2000-01-01T00:00:00.000000001Z'
   local phase=""
   local value=""
+  local -a pressure_rows=()
 
   [[ "$scenario" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] || return 1
   for phase in "$scenario-before" "$scenario-after"; do
@@ -2598,7 +2632,29 @@ write_raw_v3_stress_phase_authority_fixture() {
       value=1
     fi
     mkdir -p -- "$bundle/phases/$phase" || return 1
-    if [[ "$phase" == pressure-before &&
+    if [[ "$phase" == pressure-after ]]; then
+      pressure_rows=(
+        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 0' \
+        'obi_bpf_map_max_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 10000' \
+        'obi_instrumentation_errors_total{error_type="attaching_java_agent",process_name="java"} 0' \
+        'obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} 127'
+      )
+      if [[ "$pressure_contract_version" == 1 ]]; then
+        pressure_rows+=(
+          'obi_java_remote_parent_operations_total{operation="handoff_admission",status="overload",transport="tcp"} 5'
+        )
+      elif [[ "$pressure_contract_version" != 0 ]]; then
+        return 1
+      fi
+      pressure_rows+=(
+        'obi_java_remote_parent_operations_total{operation="inject",status="overload",transport="tcp"} 1'
+        'obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} 127'
+        'obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} 127' \
+        'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} 127'
+      )
+      printf '%s\n' "${pressure_rows[@]}" \
+        >"$bundle/phases/$phase/obi-metrics.prom" || return 1
+    elif [[ "$phase" == pressure-before &&
       -s "$bundle/phases/$phase/obi-metrics.prom" ]]; then
       printf '%s\n' \
         "obi_java_remote_parent_operations_total{operation=\"take\",status=\"valid\",transport=\"getsockopt\"} $value" \
@@ -2616,6 +2672,29 @@ write_raw_v3_stress_phase_authority_fixture() {
       "$bundle" "$phase" "$container_id" "$started_at" || return 1
     write_java_diagnostics_fixture "$bundle" "$phase" || return 1
   done
+  if [[ "$scenario" == pressure ]]; then
+    pressure_rows=(
+      'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} before=0 after=0 delta=0' \
+      'obi_bpf_map_max_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} before=10000 after=10000 delta=0' \
+      'obi_instrumentation_errors_total{error_type="attaching_java_agent",process_name="java"} before=0 after=0 delta=0' \
+      'obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} before=0 after=127 delta=127'
+    )
+    if [[ "$pressure_contract_version" == 1 ]]; then
+      pressure_rows+=(
+        'obi_java_remote_parent_operations_total{operation="handoff_admission",status="overload",transport="tcp"} before=0 after=5 delta=5'
+      )
+    elif [[ "$pressure_contract_version" != 0 ]]; then
+      return 1
+    fi
+    pressure_rows+=(
+      'obi_java_remote_parent_operations_total{operation="inject",status="overload",transport="tcp"} before=0 after=1 delta=1'
+      'obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} before=0 after=127 delta=127'
+      'obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} before=0 after=127 delta=127' \
+      'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} before=0 after=127 delta=127'
+    )
+    printf '%s\n' "${pressure_rows[@]}" \
+      >"$bundle/phases/pressure-after/obi-metrics.delta" || return 1
+  fi
 }
 
 sync_raw_v3_stress_status_authority_fixture() {
@@ -2663,43 +2742,196 @@ sync_timeout_status_fixture() {
 
   fault="$(jq -c '.faults[0]' "$bundle/scenario-timeout-retry.json")" ||
     return 1
+  # jq's $fault is supplied through --argjson.
+  # shellcheck disable=SC2016
   replace_json_file "$bundle/scenario-timeout-retry-status.json" \
     '.scenario_reconciliation = $fault' --argjson fault "$fault"
 }
 
+write_raw_pressure_container_inspections_fixture() {
+  local -r bundle="$1"
+  local -r artifact="$bundle/map-pressure-pressure-container-inspections.json"
+  local -r session='0123456789abcdef0123456789abcdef'
+  local runner_gid=""
+
+  runner_gid="$(id -g)" || return 1
+  [[ "$runner_gid" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+  jq -cS -n \
+    --arg project 'obi-java-https-test' \
+    --arg session "$session" \
+    --arg user "$EUID:$runner_gid" '
+      def snapshot($state): {
+        config: {
+          cmd: ["--scenario", "pressure", "--expected-tls", "TLSv1.3",
+            "--seed", "1", "--timeout", "75s", "--pressure-control-dir",
+            "/run/obi-demo/pressure-control", "--pressure-control-session",
+            $session, "--pressure-control-timeout", "255s"],
+          entrypoint: ["/trace-scenario"],
+          path: "/trace-scenario",
+          user: $user
+        },
+        identity: {
+          id: ("a" * 64),
+          image_id: ("sha256:" + ("b" * 64)),
+          image_reference: "obi-apache-java-https-tracecheck:local",
+          name: ("/" + $project + "-pressure-scenario-" + $session[0:12])
+        },
+        labels: {
+          oneoff: "True",
+          owner: "acceptance-demo-v1",
+          project: $project,
+          service: "scenario"
+        },
+        mount: {
+          destination: "/run/obi-demo/pressure-control",
+          rw: true,
+          source_leaf: (".pressure-control." + $session),
+          type: "bind"
+        },
+        runtime: {
+          attach_stdin: false,
+          network_mode: "host",
+          open_stdin: false,
+          pid_mode: "",
+          privileged: false,
+          restart_policy: "none",
+          stdin_once: false,
+          tty: false
+        },
+        state: $state
+      };
+      {
+        running: snapshot({
+          dead: false,
+          error: "",
+          exit_code: 0,
+          finished_at: "0001-01-01T00:00:00Z",
+          host_pid: 4242,
+          oom_killed: false,
+          restart_count: 0,
+          running: true,
+          started_at: "2026-08-17T00:00:00.000000001Z",
+          status: "running"
+        }),
+        scenario_label: "pressure",
+        schema: "pressure-scenario-container-inspections-v1",
+        session: $session,
+        status: "passed",
+        terminal: snapshot({
+          dead: false,
+          error: "",
+          exit_code: 0,
+          finished_at: "2026-08-17T00:00:01.000000001Z",
+          host_pid: 0,
+          oom_killed: false,
+          restart_count: 0,
+          running: false,
+          started_at: "2026-08-17T00:00:00.000000001Z",
+          status: "exited"
+        }),
+        wait_exit_code: 0
+      }
+    ' >"$artifact" || return 1
+  chmod 0600 -- "$artifact"
+}
+
+sync_raw_pressure_container_inspection_descriptors_fixture() {
+  local -r bundle="$1"
+  local -r reference='map-pressure-pressure-container-inspections.json'
+  local -r artifact="$bundle/$reference"
+  local -r status="$bundle/scenario-pressure-status.json"
+  local -r barrier="$bundle/map-pressure-pressure-barrier-status.json"
+  local digest=""
+  local size=""
+
+  [[ -f "$artifact" && ! -L "$artifact" && -f "$status" && ! -L "$status" ]] ||
+    return 1
+  digest="$(sha256sum <"$artifact")" || return 1
+  digest="${digest%% *}"
+  size="$(stat -Lc '%s' -- "$artifact")" || return 1
+  [[ "$digest" =~ ^[0-9a-f]{64}$ && "$size" =~ ^[1-9][0-9]*$ ]] || return 1
+  # jq variables below are supplied through --arg/--argjson.
+  # shellcheck disable=SC2016
+  replace_canonical_json_file "$status" '
+    .pressure_correlation.container_inspections = {
+      reference: $reference, sha256: $sha256, size_bytes: $size
+    }
+  ' --arg reference "$reference" --arg sha256 "$digest" --argjson size "$size" ||
+    return 1
+  if [[ -e "$barrier" || -L "$barrier" ]]; then
+    [[ -f "$barrier" && ! -L "$barrier" ]] || return 1
+    # jq variables below are supplied through --arg/--argjson.
+    # shellcheck disable=SC2016
+    replace_canonical_json_file "$barrier" '
+      .container_inspections = {
+        reference: $reference, sha256: $sha256, size_bytes: $size
+      }
+    ' --arg reference "$reference" --arg sha256 "$digest" \
+      --argjson size "$size" || return 1
+  fi
+}
+
+reseal_unparsed_raw_pressure_container_inspection_fixture() {
+  local -r bundle="$1"
+  local -r barrier="$bundle/map-pressure-pressure-barrier-status.json"
+  local -r status="$bundle/scenario-pressure-status.json"
+  local status_sha256=""
+
+  # The malformed artifact cannot be slurped by jq. Reseal its raw-byte
+  # descriptors first, then the status authority, without parsing the artifact.
+  sync_raw_pressure_container_inspection_descriptors_fixture "$bundle" ||
+    return 1
+  sync_raw_v3_pressure_status_index_fixture "$bundle" || return 1
+  status_sha256="$(sha256sum <"$status")" || return 1
+  status_sha256="${status_sha256%% *}"
+  [[ "$status_sha256" =~ ^[0-9a-f]{64}$ ]] || return 1
+  # jq's $status_sha256 is supplied through --arg.
+  # shellcheck disable=SC2016
+  replace_canonical_json_file "$barrier" \
+    '.traffic.status_sha256 = $status_sha256' \
+    --arg status_sha256 "$status_sha256"
+}
+
 write_raw_pressure_fixture() {
   local -r bundle="$1"
+  local -r pressure_contract_version="${2:-0}"
 
   printf '%s\n' \
-    '{"status":"passed","mode":"prepare","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":10000,"process_map_id":42,"process_pid":101,"process_namespace":202,"token_base":18446744073709551605,"touched":0}' \
+    '{"status":"passed","mode":"prepare","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":10000,"process_map_id":42,"process_pid":101,"process_namespace":202,"token_base":18446744073709551605,"synthetic_pid":0,"synthetic_namespace":0,"touched":0}' \
     >"$bundle/map-pressure-pressure-prepare.json"
   printf '%s\n' \
-    '{"status":"passed","mode":"fill","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":10000,"process_map_id":42,"process_pid":101,"process_namespace":202,"token_base":18446744073709551605,"touched":10000,"capacity_rejected_entries":1,"verified_present_entries":10000}' \
+    '{"status":"passed","mode":"fill","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":10000,"process_map_id":42,"process_pid":101,"process_namespace":202,"token_base":18446744073709551605,"synthetic_pid":0,"synthetic_namespace":0,"touched":10000,"capacity_rejected_entries":1,"verified_present_entries":10000,"content_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","verified_absent_entries":1}' \
     >"$bundle/map-pressure-pressure-fill.json"
   printf '%s\n' \
-    '{"status":"passed","mode":"cleanup","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":10000,"process_map_id":0,"process_pid":101,"process_namespace":202,"token_base":18446744073709551605,"touched":10000,"cleanup_verified":true,"verified_absent_entries":10001}' \
+    '{"status":"passed","mode":"verify","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":10000,"process_map_id":42,"process_pid":101,"process_namespace":202,"token_base":18446744073709551605,"synthetic_pid":0,"synthetic_namespace":0,"touched":0,"verified_present_entries":10000,"content_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","verified_absent_entries":1}' \
+    >"$bundle/map-pressure-pressure-verify.json"
+  printf '%s\n' \
+    '{"status":"passed","mode":"cleanup","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":10000,"process_map_id":0,"process_pid":101,"process_namespace":202,"token_base":18446744073709551605,"synthetic_pid":0,"synthetic_namespace":0,"touched":10000,"cleanup_verified":true,"verified_absent_entries":10001}' \
     >"$bundle/map-pressure-pressure-cleanup.json"
   printf '%s\n' \
     'command_status=0' \
     'validation_status=passed' \
     'recovery_status=passed' \
-    'monitor_status=0' \
+    'barrier_status=retained' \
     >"$bundle/map-pressure-pressure-cleanup-attempt-01.status"
   cp -- "$bundle/map-pressure-pressure-cleanup.json" \
     "$bundle/map-pressure-pressure-cleanup-attempt-01.json"
   : >"$bundle/map-pressure-pressure-prepare.stderr.log"
   : >"$bundle/map-pressure-pressure-fill.stderr.log"
+  : >"$bundle/map-pressure-pressure-verify.stderr.log"
   : >"$bundle/map-pressure-pressure-cleanup.stderr.log"
   : >"$bundle/map-pressure-pressure-cleanup-attempt-01.stderr.log"
   mkdir -p -- "$bundle/phases/pressure-before"
   printf '%s\n' \
     'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 0' \
+    'obi_bpf_map_max_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 10000' \
     >"$bundle/phases/pressure-before/obi-metrics.prom"
   printf '%s\n' \
-    'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 10000' \
-    >"$bundle/map-pressure-pressure-pressured.prom"
-  cp -- "$bundle/map-pressure-pressure-pressured.prom" \
-    "$bundle/map-pressure-pressure-traffic-complete.prom"
+    'pressure-ready-v1:0123456789abcdef0123456789abcdef' \
+    >"$bundle/map-pressure-pressure-barrier-ready.txt"
+  printf '%s\n' \
+    'pressure-release-v1:0123456789abcdef0123456789abcdef' \
+    >"$bundle/map-pressure-pressure-barrier-release.txt"
   printf '%s\n' \
     'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 0' \
     >"$bundle/map-pressure-pressure-recovered.prom"
@@ -2719,10 +2951,180 @@ write_raw_pressure_fixture() {
     "$bundle/map-pressure-pressure-cleanup-attempt-01-recovered-sample-02.prom"
   cp -- "$bundle/map-pressure-pressure-recovered-samples.log" \
     "$bundle/map-pressure-pressure-cleanup-attempt-01-recovered-samples.log"
-  printf '%s\n' \
-    'status=pressured observed_at=2000-01-01T00:00:01Z map_id=41 baseline=0 max_entries=10000 entries=10000' \
-    'status=traffic-complete observed_at=2000-01-01T00:00:02Z map_id=41 baseline=0 max_entries=10000 entries=10000 operation=inject transport=tcp inject_total=128 target=128' \
-    >"$bundle/map-pressure-pressure-monitor.log"
+
+  case "$pressure_contract_version" in
+    0)
+      printf '%s\n' \
+        '{"status":"passed","mode":"prepare","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":10000,"process_map_id":42,"process_pid":101,"process_namespace":202,"token_base":18446744073709551605,"touched":0}' \
+        >"$bundle/map-pressure-pressure-prepare.json"
+      printf '%s\n' \
+        '{"status":"passed","mode":"fill","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":10000,"process_map_id":42,"process_pid":101,"process_namespace":202,"token_base":18446744073709551605,"touched":10000,"capacity_rejected_entries":1,"verified_present_entries":10000}' \
+        >"$bundle/map-pressure-pressure-fill.json"
+      printf '%s\n' \
+        '{"status":"passed","mode":"cleanup","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":10000,"process_map_id":0,"process_pid":101,"process_namespace":202,"token_base":18446744073709551605,"touched":10000,"cleanup_verified":true,"verified_absent_entries":10001}' \
+        >"$bundle/map-pressure-pressure-cleanup.json"
+      cp -- "$bundle/map-pressure-pressure-cleanup.json" \
+        "$bundle/map-pressure-pressure-cleanup-attempt-01.json"
+      printf '%s\n' \
+        'command_status=0' \
+        'validation_status=passed' \
+        'recovery_status=passed' \
+        'monitor_status=0' \
+        >"$bundle/map-pressure-pressure-cleanup-attempt-01.status"
+      rm -f -- \
+        "$bundle/map-pressure-pressure-verify.json" \
+        "$bundle/map-pressure-pressure-verify.stderr.log" \
+        "$bundle/map-pressure-pressure-barrier-ready.txt" \
+        "$bundle/map-pressure-pressure-barrier-release.txt" \
+        "$bundle/map-pressure-pressure-container-inspections.json"
+      printf '%s\n' \
+        'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 10000' \
+        >"$bundle/map-pressure-pressure-pressured.prom"
+      cp -- "$bundle/map-pressure-pressure-pressured.prom" \
+        "$bundle/map-pressure-pressure-traffic-complete.prom"
+      printf '%s\n' \
+        'status=pressured map_id=41 baseline=0 max_entries=10000 entries=10000' \
+        'status=traffic-complete map_id=41 baseline=0 max_entries=10000 entries=10000 operation=inject transport=tcp inject_total=128 target=128' \
+        >"$bundle/map-pressure-pressure-monitor.log"
+      ;;
+    1)
+      local cleanup_output_sha256=""
+      local cleanup_stderr_sha256=""
+      cleanup_output_sha256="$(sha256sum \
+        <"$bundle/map-pressure-pressure-cleanup-attempt-01.json")" || return 1
+      cleanup_output_sha256="${cleanup_output_sha256%% *}"
+      cleanup_stderr_sha256="$(sha256sum \
+        <"$bundle/map-pressure-pressure-cleanup-attempt-01.stderr.log")" || return 1
+      cleanup_stderr_sha256="${cleanup_stderr_sha256%% *}"
+      printf '%s\n' \
+        'barrier_status=retained' \
+        'deletion_command_status=0' \
+        'deletion_output_reference=map-pressure-pressure-cleanup-attempt-01.json' \
+        "deletion_output_sha256=$cleanup_output_sha256" \
+        'deletion_proof_reference=map-pressure-pressure-cleanup-attempt-01.json' \
+        "deletion_proof_sha256=$cleanup_output_sha256" \
+        'deletion_reused=false' \
+        'deletion_stderr_reference=map-pressure-pressure-cleanup-attempt-01.stderr.log' \
+        "deletion_stderr_sha256=$cleanup_stderr_sha256" \
+        'deletion_validation_status=passed' \
+        'recovery_status=passed' \
+        'schema=pressure-cleanup-attempt-v1' \
+        >"$bundle/map-pressure-pressure-cleanup-attempt-01.status"
+      write_raw_pressure_container_inspections_fixture "$bundle" || return 1
+      sync_raw_pressure_container_inspection_descriptors_fixture "$bundle" ||
+        return 1
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+write_raw_pressure_barrier_status_fixture() {
+  local -r bundle="$1"
+  local ready_sha256=""
+  local release_sha256=""
+  local fill_sha256=""
+  local verify_sha256=""
+  local result_sha256=""
+  local status_sha256=""
+  local inspections_sha256=""
+  local inspections_size=""
+
+  ready_sha256="$(sha256sum \
+    <"$bundle/map-pressure-pressure-barrier-ready.txt")" || return 1
+  release_sha256="$(sha256sum \
+    <"$bundle/map-pressure-pressure-barrier-release.txt")" || return 1
+  fill_sha256="$(sha256sum \
+    <"$bundle/map-pressure-pressure-fill.json")" || return 1
+  verify_sha256="$(sha256sum \
+    <"$bundle/map-pressure-pressure-verify.json")" || return 1
+  result_sha256="$(sha256sum <"$bundle/scenario-pressure.json")" || return 1
+  status_sha256="$(sha256sum \
+    <"$bundle/scenario-pressure-status.json")" || return 1
+  inspections_sha256="$(sha256sum \
+    <"$bundle/map-pressure-pressure-container-inspections.json")" || return 1
+  inspections_size="$(stat -Lc '%s' -- \
+    "$bundle/map-pressure-pressure-container-inspections.json")" || return 1
+  ready_sha256="${ready_sha256%% *}"
+  release_sha256="${release_sha256%% *}"
+  fill_sha256="${fill_sha256%% *}"
+  verify_sha256="${verify_sha256%% *}"
+  result_sha256="${result_sha256%% *}"
+  status_sha256="${status_sha256%% *}"
+  inspections_sha256="${inspections_sha256%% *}"
+  jq -cS -n \
+    --arg ready_sha256 "$ready_sha256" \
+    --arg release_sha256 "$release_sha256" \
+    --arg fill_sha256 "$fill_sha256" \
+    --arg verify_sha256 "$verify_sha256" \
+    --arg result_sha256 "$result_sha256" \
+    --arg status_sha256 "$status_sha256" \
+    --arg inspections_sha256 "$inspections_sha256" \
+    --argjson inspections_size "$inspections_size" \
+    --slurpfile inspections \
+      "$bundle/map-pressure-pressure-container-inspections.json" '{
+      schema: "pressure-traffic-barrier-v1",
+      status: "passed",
+      scenario_label: "pressure",
+      session: "0123456789abcdef0123456789abcdef",
+      sequence: ["scenario_ready", "capacity_fill_verified",
+        "release_published", "scenario_reaped",
+        "post_traffic_content_verified"],
+      control: {
+        ready_reference: "map-pressure-pressure-barrier-ready.txt",
+        ready_sha256: $ready_sha256,
+        release_reference: "map-pressure-pressure-barrier-release.txt",
+        release_sha256: $release_sha256
+      },
+      container: {
+        id: $inspections[0].running.identity.id,
+        host_pid: ($inspections[0].running.state.host_pid | tostring),
+        started_at: $inspections[0].running.state.started_at,
+        user: $inspections[0].running.config.user
+      },
+      container_inspections: {
+        reference: "map-pressure-pressure-container-inspections.json",
+        sha256: $inspections_sha256,
+        size_bytes: $inspections_size
+      },
+      fill: {
+        reference: "map-pressure-pressure-fill.json",
+        sha256: $fill_sha256,
+        map_id: "41",
+        baseline_entries: 0,
+        synthetic_pid: 0,
+        synthetic_namespace: 0,
+        max_entries: 10000,
+        touched: 10000,
+        verified_present_entries: 10000,
+        verified_absent_entries: 1,
+        content_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        capacity_rejected_entries: 1
+      },
+      verification: {
+        reference: "map-pressure-pressure-verify.json",
+        sha256: $verify_sha256,
+        map_id: "41",
+        synthetic_pid: 0,
+        synthetic_namespace: 0,
+        verified_present_entries: 10000,
+        verified_absent_entries: 1,
+        content_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      traffic: {
+        result_reference: "scenario-pressure.json",
+        result_sha256: $result_sha256,
+        status_reference: "scenario-pressure-status.json",
+        status_sha256: $status_sha256,
+        request_count: 128,
+        exact_hit_count: 127,
+        explicit_root_count: 1,
+        handoff_admission_overload_count: 5,
+        handoff_admission_ambiguous_count: 0,
+        handoff_admission_maximum_count: 1152,
+        wrong_parent_count: 0,
+        unresolved_count: 0
+      }
+    }' >"$bundle/map-pressure-pressure-barrier-status.json"
 }
 
 materialize_raw_v3_fixture_file() {
@@ -2860,6 +3262,8 @@ materialize_raw_v3_scenario_fixture() {
 }
 
 raw_v3_pair_labels_fixture() {
+  local -r pressure_contract_version="${1:-0}"
+
   printf '%s\n' \
     basic keepalive pipelining concurrency connection-churn fd-port-reuse \
     slow-body tls-boundary coalesced-bridge timeout-retry pressure handoff \
@@ -2882,6 +3286,14 @@ raw_v3_pair_labels_fixture() {
     primary-w3c-fault-bad-size primary-w3c-fault-zero-trace-id \
     primary-w3c-fault-zero-span-id primary-generation-mismatch-fault \
     restart-fault helper-attach-rejection
+  case "$pressure_contract_version" in
+    0) ;;
+    1)
+      printf '%s\n' \
+        w3c-match-pre-stop late-attach-pre-stop extension-controls-pre-stop
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 raw_v3_status_owner_fixture() {
@@ -2920,7 +3332,8 @@ raw_v3_status_owner_fixture() {
     basic-permanent-absence-recovery)
       printf 'permanent-absence\n'
       ;;
-    late-attach-obi-stopped|fail-open-obi-absent|w3c-only-obi-absent|\
+    late-attach-pre-stop|late-attach-obi-stopped|\
+    fail-open-obi-absent|w3c-only-obi-absent|\
     restart-late-attach-recovery)
       printf 'late-attach\n'
       ;;
@@ -2932,10 +3345,11 @@ raw_v3_status_owner_fixture() {
     basic-helper-attach-recovery)
       printf 'helper-attach-failure\n'
       ;;
-    w3c-match-obi-stopped)
+    w3c-match-pre-stop|w3c-match-obi-stopped)
       printf 'w3c-match\n'
       ;;
-    extension-controls-obi-stopped|w3c-only-extension-absent|\
+    extension-controls-pre-stop|extension-controls-obi-stopped|\
+    w3c-only-extension-absent|\
     w3c-only-extension-disabled)
       printf 'extension-controls\n'
       ;;
@@ -2946,21 +3360,92 @@ raw_v3_status_owner_fixture() {
 write_raw_v3_pair_fixture() {
   local -r bundle="$1"
   local -r label="$2"
+  local -r pressure_contract_version="${3:-0}"
   local -r template="$bundle/obi-metric-pairs/basic.json"
   local -r output="$bundle/obi-metric-pairs/$label.json"
+  local control_label=""
 
   [[ -f "$template" && ! -L "$template" ]] || return 1
   [[ "$label" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] || return 1
   if [[ "$label" != basic ]]; then
     case "$label" in
+      late-attach-pre-stop|w3c-match-pre-stop|extension-controls-pre-stop)
+        [[ "$pressure_contract_version" == 1 ]] || return 1
+        control_label="${label%-pre-stop}"
+        jq -cn --arg boundary "$label" \
+          --arg before_reference \
+            "phases/$control_label-obi-pre-stop/obi-identity.json" \
+          --arg after_reference \
+            "phases/$control_label-obi-running/obi-identity.json" '{
+            schema: "obi-java-remote-parent-metric-pair-v1",
+            boundary: $boundary,
+            continuity: "same_process",
+            before: {state: "running", identity_reference: $before_reference},
+            after: {state: "running", identity_reference: $after_reference},
+            series: [
+              {transport:"getsockopt", operation:"take", status:"valid",
+                before:"1", after:"1", delta:"0"},
+              {transport:"tcp", operation:"handoff_admission", status:"overload",
+                before:"5", after:"5", delta:"0"}
+            ],
+            java_attach_errors: {before:"0", after:"0", delta:"0"}
+          }' >"$output" || return 1
+        ;;
+      late-attach-obi-stopped|w3c-match-obi-stopped|extension-controls-obi-stopped)
+        if [[ "$pressure_contract_version" == 0 ]]; then
+          jq -cS --arg boundary "$label" '.boundary = $boundary' "$template" \
+            >"$output" || return 1
+        else
+          [[ "$pressure_contract_version" == 1 ]] || return 1
+          control_label="${label%-obi-stopped}"
+          jq -cn --arg boundary "$label" \
+            --arg before_reference \
+              "phases/$control_label-obi-running/obi-identity.json" \
+            --arg after_reference \
+              "phases/$control_label-obi-stopped/obi-identity.json" '{
+              schema: "obi-java-remote-parent-metric-pair-v1",
+              boundary: $boundary,
+              continuity: "same_process",
+              before: {state: "running", identity_reference: $before_reference},
+              after: {state: "obi_stopped", identity_reference: $after_reference},
+              series: [
+                {transport:"getsockopt", operation:"take", status:"valid",
+                  before:"1", after:null, delta:null},
+                {transport:"tcp", operation:"handoff_admission", status:"overload",
+                  before:"5", after:null, delta:null}
+              ],
+              java_attach_errors: {before:"0", after:null, delta:null}
+            }' >"$output" || return 1
+        fi
+        ;;
       keepalive|pipelining|concurrency|connection-churn|fd-port-reuse|\
       slow-body|tls-boundary|coalesced-bridge|timeout-retry|pressure|handoff)
         jq -cS --arg boundary "$label" \
           --arg before_reference "phases/$label-before/obi-identity.json" \
-          --arg after_reference "phases/$label-after/obi-identity.json" '
+          --arg after_reference "phases/$label-after/obi-identity.json" \
+          --argjson pressure_contract_version "$pressure_contract_version" '
             .boundary = $boundary |
             .before.identity_reference = $before_reference |
-            .after.identity_reference = $after_reference
+            .after.identity_reference = $after_reference |
+            if $boundary == "pressure" then
+              .series = ([
+                {transport:"getsockopt", operation:"take", status:"valid",
+                  before:"0", after:"127", delta:"127"},
+                {transport:"tcp", operation:"candidate", status:"valid",
+                  before:"0", after:"127", delta:"127"}
+              ] + (if $pressure_contract_version == 1 then [
+                {transport:"tcp", operation:"handoff_admission",
+                  status:"overload", before:"0", after:"5", delta:"5"}
+              ] elif $pressure_contract_version == 0 then [] else
+                error("unknown pressure contract") end) + [
+                {transport:"tcp", operation:"inject", status:"overload",
+                  before:"0", after:"1", delta:"1"},
+                {transport:"tcp", operation:"inject", status:"valid",
+                  before:"0", after:"127", delta:"127"},
+                {transport:"tcp", operation:"stage", status:"valid",
+                  before:"0", after:"127", delta:"127"}
+              ])
+            else . end
           ' "$template" >"$output" || return 1
         ;;
       *)
@@ -3099,9 +3584,40 @@ materialize_raw_v3_acceptance_roots_fixture() {
   done
 }
 
+materialize_raw_v3_stopped_pre_stop_fixture() {
+  local -r bundle="$1"
+  local -r label="$2"
+  local -r container_id='0000000000000000000000000000000000000000000000000000000000000001'
+  local -r started_at='2000-01-01T00:00:00.000000001Z'
+  local phase=""
+
+  [[ "$label" =~ ^(late-attach|w3c-match|extension-controls)$ ]] || return 1
+  for phase in "$label-obi-pre-stop" "$label-obi-running"; do
+    printf '%s\n' \
+      'obi_instrumentation_errors_total{error_type="attaching_java_agent",process_name="java"} 0' \
+      'obi_java_remote_parent_operations_total{operation="handoff_admission",status="overload",transport="tcp"} 5' \
+      'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} 1' \
+      >"$bundle/phases/$phase/obi-metrics.prom" || return 1
+    LC_ALL=C sort -o "$bundle/phases/$phase/obi-metrics.prom" -- \
+      "$bundle/phases/$phase/obi-metrics.prom" || return 1
+    write_running_identity_fixture \
+      "$bundle" "$phase" "$container_id" "$started_at" || return 1
+  done
+  jq -cn --arg container_id "$container_id" --arg started_at "$started_at" '{
+    schema: "obi-process-identity-v1",
+    state: "obi_stopped",
+    container_id: $container_id,
+    host_pid: "0",
+    started_at: $started_at,
+    finished_at: "2000-01-01T00:00:10.000000001Z",
+    exit_code: "0"
+  }' >"$bundle/phases/$label-obi-stopped/obi-identity.json"
+}
+
 materialize_raw_v3_acceptance_scenarios_fixture() {
   local -r bundle="$1"
   local -r statuses="$2"
+  local -r pressure_contract_version="${3:-0}"
   local label=""
   local mode=""
   local relative=""
@@ -3191,10 +3707,20 @@ materialize_raw_v3_acceptance_scenarios_fixture() {
     scenario-security-status.json >>"$statuses" || return 1
 
   for label in w3c-match late-attach extension-controls; do
+    if [[ "$pressure_contract_version" == 1 ]]; then
+      materialize_raw_v3_phase_fixture \
+        "$bundle" "$label-obi-pre-stop" full-live || return 1
+    elif [[ "$pressure_contract_version" != 0 ]]; then
+      return 1
+    fi
     materialize_raw_v3_phase_fixture \
       "$bundle" "$label-obi-running" full-live || return 1
     materialize_raw_v3_phase_fixture \
       "$bundle" "$label-obi-stopped" stopped-attestation || return 1
+    if [[ "$pressure_contract_version" == 1 ]]; then
+      materialize_raw_v3_stopped_pre_stop_fixture \
+        "$bundle" "$label" || return 1
+    fi
   done
   materialize_raw_v3_fixture_file \
     "$bundle" metrics-boundary-late-attach.prom || return 1
@@ -3234,7 +3760,12 @@ materialize_raw_v3_acceptance_scenarios_fixture() {
     "$bundle" helper-attach-failure-after full-live || return 1
   materialize_raw_v3_phase_fixture "$bundle" helper-attach-recovery java-only ||
     return 1
-  materialize_raw_v3_phase_fixture "$bundle" pressure-pressured full-live || return 1
+  if [[ "$pressure_contract_version" == 0 ]]; then
+    materialize_raw_v3_phase_fixture \
+      "$bundle" pressure-pressured full-live || return 1
+  elif [[ "$pressure_contract_version" != 1 ]]; then
+    return 1
+  fi
   materialize_raw_v3_phase_fixture "$bundle" final full-unavailable-java || return 1
   for label in unix-w3c-stale unix-generation-mismatch w3c-fault \
     auto-unavailable; do
@@ -3447,6 +3978,7 @@ write_raw_v3_exact_index_fixture() {
 materialize_raw_v3_exact_fixture() {
   local -r bundle="$1"
   local -r kind="$2"
+  local -r pressure_contract_version="${3:-0}"
   local ids_json=""
   local statuses=""
   local status_owners=""
@@ -3470,8 +4002,8 @@ materialize_raw_v3_exact_fixture() {
       terminal_phase=extension-controls-obi-stopped
       materialize_raw_v3_acceptance_roots_fixture "$bundle" || return 1
       materialize_raw_v3_acceptance_scenarios_fixture \
-        "$bundle" "$statuses" || return 1
-      raw_v3_pair_labels_fixture >"$pairs" || return 1
+        "$bundle" "$statuses" "$pressure_contract_version" || return 1
+      raw_v3_pair_labels_fixture "$pressure_contract_version" >"$pairs" || return 1
       ;;
     assertion-failure)
       ids_json='["basic"]'
@@ -3496,10 +4028,11 @@ materialize_raw_v3_exact_fixture() {
       basic|keepalive|pipelining|concurrency|connection-churn|fd-port-reuse|\
       slow-body|tls-boundary|coalesced-bridge|timeout-retry|pressure|handoff)
         write_raw_v3_stress_phase_authority_fixture \
-          "$bundle" "$label" || return 1
+          "$bundle" "$label" "$pressure_contract_version" || return 1
         ;;
     esac
-    write_raw_v3_pair_fixture "$bundle" "$label" || return 1
+    write_raw_v3_pair_fixture \
+      "$bundle" "$label" "$pressure_contract_version" || return 1
     case "$label" in
       basic|keepalive|pipelining|concurrency|connection-churn|fd-port-reuse|\
       slow-body|tls-boundary|coalesced-bridge|timeout-retry|pressure|handoff)
@@ -3510,6 +4043,9 @@ materialize_raw_v3_exact_fixture() {
   done <"$pairs"
   write_raw_v3_status_files_fixture \
     "$bundle" "$statuses" "$status_owners" || return 1
+  if [[ "$kind" == acceptance && "$pressure_contract_version" == 1 ]]; then
+    write_raw_pressure_barrier_status_fixture "$bundle" || return 1
+  fi
   write_raw_v3_exact_index_fixture \
     "$bundle" "$selection" \
     "$ids_json" "$pairs" "$status_owners" || return 1
@@ -3638,6 +4174,7 @@ create_raw_v3_acceptance_fixture() {
   local -r repository="$1"
   local -r revision="$2"
   local -r bundle="$3"
+  local -r pressure_contract_version="${4:-0}"
   local scenario=""
   local request_count=""
   local -a stress_scenarios=(
@@ -3654,10 +4191,12 @@ create_raw_v3_acceptance_fixture() {
     request_count="$(scenario_request_count_fixture "$scenario")" || return 1
     write_raw_v3_scenario_result_fixture \
       "$bundle" "$scenario" "$request_count"
-    write_raw_v3_scenario_status_fixture "$bundle" "$scenario"
+    write_raw_v3_scenario_status_fixture \
+      "$bundle" "$scenario" "$pressure_contract_version"
   done
-  write_raw_pressure_fixture "$bundle"
-  materialize_raw_v3_exact_fixture "$bundle" acceptance
+  write_raw_pressure_fixture "$bundle" "$pressure_contract_version"
+  materialize_raw_v3_exact_fixture \
+    "$bundle" acceptance "$pressure_contract_version"
   write_raw_resource_recovery_fixture "$bundle"
   write_raw_v3_run_status_fixture "$bundle" acceptance
 }
@@ -3724,6 +4263,8 @@ expect_external_v3_rejection() {
 write_cleanup_chmod_wrapper() {
   local -r output="$1"
 
+  # These expansions are literals for the generated wrapper.
+  # shellcheck disable=SC2016
   printf '%s\n' \
     '#!/usr/bin/env bash' \
     'set -Eeuo pipefail' \
@@ -3853,6 +4394,8 @@ rewire_raw_stress_pair_authority_fixture() {
   java_digest="$(sha256sum \
     <"$bundle/phases/basic-after/java-diagnostics.txt")" || return 1
   java_digest="${java_digest%% *}"
+  # jq variables below are supplied through --arg/--slurpfile.
+  # shellcheck disable=SC2016
   replace_json_file "$bundle/$status_reference" '
     .before_phase = $basic[0].before_phase |
     .after_phase = $basic[0].after_phase |
@@ -3866,6 +4409,8 @@ rewire_raw_stress_pair_authority_fixture() {
     --slurpfile basic "$bundle/$basic_status"
   status_digest="$(sha256sum <"$bundle/$status_reference")" || return 1
   status_digest="${status_digest%% *}"
+  # jq variables below are supplied through --arg.
+  # shellcheck disable=SC2016
   replace_json_file "$bundle/obi-metric-boundary-index.json" '
     (.boundaries[] | select(.id == "keepalive")) |= (
       (.captures[] | select(.kind == "pair")) |= (
@@ -3881,13 +4426,17 @@ rewire_raw_stress_pair_authority_fixture() {
 
 mutate_raw_pressure_capacity_fixture() {
   local -r bundle="$1"
-  local file=""
+  local cleanup_output_sha256=""
 
   replace_json_file "$bundle/map-pressure-pressure-prepare.json" \
     '.max_entries = 9999'
   replace_json_file "$bundle/map-pressure-pressure-fill.json" '
     .max_entries = 9999 |
     .touched = 9999 |
+    .verified_present_entries = 9999
+  '
+  replace_json_file "$bundle/map-pressure-pressure-verify.json" '
+    .max_entries = 9999 |
     .verified_present_entries = 9999
   '
   replace_json_file "$bundle/map-pressure-pressure-cleanup.json" '
@@ -3897,32 +4446,1191 @@ mutate_raw_pressure_capacity_fixture() {
   '
   cp -- "$bundle/map-pressure-pressure-cleanup.json" \
     "$bundle/map-pressure-pressure-cleanup-attempt-01.json" || return 1
-  for file in map-pressure-pressure-pressured.prom \
-    map-pressure-pressure-traffic-complete.prom; do
-    sed 's/ 10000$/ 9999/' "$bundle/$file" >"$bundle/$file.tmp" || return 1
-    mv -fT -- "$bundle/$file.tmp" "$bundle/$file" || return 1
+  cleanup_output_sha256="$(sha256sum \
+    <"$bundle/map-pressure-pressure-cleanup-attempt-01.json")" || return 1
+  cleanup_output_sha256="${cleanup_output_sha256%% *}"
+  replace_fixture_key_value \
+    "$bundle/map-pressure-pressure-cleanup-attempt-01.status" \
+    deletion_output_sha256 "$cleanup_output_sha256" || return 1
+  replace_fixture_key_value \
+    "$bundle/map-pressure-pressure-cleanup-attempt-01.status" \
+    deletion_proof_sha256 "$cleanup_output_sha256" || return 1
+  replace_fixture_literal_line \
+    "$bundle/phases/pressure-before/obi-metrics.prom" \
+    'obi_bpf_map_max_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 10000' \
+    'obi_bpf_map_max_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 9999' || return 1
+  replace_fixture_literal_line \
+    "$bundle/phases/pressure-after/obi-metrics.prom" \
+    'obi_bpf_map_max_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 10000' \
+    'obi_bpf_map_max_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 9999' || return 1
+  replace_fixture_literal_line \
+    "$bundle/phases/pressure-after/obi-metrics.delta" \
+    'obi_bpf_map_max_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} before=10000 after=10000 delta=0' \
+    'obi_bpf_map_max_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} before=9999 after=9999 delta=0' || return 1
+  refresh_running_identity_metrics_digest "$bundle" pressure-before || return 1
+  refresh_running_identity_metrics_digest "$bundle" pressure-after || return 1
+  sync_raw_pressure_barrier_mirrors_fixture "$bundle"
+}
+
+replace_fixture_key_value() {
+  local -r file="$1"
+  local -r key="$2"
+  local -r value="$3"
+  local -r candidate="$file.tmp"
+
+  [[ "$key" =~ ^[a-z][a-z0-9_]*$ && ! -L "$file" && -f "$file" ]] ||
+    return 1
+  awk -v key="$key" -v value="$value" '
+    index($0, key "=") == 1 {
+      count++
+      $0 = key "=" value
+    }
+    { print }
+    END { if (count != 1) exit 1 }
+  ' "$file" >"$candidate" || return 1
+  mv -fT -- "$candidate" "$file"
+}
+
+replace_fixture_literal_line() {
+  local -r file="$1"
+  local -r expected="$2"
+  local -r replacement="$3"
+  local -r candidate="$file.tmp"
+
+  [[ ! -L "$file" && -f "$file" ]] || return 1
+  awk -v expected="$expected" -v replacement="$replacement" '
+    $0 == expected {
+      count++
+      $0 = replacement
+    }
+    { print }
+    END { if (count != 1) exit 1 }
+  ' "$file" >"$candidate" || return 1
+  mv -fT -- "$candidate" "$file"
+}
+
+remove_fixture_literal_line() {
+  local -r file="$1"
+  local -r expected="$2"
+  local -r candidate="$file.tmp"
+
+  [[ ! -L "$file" && -f "$file" ]] || return 1
+  awk -v expected="$expected" '
+    $0 == expected {
+      count++
+      next
+    }
+    { print }
+    END { if (count != 1) exit 1 }
+  ' "$file" >"$candidate" || return 1
+  mv -fT -- "$candidate" "$file"
+}
+
+sync_raw_v3_pair_index_hashes_fixture() {
+  local -r bundle="$1"
+  shift
+  local label=""
+  local pair_reference=""
+  local pair_sha256=""
+
+  (( $# > 0 )) || return 1
+  for label in "$@"; do
+    [[ "$label" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] || return 1
+    pair_reference="obi-metric-pairs/$label.json"
+    [[ -f "$bundle/$pair_reference" && ! -L "$bundle/$pair_reference" ]] ||
+      return 1
+    pair_sha256="$(sha256sum <"$bundle/$pair_reference")" || return 1
+    pair_sha256="${pair_sha256%% *}"
+    # jq variables below are supplied through --arg.
+    # shellcheck disable=SC2016
+    replace_json_file "$bundle/obi-metric-boundary-index.json" '
+      if ([.boundaries[].captures[] |
+        select(.pair_reference == $pair_reference)] | length) == 1 then
+        (.boundaries[].captures[] |
+          select(.pair_reference == $pair_reference) | .pair_sha256) =
+            $pair_sha256
+      else error("pair capture cardinality") end
+    ' --arg pair_reference "$pair_reference" \
+      --arg pair_sha256 "$pair_sha256" || return 1
   done
-  sed 's/max_entries=10000 entries=10000/max_entries=9999 entries=9999/g' \
-    "$bundle/map-pressure-pressure-monitor.log" \
-    >"$bundle/map-pressure-pressure-monitor.log.tmp" || return 1
-  mv -fT -- "$bundle/map-pressure-pressure-monitor.log.tmp" \
-    "$bundle/map-pressure-pressure-monitor.log"
+  sync_v3_index_envelopes "$bundle"
+}
+
+sync_raw_v3_pressure_status_index_fixture() {
+  local -r bundle="$1"
+  local -r pair_reference='obi-metric-pairs/pressure.json'
+  local -r status_reference='scenario-pressure-status.json'
+  local pair_sha256=""
+  local status_sha256=""
+
+  sync_raw_v3_stress_status_authority_fixture "$bundle" pressure || return 1
+  pair_sha256="$(sha256sum <"$bundle/$pair_reference")" || return 1
+  pair_sha256="${pair_sha256%% *}"
+  status_sha256="$(sha256sum <"$bundle/$status_reference")" || return 1
+  status_sha256="${status_sha256%% *}"
+  # jq variables below are supplied through --arg.
+  # shellcheck disable=SC2016
+  replace_json_file "$bundle/obi-metric-boundary-index.json" '
+    if ([.boundaries[].captures[] |
+      select(.pair_reference == $pair_reference)] | length) == 1 and
+      ([.boundaries[].status_references[] |
+        select(.reference == $status_reference)] | length) == 1 then
+      (.boundaries[].captures[] |
+        select(.pair_reference == $pair_reference) | .pair_sha256) =
+          $pair_sha256 |
+      (.boundaries[].status_references[] |
+        select(.reference == $status_reference) | .sha256) = $status_sha256
+    else error("pressure authority cardinality") end
+  ' --arg pair_reference "$pair_reference" \
+    --arg pair_sha256 "$pair_sha256" \
+    --arg status_reference "$status_reference" \
+    --arg status_sha256 "$status_sha256" || return 1
+  sync_v3_index_envelopes "$bundle"
+}
+
+sync_raw_pressure_barrier_mirrors_fixture() {
+  local -r bundle="$1"
+  local -r barrier="$bundle/map-pressure-pressure-barrier-status.json"
+  local ready_sha256=""
+  local release_sha256=""
+  local fill_sha256=""
+  local verify_sha256=""
+  local result_sha256=""
+  local status_sha256=""
+  local inspections_sha256=""
+  local inspections_size=""
+
+  ready_sha256="$(sha256sum \
+    <"$bundle/map-pressure-pressure-barrier-ready.txt")" || return 1
+  release_sha256="$(sha256sum \
+    <"$bundle/map-pressure-pressure-barrier-release.txt")" || return 1
+  fill_sha256="$(sha256sum \
+    <"$bundle/map-pressure-pressure-fill.json")" || return 1
+  verify_sha256="$(sha256sum \
+    <"$bundle/map-pressure-pressure-verify.json")" || return 1
+  result_sha256="$(sha256sum <"$bundle/scenario-pressure.json")" || return 1
+  status_sha256="$(sha256sum \
+    <"$bundle/scenario-pressure-status.json")" || return 1
+  inspections_sha256="$(sha256sum \
+    <"$bundle/map-pressure-pressure-container-inspections.json")" || return 1
+  inspections_size="$(stat -Lc '%s' -- \
+    "$bundle/map-pressure-pressure-container-inspections.json")" || return 1
+  ready_sha256="${ready_sha256%% *}"
+  release_sha256="${release_sha256%% *}"
+  fill_sha256="${fill_sha256%% *}"
+  verify_sha256="${verify_sha256%% *}"
+  result_sha256="${result_sha256%% *}"
+  status_sha256="${status_sha256%% *}"
+  inspections_sha256="${inspections_sha256%% *}"
+
+  # jq variables below are supplied through --arg/--slurpfile.
+  # shellcheck disable=SC2016
+  replace_canonical_json_file "$barrier" '
+    .control.ready_reference =
+      "map-pressure-pressure-barrier-ready.txt" |
+    .control.ready_sha256 = $ready_sha256 |
+    .control.release_reference =
+      "map-pressure-pressure-barrier-release.txt" |
+    .control.release_sha256 = $release_sha256 |
+    .container = {
+      id: $inspections[0].running.identity.id,
+      host_pid: ($inspections[0].running.state.host_pid | tostring),
+      started_at: $inspections[0].running.state.started_at,
+      user: $inspections[0].running.config.user
+    } |
+    .container_inspections = {
+      reference: "map-pressure-pressure-container-inspections.json",
+      sha256: $inspections_sha256,
+      size_bytes: $inspections_size
+    } |
+    .fill.reference = "map-pressure-pressure-fill.json" |
+    .fill.sha256 = $fill_sha256 |
+    .fill.map_id = ($fill[0].map_id | tostring) |
+    .fill.max_entries = $fill[0].max_entries |
+    .fill.synthetic_pid = $fill[0].synthetic_pid |
+    .fill.synthetic_namespace = $fill[0].synthetic_namespace |
+    .fill.touched = $fill[0].touched |
+    .fill.verified_present_entries = $fill[0].verified_present_entries |
+    .fill.verified_absent_entries = $fill[0].verified_absent_entries |
+    .fill.content_sha256 = $fill[0].content_sha256 |
+    .fill.capacity_rejected_entries = $fill[0].capacity_rejected_entries |
+    .verification.reference = "map-pressure-pressure-verify.json" |
+    .verification.sha256 = $verify_sha256 |
+    .verification.map_id = ($verify[0].map_id | tostring) |
+    .verification.synthetic_pid = $verify[0].synthetic_pid |
+    .verification.synthetic_namespace = $verify[0].synthetic_namespace |
+    .verification.verified_present_entries =
+      $verify[0].verified_present_entries |
+    .verification.verified_absent_entries =
+      $verify[0].verified_absent_entries |
+    .verification.content_sha256 = $verify[0].content_sha256 |
+    .traffic.result_reference = "scenario-pressure.json" |
+    .traffic.result_sha256 = $result_sha256 |
+    .traffic.status_reference = "scenario-pressure-status.json" |
+    .traffic.status_sha256 = $status_sha256 |
+    .traffic.request_count = $result[0].request_count |
+    .traffic.exact_hit_count =
+      $result[0].pressure_correlation.exact_hit_count |
+    .traffic.explicit_root_count =
+      $result[0].pressure_correlation.explicit_root_count |
+    .traffic.wrong_parent_count =
+      $result[0].pressure_correlation.wrong_parent_count |
+    .traffic.unresolved_count =
+      $result[0].pressure_correlation.unresolved_count |
+    .traffic.handoff_admission_overload_count =
+      ($status[0].pressure_correlation.bridge |
+        .handoff_admission_outcome_counts.overload) |
+    .traffic.handoff_admission_ambiguous_count =
+      ($status[0].pressure_correlation.bridge |
+        .handoff_admission_outcome_counts.ambiguous) |
+    .traffic.handoff_admission_maximum_count =
+      ($status[0].pressure_correlation.bridge |
+        .handoff_admission_outcome_counts.maximum)
+  ' --arg ready_sha256 "$ready_sha256" \
+    --arg release_sha256 "$release_sha256" \
+    --arg fill_sha256 "$fill_sha256" \
+    --arg verify_sha256 "$verify_sha256" \
+    --arg result_sha256 "$result_sha256" \
+    --arg status_sha256 "$status_sha256" \
+    --arg inspections_sha256 "$inspections_sha256" \
+    --argjson inspections_size "$inspections_size" \
+    --slurpfile fill "$bundle/map-pressure-pressure-fill.json" \
+    --slurpfile verify "$bundle/map-pressure-pressure-verify.json" \
+    --slurpfile result "$bundle/scenario-pressure.json" \
+    --slurpfile status "$bundle/scenario-pressure-status.json" \
+    --slurpfile inspections \
+      "$bundle/map-pressure-pressure-container-inspections.json"
+}
+
+set_raw_pressure_admission_fixture() {
+  local -r bundle="$1"
+  local -r overload="$2"
+  local -r ambiguous="${3:-absent}"
+  local -r after="$bundle/phases/pressure-after/obi-metrics.prom"
+  local -r delta="$bundle/phases/pressure-after/obi-metrics.delta"
+  local -r pair="$bundle/obi-metric-pairs/pressure.json"
+
+  [[ "$overload" =~ ^(0|[1-9][0-9]{0,4})$ ]] || return 1
+  [[ "$ambiguous" == absent ||
+    "$ambiguous" =~ ^(0|[1-9][0-9]{0,4})$ ]] || return 1
+  awk '!/operation="handoff_admission"/' "$after" >"$after.tmp" || return 1
+  printf '%s %s\n' \
+    'obi_java_remote_parent_operations_total{operation="handoff_admission",status="overload",transport="tcp"}' \
+    "$overload" >>"$after.tmp" || return 1
+  if [[ "$ambiguous" != absent ]]; then
+    printf '%s %s\n' \
+      'obi_java_remote_parent_operations_total{operation="handoff_admission",status="ambiguous",transport="tcp"}' \
+      "$ambiguous" >>"$after.tmp" || return 1
+  fi
+  LC_ALL=C sort -o "$after.tmp" -- "$after.tmp" || return 1
+  mv -fT -- "$after.tmp" "$after"
+
+  awk '!/operation="handoff_admission"/' "$delta" >"$delta.tmp" || return 1
+  printf '%s before=0 after=%s delta=%s\n' \
+    'obi_java_remote_parent_operations_total{operation="handoff_admission",status="overload",transport="tcp"}' \
+    "$overload" "$overload" >>"$delta.tmp" || return 1
+  if [[ "$ambiguous" != absent ]]; then
+    printf '%s before=0 after=%s delta=%s\n' \
+      'obi_java_remote_parent_operations_total{operation="handoff_admission",status="ambiguous",transport="tcp"}' \
+      "$ambiguous" "$ambiguous" >>"$delta.tmp" || return 1
+  fi
+  LC_ALL=C sort -o "$delta.tmp" -- "$delta.tmp" || return 1
+  mv -fT -- "$delta.tmp" "$delta"
+
+  # jq variables below are supplied through --arg.
+  # shellcheck disable=SC2016
+  replace_canonical_json_file "$pair" '
+    .series = ((.series |
+      map(select(.operation != "handoff_admission"))) + [{
+        transport: "tcp", operation: "handoff_admission",
+        status: "overload", before: "0", after: $overload,
+        delta: $overload
+      }] + (if $ambiguous == "absent" then [] else [{
+        transport: "tcp", operation: "handoff_admission",
+        status: "ambiguous", before: "0", after: $ambiguous,
+        delta: $ambiguous
+      }] end) | sort_by(.transport, .operation, .status))
+  ' --arg overload "$overload" --arg ambiguous "$ambiguous" || return 1
+  # jq variables below are supplied through --argjson.
+  # shellcheck disable=SC2016
+  replace_canonical_json_file "$bundle/scenario-pressure-status.json" '
+    .pressure_correlation.bridge.handoff_admission_outcome_counts.overload =
+      $overload |
+    .pressure_correlation.bridge.handoff_admission_outcome_counts.ambiguous =
+      $ambiguous
+  ' --argjson overload "$overload" \
+    --argjson ambiguous "${ambiguous/absent/0}" || return 1
+  refresh_running_identity_metrics_digest "$bundle" pressure-after || return 1
+  sync_raw_v3_pressure_status_index_fixture "$bundle" || return 1
+  sync_raw_pressure_barrier_mirrors_fixture "$bundle"
+}
+
+omit_raw_stopped_admission_fixture() {
+  local -r bundle="$1"
+  local -r label="$2"
+  local phase=""
+
+  [[ "$label" =~ ^(late-attach|w3c-match|extension-controls)$ ]] || return 1
+  for phase in "$label-obi-pre-stop" "$label-obi-running"; do
+    awk '!/operation="handoff_admission"/' \
+      "$bundle/phases/$phase/obi-metrics.prom" \
+      >"$bundle/phases/$phase/obi-metrics.prom.tmp" || return 1
+    mv -fT -- "$bundle/phases/$phase/obi-metrics.prom.tmp" \
+      "$bundle/phases/$phase/obi-metrics.prom"
+    refresh_running_identity_metrics_digest "$bundle" "$phase" || return 1
+  done
+  replace_canonical_json_file \
+    "$bundle/obi-metric-pairs/$label-pre-stop.json" \
+    '.series |= map(select(.operation != "handoff_admission"))' || return 1
+  replace_canonical_json_file \
+    "$bundle/obi-metric-pairs/$label-obi-stopped.json" \
+    '.series |= map(select(.operation != "handoff_admission"))' || return 1
+  sync_raw_v3_pair_index_hashes_fixture "$bundle" \
+    "$label-pre-stop" "$label-obi-stopped"
+}
+
+add_raw_stopped_ambiguous_zero_fixture() {
+  local -r bundle="$1"
+  local -r label="$2"
+  local phase=""
+
+  [[ "$label" =~ ^(late-attach|w3c-match|extension-controls)$ ]] || return 1
+  for phase in "$label-obi-pre-stop" "$label-obi-running"; do
+    printf '%s\n' \
+      'obi_java_remote_parent_operations_total{operation="handoff_admission",status="ambiguous",transport="tcp"} 0' \
+      >>"$bundle/phases/$phase/obi-metrics.prom" || return 1
+    LC_ALL=C sort -o "$bundle/phases/$phase/obi-metrics.prom" -- \
+      "$bundle/phases/$phase/obi-metrics.prom" || return 1
+    refresh_running_identity_metrics_digest "$bundle" "$phase" || return 1
+  done
+  replace_canonical_json_file \
+    "$bundle/obi-metric-pairs/$label-pre-stop.json" '
+      .series += [{transport:"tcp", operation:"handoff_admission",
+        status:"ambiguous", before:"0", after:"0", delta:"0"}] |
+      .series |= sort_by(.transport, .operation, .status)
+    ' || return 1
+  replace_canonical_json_file \
+    "$bundle/obi-metric-pairs/$label-obi-stopped.json" '
+      .series += [{transport:"tcp", operation:"handoff_admission",
+        status:"ambiguous", before:"0", after:null, delta:null}] |
+      .series |= sort_by(.transport, .operation, .status)
+    ' || return 1
+  sync_raw_v3_pair_index_hashes_fixture "$bundle" \
+    "$label-pre-stop" "$label-obi-stopped"
+}
+
+write_raw_pressure_cleanup_reuse_fixture() {
+  local -r bundle="$1"
+  local -r attempt_one='map-pressure-pressure-cleanup-attempt-01'
+  local -r attempt_two='map-pressure-pressure-cleanup-attempt-02'
+  local proof_sha256=""
+
+  proof_sha256="$(sha256sum <"$bundle/$attempt_one.json")" || return 1
+  proof_sha256="${proof_sha256%% *}"
+  replace_fixture_key_value "$bundle/$attempt_one.status" \
+    recovery_status failed || return 1
+  rm -f -- \
+    "$bundle/$attempt_one-recovered.prom" \
+    "$bundle/$attempt_one-recovered-sample-01.prom" \
+    "$bundle/$attempt_one-recovered-sample-02.prom"
+  printf '%s\n' \
+    'attempt=1 observed_at=2000-01-01T00:00:03Z entries=1 matched=false consecutive=0' \
+    >"$bundle/$attempt_one-recovered-samples.log"
+  cp -- "$bundle/map-pressure-pressure-recovered.prom" \
+    "$bundle/$attempt_two-recovered.prom" || return 1
+  cp -- "$bundle/map-pressure-pressure-recovered-sample-01.prom" \
+    "$bundle/$attempt_two-recovered-sample-01.prom" || return 1
+  cp -- "$bundle/map-pressure-pressure-recovered-sample-02.prom" \
+    "$bundle/$attempt_two-recovered-sample-02.prom" || return 1
+  cp -- "$bundle/map-pressure-pressure-recovered-samples.log" \
+    "$bundle/$attempt_two-recovered-samples.log" || return 1
+  printf '%s\n' \
+    'barrier_status=retained' \
+    'deletion_command_status=not-run' \
+    'deletion_output_reference=none' \
+    'deletion_output_sha256=none' \
+    "deletion_proof_reference=$attempt_one.json" \
+    "deletion_proof_sha256=$proof_sha256" \
+    'deletion_reused=true' \
+    'deletion_stderr_reference=none' \
+    'deletion_stderr_sha256=none' \
+    'deletion_validation_status=passed' \
+    'recovery_status=passed' \
+    'schema=pressure-cleanup-attempt-v1' \
+    >"$bundle/$attempt_two.status"
+}
+
+mutate_raw_pressure_container_inspections_fixture() {
+  local -r bundle="$1"
+  local -r filter="$2"
+  local -r artifact="$bundle/map-pressure-pressure-container-inspections.json"
+
+  replace_canonical_json_file "$artifact" "$filter" || return 1
+  chmod 0600 -- "$artifact" || return 1
+  sync_raw_pressure_container_inspection_descriptors_fixture "$bundle" || return 1
+  sync_raw_v3_pressure_status_index_fixture "$bundle" || return 1
+  sync_raw_pressure_barrier_mirrors_fixture "$bundle"
+}
+
+test_raw_v1_pressure_container_inspection_mutations() {
+  local -r verifier="$1"
+  local -r acceptance="$2"
+  local -r acceptance_baseline="$3"
+  local -r artifact="$acceptance/map-pressure-pressure-container-inspections.json"
+  local -r status="$acceptance/scenario-pressure-status.json"
+  local -r barrier="$acceptance/map-pressure-pressure-barrier-status.json"
+  local -r external_link="$TEST_TMP_DIR/raw-pressure-container-inspection-link"
+  local -r nul_needle='"status":"passed"'
+  local field=""
+  local line_count=""
+  local mutated_size=""
+  local original_size=""
+  local payload=""
+  local prefix=""
+  local replacement=""
+  local suffix=""
+  local -i index=0
+  local -a descriptions=(
+    'an unknown inspection schema'
+    'a failed inspection status'
+    'a mismatched inspection scenario label'
+    'a nonzero Docker wait status'
+    'an inspection session detached from its static fields'
+    'a coherent inspection session detached from the barrier authority'
+    'an extra inspection envelope field'
+    'an extra normalized Docker snapshot field'
+    'an extra running state field'
+    'an extra terminal state field'
+    'an extra container identity field'
+    'an extra container config field'
+    'an extra container label field'
+    'an extra container mount field'
+    'an extra container runtime field'
+    'running and terminal static Docker fields that differ'
+    'an all-zero container identity'
+    'an all-zero image identity'
+    'a different image reference'
+    'a different exact container name'
+    'a different exact container command'
+    'a different container entrypoint'
+    'a different executable path'
+    'a non-uint32 container user'
+    'an oversized container GID paired with the correct UID'
+    'a valid alternate container GID paired with the correct UID'
+    'a different Compose oneoff label'
+    'a different pressure owner label'
+    'a different Compose project label'
+    'a different Compose service label'
+    'a non-bind pressure-control mount'
+    'a read-only pressure-control mount'
+    'a different pressure-control mount destination'
+    'an absolute pressure-control mount source'
+    'a container runtime with stdin attached'
+    'a container runtime with bridge networking'
+    'a container runtime with stdin held open'
+    'a container runtime sharing the host PID namespace'
+    'a privileged container runtime'
+    'a container runtime with a restart policy'
+    'a container runtime with single-use stdin'
+    'a container runtime with a TTY'
+    'a running snapshot marked dead'
+    'a running snapshot with a runtime error'
+    'a running snapshot with a nonzero exit code'
+    'a running snapshot with a terminal timestamp'
+    'a running snapshot without a host PID'
+    'a running snapshot with a host PID above uint32'
+    'a running snapshot marked OOM-killed'
+    'a running snapshot with a restart'
+    'a running snapshot not marked running'
+    'a running snapshot whose start is the exact Docker zero sentinel'
+    'a non-UTC running timestamp'
+    'a syntactically UTC but invalid calendar timestamp'
+    'a UTC timestamp with an invalid calendar day'
+    'a UTC timestamp with a leap second'
+    'a UTC timestamp with a zero-only fractional second'
+    'a UTC timestamp with a trailing-zero fractional second'
+    'a running snapshot with a non-running state'
+    'a terminal snapshot marked dead'
+    'a terminal snapshot with a runtime error'
+    'a terminal snapshot with a nonzero exit code'
+    'a terminal snapshot marked OOM-killed'
+    'a terminal snapshot with a restart'
+    'a terminal snapshot retaining a host PID'
+    'a terminal snapshot still marked running'
+    'a terminal snapshot with a non-exited state'
+    'a terminal snapshot with a different start timestamp'
+    'a terminal snapshot whose finish is the exact Docker zero sentinel'
+    'a terminal snapshot that finishes strictly before it starts'
+    'a terminal timestamp equal to its start timestamp'
+    'a non-UTC terminal timestamp'
+  )
+  local -a filters=(
+    '.schema = "pressure-scenario-container-inspections-v2"'
+    '.status = "failed"'
+    '.scenario_label = "basic"'
+    '.wait_exit_code = 1'
+    '.session = "ffffffffffffffffffffffffffffffff"'
+    '.session = "ffffffffffffffffffffffffffffffff" |
+      (.running.identity.name, .terminal.identity.name) =
+        "/obi-java-https-test-pressure-scenario-ffffffffffff" |
+      (.running.config.cmd[11], .terminal.config.cmd[11]) = .session |
+      (.running.mount.source_leaf, .terminal.mount.source_leaf) =
+        (".pressure-control." + .session)'
+    '.unexpected = true'
+    '.running.unexpected = true'
+    '.running.state.unexpected = true'
+    '.terminal.state.unexpected = true'
+    '(.running.identity.unexpected, .terminal.identity.unexpected) = true'
+    '(.running.config.unexpected, .terminal.config.unexpected) = true'
+    '(.running.labels.unexpected, .terminal.labels.unexpected) = true'
+    '(.running.mount.unexpected, .terminal.mount.unexpected) = true'
+    '(.running.runtime.unexpected, .terminal.runtime.unexpected) = true'
+    '.terminal.config.path = "/other"'
+    '(.running.identity.id, .terminal.identity.id) = ("0" * 64)'
+    '(.running.identity.image_id, .terminal.identity.image_id) = ("sha256:" + ("0" * 64))'
+    '(.running.identity.image_reference, .terminal.identity.image_reference) = "other:local"'
+    '(.running.identity.name, .terminal.identity.name) = "/other"'
+    '(.running.config.cmd, .terminal.config.cmd) += ["--unexpected"]'
+    '(.running.config.entrypoint, .terminal.config.entrypoint) = ["/bin/false"]'
+    '(.running.config.path, .terminal.config.path) = "/bin/false"'
+    '(.running.config.user, .terminal.config.user) = "4294967296:0"'
+    '(.running.config.user, .terminal.config.user) |=
+      ((split(":")[0]) + ":4294967296")'
+    '(.running.config.user, .terminal.config.user) |=
+      ((split(":")[0]) + ":" +
+        (if split(":")[1] == "0" then "1" else "0" end))'
+    '(.running.labels.oneoff, .terminal.labels.oneoff) = "False"'
+    '(.running.labels.owner, .terminal.labels.owner) = "other"'
+    '(.running.labels.project, .terminal.labels.project) = "other"'
+    '(.running.labels.service, .terminal.labels.service) = "other"'
+    '(.running.mount.type, .terminal.mount.type) = "volume"'
+    '(.running.mount.rw, .terminal.mount.rw) = false'
+    '(.running.mount.destination, .terminal.mount.destination) = "/tmp"'
+    '(.running.mount.source_leaf, .terminal.mount.source_leaf) = "/tmp/private"'
+    '(.running.runtime.attach_stdin, .terminal.runtime.attach_stdin) = true'
+    '(.running.runtime.network_mode, .terminal.runtime.network_mode) = "bridge"'
+    '(.running.runtime.open_stdin, .terminal.runtime.open_stdin) = true'
+    '(.running.runtime.pid_mode, .terminal.runtime.pid_mode) = "host"'
+    '(.running.runtime.privileged, .terminal.runtime.privileged) = true'
+    '(.running.runtime.restart_policy, .terminal.runtime.restart_policy) = "always"'
+    '(.running.runtime.stdin_once, .terminal.runtime.stdin_once) = true'
+    '(.running.runtime.tty, .terminal.runtime.tty) = true'
+    '.running.state.dead = true'
+    '.running.state.error = "runtime failure"'
+    '.running.state.exit_code = 1'
+    '.running.state.finished_at = "2026-08-17T00:00:01Z"'
+    '.running.state.host_pid = 0'
+    '.running.state.host_pid = 4294967296'
+    '.running.state.oom_killed = true'
+    '.running.state.restart_count = 1'
+    '.running.state.running = false'
+    '(.running.state.started_at, .terminal.state.started_at) =
+      "0001-01-01T00:00:00Z"'
+    '(.running.state.started_at, .terminal.state.started_at) = "2026-08-17T00:00:00+00:00"'
+    '(.running.state.started_at, .terminal.state.started_at) = "2026-13-17T00:00:00Z"'
+    '(.running.state.started_at, .terminal.state.started_at) = "2026-02-30T00:00:00Z"'
+    '(.running.state.started_at, .terminal.state.started_at) = "2026-08-17T00:00:60Z"'
+    '(.running.state.started_at, .terminal.state.started_at) = "2026-08-17T00:00:00.0Z"'
+    '(.running.state.started_at, .terminal.state.started_at) = "2026-08-17T00:00:00.100Z"'
+    '.running.state.status = "exited"'
+    '.terminal.state.dead = true'
+    '.terminal.state.error = "runtime failure"'
+    '.terminal.state.exit_code = 1'
+    '.terminal.state.oom_killed = true'
+    '.terminal.state.restart_count = 1'
+    '.terminal.state.host_pid = 4242'
+    '.terminal.state.running = true'
+    '.terminal.state.status = "running"'
+    '.terminal.state.started_at = "2026-08-17T00:00:00.000000002Z"'
+    '.terminal.state.finished_at = "0001-01-01T00:00:00Z"'
+    '.terminal.state.finished_at = "2026-08-16T23:59:59.999999999Z"'
+    '.terminal.state.finished_at = .terminal.state.started_at'
+    '.terminal.state.finished_at = "2026-08-17T00:00:01+00:00"'
+  )
+
+  ((${#descriptions[@]} == ${#filters[@]})) || return 1
+  for ((index = 0; index < ${#filters[@]}; index++)); do
+    mutate_raw_pressure_container_inspections_fixture \
+      "$acceptance" "${filters[index]}" || return 1
+    expect_external_v3_rejection \
+      "raw v1 pressure evidence with ${descriptions[index]}" \
+      "$verifier" --raw-v3 acceptance "$acceptance"
+    restore_external_v3_fixture "$acceptance" "$acceptance_baseline" || return 1
+  done
+
+  mutate_raw_pressure_container_inspections_fixture "$acceptance" '
+    .running.state.started_at = "2026-08-17T00:00:00Z" |
+    .terminal.state.started_at = .running.state.started_at |
+    .terminal.state.finished_at = "2026-08-17T00:00:01Z"
+  ' || return 1
+  "$verifier" --raw-v3 acceptance "$acceptance" >/dev/null ||
+    die 'raw v1 pressure evidence rejected whole-second UTC timestamps'
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline" || return 1
+
+  mutate_raw_pressure_container_inspections_fixture "$acceptance" '
+    .running.state.started_at = "2026-08-17T00:00:00.1Z" |
+    .terminal.state.started_at = .running.state.started_at |
+    .terminal.state.finished_at = "2026-08-17T00:00:00.2Z"
+  ' || return 1
+  "$verifier" --raw-v3 acceptance "$acceptance" >/dev/null ||
+    die 'raw v1 pressure evidence rejected short nonzero fractional timestamps'
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline" || return 1
+
+  rm -f -- "$artifact" || return 1
+  expect_external_v3_rejection \
+    'raw v1 pressure evidence without its container inspections' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline" || return 1
+
+  jq . "$artifact" >"$artifact.tmp" || return 1
+  mv -fT -- "$artifact.tmp" "$artifact" || return 1
+  chmod 0600 -- "$artifact" || return 1
+  sync_raw_pressure_container_inspection_descriptors_fixture "$acceptance" ||
+    return 1
+  sync_raw_v3_pressure_status_index_fixture "$acceptance" || return 1
+  sync_raw_pressure_barrier_mirrors_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v1 pressure inspections that are not canonical one-line JSON' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline" || return 1
+
+  sed 's/^{/{ /' "$artifact" >"$artifact.tmp" || return 1
+  mv -fT -- "$artifact.tmp" "$artifact" || return 1
+  chmod 0600 -- "$artifact" || return 1
+  sync_raw_pressure_container_inspection_descriptors_fixture "$acceptance" ||
+    return 1
+  sync_raw_v3_pressure_status_index_fixture "$acceptance" || return 1
+  sync_raw_pressure_barrier_mirrors_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v1 pressure inspections with valid one-line noncanonical JSON' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline" || return 1
+
+  sed 's/^{/{"status":"passed",/' "$artifact" >"$artifact.tmp" || return 1
+  mv -fT -- "$artifact.tmp" "$artifact" || return 1
+  chmod 0600 -- "$artifact" || return 1
+  sync_raw_pressure_container_inspection_descriptors_fixture "$acceptance" ||
+    return 1
+  sync_raw_v3_pressure_status_index_fixture "$acceptance" || return 1
+  sync_raw_pressure_barrier_mirrors_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v1 pressure inspections with a duplicate JSON key' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline" || return 1
+
+  mutate_raw_pressure_container_inspections_fixture \
+    "$acceptance" '.status = "passed\u0000"' || return 1
+  expect_external_v3_rejection \
+    'raw v1 pressure inspections with an escaped NUL' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline" || return 1
+
+  original_size="$(stat -Lc '%s' -- "$artifact")" || return 1
+  payload="$(<"$artifact")" || return 1
+  [[ "$original_size" =~ ^[1-9][0-9]*$ &&
+    "$payload" == *"$nul_needle"* ]] || return 1
+  prefix="${payload%%"$nul_needle"*}"
+  suffix="${payload#*"$nul_needle"}"
+  [[ "$suffix" != *"$nul_needle"* ]] || return 1
+  {
+    printf '%s' "$prefix" '"status":"passed'
+    printf '\0'
+    printf '%s\n' "\"$suffix"
+  } >"$artifact.tmp" || return 1
+  mv -fT -- "$artifact.tmp" "$artifact" || return 1
+  chmod 0600 -- "$artifact" || return 1
+  mutated_size="$(stat -Lc '%s' -- "$artifact")" || return 1
+  line_count="$(awk 'END { print NR }' "$artifact")" || return 1
+  [[ "$mutated_size" =~ ^[1-9][0-9]*$ &&
+    "$mutated_size" -eq "$((original_size + 1))" &&
+    "$line_count" == 1 ]] || return 1
+  cmp -s -- <(tail -c 1 -- "$artifact") <(printf '\n') || return 1
+  reseal_unparsed_raw_pressure_container_inspection_fixture "$acceptance" ||
+    return 1
+  expect_external_v3_rejection \
+    'raw v1 pressure inspections with an actual NUL' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline" || return 1
+
+  truncate -s -1 -- "$artifact" || return 1
+  sync_raw_pressure_container_inspection_descriptors_fixture "$acceptance" ||
+    return 1
+  sync_raw_v3_pressure_status_index_fixture "$acceptance" || return 1
+  sync_raw_pressure_barrier_mirrors_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v1 pressure inspections without a terminal line feed' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline" || return 1
+
+  replace_canonical_json_file "$artifact" '.unexpected = ("x" * 32768)' ||
+    return 1
+  chmod 0600 -- "$artifact" || return 1
+  sync_raw_pressure_container_inspection_descriptors_fixture "$acceptance" ||
+    return 1
+  sync_raw_v3_pressure_status_index_fixture "$acceptance" || return 1
+  sync_raw_pressure_barrier_mirrors_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v1 pressure inspections above their private size bound' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline" || return 1
+
+  chmod 0400 -- "$artifact" || return 1
+  "$verifier" --raw-v3 acceptance "$acceptance" >/dev/null ||
+    die 'raw v1 pressure evidence rejected a sealed mode-0400 container inspection'
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline" || return 1
+
+  chmod 0640 -- "$artifact" || return 1
+  expect_external_v3_rejection \
+    'raw v1 pressure inspections readable by their group' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline" || return 1
+
+  chmod 0644 -- "$artifact" || return 1
+  expect_external_v3_rejection \
+    'raw v1 pressure inspections readable by everyone' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline" || return 1
+
+  rm -f -- "$external_link" || return 1
+  ln -- "$artifact" "$external_link" || return 1
+  expect_external_v3_rejection \
+    'raw v1 pressure inspections with more than one hard link' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  rm -f -- "$external_link" || return 1
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline" || return 1
+
+  cp -- "$artifact" "$external_link" || return 1
+  rm -f -- "$artifact" || return 1
+  ln -s -- "$external_link" "$artifact" || return 1
+  expect_external_v3_rejection \
+    'raw v1 pressure inspections published as a symbolic link' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  rm -f -- "$external_link" || return 1
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline" || return 1
+
+  # Raw preflight and the frozen source manifest already authenticate ownership;
+  # this private artifact then narrows the permitted owner from EUID-or-root to
+  # EUID. A stat shim would perturb both gates and cannot isolate that narrowing
+  # without adding a production bypass, so only a real alternate owner is used.
+  if ((EUID == 0)); then
+    chown 65534:65534 -- "$artifact" || return 1
+    expect_external_v3_rejection \
+      'raw v1 pressure inspections owned by a different identity' \
+      "$verifier" --raw-v3 acceptance "$acceptance"
+    restore_external_v3_fixture "$acceptance" "$acceptance_baseline" || return 1
+  fi
+
+  replace_canonical_json_file "$artifact" \
+    '.terminal.state.finished_at = "2026-08-17T00:00:02.000000001Z"' ||
+    return 1
+  chmod 0600 -- "$artifact" || return 1
+  expect_external_v3_rejection \
+    'raw v1 pressure status and barrier descriptors with a stale artifact hash' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline" || return 1
+
+  replace_canonical_json_file "$status" \
+    '.pressure_correlation.container_inspections.sha256 = ("0" * 64)' ||
+    return 1
+  sync_raw_v3_pressure_status_index_fixture "$acceptance" || return 1
+  sync_raw_pressure_barrier_mirrors_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v1 pressure scenario status with a forged inspection digest' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline" || return 1
+
+  replace_canonical_json_file "$status" \
+    '.pressure_correlation.container_inspections.reference = "other.json"' ||
+    return 1
+  sync_raw_v3_pressure_status_index_fixture "$acceptance" || return 1
+  sync_raw_pressure_barrier_mirrors_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v1 pressure scenario status with a different inspection reference' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline" || return 1
+
+  replace_canonical_json_file "$status" \
+    '.pressure_correlation.container_inspections.size_bytes += 1' || return 1
+  sync_raw_v3_pressure_status_index_fixture "$acceptance" || return 1
+  sync_raw_pressure_barrier_mirrors_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v1 pressure scenario status with a forged inspection size' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline" || return 1
+
+  replace_canonical_json_file "$status" \
+    '.pressure_correlation.container_inspections.unexpected = true' || return 1
+  sync_raw_v3_pressure_status_index_fixture "$acceptance" || return 1
+  sync_raw_pressure_barrier_mirrors_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v1 pressure scenario status with an extra inspection descriptor field' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline" || return 1
+
+  replace_canonical_json_file "$status" \
+    'del(.pressure_correlation.container_inspections)' || return 1
+  sync_raw_v3_pressure_status_index_fixture "$acceptance" || return 1
+  sync_raw_pressure_barrier_mirrors_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v1 pressure scenario status without its inspection descriptor' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline" || return 1
+
+  replace_canonical_json_file "$barrier" \
+    '.container_inspections.sha256 = ("0" * 64)' || return 1
+  expect_external_v3_rejection \
+    'raw v1 pressure barrier with a forged inspection digest' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline" || return 1
+
+  replace_canonical_json_file "$barrier" \
+    '.container_inspections.size_bytes += 1' || return 1
+  expect_external_v3_rejection \
+    'raw v1 pressure barrier with a forged inspection size' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline" || return 1
+
+  replace_canonical_json_file "$barrier" \
+    '.container_inspections.reference = "other.json"' || return 1
+  expect_external_v3_rejection \
+    'raw v1 pressure barrier with a different inspection reference' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline" || return 1
+
+  replace_canonical_json_file "$barrier" \
+    '.container_inspections.unexpected = true' || return 1
+  expect_external_v3_rejection \
+    'raw v1 pressure barrier with an extra inspection descriptor field' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline" || return 1
+
+  for field in id host_pid started_at user; do
+    case "$field" in
+      id) replacement="$(printf 'b%.0s' {1..64})" ;;
+      host_pid) replacement=4243 ;;
+      started_at) replacement=2026-08-17T00:00:00.000000002Z ;;
+      user) replacement=4294967295:4294967295 ;;
+      *) return 1 ;;
+    esac
+    # jq variables below are supplied through --arg.
+    # shellcheck disable=SC2016
+    replace_canonical_json_file "$barrier" '.container[$field] = $value' \
+      --arg field "$field" --arg value "$replacement" || return 1
+    expect_external_v3_rejection \
+      "raw v1 pressure barrier whose running container $field is not inspected" \
+      "$verifier" --raw-v3 acceptance "$acceptance"
+    restore_external_v3_fixture "$acceptance" "$acceptance_baseline" || return 1
+  done
+}
+
+test_raw_v1_pressure_contract_mutations() {
+  local -r verifier="$1"
+  local -r acceptance="$2"
+  local -r acceptance_baseline="$3"
+  local -r reuse_baseline="$TEST_TMP_DIR/raw-v3-pressure-reuse-baseline"
+  local -r stopped_pair="$acceptance/obi-metric-pairs/late-attach-obi-stopped.json"
+  local -r pressure_delta="$acceptance/phases/pressure-after/obi-metrics.delta"
+  local -r candidate_delta='obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} before=0 after=127 delta=127'
+  local -r overload_delta='obi_java_remote_parent_operations_total{operation="handoff_admission",status="overload",transport="tcp"} before=0 after=5 delta=5'
+  local -r ambiguous_delta='obi_java_remote_parent_operations_total{operation="handoff_admission",status="ambiguous",transport="tcp"} before=0 after=0 delta=0'
+
+  test_raw_v1_pressure_container_inspection_mutations \
+    "$verifier" "$acceptance" "$acceptance_baseline" || return 1
+
+  replace_fixture_literal_line "$pressure_delta" "$candidate_delta" \
+    'obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} before=1 after=128 delta=127' || return 1
+  expect_external_v3_rejection \
+    'raw v3 pressure delta values split from its snapshot-authenticated pair' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
+
+  set_raw_pressure_admission_fixture "$acceptance" 5 0 || return 1
+  remove_fixture_literal_line "$pressure_delta" "$ambiguous_delta" || return 1
+  expect_external_v3_rejection \
+    'raw v3 pressure delta missing a zero tuple retained by its pair' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
+
+  printf '%s\n' \
+    'obi_java_remote_parent_operations_total{operation="cleanup",status="valid",transport="tcp"} before=0 after=0 delta=0' \
+    >>"$pressure_delta" || return 1
+  LC_ALL=C sort -o "$pressure_delta" -- "$pressure_delta" || return 1
+  expect_external_v3_rejection \
+    'raw v3 pressure delta with a zero tuple absent from its pair' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
+
+  replace_fixture_literal_line "$pressure_delta" "$candidate_delta" \
+    'obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} before=0 after=128 delta=127' || return 1
+  expect_external_v3_rejection \
+    'raw v3 pressure delta with invalid before-plus-delta arithmetic' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
+
+  replace_fixture_literal_line "$pressure_delta" "$candidate_delta" \
+    'obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} before=00 after=127 delta=127' || return 1
+  expect_external_v3_rejection \
+    'raw v3 pressure delta with a noncanonical numeric field' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
+
+  replace_fixture_literal_line "$pressure_delta" "$candidate_delta" \
+    'obi_java_remote_parent_operations_total{operation="candidate",operation="candidate",status="valid",transport="tcp"} before=0 after=127 delta=127' || return 1
+  expect_external_v3_rejection \
+    'raw v3 pressure delta with a duplicate metric label' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
+
+  printf '%s\n' "$candidate_delta" >>"$pressure_delta" || return 1
+  LC_ALL=C sort -o "$pressure_delta" -- "$pressure_delta" || return 1
+  expect_external_v3_rejection \
+    'raw v3 pressure delta with a duplicate tuple' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
+
+  replace_fixture_literal_line "$pressure_delta" "$overload_delta" \
+    'obi_java_remote_parent_operations_total{operation="handoff_admission",status=overload,transport="tcp"} before=0 after=5 delta=5' || return 1
+  expect_external_v3_rejection \
+    'raw v3 pressure delta with a malformed admission label' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
+
+  replace_fixture_literal_line "$pressure_delta" "$overload_delta" \
+    'obi_java_remote_parent_operations_total{operation="handoff_admission",status="overload",transport="getsockopt"} before=0 after=5 delta=5' || return 1
+  expect_external_v3_rejection \
+    'raw v3 pressure delta with the wrong admission transport' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
+
+  replace_fixture_literal_line "$pressure_delta" "$overload_delta" \
+    'obi_java_remote_parent_operations_total{operation="handoff_admission",status="valid",transport="tcp"} before=0 after=5 delta=5' || return 1
+  expect_external_v3_rejection \
+    'raw v3 pressure delta with the wrong admission status' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
+
+  printf '%s\n' "$overload_delta" >>"$pressure_delta" || return 1
+  LC_ALL=C sort -o "$pressure_delta" -- "$pressure_delta" || return 1
+  expect_external_v3_rejection \
+    'raw v3 pressure delta with a duplicate admission tuple' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
+
+  set_raw_pressure_admission_fixture "$acceptance" 0 absent || return 1
+  expect_external_v3_rejection \
+    'raw v3 pressure evidence with zero capacity-admission overloads' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
+
+  set_raw_pressure_admission_fixture "$acceptance" 1153 absent || return 1
+  expect_external_v3_rejection \
+    'raw v3 pressure evidence above the nine-per-request admission bound' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
+
+  set_raw_pressure_admission_fixture "$acceptance" 5 0 || return 1
+  "$verifier" --raw-v3 acceptance "$acceptance" >/dev/null ||
+    die 'raw v3 pressure evidence rejected an optional zero ambiguous row'
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
+
+  set_raw_pressure_admission_fixture "$acceptance" 5 1 || return 1
+  expect_external_v3_rejection \
+    'raw v3 pressure evidence with a positive ambiguous admission outcome' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
+
+  printf '%s\n' \
+    'pressure-ready-v1:ffffffffffffffffffffffffffffffff' \
+    >"$acceptance/map-pressure-pressure-barrier-ready.txt"
+  sync_raw_pressure_barrier_mirrors_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v3 pressure barrier whose ready session differs from its authority' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
+
+  replace_canonical_json_file \
+    "$acceptance/map-pressure-pressure-barrier-status.json" '
+      .sequence = ["scenario_ready", "release_published",
+        "capacity_fill_verified", "scenario_reaped",
+        "post_traffic_content_verified"]
+    '
+  expect_external_v3_rejection \
+    'raw v3 pressure barrier with a reordered release sequence' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
+
+  # jq's $control is an internal binding.
+  # shellcheck disable=SC2016
+  replace_canonical_json_file \
+    "$acceptance/map-pressure-pressure-barrier-status.json" '
+      .control as $control |
+      .control.ready_reference = $control.release_reference |
+      .control.ready_sha256 = $control.release_sha256 |
+      .control.release_reference = $control.ready_reference |
+      .control.release_sha256 = $control.ready_sha256
+    '
+  expect_external_v3_rejection \
+    'raw v3 pressure barrier with swapped ready and release references' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
+
+  replace_canonical_json_file \
+    "$acceptance/map-pressure-pressure-barrier-status.json" \
+    '.fill.sha256 = ("0" * 64)'
+  expect_external_v3_rejection \
+    'raw v3 pressure barrier with a forged fill-reference digest' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
+
+  replace_canonical_json_file "$acceptance/scenario-pressure-status.json" \
+    '.pressure_correlation.barrier_reference =
+      "map-pressure-pressure-other-barrier-status.json"'
+  sync_raw_v3_pressure_status_index_fixture "$acceptance" || return 1
+  sync_raw_pressure_barrier_mirrors_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v3 pressure status crosslinked to a different barrier' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
+
+  replace_json_file "$acceptance/map-pressure-pressure-fill.json" \
+    '.map_id = 43'
+  sync_raw_pressure_barrier_mirrors_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v3 pressure fill with map identity drift' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
+
+  replace_json_file "$acceptance/map-pressure-pressure-verify.json" '
+    .process_map_id = 43 |
+    .process_pid = 102 |
+    .process_namespace = 203
+  '
+  sync_raw_pressure_barrier_mirrors_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v3 pressure verify with process identity drift' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
+
+  replace_json_file "$acceptance/map-pressure-pressure-fill.json" \
+    '.synthetic_pid = 1'
+  sync_raw_pressure_barrier_mirrors_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v3 pressure fill with a nonzero synthetic PID' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
+
+  replace_json_file "$acceptance/map-pressure-pressure-verify.json" \
+    '.synthetic_namespace = 1'
+  sync_raw_pressure_barrier_mirrors_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v3 pressure verify with a nonzero synthetic namespace' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
+
+  replace_json_file "$acceptance/map-pressure-pressure-verify.json" \
+    '.content_sha256 = ("b" * 64)'
+  sync_raw_pressure_barrier_mirrors_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v3 pressure verify with content identity drift' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
+
+  omit_raw_stopped_admission_fixture "$acceptance" late-attach || return 1
+  expect_external_v3_rejection \
+    'raw v3 stopped evidence without its pre-stop admission authority' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
+
+  add_raw_stopped_ambiguous_zero_fixture "$acceptance" late-attach || return 1
+  "$verifier" --raw-v3 acceptance "$acceptance" >/dev/null ||
+    die 'raw v3 stopped evidence rejected an optional zero ambiguous row'
+  replace_canonical_json_file "$stopped_pair" '
+    (.series[] | select(.operation == "handoff_admission" and
+      .status == "overload") | .before) = "0" |
+    (.series[] | select(.operation == "handoff_admission" and
+      .status == "ambiguous") | .before) = "5"
+  '
+  sync_raw_v3_pair_index_hashes_fixture "$acceptance" \
+    late-attach-obi-stopped || return 1
+  expect_external_v3_rejection \
+    'raw v3 stopped evidence with admission statuses swapped at stop' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
+
+  replace_canonical_json_file "$stopped_pair" '
+    (.series[] | select(.operation == "handoff_admission" and
+      .status == "overload") | .delta) = "1"
+  '
+  sync_raw_v3_pair_index_hashes_fixture "$acceptance" \
+    late-attach-obi-stopped || return 1
+  expect_external_v3_rejection \
+    'raw v3 stopped evidence with a non-null admission delta' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
+
+  write_raw_pressure_cleanup_reuse_fixture "$acceptance" || return 1
+  "$verifier" --raw-v3 acceptance "$acceptance" >/dev/null ||
+    die 'raw v3 pressure evidence rejected a valid deletion-proof reuse'
+  cp -a -- "$acceptance" "$reuse_baseline"
+
+  replace_fixture_key_value \
+    "$acceptance/map-pressure-pressure-cleanup-attempt-02.status" \
+    deletion_proof_sha256 \
+    '0000000000000000000000000000000000000000000000000000000000000000' ||
+    return 1
+  expect_external_v3_rejection \
+    'raw v3 reused deletion proof with a different digest' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$reuse_baseline"
+
+  replace_fixture_key_value \
+    "$acceptance/map-pressure-pressure-cleanup-attempt-02.status" \
+    deletion_proof_reference \
+    map-pressure-pressure-cleanup-attempt-02.json || return 1
+  expect_external_v3_rejection \
+    'raw v3 reused deletion proof with a different reference' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$reuse_baseline"
+
+  replace_fixture_key_value \
+    "$acceptance/map-pressure-pressure-cleanup-attempt-02.status" \
+    deletion_command_status 0 || return 1
+  expect_external_v3_rejection \
+    'raw v3 cleanup that reruns deletion after proof latching' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$reuse_baseline"
+
+  printf '%s\n' \
+    'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 1' \
+    >"$acceptance/map-pressure-pressure-cleanup-attempt-02-recovered-sample-02.prom"
+  expect_external_v3_rejection \
+    'raw v3 final cleanup attempt whose recovery content is not canonical' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$reuse_baseline"
+
+  printf '%s\n' 'unexpected recovery sample' \
+    >"$acceptance/map-pressure-pressure-cleanup-attempt-02-recovered-sample-03.prom"
+  expect_external_v3_rejection \
+    'raw v3 cleanup attempt with an extra recovery artifact' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
 }
 
 test_raw_v3_mode() {
   local -r repository="$1"
   local -r verifier="$2"
   local -r revision="$3"
+  local -r pressure_contract_version="${4:-1}"
   local -r acceptance="$TEST_TMP_DIR/raw-v3-acceptance"
   local -r assertion="$TEST_TMP_DIR/raw-v3-assertion"
   local -r acceptance_baseline="$TEST_TMP_DIR/raw-v3-acceptance-baseline"
   local -r assertion_baseline="$TEST_TMP_DIR/raw-v3-assertion-baseline"
   local reference=""
-  local metrics_reference=""
   local digest=""
   local path=""
 
-  create_raw_v3_acceptance_fixture "$repository" "$revision" "$acceptance"
+  create_raw_v3_acceptance_fixture \
+    "$repository" "$revision" "$acceptance" "$pressure_contract_version"
   "$verifier" --raw-v3 acceptance "$acceptance" >/dev/null
   cp -a -- "$acceptance" "$acceptance_baseline"
 
@@ -4224,6 +5932,8 @@ test_raw_v3_mode() {
     "$verifier" --raw-v3 acceptance "$acceptance"
   restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
 
+  # jq variables below are internal bindings.
+  # shellcheck disable=SC2016
   replace_json_file "$acceptance/scenario-pressure.json" '
     .cases[0].request.handoff_hops = 9 |
     .cases[0].response.handoff_hops = "9"
@@ -4242,6 +5952,8 @@ test_raw_v3_mode() {
     "$verifier" --raw-v3 acceptance "$acceptance"
   restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
 
+  # jq variables below are internal bindings.
+  # shellcheck disable=SC2016
   replace_json_file "$acceptance/scenario-pressure.json" '
     ([.cases[0].trace.spans[] | select(
       .service_name == "apache-proxy" and .kind == "CLIENT")][0]) as $client |
@@ -4321,51 +6033,6 @@ test_raw_v3_mode() {
     "$verifier" --raw-v3 acceptance "$acceptance"
   restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
 
-  reference='phases/pressure-pressured/obi-identity.json'
-  metrics_reference='phases/pressure-pressured/obi-metrics.prom'
-  printf '%s\n' \
-    'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="getsockopt"} 2' \
-    'obi_instrumentation_errors_total{error_type="attaching_java_agent",process_name="java"} 0' \
-    >"$acceptance/$metrics_reference"
-  write_running_identity_fixture \
-    "$acceptance" pressure-pressured \
-    '9999999999999999999999999999999999999999999999999999999999999999' \
-    '2000-01-01T00:00:00.000000099Z'
-  digest="$(sha256sum <"$acceptance/$reference")"
-  digest="${digest%% *}"
-  # shellcheck disable=SC2016
-  replace_json_file "$acceptance/obi-metric-boundary-index.json" \
-    '(.boundaries[] | select(.id == "pressure").captures) += [{
-      id: "pressure-pressured",
-      kind: "phase",
-      state: "captured",
-      identity_reference: "phases/pressure-pressured/obi-identity.json",
-      identity_sha256: $digest
-    }]' --arg digest "$digest"
-  sync_v3_index_envelopes "$acceptance"
-  "$verifier" --raw-v3 acceptance "$acceptance" >/dev/null
-  printf '%s\n' \
-    'obi_java_remote_parent_operations_total{credential="TOPSECRET"} 1' \
-    >>"$acceptance/$metrics_reference"
-  digest="$(sha256sum <"$acceptance/$metrics_reference")"
-  digest="${digest%% *}"
-  # shellcheck disable=SC2016
-  replace_json_file "$acceptance/$reference" \
-    '.metrics_sha256 = $digest' --arg digest "$digest"
-  digest="$(sha256sum <"$acceptance/$reference")"
-  digest="${digest%% *}"
-  # shellcheck disable=SC2016
-  replace_json_file "$acceptance/obi-metric-boundary-index.json" \
-    '(.boundaries[].captures[] |
-      select(.kind == "phase" and .identity_reference == $reference) |
-      .identity_sha256) = $digest' \
-    --arg reference "$reference" --arg digest "$digest"
-  sync_v3_index_envelopes "$acceptance"
-  expect_external_v3_rejection \
-    'raw v3 phase-only identity metrics with an unallowlisted label' \
-    "$verifier" --raw-v3 acceptance "$acceptance"
-  restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
-
   # shellcheck disable=SC2016
   replace_json_file "$acceptance/obi-metric-boundary-index.json" '
     (.boundaries[] | select(.id == "basic") | .captures) as $basic |
@@ -4408,16 +6075,38 @@ test_raw_v3_mode() {
 
   replace_json_file "$acceptance/map-pressure-pressure-fill.json" \
     '.capacity_rejected_entries = 0'
+  sync_raw_pressure_barrier_mirrors_fixture "$acceptance" || return 1
   expect_external_v3_rejection \
     'raw v3 pressure evidence without capacity rejection' \
     "$verifier" --raw-v3 acceptance "$acceptance"
   restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
 
-  mutate_raw_pressure_capacity_fixture "$acceptance"
+  mutate_raw_pressure_capacity_fixture "$acceptance" || return 1
   expect_external_v3_rejection \
     'raw v3 pressure evidence with a coherent non-producer map capacity' \
     "$verifier" --raw-v3 acceptance "$acceptance"
   restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
+
+  printf '%s\n' \
+    'obi_java_remote_parent_operations_total{operation="handoff_admission",status="overload",transport="tcp"} before=0 after=1 delta=1' \
+    >>"$acceptance/helper-attach-failure-metrics.delta"
+  expect_external_v3_rejection \
+    'raw v3 nonpressure evidence with a capacity-admission overload delta' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
+
+  printf '%s\n' \
+    'obi_java_remote_parent_operations_total{operation="handoff_admission",status="ambiguous",transport="tcp"} before=0 after=1 delta=1' \
+    >>"$acceptance/helper-attach-failure-metrics.delta"
+  expect_external_v3_rejection \
+    'raw v3 nonpressure evidence with an ambiguous admission delta' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$acceptance_baseline"
+
+  if [[ "$pressure_contract_version" == 1 ]]; then
+    test_raw_v1_pressure_contract_mutations \
+      "$verifier" "$acceptance" "$acceptance_baseline" || return 1
+  fi
 
   replace_json_file \
     "$acceptance/receive-cursor-map-tls-boundary-after.json" \
@@ -4451,6 +6140,108 @@ test_raw_v3_mode() {
 
 }
 
+test_pressure_contract_version_is_source_anchored() {
+  local -r verifier_source="$1"
+  local -r repository="$TEST_TMP_DIR/pressure-contract-repository"
+  local -r fixture_verifier="$repository/examples/apache-java-https/scripts/verify-retained-evidence.sh"
+  local -r producer="$repository/examples/apache-java-https/run.sh"
+  local -r v0_bundle="$TEST_TMP_DIR/pressure-contract-v0"
+  local -r v0_with_v1_shape="$TEST_TMP_DIR/pressure-contract-v0-with-v1-shape"
+  local -r v1_bundle="$TEST_TMP_DIR/pressure-contract-v1"
+  local -r v1_with_v0_shape="$TEST_TMP_DIR/pressure-contract-v1-with-v0-shape"
+  local -r v1_assertion="$TEST_TMP_DIR/pressure-contract-v1-assertion"
+  local -r unknown_assertion="$TEST_TMP_DIR/pressure-contract-unknown-assertion"
+  local -r duplicate_assertion="$TEST_TMP_DIR/pressure-contract-duplicate-assertion"
+  local v0_revision=""
+  local v1_revision=""
+  local unknown_revision=""
+  local duplicate_revision=""
+
+  git init --quiet "$repository"
+  git -C "$repository" config user.email 'pressure-contract-test@example.invalid'
+  git -C "$repository" config user.name 'Pressure Contract Test'
+  git -C "$repository" config commit.gpgSign false
+  mkdir -p -- "${fixture_verifier%/*}"
+  cp -- "$verifier_source" "$fixture_verifier"
+  chmod 0755 -- "$fixture_verifier"
+  printf 'tested source\n' >"$repository/source.txt"
+  printf '%s\n' '#!/usr/bin/env bash' '# legacy pressure producer' >"$producer"
+  chmod 0755 -- "$producer"
+  commit_fixture "$repository" 'Create legacy pressure producer'
+  v0_revision="$(git -C "$repository" rev-parse HEAD)"
+
+  create_raw_v3_acceptance_fixture \
+    "$repository" "$v0_revision" "$v0_bundle" 0
+  "$fixture_verifier" --raw-v3 acceptance "$v0_bundle" >/dev/null ||
+    die 'legacy raw-v3 pressure evidence was rejected'
+  printf '{}\n' \
+    >"$v0_bundle/map-pressure-pressure-container-inspections.json"
+  chmod 0600 -- \
+    "$v0_bundle/map-pressure-pressure-container-inspections.json"
+  expect_external_v3_rejection \
+    'a private pressure container inspection under the v0 roster' \
+    "$fixture_verifier" --raw-v3 acceptance "$v0_bundle"
+  rm -f -- "$v0_bundle/map-pressure-pressure-container-inspections.json"
+  printf '%s\n' \
+    'obi_java_remote_parent_operations_total{operation="handoff_admission",status="overload",transport="tcp"} before=0 after=0 delta=0' \
+    >>"$v0_bundle/helper-attach-failure-metrics.delta"
+  expect_external_v3_rejection \
+    'an admission row under an authenticated legacy pressure producer' \
+    "$fixture_verifier" --raw-v3 acceptance "$v0_bundle"
+  create_raw_v3_acceptance_fixture \
+    "$repository" "$v0_revision" "$v0_with_v1_shape" 1
+  expect_external_v3_rejection \
+    'barrier pressure evidence authenticated by a legacy producer' \
+    "$fixture_verifier" --raw-v3 acceptance "$v0_with_v1_shape"
+
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'PRESSURE_TRAFFIC_CONTRACT_VERSION=1' >"$producer"
+  chmod 0755 -- "$producer"
+  commit_fixture "$repository" 'Create barrier pressure producer'
+  v1_revision="$(git -C "$repository" rev-parse HEAD)"
+  create_raw_v3_acceptance_fixture \
+    "$repository" "$v1_revision" "$v1_bundle" 1
+  "$fixture_verifier" --raw-v3 acceptance "$v1_bundle" >/dev/null ||
+    die 'barrier raw-v3 pressure evidence was rejected'
+  create_raw_v3_acceptance_fixture \
+    "$repository" "$v1_revision" "$v1_with_v0_shape" 0
+  expect_external_v3_rejection \
+    'legacy pressure evidence authenticated by a barrier producer' \
+    "$fixture_verifier" --raw-v3 acceptance "$v1_with_v0_shape"
+  create_raw_v3_assertion_fixture \
+    "$repository" "$v1_revision" "$v1_assertion"
+  "$fixture_verifier" --raw-v3 assertion-failure "$v1_assertion" >/dev/null ||
+    die 'barrier producer assertion control was rejected'
+  cp -- "$v1_bundle/map-pressure-pressure-container-inspections.json" \
+    "$v1_assertion/map-pressure-pressure-container-inspections.json" || return 1
+  chmod 0600 -- \
+    "$v1_assertion/map-pressure-pressure-container-inspections.json" || return 1
+  expect_external_v3_rejection \
+    'a private pressure inspection added to the assertion-v1 exact roster' \
+    "$fixture_verifier" --raw-v3 assertion-failure "$v1_assertion"
+
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'PRESSURE_TRAFFIC_CONTRACT_VERSION=2' >"$producer"
+  commit_fixture "$repository" 'Create unknown pressure contract producer'
+  unknown_revision="$(git -C "$repository" rev-parse HEAD)"
+  create_raw_v3_assertion_fixture \
+    "$repository" "$unknown_revision" "$unknown_assertion"
+  expect_external_v3_rejection \
+    'an unknown authenticated pressure contract version' \
+    "$fixture_verifier" --raw-v3 assertion-failure "$unknown_assertion"
+
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'PRESSURE_TRAFFIC_CONTRACT_VERSION=1' \
+    'PRESSURE_TRAFFIC_CONTRACT_VERSION=1' >"$producer"
+  commit_fixture "$repository" 'Create duplicate pressure contract marker'
+  duplicate_revision="$(git -C "$repository" rev-parse HEAD)"
+  create_raw_v3_assertion_fixture \
+    "$repository" "$duplicate_revision" "$duplicate_assertion"
+  expect_external_v3_rejection \
+    'duplicate authenticated pressure contract assignments' \
+    "$fixture_verifier" --raw-v3 assertion-failure "$duplicate_assertion"
+}
+
 main() {
   local -r evidence_id='synthetic-current-code'
   local repository=""
@@ -4467,6 +6258,7 @@ main() {
   umask 022
   [[ -x "$VERIFIER" ]] || die "verifier is not executable: $VERIFIER"
   TEST_TMP_DIR="$(mktemp -d)"
+  test_pressure_contract_version_is_source_anchored "$VERIFIER"
   repository="$TEST_TMP_DIR/repository"
   fixture_verifier="$repository/examples/apache-java-https/scripts/verify-retained-evidence.sh"
   bundle="$repository/examples/apache-java-https/evidence/$evidence_id"
@@ -4480,6 +6272,9 @@ main() {
   mkdir -p -- "${fixture_verifier%/*}"
   cp -- "$VERIFIER" "$fixture_verifier"
   chmod 0755 -- "$fixture_verifier"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'PRESSURE_TRAFFIC_CONTRACT_VERSION=1' \
+    >"$repository/examples/apache-java-https/run.sh"
   printf 'tested source\n' >"$repository/source.txt"
   commit_fixture "$repository" 'Create tested source revision'
   source_revision="$(git -C "$repository" rev-parse HEAD)"
@@ -4513,7 +6308,7 @@ main() {
   test_v3_runtime_private_path_guards \
     "$repository" "$fixture_verifier" "$bundle"
   test_raw_v3_mode \
-    "$repository" "$fixture_verifier" "$source_revision"
+    "$repository" "$fixture_verifier" "$source_revision" 1
 
   mkdir -p -- "$repository/devdocs"
   printf 'Documentation-only follow-up.\n' >"$repository/devdocs/freshness.md"

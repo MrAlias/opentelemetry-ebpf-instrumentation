@@ -16,7 +16,7 @@ readonly RUN_STATUS_MAX_BYTES=262144
 readonly TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES=16384
 readonly OBI_METRIC_PAIR_MAX_BYTES=131072
 readonly OBI_PROCESS_IDENTITY_MAX_BYTES=2048
-readonly OBI_METRIC_PAIR_MAX_SERIES=792
+readonly OBI_METRIC_PAIR_MAX_SERIES=864
 readonly OBI_METRIC_SNAPSHOT_MAX_BYTES=8388608
 readonly OBI_METRIC_SNAPSHOT_MAX_LINES=20000
 readonly OBI_METRIC_BOUNDARY_INDEX_MAX_BYTES=4194304
@@ -34,6 +34,7 @@ readonly CLAIM_V1_ARCHIVE_MAX_BYTES=188416
 readonly CLAIM_V1_ARCHIVE_MAX_FILES=7
 readonly CLAIM_VERIFY_SH_SHA256='376907ef806b4fdbdc971dde6d4a6f968476c64b237900d80a80dcd8d83e6f8b'
 readonly RAW_V3_JSON_MAX_BYTES=1048576
+readonly RAW_V3_PRESSURE_CONTAINER_INSPECTIONS_MAX_BYTES=32768
 readonly RAW_V3_SCENARIO_MAX_BYTES=8388608
 readonly RAW_V3_SCENARIO_MAX_LINES=131072
 readonly RAW_V3_RESOURCE_MAX_BYTES=2048
@@ -56,6 +57,7 @@ BUNDLE_SNAPSHOT_ROOT=""
 REQUIRE_CURRENT_CODE=false
 VERIFICATION_MODE="tracked"
 RAW_V3_KIND=""
+RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION=""
 EXTERNAL_SOURCE_DIRECTORY=""
 OBI_METRIC_BOUNDARY_INDEX_PAYLOAD=""
 OBI_METRIC_BOUNDARY_INDEX_SHA256=""
@@ -423,7 +425,7 @@ check_dependencies() {
   local -a missing=()
   local command_name=""
 
-  for command_name in awk chmod cmp cp cut find git grep jq mkdir mktemp \
+  for command_name in awk chmod cmp cp cut find git grep id jq mkdir mktemp \
     mountpoint readlink rm sha256sum sort stat tail tar tr; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
       missing+=("$command_name")
@@ -1411,7 +1413,8 @@ obi_metric_label_value_is_allowed() {
 
   case "$kind:$value" in
     transport:tcp|transport:getsockopt|transport:unix|transport:disabled|\
-    operation:stage|operation:candidate|operation:handoff|operation:inject|\
+    operation:stage|operation:candidate|operation:handoff|\
+    operation:handoff_admission|operation:inject|\
     operation:take|operation:discard|operation:negotiate|\
     operation:availability|operation:cleanup|operation:evict|operation:report|\
     status:unknown|status:valid|status:missing|status:stale|\
@@ -1939,6 +1942,38 @@ validate_obi_metric_pair() {
     (.java_attach_errors.delta == null or
       (.java_attach_errors.delta | type == "string"))
   ' "$pair" >/dev/null || return 1
+  if [[ "$VERIFICATION_MODE" == raw-v3 ]]; then
+    case "${RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION:-}" in
+      0)
+        jq -e 'all(.series[]; .operation != "handoff_admission")' \
+          "$pair" >/dev/null || return 1
+        ;;
+      1)
+        jq -e '
+          . as $pair |
+          [.series[] | select(.operation == "handoff_admission")] as $rows |
+          ($rows | length) <= 2 and
+          all($rows[];
+            .transport == "tcp" and
+            (.status == "overload" or .status == "ambiguous")) and
+          ([$rows[].status] | length == (unique | length)) and
+          if .boundary == "pressure" then
+            ([$rows[] | select(.status == "overload" and
+              (.delta | type == "string" and test("^[1-9][0-9]*$")))] |
+              length) == 1 and
+            all($rows[] | select(.status == "ambiguous"); .delta == "0")
+          elif $pair.continuity == "process_replaced" then
+            all($rows[]; .after == "0" and .delta == null)
+          elif $pair.after.state == "obi_stopped" then
+            all($rows[]; .delta == null)
+          else
+            all($rows[]; .delta == "0")
+          end
+        ' "$pair" >/dev/null || return 1
+        ;;
+      *) return 1 ;;
+    esac
+  fi
   [[ "$(jq -er '.boundary' "$pair")" == "$boundary" ]] || return 1
   continuity="$(jq -er '.continuity' "$pair")" || return 1
   before_reference="$(jq -er '.before.identity_reference' "$pair")" || return 1
@@ -3008,6 +3043,37 @@ validate_raw_v3_run_status() {
   esac
 }
 
+# Select the raw pressure contract only from the authenticated producer blob.
+# Bundles made before the marker retain the legacy monitor contract; one exact
+# marker selects the ready/fill/release/post-traffic-verification contract.
+recorded_pressure_traffic_contract_version() {
+  local -r revision="$1"
+  local -r producer_path='examples/apache-java-https/run.sh'
+  local producer="$TMP_DIR/recorded-pressure-run-producer"
+  local producer_size=""
+  local assignment_count=""
+  local marker_count=""
+
+  is_sha1 "$revision" || return 1
+  producer_size="$(git -C "$REPO_ROOT" cat-file -s \
+    "$revision:$producer_path")" || return 1
+  [[ "$producer_size" =~ ^[1-9][0-9]*$ ]] || return 1
+  ((producer_size <= 4194304)) || return 1
+  git -C "$REPO_ROOT" cat-file blob \
+    "$revision:$producer_path" >"$producer" || return 1
+  [[ -f "$producer" && ! -L "$producer" &&
+    "$(stat -Lc '%s' -- "$producer")" == "$producer_size" ]] || return 1
+  assignment_count="$(grep -Ec \
+    '^PRESSURE_TRAFFIC_CONTRACT_VERSION=' "$producer" || true)"
+  marker_count="$(grep -Fxc \
+    'PRESSURE_TRAFFIC_CONTRACT_VERSION=1' "$producer" || true)"
+  case "$assignment_count:$marker_count" in
+    0:0) printf '0\n' ;;
+    1:1) printf '1\n' ;;
+    *) return 1 ;;
+  esac
+}
+
 validate_raw_source_provenance() {
   local -r kind="$1"
   local -r environment="$BUNDLE_DIR/environment.txt"
@@ -3025,6 +3091,7 @@ validate_raw_source_provenance() {
   local expected_reason="none"
   local expected_invocation='./examples/apache-java-https/run.sh --transport getsockopt --agent otel --tls TLSv1.3'
   local invocation=""
+  local pressure_contract_version=""
 
   if [[ "$kind" == assertion-failure ]]; then
     expected_scenario="assertion-failure"
@@ -3102,6 +3169,13 @@ validate_raw_source_provenance() {
     return 1
   }
   REPO_ROOT="$TRUSTED_REPO_ROOT"
+  pressure_contract_version="$(
+    recorded_pressure_traffic_contract_version "$revision"
+  )" || {
+    printf '%s: raw provenance predicate failed: pressure-contract-version\n' \
+      "$SCRIPT_NAME" >&2
+    return 1
+  }
   write_source_tree_manifest_for_revision "$revision" "$expected_manifest" || {
     printf '%s: raw provenance predicate failed: source-tree-reconstruction\n' \
       "$SCRIPT_NAME" >&2
@@ -3162,7 +3236,9 @@ validate_raw_source_provenance() {
       "$SCRIPT_NAME" >&2
     return 1
   }
+  RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION="$pressure_contract_version"
   validate_raw_v3_run_status "$kind" || {
+    RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION=""
     printf '%s: raw provenance predicate failed: run-status-authority\n' \
       "$SCRIPT_NAME" >&2
     return 1
@@ -4038,7 +4114,8 @@ validate_raw_scenario_graph() {
         }
       ;;
     pressure)
-      jq -e '
+      jq -e --argjson contract_version \
+        "${RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION:-0}" '
         def zero_parent:
           . == null or . == "" or . == "0000000000000000";
         . as $root |
@@ -4061,15 +4138,20 @@ validate_raw_scenario_graph() {
         (.pressure_correlation.exact_hit_count | type == "number" and
           floor == . and . >= 0 and . <= $root.request_count) and
         (.pressure_correlation.explicit_root_count | type == "number" and
-          floor == . and . >= 0 and . <= $root.request_count) and
+          floor == . and
+          . >= (if $contract_version == 1 then 1 else 0 end) and
+          . <= $root.request_count) and
         (.pressure_correlation.exact_hit_count +
           .pressure_correlation.explicit_root_count) == .request_count and
         .pressure_correlation.wrong_parent_count == 0 and
         .pressure_correlation.unresolved_count == 0
       ' "$BUNDLE_DIR/$result" >/dev/null || return 1
-      jq -e -s '
+      jq -e -s --argjson contract_version \
+        "${RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION:-0}" '
         def count:
           type == "number" and floor == . and . >= 0 and . <= 128;
+        def admission_count:
+          type == "number" and floor == . and . >= 0 and . <= 1152;
         .[0].pressure_correlation as $trace |
         .[1].pressure_correlation as $status |
         $trace == $status.trace and
@@ -4083,6 +4165,14 @@ validate_raw_scenario_graph() {
           ($bridge.auxiliary_outcome_counts |
             keys == ["handoff"] and (.handoff | count) and
             .handoff <= $trace.exact_hit_count) and
+          (if $contract_version == 1 then
+            ($bridge.handoff_admission_outcome_counts |
+              keys == ["ambiguous", "maximum", "overload"] and
+              (.overload | admission_count) and .overload >= 1 and
+              .ambiguous == 0 and .maximum == 1152)
+          else
+            ($bridge | has("handoff_admission_outcome_counts") | not)
+          end) and
           ($bridge.retrieval_valid_count | count) and
           ($bridge.upstream_failure_count | count) and
           ($bridge.retrieval_failure_count | count) and
@@ -4108,7 +4198,22 @@ validate_raw_scenario_graph() {
         ($status.java_reconciliation_target |
           .take_valid_count == $trace.exact_hit_count and
           .attributable_absence_count == $trace.explicit_root_count and
-          (.diagnostic_self_miss_count | count))
+          (.diagnostic_self_miss_count | count)) and
+        (if $contract_version == 1 then
+          ($status | keys == ["barrier_reference", "bridge",
+            "container_inspections", "java_reconciliation_target", "trace"]) and
+          $status.barrier_reference ==
+            "map-pressure-pressure-barrier-status.json" and
+          ($status.container_inspections |
+            keys == ["reference", "sha256", "size_bytes"] and
+            .reference ==
+              "map-pressure-pressure-container-inspections.json" and
+            (.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+            (.size_bytes | type == "number" and floor == . and . >= 1 and
+              . <= 32768))
+        else
+          ($status | keys == ["bridge", "java_reconciliation_target", "trace"])
+        end)
       ' "$BUNDLE_DIR/$result" "$BUNDLE_DIR/$status" >/dev/null || return 1
       ;;
     handoff)
@@ -4404,7 +4509,7 @@ raw_pressure_map_entries() {
   ' "$BUNDLE_DIR/$relative_path"
 }
 
-validate_raw_pressure_monitor() {
+validate_raw_pressure_monitor_v0() {
   local -r relative_path='map-pressure-pressure-monitor.log'
   local -r map_id="$1"
   local -r baseline="$2"
@@ -4446,7 +4551,682 @@ validate_raw_pressure_monitor() {
   ' "$BUNDLE_DIR/$relative_path"
 }
 
-validate_raw_pressure_evidence() {
+validate_raw_pressure_control_file() {
+  local -r relative_path="$1"
+  local -r expected_payload="$2"
+  local -a lines=()
+
+  validate_bounded_regular_file "$relative_path" 80 1 || return 1
+  mapfile -t lines <"$BUNDLE_DIR/$relative_path" || return 1
+  [[ ${#lines[@]} == 1 && "${lines[0]}" == "$expected_payload" &&
+    "$(stat -Lc '%s' -- "$BUNDLE_DIR/$relative_path")" == \
+      "$(( ${#expected_payload} + 1 ))" ]]
+}
+
+raw_pressure_admission_max_events() {
+  local -r request_count="$1"
+
+  [[ "$request_count" =~ ^[1-9][0-9]{0,2}$ || "$request_count" == 1000 ]] ||
+    return 1
+  ((request_count <= 1000)) || return 1
+  printf '%d\n' "$((request_count * 9))"
+}
+
+parse_raw_pressure_operation_delta_v1() {
+  local -r relative_path="$1"
+  local -r output="$2"
+  local -r input="$BUNDLE_DIR/$relative_path"
+  local line=""
+  local metric=""
+  local before_field=""
+  local after_field=""
+  local delta_field=""
+  local extra=""
+  local before=""
+  local after=""
+  local delta=""
+  local expected_delta=""
+  local comparison=""
+  local labels=""
+  local entry=""
+  local label_name=""
+  local label_value=""
+  local transport=""
+  local operation=""
+  local status=""
+  local key=""
+  local canonical_metric=""
+  local canonical_line=""
+  local -i row_count=0
+  local -a label_entries=()
+  local LC_ALL=C
+  declare -A seen_labels=()
+  declare -A seen_series=()
+
+  [[ ! -L "$output" ]] || return 1
+  validate_bounded_regular_file \
+    "$relative_path" "$OBI_METRIC_SNAPSHOT_MAX_BYTES" \
+    "$OBI_METRIC_SNAPSHOT_MAX_LINES" || return 1
+  : >"$output" || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" == obi_java_remote_parent_operations_total* ]] || continue
+    [[ "$line" != *$'\r'* ]] || return 1
+    metric=""
+    before_field=""
+    after_field=""
+    delta_field=""
+    extra=""
+    read -r metric before_field after_field delta_field extra <<<"$line"
+    [[ -n "$metric" && -n "$before_field" && -n "$after_field" &&
+      -n "$delta_field" && -z "$extra" &&
+      "$metric" == 'obi_java_remote_parent_operations_total{'*'}' &&
+      "$before_field" == before=* && "$after_field" == after=* &&
+      "$delta_field" == delta=* ]] || return 1
+
+    labels="${metric#*\{}"
+    labels="${labels%\}}"
+    IFS=',' read -r -a label_entries <<<"$labels"
+    (( ${#label_entries[@]} == 3 )) || return 1
+    transport=""
+    operation=""
+    status=""
+    seen_labels=()
+    for entry in "${label_entries[@]}"; do
+      [[ "$entry" =~ ^(operation|status|transport)=\"([a-z_]+)\"$ ]] ||
+        return 1
+      label_name="${BASH_REMATCH[1]}"
+      label_value="${BASH_REMATCH[2]}"
+      [[ -z "${seen_labels[$label_name]:-}" ]] || return 1
+      seen_labels["$label_name"]=1
+      obi_metric_label_value_is_allowed "$label_name" "$label_value" ||
+        return 1
+      case "$label_name" in
+        transport) transport="$label_value" ;;
+        operation) operation="$label_value" ;;
+        status) status="$label_value" ;;
+      esac
+    done
+    [[ -n "$transport" && -n "$operation" && -n "$status" ]] || return 1
+    printf -v canonical_metric \
+      'obi_java_remote_parent_operations_total{operation="%s",status="%s",transport="%s"}' \
+      "$operation" "$status" "$transport"
+    [[ "$metric" == "$canonical_metric" ]] || return 1
+
+    before="${before_field#before=}"
+    after="${after_field#after=}"
+    delta="${delta_field#delta=}"
+    canonical_uint64_string "$before" || return 1
+    canonical_uint64_string "$after" || return 1
+    canonical_uint64_string "$delta" || return 1
+    # Exact subtraction avoids shell-integer overflow while proving
+    # before + delta == after for canonical unsigned decimal values.
+    uint64_string_subtract "$after" "$before" expected_delta || return 1
+    [[ "$delta" == "$expected_delta" ]] || return 1
+    uint64_string_compare "$delta" 10000 comparison || return 1
+    [[ "$comparison" != 1 ]] || return 1
+    printf -v canonical_line '%s before=%s after=%s delta=%s' \
+      "$canonical_metric" "$before" "$after" "$delta"
+    [[ "$line" == "$canonical_line" ]] || return 1
+
+    key="$transport|$operation|$status"
+    [[ -z "${seen_series[$key]:-}" ]] || return 1
+    seen_series["$key"]=1
+    ((row_count += 1))
+    ((row_count <= OBI_METRIC_PAIR_MAX_SERIES)) || return 1
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$transport" "$operation" "$status" "$before" "$after" "$delta" \
+      >>"$output" || return 1
+  done <"$input"
+  ((row_count > 0)) || return 1
+  LC_ALL=C sort -o "$output" -- "$output"
+}
+
+validate_raw_pressure_delta_pair_v1() {
+  local -r relative_path="$1"
+  local -r expected_requests="$2"
+  local -r output="$3"
+  local -r pair_reference='obi-metric-pairs/pressure.json'
+  local -r pair="$BUNDLE_DIR/$pair_reference"
+  local expected=""
+  local maximum_admission=""
+  local pair_admission_overload=""
+  local minimum_comparison=""
+  local maximum_comparison=""
+
+  maximum_admission="$(
+    raw_pressure_admission_max_events "$expected_requests"
+  )" || return 1
+  validate_obi_metric_pair "$pair_reference" || return 1
+  parse_raw_pressure_operation_delta_v1 "$relative_path" "$output" || return 1
+  expected="$(mktemp "$TMP_DIR/raw-pressure-pair.XXXXXX")" || return $?
+  jq -r '
+    .series[] |
+    [.transport, .operation, .status, .before, .after, .delta] | @tsv
+  ' "$pair" >"$expected" || return 1
+  LC_ALL=C sort -o "$expected" -- "$expected" || return 1
+  cmp -s -- "$expected" "$output" || return 1
+
+  pair_admission_overload="$(jq -er '
+    [.series[] | select(.operation == "handoff_admission" and
+      .transport == "tcp" and .status == "overload")] |
+    if length == 1 then .[0].delta else error("admission cardinality") end
+  ' "$pair")" || return 1
+  canonical_uint64_string "$pair_admission_overload" || return 1
+  uint64_string_compare \
+    "$pair_admission_overload" 1 minimum_comparison || return 1
+  uint64_string_compare \
+    "$pair_admission_overload" "$maximum_admission" maximum_comparison ||
+    return 1
+  [[ "$minimum_comparison" != -1 && "$maximum_comparison" != 1 ]]
+}
+
+raw_pressure_delta_summary() {
+  local -r relative_path="$1"
+  local -r expected_valid="$2"
+  local -r expected_roots="$3"
+  local -r expected_requests="$4"
+  local maximum_admission=""
+  local parsed_delta=""
+
+  maximum_admission="$(
+    raw_pressure_admission_max_events "$expected_requests"
+  )" || return 1
+  parsed_delta="$(mktemp "$TMP_DIR/raw-pressure-delta.XXXXXX")" || return $?
+  validate_raw_pressure_delta_pair_v1 \
+    "$relative_path" "$expected_requests" "$parsed_delta" || return 1
+  LC_ALL=C awk \
+    -v wanted_valid="$expected_valid" \
+    -v wanted_roots="$expected_roots" \
+    -v wanted_requests="$expected_requests" \
+    -v max_admission="$maximum_admission" '
+    function upstream_status(status) {
+      return status == "missing" || status == "stale" ||
+        status == "ambiguous" || status == "malformed" ||
+        status == "overload" || status == "segmented"
+    }
+    function retrieval_status(status) {
+      return status == "missing" || status == "stale" ||
+        status == "unsupported" || status == "malformed" ||
+        status == "version_mismatch" || status == "ambiguous" ||
+        status == "unauthorized" || status == "already_consumed" ||
+        status == "timeout" || status == "overload" ||
+        status == "transport_error" || status == "disabled"
+    }
+    {
+      if (NF != 6) {
+        failed = 1
+        next
+      }
+      transport = $1
+      operation = $2
+      status = $3
+      delta = $6
+      if (operation !~ /^[a-z_]+$/ || status !~ /^[a-z_]+$/ ||
+          transport !~ /^[a-z_]+$/ ||
+          delta !~ /^(0|[1-9][0-9]{0,4})$/ || (delta + 0) > 10000) {
+        failed = 1
+        next
+      }
+      key = transport "|" operation "|" status
+      if (seen[key]++) {
+        failed = 1
+        next
+      }
+      if (operation == "inject" && transport == "tcp") {
+        inject_total += delta
+        if (status == "valid") inject_valid += delta
+        else if (upstream_status(status)) {
+          upstream_total += delta
+          upstream_reason[status] += delta
+        } else if (delta != 0) failed = 1
+        next
+      }
+      if (operation == "candidate" && transport == "tcp") {
+        candidate_total += delta
+        if (status == "valid") candidate_valid += delta
+        else if (status == "ambiguous" || status == "malformed" ||
+            status == "overload") {
+          upstream_total += delta
+          upstream_reason[status] += delta
+        } else if (delta != 0) failed = 1
+        next
+      }
+      if (operation == "stage" && transport == "tcp") {
+        stage_total += delta
+        if (status == "valid") stage_valid += delta
+        else if (status == "ambiguous" || status == "malformed" ||
+            status == "overload") {
+          upstream_total += delta
+          upstream_reason[status] += delta
+        } else if (delta != 0) failed = 1
+        next
+      }
+      if (operation == "take") {
+        if (transport != "getsockopt") {
+          if (delta != 0) failed = 1
+        } else {
+          retrieval_total += delta
+          if (status == "valid") retrieval_valid += delta
+          else if (retrieval_status(status)) {
+            retrieval_fail += delta
+            retrieval_reason[status] += delta
+          } else if (delta != 0) failed = 1
+        }
+        next
+      }
+      if (operation == "handoff" && transport == "tcp") {
+        if (status == "valid") handoff_valid += delta
+        else if (delta != 0) failed = 1
+        next
+      }
+      if (operation == "handoff_admission") {
+        if (transport != "tcp" ||
+            (status != "overload" && status != "ambiguous")) {
+          failed = 1
+          next
+        }
+        if (status == "overload") {
+          admission_overload_rows++
+          admission_overload += delta
+        } else {
+          admission_ambiguous_rows++
+          admission_ambiguous += delta
+        }
+        next
+      }
+      allowed = operation == "negotiate" && status == "missing" &&
+        transport == "getsockopt"
+      allowed = allowed || (operation == "cleanup" && status == "valid" &&
+        transport == "tcp")
+      allowed = allowed || (operation == "report" && status == "valid" &&
+        transport == "tcp")
+      if (delta != 0 && !allowed) failed = 1
+    }
+    END {
+      if (inject_total != wanted_requests || inject_valid != candidate_total ||
+          candidate_valid != stage_total || retrieval_valid != wanted_valid ||
+          stage_valid != retrieval_total || handoff_valid > retrieval_valid ||
+          upstream_total + retrieval_fail != wanted_roots ||
+          wanted_valid + wanted_roots != wanted_requests ||
+          admission_overload_rows != 1 || admission_ambiguous_rows > 1 ||
+          admission_overload < 1 || admission_overload > max_admission ||
+          admission_ambiguous != 0) failed = 1
+      if (failed) exit 1
+      printf "%d %d %d %d %d %d %d\n", inject_total, candidate_total,
+        stage_total, retrieval_total, handoff_valid, admission_overload,
+        max_admission
+    }
+  ' "$parsed_delta"
+}
+
+validate_raw_pressure_container_inspections() {
+  local -r artifact='map-pressure-pressure-container-inspections.json'
+  local -r source_manifest="$TMP_DIR/external-before.manifest"
+  local canonical=""
+  local compose_project=""
+  local owner_gid=""
+  local owner_gid_comparison=""
+  local payload=""
+  local size=""
+  local source_identity=""
+  local source_device=""
+  local source_inode=""
+  local source_owner=""
+  local source_mode=""
+  local source_links=""
+  local source_size=""
+  local source_extra=""
+  local LC_ALL=C
+  local -a lines=()
+
+  validate_single_json_object \
+    "$artifact" "$RAW_V3_PRESSURE_CONTAINER_INSPECTIONS_MAX_BYTES" || return 1
+  mapfile -t lines <"$BUNDLE_DIR/$artifact" || return 1
+  [[ ${#lines[@]} == 1 ]] || return 1
+  payload="${lines[0]}"
+  size="$(stat -Lc '%s' -- "$BUNDLE_DIR/$artifact")" || return 1
+  [[ "$size" =~ ^[1-9][0-9]*$ ]] || return 1
+  canonical="$(jq -cS . <<<"$payload")" || return 1
+  [[ "$payload" == "$canonical" && "$size" == "$(( ${#payload} + 1 ))" ]] ||
+    return 1
+
+  [[ -f "$source_manifest" && ! -L "$source_manifest" ]] || return 1
+  source_identity="$(awk -F '\t' -v wanted="$artifact" '
+    $1 == wanted { matches++; identity = $2 }
+    END {
+      if (matches != 1) exit 1
+      print identity
+    }
+  ' "$source_manifest")" || return 1
+  IFS=: read -r source_device source_inode source_owner source_mode \
+    source_links source_size source_extra <<<"$source_identity"
+  [[ -z "$source_extra" && "$source_device" =~ ^[0-9]+$ &&
+    "$source_inode" =~ ^[1-9][0-9]*$ && "$source_owner" == "$EUID" &&
+    ( "$source_mode" == 400 || "$source_mode" == 600 ) &&
+    "$source_links" == 1 &&
+    "$source_size" == "$size" ]] || return 1
+
+  compose_project="$(key_value "$BUNDLE_DIR/environment.txt" compose_project)" ||
+    return 1
+  [[ "$compose_project" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] || return 1
+  owner_gid="$(id -g)" || return 1
+  canonical_uint64_string "$owner_gid" || return 1
+  uint64_string_compare "$owner_gid" 4294967295 owner_gid_comparison ||
+    return 1
+  [[ "$owner_gid_comparison" != 1 ]] || return 1
+
+  jq -e --arg project "$compose_project" --arg owner_uid "$EUID" \
+    --arg owner_gid "$owner_gid" '
+    def uint32:
+      type == "number" and floor == . and . >= 0 and . <= 4294967295;
+    def uint32_decimal:
+      type == "string" and test("^(0|[1-9][0-9]*)$") and
+      (tonumber >= 0 and tonumber <= 4294967295);
+    def timestamp_parts:
+      capture("^(?<base>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\\.(?<fraction>[0-9]{0,8}[1-9]))?Z$") as $parts |
+      ($parts.base + "Z" | fromdateiso8601) as $seconds |
+      select(($seconds | todateiso8601) == ($parts.base + "Z")) |
+      [$seconds,
+        (((($parts.fraction // "") + "000000000")[0:9]) | tonumber)];
+    . as $root |
+    $root.running as $running |
+    $root.terminal as $terminal |
+    ($running.config.user | split(":")) as $user |
+    ($running.state.started_at | timestamp_parts) as $started |
+    ($terminal.state.finished_at | timestamp_parts) as $finished |
+    keys == ["running", "scenario_label", "schema", "session", "status",
+      "terminal", "wait_exit_code"] and
+    .schema == "pressure-scenario-container-inspections-v1" and
+    .status == "passed" and .scenario_label == "pressure" and
+    (.session | type == "string" and test("^[0-9a-f]{32}$")) and
+    .wait_exit_code == 0 and
+    ($running | keys == ["config", "identity", "labels", "mount", "runtime",
+      "state"]) and
+    ($terminal | keys == ["config", "identity", "labels", "mount", "runtime",
+      "state"]) and
+    ($running | del(.state)) == ($terminal | del(.state)) and
+    ($running.identity |
+      keys == ["id", "image_id", "image_reference", "name"] and
+      (.id | type == "string" and test("^[0-9a-f]{64}$") and
+        . != ("0" * 64)) and
+      (.image_id | type == "string" and test("^sha256:[0-9a-f]{64}$") and
+        . != ("sha256:" + ("0" * 64))) and
+      .image_reference == "obi-apache-java-https-tracecheck:local" and
+      .name == ("/" + $project + "-pressure-scenario-" +
+        ($root.session[0:12]))) and
+    ($running.config |
+      keys == ["cmd", "entrypoint", "path", "user"] and
+      .entrypoint == ["/trace-scenario"] and .path == "/trace-scenario" and
+      .cmd == ["--scenario", "pressure", "--expected-tls", "TLSv1.3",
+        "--seed", "1", "--timeout", "75s", "--pressure-control-dir",
+        "/run/obi-demo/pressure-control", "--pressure-control-session",
+        $root.session, "--pressure-control-timeout", "255s"] and
+      (.user | type == "string" and
+        test("^(0|[1-9][0-9]*):(0|[1-9][0-9]*)$"))) and
+    ($user | length == 2 and all(.[]; uint32_decimal)) and
+    $running.config.user == ($owner_uid + ":" + $owner_gid) and
+    ($running.labels |
+      keys == ["oneoff", "owner", "project", "service"] and
+      .oneoff == "True" and .owner == "acceptance-demo-v1" and
+      .project == $project and .service == "scenario") and
+    ($running.mount |
+      keys == ["destination", "rw", "source_leaf", "type"] and
+      .type == "bind" and .rw == true and
+      .destination == "/run/obi-demo/pressure-control" and
+      .source_leaf == (".pressure-control." + $root.session)) and
+    ($running.runtime |
+      keys == ["attach_stdin", "network_mode", "open_stdin", "pid_mode",
+        "privileged", "restart_policy", "stdin_once", "tty"] and
+      .attach_stdin == false and .network_mode == "host" and
+      .open_stdin == false and .pid_mode == "" and .privileged == false and
+      .restart_policy == "none" and .stdin_once == false and .tty == false) and
+    ($running.state |
+      keys == ["dead", "error", "exit_code", "finished_at", "host_pid",
+        "oom_killed", "restart_count", "running", "started_at", "status"] and
+      .dead == false and .error == "" and .exit_code == 0 and
+      .finished_at == "0001-01-01T00:00:00Z" and
+      (.host_pid | uint32 and . >= 1) and .oom_killed == false and
+      .restart_count == 0 and .running == true and .status == "running" and
+      .started_at != "0001-01-01T00:00:00Z") and
+    ($terminal.state |
+      keys == ["dead", "error", "exit_code", "finished_at", "host_pid",
+        "oom_killed", "restart_count", "running", "started_at", "status"] and
+      .dead == false and .error == "" and .exit_code == 0 and
+      .host_pid == 0 and .oom_killed == false and .restart_count == 0 and
+      .running == false and .status == "exited" and
+      .started_at == $running.state.started_at and
+      .finished_at != "0001-01-01T00:00:00Z") and
+    $finished > $started
+  ' "$BUNDLE_DIR/$artifact" >/dev/null
+}
+
+validate_raw_pressure_barrier() {
+  local -r label="$1"
+  local -r map_id="$2"
+  local -r result="scenario-$label.json"
+  local -r scenario_status="scenario-$label-status.json"
+  local -r ready="map-pressure-$label-barrier-ready.txt"
+  local -r release="map-pressure-$label-barrier-release.txt"
+  local -r fill="map-pressure-$label-fill.json"
+  local -r verify="map-pressure-$label-verify.json"
+  local -r barrier="map-pressure-$label-barrier-status.json"
+  local -r inspections="map-pressure-$label-container-inspections.json"
+  local session=""
+  local canonical=""
+  local payload=""
+  local size=""
+  local result_sha256=""
+  local status_sha256=""
+  local fill_sha256=""
+  local verify_sha256=""
+  local fill_content_sha256=""
+  local verify_content_sha256=""
+  local ready_sha256=""
+  local release_sha256=""
+  local inspections_sha256=""
+  local inspections_size=""
+  local exact_hits=""
+  local roots=""
+  local request_count=""
+  local delta_summary=""
+  local inject_total=""
+  local candidate_total=""
+  local stage_total=""
+  local retrieval_total=""
+  local handoff_total=""
+  local admission_overload=""
+  local admission_maximum=""
+  local extra=""
+  local -a lines=()
+
+  [[ "$label" == pressure ]] || return 1
+  validate_single_json_object "$barrier" 16384 || return 1
+  mapfile -t lines <"$BUNDLE_DIR/$barrier" || return 1
+  [[ ${#lines[@]} == 1 ]] || return 1
+  payload="${lines[0]}"
+  size="$(stat -Lc '%s' -- "$BUNDLE_DIR/$barrier")" || return 1
+  canonical="$(jq -cS . <<<"$payload")" || return 1
+  [[ "$payload" == "$canonical" && "$size" == "$(( ${#payload} + 1 ))" ]] ||
+    return 1
+  session="$(jq -er '.session' "$BUNDLE_DIR/$barrier")" || return 1
+  [[ "$session" =~ ^[0-9a-f]{32}$ ]] || return 1
+  validate_raw_pressure_control_file \
+    "$ready" "pressure-ready-v1:$session" || return 1
+  validate_raw_pressure_control_file \
+    "$release" "pressure-release-v1:$session" || return 1
+
+  ready_sha256="$(sha256sum <"$BUNDLE_DIR/$ready")" || return 1
+  release_sha256="$(sha256sum <"$BUNDLE_DIR/$release")" || return 1
+  fill_sha256="$(sha256sum <"$BUNDLE_DIR/$fill")" || return 1
+  verify_sha256="$(sha256sum <"$BUNDLE_DIR/$verify")" || return 1
+  result_sha256="$(sha256sum <"$BUNDLE_DIR/$result")" || return 1
+  status_sha256="$(sha256sum <"$BUNDLE_DIR/$scenario_status")" || return 1
+  inspections_sha256="$(sha256sum <"$BUNDLE_DIR/$inspections")" || return 1
+  inspections_size="$(stat -Lc '%s' -- "$BUNDLE_DIR/$inspections")" || return 1
+  ready_sha256="${ready_sha256%% *}"
+  release_sha256="${release_sha256%% *}"
+  fill_sha256="${fill_sha256%% *}"
+  verify_sha256="${verify_sha256%% *}"
+  result_sha256="${result_sha256%% *}"
+  status_sha256="${status_sha256%% *}"
+  inspections_sha256="${inspections_sha256%% *}"
+  [[ "$inspections_sha256" =~ ^[0-9a-f]{64}$ &&
+    "$inspections_size" =~ ^[1-9][0-9]*$ &&
+    "$inspections_size" -le "$RAW_V3_PRESSURE_CONTAINER_INSPECTIONS_MAX_BYTES" ]] ||
+    return 1
+  fill_content_sha256="$(jq -er '.content_sha256' "$BUNDLE_DIR/$fill")" ||
+    return 1
+  verify_content_sha256="$(jq -er '.content_sha256' "$BUNDLE_DIR/$verify")" ||
+    return 1
+  [[ "$fill_content_sha256" =~ ^[0-9a-f]{64}$ &&
+    "$verify_content_sha256" == "$fill_content_sha256" ]] || return 1
+  exact_hits="$(jq -er '.pressure_correlation.exact_hit_count' \
+    "$BUNDLE_DIR/$result")" || return 1
+  roots="$(jq -er '.pressure_correlation.explicit_root_count' \
+    "$BUNDLE_DIR/$result")" || return 1
+  request_count="$(jq -er '.request_count' "$BUNDLE_DIR/$result")" || return 1
+  [[ "$exact_hits" =~ ^(0|[1-9][0-9]*)$ &&
+    "$roots" =~ ^[1-9][0-9]*$ &&
+    "$request_count" =~ ^[1-9][0-9]{0,3}$ ]] || return 1
+  admission_maximum="$(
+    raw_pressure_admission_max_events "$request_count"
+  )" || return 1
+  delta_summary="$(raw_pressure_delta_summary \
+    "phases/$label-after/obi-metrics.delta" \
+    "$exact_hits" "$roots" "$request_count")" || return 1
+  read -r inject_total candidate_total stage_total retrieval_total \
+    handoff_total admission_overload admission_maximum extra \
+    <<<"$delta_summary" || return 1
+  [[ -z "$extra" ]] || return 1
+
+  jq -e \
+    --arg label "$label" \
+    --arg session "$session" \
+    --arg map_id "$map_id" \
+    --arg ready "$ready" --arg ready_sha256 "$ready_sha256" \
+    --arg release "$release" --arg release_sha256 "$release_sha256" \
+    --arg fill "$fill" --arg fill_sha256 "$fill_sha256" \
+    --arg verify "$verify" --arg verify_sha256 "$verify_sha256" \
+    --arg content_sha256 "$fill_content_sha256" \
+    --arg result "$result" --arg result_sha256 "$result_sha256" \
+    --arg scenario_status "$scenario_status" \
+    --arg status_sha256 "$status_sha256" \
+    --arg inspections "$inspections" \
+    --arg inspections_sha256 "$inspections_sha256" \
+    --argjson inspections_size "$inspections_size" \
+    --argjson exact_hits "$exact_hits" --argjson roots "$roots" \
+    --argjson request_count "$request_count" \
+    --argjson admission_overload "$admission_overload" \
+    --argjson admission_maximum "$admission_maximum" \
+    --slurpfile inspection "$BUNDLE_DIR/$inspections" '
+      keys == ["container", "container_inspections", "control", "fill",
+        "scenario_label", "schema", "sequence", "session", "status",
+        "traffic", "verification"] and
+      .schema == "pressure-traffic-barrier-v1" and .status == "passed" and
+      .scenario_label == $label and .session == $session and
+      .sequence == ["scenario_ready", "capacity_fill_verified",
+        "release_published", "scenario_reaped",
+        "post_traffic_content_verified"] and
+      (.control | keys == ["ready_reference", "ready_sha256",
+        "release_reference", "release_sha256"] and
+        .ready_reference == $ready and .ready_sha256 == $ready_sha256 and
+        .release_reference == $release and
+        .release_sha256 == $release_sha256) and
+      (.container | keys == ["host_pid", "id", "started_at", "user"] and
+        (.id | type == "string" and test("^[0-9a-f]{64}$")) and
+        (.host_pid | type == "string" and test("^[1-9][0-9]*$")) and
+        (.started_at | type == "string" and
+          test("^[0-9TZ:.-]{20,64}$")) and
+        (.user | type == "string" and
+          test("^(0|[1-9][0-9]*):(0|[1-9][0-9]*)$"))) and
+      (.container_inspections |
+        keys == ["reference", "sha256", "size_bytes"] and
+        .reference == $inspections and .sha256 == $inspections_sha256 and
+        .size_bytes == $inspections_size) and
+      $inspection[0].session == $session and
+      .container == {
+        id: $inspection[0].running.identity.id,
+        host_pid: ($inspection[0].running.state.host_pid | tostring),
+        started_at: $inspection[0].running.state.started_at,
+        user: $inspection[0].running.config.user
+      } and
+      (.fill | keys == ["baseline_entries", "capacity_rejected_entries",
+        "content_sha256", "map_id", "max_entries", "reference", "sha256",
+        "synthetic_namespace", "synthetic_pid", "touched",
+        "verified_absent_entries", "verified_present_entries"] and
+        .reference == $fill and .sha256 == $fill_sha256 and
+        .map_id == $map_id and .baseline_entries == 0 and
+        .synthetic_pid == 0 and .synthetic_namespace == 0 and
+        .max_entries == 10000 and .touched == 10000 and
+        .verified_present_entries == 10000 and
+        .verified_absent_entries == 1 and
+        .content_sha256 == $content_sha256 and
+        .capacity_rejected_entries == 1) and
+      (.verification | keys == ["content_sha256", "map_id", "reference",
+        "sha256", "synthetic_namespace", "synthetic_pid",
+        "verified_absent_entries", "verified_present_entries"] and
+        .reference == $verify and .sha256 == $verify_sha256 and
+        .map_id == $map_id and .synthetic_pid == 0 and
+        .synthetic_namespace == 0 and .verified_present_entries == 10000 and
+        .verified_absent_entries == 1 and
+        .content_sha256 == $content_sha256) and
+      .verification.content_sha256 == .fill.content_sha256 and
+      (.traffic | keys == ["exact_hit_count", "explicit_root_count",
+        "handoff_admission_ambiguous_count",
+        "handoff_admission_maximum_count",
+        "handoff_admission_overload_count",
+        "request_count", "result_reference", "result_sha256",
+        "status_reference", "status_sha256", "unresolved_count",
+        "wrong_parent_count"] and
+        .result_reference == $result and .result_sha256 == $result_sha256 and
+        .status_reference == $scenario_status and
+        .status_sha256 == $status_sha256 and
+        .request_count == $request_count and
+        .exact_hit_count == $exact_hits and .explicit_root_count == $roots and
+        .handoff_admission_overload_count == $admission_overload and
+        .handoff_admission_ambiguous_count == 0 and
+        .handoff_admission_maximum_count == $admission_maximum and
+        .wrong_parent_count == 0 and
+        .unresolved_count == 0)
+    ' "$BUNDLE_DIR/$barrier" >/dev/null || return 1
+  jq -e --arg barrier "$barrier" \
+    --arg inspections "$inspections" \
+    --arg inspections_sha256 "$inspections_sha256" \
+    --argjson inspections_size "$inspections_size" \
+    --argjson inject "$inject_total" \
+    --argjson candidate "$candidate_total" \
+    --argjson stage "$stage_total" \
+    --argjson retrieval "$retrieval_total" \
+    --argjson handoff "$handoff_total" \
+    --argjson roots "$roots" \
+    --argjson admission_overload "$admission_overload" \
+    --argjson admission_maximum "$admission_maximum" '
+      .pressure_correlation.barrier_reference == $barrier and
+      .pressure_correlation.container_inspections == {
+        reference: $inspections, sha256: $inspections_sha256,
+        size_bytes: $inspections_size
+      } and
+      .pressure_correlation.trace.explicit_root_count == $roots and
+      .pressure_correlation.trace.wrong_parent_count == 0 and
+      .pressure_correlation.trace.unresolved_count == 0 and
+      .pressure_correlation.bridge.transport == "getsockopt" and
+      .pressure_correlation.bridge.phase_outcome_counts == {
+        inject: $inject, candidate: $candidate, stage: $stage,
+        retrieval: $retrieval
+      } and
+      .pressure_correlation.bridge.auxiliary_outcome_counts == {
+        handoff: $handoff
+      } and
+      .pressure_correlation.bridge.handoff_admission_outcome_counts == {
+        overload: $admission_overload, ambiguous: 0,
+        maximum: $admission_maximum
+      } and
+      (.pressure_correlation.bridge.upstream_failure_count +
+        .pressure_correlation.bridge.retrieval_failure_count) == $roots
+    ' "$BUNDLE_DIR/$scenario_status" >/dev/null
+}
+
+validate_raw_pressure_evidence_v0() {
   local -r prepare='map-pressure-pressure-prepare.json'
   local -r fill='map-pressure-pressure-fill.json'
   local -r cleanup='map-pressure-pressure-cleanup.json'
@@ -4467,8 +5247,8 @@ validate_raw_pressure_evidence() {
   local attempt_status=""
   local attempt_command_status=""
   local attempt_validation_status=""
-  local expected_attempts="$TMP_DIR/raw-pressure-attempts.expected"
-  local actual_attempts="$TMP_DIR/raw-pressure-attempts.actual"
+  local expected_attempts="$TMP_DIR/raw-pressure-v0-attempts.expected"
+  local actual_attempts="$TMP_DIR/raw-pressure-v0-attempts.actual"
   local -i attempt=0
   local -i final_attempt=0
 
@@ -4488,8 +5268,7 @@ validate_raw_pressure_evidence() {
       .map_name == "java_remote_parent_handoff_claims" and
       .kernel_name == "java_remote_par" and .map_type == "Hash" and
       (.map_id | type == "number" and floor == . and . >= 1 and
-        . <= 4294967295) and
-      .max_entries == 10000 and
+        . <= 4294967295) and .max_entries == 10000 and
       (.process_map_id | type == "number" and floor == . and . >= 1 and
         . <= 4294967295) and
       (.process_pid | type == "number" and floor == . and . >= 1 and
@@ -4612,7 +5391,7 @@ validate_raw_pressure_evidence() {
     traffic_entries <= capacity && recovered_entries <= baseline_entries &&
     sample_one_entries <= baseline_entries && sample_two_entries <= baseline_entries)) ||
     return 1
-  validate_raw_pressure_monitor "$map_id" "$baseline_entries" "$capacity" ||
+  validate_raw_pressure_monitor_v0 "$map_id" "$baseline_entries" "$capacity" ||
     return 1
   validate_bounded_regular_file \
     map-pressure-pressure-recovered-samples.log "$RAW_V3_JSON_MAX_BYTES" 4096 ||
@@ -4638,6 +5417,497 @@ validate_raw_pressure_evidence() {
   ' "$BUNDLE_DIR/receive-cursor-map-tls-boundary-before.json" \
     "$BUNDLE_DIR/receive-cursor-map-coalesced-bridge-before.json" \
     "$BUNDLE_DIR/map-pressure-pressure-prepare.json" >/dev/null
+}
+
+validate_raw_pressure_recovery_attempt_log_v1() {
+  local -r relative_path="$1"
+  local -r complete="$2"
+
+  [[ "$complete" == true || "$complete" == false ]] || return 1
+  validate_bounded_regular_file "$relative_path" "$RAW_V3_JSON_MAX_BYTES" 61 ||
+    return 1
+  LC_ALL=C awk -v complete="$complete" '
+    BEGIN { previous_consecutive = 0 }
+    {
+      if (NF != 5 || $1 != "attempt=" NR ||
+          $2 !~ /^observed_at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$/ ||
+          $3 !~ /^entries=(unavailable|0|[1-9][0-9]{0,4})$/ ||
+          $4 !~ /^matched=(true|false)$/ ||
+          $5 !~ /^consecutive=[0-2]$/) {
+        invalid = 1
+        next
+      }
+      entries = $3
+      sub(/^entries=/, "", entries)
+      if (entries != "unavailable" && (entries + 0) > 10000) invalid = 1
+      matched = $4
+      sub(/^matched=/, "", matched)
+      consecutive = $5
+      sub(/^consecutive=/, "", consecutive)
+      expected_match = entries == "0" ? "true" : "false"
+      if (matched != expected_match) invalid = 1
+      if (matched == "true") previous_consecutive++
+      else previous_consecutive = 0
+      if (consecutive + 0 != previous_consecutive || previous_consecutive > 2) {
+        invalid = 1
+      }
+      if (previous_consecutive == 2) completion_line = NR
+    }
+    END {
+      if (NR < 1 || NR > 61) invalid = 1
+      if (complete == "true") {
+        if (completion_line != NR || previous_consecutive != 2) invalid = 1
+      } else if (completion_line != 0) {
+        invalid = 1
+      }
+      exit invalid ? 1 : 0
+    }
+  ' "$BUNDLE_DIR/$relative_path"
+}
+
+validate_raw_pressure_cleanup_attempts_v1() {
+  local cleanup_status=""
+  local attempt_name=""
+  local attempt_status=""
+  local command_status=""
+  local validation_status=""
+  local recovery_status=""
+  local barrier_status=""
+  local schema=""
+  local deletion_reused=""
+  local output_reference=""
+  local output_sha256=""
+  local stderr_reference=""
+  local stderr_sha256=""
+  local proof_reference=""
+  local proof_sha256=""
+  local observed_sha256=""
+  local latched_proof_reference=""
+  local latched_proof_sha256=""
+  local latched_stderr_reference=""
+  local expected_attempts="$TMP_DIR/raw-pressure-v1-attempts.expected"
+  local actual_attempts="$TMP_DIR/raw-pressure-v1-attempts.actual"
+  local -i attempt=0
+  local -i final_attempt=0
+
+  cleanup_status="$(find -- "$BUNDLE_DIR" -mindepth 1 -maxdepth 1 -type f \
+    -name 'map-pressure-pressure-cleanup-attempt-??.status' -print |
+    LC_ALL=C sort | tail -n 1)" || return 1
+  [[ "${cleanup_status##*/}" =~ ^map-pressure-pressure-cleanup-attempt-0([1-3])\.status$ ]] ||
+    return 1
+  final_attempt="${BASH_REMATCH[1]}"
+  : >"$expected_attempts"
+  for ((attempt = 1; attempt <= final_attempt; attempt++)); do
+    printf -v attempt_name 'map-pressure-pressure-cleanup-attempt-%02d' "$attempt"
+    attempt_status="$BUNDLE_DIR/$attempt_name.status"
+    validate_key_value_file "$attempt_status" || return 1
+    [[ "$(awk 'END { print NR + 0 }' "$attempt_status")" == 12 &&
+      "$(cut -d= -f1 -- "$attempt_status" | LC_ALL=C sort | tr '\n' ' ')" == \
+        'barrier_status deletion_command_status deletion_output_reference deletion_output_sha256 deletion_proof_reference deletion_proof_sha256 deletion_reused deletion_stderr_reference deletion_stderr_sha256 deletion_validation_status recovery_status schema ' ]] ||
+      return 1
+    barrier_status="$(key_value "$attempt_status" barrier_status)" || return 1
+    command_status="$(key_value "$attempt_status" deletion_command_status)" ||
+      return 1
+    output_reference="$(key_value "$attempt_status" deletion_output_reference)" ||
+      return 1
+    output_sha256="$(key_value "$attempt_status" deletion_output_sha256)" || return 1
+    proof_reference="$(key_value "$attempt_status" deletion_proof_reference)" ||
+      return 1
+    proof_sha256="$(key_value "$attempt_status" deletion_proof_sha256)" || return 1
+    deletion_reused="$(key_value "$attempt_status" deletion_reused)" || return 1
+    stderr_reference="$(key_value "$attempt_status" deletion_stderr_reference)" ||
+      return 1
+    stderr_sha256="$(key_value "$attempt_status" deletion_stderr_sha256)" || return 1
+    validation_status="$(key_value \
+      "$attempt_status" deletion_validation_status)" || return 1
+    recovery_status="$(key_value "$attempt_status" recovery_status)" || return 1
+    schema="$(key_value "$attempt_status" schema)" || return 1
+    [[ "$barrier_status" == retained &&
+      "$schema" == pressure-cleanup-attempt-v1 &&
+      "$deletion_reused" =~ ^(true|false)$ &&
+      "$validation_status" =~ ^(not-run|failed|passed)$ &&
+      "$recovery_status" =~ ^(not-run|failed|passed)$ ]] || return 1
+    printf '%s.status\n' "$attempt_name" >>"$expected_attempts" || return 1
+
+    if [[ "$deletion_reused" == false ]]; then
+      [[ -z "$latched_proof_reference" &&
+        "$command_status" =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
+      ((command_status <= 255)) || return 1
+      [[ "$output_reference" == "$attempt_name.json" &&
+        "$stderr_reference" == "$attempt_name.stderr.log" &&
+        "$output_sha256" =~ ^[0-9a-f]{64}$ &&
+        "$stderr_sha256" =~ ^[0-9a-f]{64}$ ]] || return 1
+      validate_bounded_regular_file_allow_empty \
+        "$output_reference" 4096 4096 || return 1
+      validate_bounded_regular_file_allow_empty \
+        "$stderr_reference" "$RAW_V3_JSON_MAX_BYTES" 4096 || return 1
+      observed_sha256="$(sha256sum <"$BUNDLE_DIR/$output_reference")" || return 1
+      observed_sha256="${observed_sha256%% *}"
+      [[ "$observed_sha256" == "$output_sha256" ]] || return 1
+      observed_sha256="$(sha256sum <"$BUNDLE_DIR/$stderr_reference")" || return 1
+      observed_sha256="${observed_sha256%% *}"
+      [[ "$observed_sha256" == "$stderr_sha256" ]] || return 1
+      printf '%s\n%s\n' "$output_reference" "$stderr_reference" \
+        >>"$expected_attempts" || return 1
+      if [[ "$validation_status" == passed ]]; then
+        [[ "$command_status" == 0 && -z "$latched_proof_reference" &&
+          "$proof_reference" == "$output_reference" &&
+          "$proof_sha256" == "$output_sha256" ]] || return 1
+        validate_single_json_object "$output_reference" 4096 || return 1
+        latched_proof_reference="$proof_reference"
+        latched_proof_sha256="$proof_sha256"
+        latched_stderr_reference="$stderr_reference"
+      else
+        [[ "$proof_reference" == none && "$proof_sha256" == none &&
+          "$recovery_status" == not-run && "$attempt" -lt "$final_attempt" ]] ||
+          return 1
+        if [[ "$command_status" == 0 ]]; then
+          [[ "$validation_status" == failed ]] || return 1
+        else
+          [[ "$validation_status" == not-run ]] || return 1
+        fi
+      fi
+    else
+      [[ -n "$latched_proof_reference" && "$command_status" == not-run &&
+        "$output_reference" == none && "$output_sha256" == none &&
+        "$stderr_reference" == none && "$stderr_sha256" == none &&
+        "$validation_status" == passed &&
+        "$proof_reference" == "$latched_proof_reference" &&
+        "$proof_sha256" == "$latched_proof_sha256" ]] || return 1
+    fi
+
+    case "$validation_status:$recovery_status" in
+      passed:passed)
+        ((attempt == final_attempt)) || return 1
+        validate_raw_pressure_recovery_attempt_log_v1 \
+          "$attempt_name-recovered-samples.log" true || return 1
+        cmp -s -- "$BUNDLE_DIR/$attempt_name-recovered.prom" \
+          "$BUNDLE_DIR/map-pressure-pressure-recovered.prom" || return 1
+        cmp -s -- "$BUNDLE_DIR/$attempt_name-recovered-sample-01.prom" \
+          "$BUNDLE_DIR/map-pressure-pressure-recovered-sample-01.prom" || return 1
+        cmp -s -- "$BUNDLE_DIR/$attempt_name-recovered-sample-02.prom" \
+          "$BUNDLE_DIR/map-pressure-pressure-recovered-sample-02.prom" || return 1
+        cmp -s -- "$BUNDLE_DIR/$attempt_name-recovered-samples.log" \
+          "$BUNDLE_DIR/map-pressure-pressure-recovered-samples.log" || return 1
+        printf '%s\n' \
+          "$attempt_name-recovered.prom" \
+          "$attempt_name-recovered-sample-01.prom" \
+          "$attempt_name-recovered-sample-02.prom" \
+          "$attempt_name-recovered-samples.log" >>"$expected_attempts" || return 1
+        ;;
+      passed:failed)
+        ((attempt < final_attempt)) || return 1
+        validate_raw_pressure_recovery_attempt_log_v1 \
+          "$attempt_name-recovered-samples.log" false || return 1
+        printf '%s-recovered-samples.log\n' "$attempt_name" \
+          >>"$expected_attempts" || return 1
+        ;;
+      not-run:not-run|failed:not-run) ;;
+      *) return 1 ;;
+    esac
+  done
+  [[ -n "$latched_proof_reference" && "$recovery_status" == passed ]] || return 1
+  find -- "$BUNDLE_DIR" -mindepth 1 -maxdepth 1 -type f \
+    -name 'map-pressure-pressure-cleanup-attempt-*' -printf '%f\n' |
+    LC_ALL=C sort >"$actual_attempts" || return 1
+  LC_ALL=C sort -o "$expected_attempts" -- "$expected_attempts" || return 1
+  cmp -s -- "$expected_attempts" "$actual_attempts" || return 1
+  cmp -s -- "$BUNDLE_DIR/$latched_proof_reference" \
+    "$BUNDLE_DIR/map-pressure-pressure-cleanup.json" || return 1
+  cmp -s -- "$BUNDLE_DIR/$latched_stderr_reference" \
+    "$BUNDLE_DIR/map-pressure-pressure-cleanup.stderr.log"
+}
+
+validate_raw_pressure_evidence_v1() {
+  local -r prepare='map-pressure-pressure-prepare.json'
+  local -r fill='map-pressure-pressure-fill.json'
+  local -r verify='map-pressure-pressure-verify.json'
+  local -r cleanup='map-pressure-pressure-cleanup.json'
+  local cleanup_status=""
+  local label=""
+  local map_id=""
+  local capacity=""
+  local token_prepare=""
+  local token_fill=""
+  local token_verify=""
+  local token_cleanup=""
+  local baseline_entries=""
+  local recovered_entries=""
+  local sample_one_entries=""
+  local sample_two_entries=""
+  local attempt_name=""
+  local attempt_status=""
+  local attempt_command_status=""
+  local attempt_validation_status=""
+  local expected_attempts="$TMP_DIR/raw-pressure-attempts.expected"
+  local actual_attempts="$TMP_DIR/raw-pressure-attempts.actual"
+  local -i attempt=0
+  local -i final_attempt=0
+
+  validate_single_json_object "$prepare" 4096 || return 1
+  validate_single_json_object "$fill" 4096 || return 1
+  validate_single_json_object "$verify" 4096 || return 1
+  validate_single_json_object "$cleanup" 4096 || return 1
+  [[ "$(awk 'END { print NR + 0 }' "$BUNDLE_DIR/$prepare")" == 1 &&
+    "$(awk 'END { print NR + 0 }' "$BUNDLE_DIR/$fill")" == 1 &&
+    "$(awk 'END { print NR + 0 }' "$BUNDLE_DIR/$verify")" == 1 &&
+    "$(awk 'END { print NR + 0 }' "$BUNDLE_DIR/$cleanup")" == 1 ]] || return 1
+  jq -e -s '
+    length == 4 and .[0] as $prepare | .[1] as $fill |
+    .[2] as $verify | .[3] as $cleanup |
+    ($prepare | keys == [
+        "kernel_name", "map_id", "map_name", "map_type", "max_entries",
+        "mode", "process_map_id", "process_namespace", "process_pid",
+        "status", "synthetic_namespace", "synthetic_pid", "token_base",
+        "touched"
+      ] and .status == "passed" and .mode == "prepare" and
+      .map_name == "java_remote_parent_handoff_claims" and
+      .kernel_name == "java_remote_par" and .map_type == "Hash" and
+      (.map_id | type == "number" and floor == . and . >= 1 and
+        . <= 4294967295) and .max_entries == 10000 and
+      (.process_map_id | type == "number" and floor == . and . >= 1 and
+        . <= 4294967295) and
+      (.process_pid | type == "number" and floor == . and . >= 1 and
+        . <= 4294967295) and
+      (.process_namespace | type == "number" and floor == . and . >= 1 and
+        . <= 4294967295) and
+      .map_id != .process_map_id and .synthetic_pid == 0 and
+      .synthetic_namespace == 0 and .touched == 0) and
+    ($fill | keys == [
+        "capacity_rejected_entries", "content_sha256", "kernel_name",
+        "map_id", "map_name", "map_type", "max_entries", "mode",
+        "process_map_id", "process_namespace", "process_pid", "status",
+        "synthetic_namespace", "synthetic_pid", "token_base", "touched",
+        "verified_absent_entries", "verified_present_entries"
+      ] and .status == "passed" and .mode == "fill" and
+      .map_name == $prepare.map_name and .kernel_name == $prepare.kernel_name and
+      .map_type == $prepare.map_type and
+      .map_id == $prepare.map_id and .max_entries == $prepare.max_entries and
+      .process_map_id == $prepare.process_map_id and
+      .process_pid == $prepare.process_pid and
+      .process_namespace == $prepare.process_namespace and
+      .synthetic_pid == 0 and .synthetic_namespace == 0 and
+      .touched == $prepare.max_entries and
+      .capacity_rejected_entries == 1 and
+      .verified_present_entries == $prepare.max_entries and
+      .verified_absent_entries == 1 and
+      (.content_sha256 | type == "string" and test("^[0-9a-f]{64}$"))) and
+    ($verify | keys == [
+        "content_sha256", "kernel_name", "map_id", "map_name", "map_type",
+        "max_entries", "mode", "process_map_id", "process_namespace",
+        "process_pid", "status", "synthetic_namespace", "synthetic_pid",
+        "token_base", "touched", "verified_absent_entries",
+        "verified_present_entries"
+      ] and .status == "passed" and .mode == "verify" and
+      .map_name == $prepare.map_name and
+      .kernel_name == $prepare.kernel_name and .map_type == $prepare.map_type and
+      .map_id == $prepare.map_id and .max_entries == $prepare.max_entries and
+      .process_map_id == $prepare.process_map_id and
+      .process_pid == $prepare.process_pid and
+      .process_namespace == $prepare.process_namespace and
+      .synthetic_pid == 0 and .synthetic_namespace == 0 and .touched == 0 and
+      .verified_present_entries == $prepare.max_entries and
+      .verified_absent_entries == 1 and
+      .content_sha256 == $fill.content_sha256) and
+    ($cleanup | keys == [
+        "cleanup_verified", "kernel_name", "map_id", "map_name", "map_type",
+        "max_entries", "mode", "process_map_id", "process_namespace",
+        "process_pid", "status", "synthetic_namespace", "synthetic_pid",
+        "token_base", "touched", "verified_absent_entries"
+      ] and .status == "passed" and .mode == "cleanup" and
+      .map_name == $prepare.map_name and .kernel_name == $prepare.kernel_name and
+      .map_type == $prepare.map_type and
+      .map_id == $prepare.map_id and .max_entries == $prepare.max_entries and
+      .process_map_id == 0 and .process_pid == $prepare.process_pid and
+      .process_namespace == $prepare.process_namespace and
+      .synthetic_pid == 0 and .synthetic_namespace == 0 and
+      .touched == $prepare.max_entries and .cleanup_verified == true and
+      .verified_absent_entries == ($prepare.max_entries + 1) and
+      .touched == $fill.touched)
+  ' "$BUNDLE_DIR/$prepare" "$BUNDLE_DIR/$fill" "$BUNDLE_DIR/$verify" \
+    "$BUNDLE_DIR/$cleanup" >/dev/null || return 1
+  map_id="$(json_decimal_lexeme "$prepare" map_id)" || return 1
+  capacity="$(json_decimal_lexeme "$prepare" max_entries)" || return 1
+  token_prepare="$(json_decimal_lexeme "$prepare" token_base)" || return 1
+  token_fill="$(json_decimal_lexeme "$fill" token_base)" || return 1
+  token_verify="$(json_decimal_lexeme "$verify" token_base)" || return 1
+  token_cleanup="$(json_decimal_lexeme "$cleanup" token_base)" || return 1
+  [[ "$token_prepare" != 0 && "$token_prepare" == "$token_fill" &&
+    "$token_prepare" == "$token_verify" &&
+    "$token_prepare" == "$token_cleanup" ]] || return 1
+  for label in prepare fill verify cleanup; do
+    validate_bounded_regular_file_allow_empty \
+      "map-pressure-pressure-$label.stderr.log" \
+      "$RAW_V3_JSON_MAX_BYTES" 4096 || return 1
+  done
+  validate_raw_pressure_cleanup_attempts_v1 || return 1
+
+  baseline_entries="$(raw_pressure_map_entries \
+    phases/pressure-before/obi-metrics.prom "$map_id")" || return 1
+  recovered_entries="$(raw_pressure_map_entries \
+    map-pressure-pressure-recovered.prom "$map_id")" || return 1
+  sample_one_entries="$(raw_pressure_map_entries \
+    map-pressure-pressure-recovered-sample-01.prom "$map_id")" || return 1
+  sample_two_entries="$(raw_pressure_map_entries \
+    map-pressure-pressure-recovered-sample-02.prom "$map_id")" || return 1
+  [[ "$baseline_entries" == 0 && "$recovered_entries" =~ ^[0-9]+$ &&
+    "$sample_one_entries" =~ ^[0-9]+$ && "$sample_two_entries" =~ ^[0-9]+$ ]] ||
+    return 1
+  ((capacity == 10000 && recovered_entries <= baseline_entries &&
+    sample_one_entries <= baseline_entries && sample_two_entries <= baseline_entries)) ||
+    return 1
+  validate_raw_pressure_container_inspections || return 1
+  validate_raw_pressure_barrier pressure "$map_id" || return 1
+  validate_bounded_regular_file \
+    map-pressure-pressure-recovered-samples.log "$RAW_V3_JSON_MAX_BYTES" 4096 ||
+    return 1
+  [[ "$(tail -n 2 -- "$BUNDLE_DIR/map-pressure-pressure-recovered-samples.log" |
+    awk -v baseline="$baseline_entries" '
+      $0 ~ / matched=true / && $0 ~ / consecutive=[12]$/ {
+        entries = $0
+        sub(/^.* entries=/, "", entries)
+        sub(/ .*/, "", entries)
+        if (entries ~ /^(0|[1-9][0-9]*)$/ && entries <= baseline) count++
+      }
+      END { print count + 0 }')" == 2 ]] || return 1
+
+  for label in tls-boundary coalesced-bridge; do
+    validate_raw_receive_coordination "$label" || return 1
+  done
+  jq -e -s '
+    .[0].cursor_map_id == .[1].cursor_map_id and
+    .[0].guard_map_id == .[1].guard_map_id and
+    .[0].cursor_map_id != .[2].map_id and
+    .[0].guard_map_id != .[2].map_id
+  ' "$BUNDLE_DIR/receive-cursor-map-tls-boundary-before.json" \
+    "$BUNDLE_DIR/receive-cursor-map-coalesced-bridge-before.json" \
+    "$BUNDLE_DIR/map-pressure-pressure-prepare.json" >/dev/null
+}
+
+validate_raw_pressure_evidence() {
+  case "${RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION:-}" in
+    0) validate_raw_pressure_evidence_v0 ;;
+    1) validate_raw_pressure_evidence_v1 ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_raw_handoff_admission_contract() {
+  local relative_path=""
+  local is_pressure=false
+
+  case "${RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION:-}" in
+    0)
+      while IFS= read -r -d '' relative_path; do
+        if grep -Fq 'operation="handoff_admission"' \
+          "$BUNDLE_DIR/$relative_path"; then
+          return 1
+        fi
+      done < <(find -- "$BUNDLE_DIR" -type f \
+        \( -name '*.prom' -o -name '*.delta' \) \
+        -printf '%P\0' | LC_ALL=C sort -z)
+      ;;
+    1)
+      while IFS= read -r -d '' relative_path; do
+        is_pressure=false
+        if [[ "$relative_path" == phases/pressure-after/obi-metrics.delta ]]; then
+          is_pressure=true
+        fi
+        LC_ALL=C awk -v is_pressure="$is_pressure" '
+          /operation="handoff_admission"/ {
+            if ($0 !~ /^obi_java_remote_parent_operations_total\{operation="handoff_admission",status="(ambiguous|overload)",transport="tcp"\} before=(0|[1-9][0-9]*) after=(0|[1-9][0-9]*) delta=(0|[1-9][0-9]*)$/) {
+              invalid = 1
+              next
+            }
+            delta = $NF
+            sub(/^delta=/, "", delta)
+            before = $2
+            after = $3
+            sub(/^before=/, "", before)
+            sub(/^after=/, "", after)
+            if (is_pressure != "true" &&
+                (delta != 0 || before != after)) invalid = 1
+          }
+          END { exit invalid ? 1 : 0 }
+        ' "$BUNDLE_DIR/$relative_path" || return 1
+      done < <(find -- "$BUNDLE_DIR" -type f -name '*.delta' \
+        -printf '%P\0' | LC_ALL=C sort -z)
+      while IFS= read -r -d '' relative_path; do
+        LC_ALL=C awk '
+          /operation="handoff_admission"/ {
+            if ($0 !~ /^obi_java_remote_parent_operations_total\{operation="handoff_admission",status="(ambiguous|overload)",transport="tcp"\} (0|[1-9][0-9]*)$/) {
+              invalid = 1
+            }
+          }
+          END { exit invalid ? 1 : 0 }
+        ' "$BUNDLE_DIR/$relative_path" || return 1
+      done < <(find -- "$BUNDLE_DIR" -type f -name '*.prom' \
+        -printf '%P\0' | LC_ALL=C sort -z)
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_raw_stopped_admission_pre_stop_contract() {
+  local label=""
+  local pre_stop_pair=""
+  local stopped_pair=""
+
+  case "${RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION:-}" in
+    0) return 0 ;;
+    1) ;;
+    *) return 1 ;;
+  esac
+  for label in late-attach w3c-match extension-controls; do
+    pre_stop_pair="obi-metric-pairs/$label-pre-stop.json"
+    stopped_pair="obi-metric-pairs/$label-obi-stopped.json"
+    validate_obi_metric_pair "$pre_stop_pair" || return 1
+    validate_obi_metric_pair "$stopped_pair" || return 1
+    jq -e -s --arg label "$label" '
+      .[0] as $pre | .[1] as $stopped |
+      $pre.boundary == ($label + "-pre-stop") and
+      $pre.continuity == "same_process" and
+      $pre.before == {
+        state: "running",
+        identity_reference: ("phases/" + $label +
+          "-obi-pre-stop/obi-identity.json")
+      } and
+      $pre.after == {
+        state: "running",
+        identity_reference: ("phases/" + $label +
+          "-obi-running/obi-identity.json")
+      } and
+      [$pre.series[] | select(.operation == "handoff_admission")] as $pre_rows |
+      ($pre_rows | length) >= 1 and ($pre_rows | length) <= 2 and
+      ([$pre_rows[].status] | length == (unique | length)) and
+      ([$pre_rows[] | select(.status == "overload" and
+        (.before | test("^[1-9][0-9]*$")) and .after == .before and
+        .delta == "0")] | length) == 1 and
+      all($pre_rows[] | select(.status == "ambiguous");
+        .transport == "tcp" and .after == .before and .delta == "0") and
+      all($pre_rows[]; .transport == "tcp" and
+        (.status == "overload" or .status == "ambiguous")) and
+      $stopped.boundary == ($label + "-obi-stopped") and
+      $stopped.continuity == "same_process" and
+      $stopped.before == $pre.after and
+      $stopped.after == {
+        state: "obi_stopped",
+        identity_reference: ("phases/" + $label +
+          "-obi-stopped/obi-identity.json")
+      } and
+      [$stopped.series[] | select(.operation == "handoff_admission")] as $stopped_rows |
+      ($stopped_rows | length) == ($pre_rows | length) and
+      all($stopped_rows[];
+        .transport == "tcp" and
+        (.status == "overload" or .status == "ambiguous") and
+        .delta == null and
+        . as $stopped_row |
+        any($pre_rows[];
+          .status == $stopped_row.status and
+          .after == $stopped_row.before))
+    ' "$BUNDLE_DIR/$pre_stop_pair" "$BUNDLE_DIR/$stopped_pair" >/dev/null ||
+      return 1
+  done
 }
 
 validate_raw_receive_coordination() {
@@ -4996,7 +6266,8 @@ raw_v3_producer_boundary_owner() {
     basic-permanent-absence-recovery)
       printf 'permanent-absence\n'
       ;;
-    late-attach-obi-stopped|fail-open-obi-absent|w3c-only-obi-absent|\
+    late-attach-pre-stop|late-attach-obi-stopped|\
+    fail-open-obi-absent|w3c-only-obi-absent|\
     restart-late-attach-recovery)
       printf 'late-attach\n'
       ;;
@@ -5008,10 +6279,11 @@ raw_v3_producer_boundary_owner() {
     basic-helper-attach-recovery)
       printf 'helper-attach-failure\n'
       ;;
-    w3c-match-obi-stopped)
+    w3c-match-pre-stop|w3c-match-obi-stopped)
       printf 'w3c-match\n'
       ;;
-    extension-controls-obi-stopped|w3c-only-extension-absent|\
+    extension-controls-pre-stop|extension-controls-obi-stopped|\
+    w3c-only-extension-absent|\
     w3c-only-extension-disabled)
       printf 'extension-controls\n'
       ;;
@@ -5072,6 +6344,92 @@ validate_raw_v3_terminal_private_state() {
     "$BUNDLE_DIR/terminal-java-diagnostics.json" >/dev/null
 }
 
+raw_v3_manifest_add_pressure_cleanup_attempts() {
+  local -r files="$1"
+  local cleanup_status=""
+  local attempt_name=""
+  local attempt_status=""
+  local command_status=""
+  local validation_status=""
+  local recovery_status=""
+  local deletion_reused=""
+  local output_reference=""
+  local stderr_reference=""
+  local -i attempt=0
+  local -i final_attempt=0
+
+  cleanup_status="$(find -- "$BUNDLE_DIR" -mindepth 1 -maxdepth 1 -type f \
+    -name 'map-pressure-pressure-cleanup-attempt-??.status' -print |
+    LC_ALL=C sort | tail -n 1)" || return 1
+  [[ "${cleanup_status##*/}" =~ ^map-pressure-pressure-cleanup-attempt-0([1-3])\.status$ ]] ||
+    return 1
+  final_attempt="${BASH_REMATCH[1]}"
+  for ((attempt = 1; attempt <= final_attempt; attempt++)); do
+    printf -v attempt_name 'map-pressure-pressure-cleanup-attempt-%02d' "$attempt"
+    attempt_status="$BUNDLE_DIR/$attempt_name.status"
+    printf '%s.status\n' "$attempt_name" >>"$files" || return 1
+    case "${RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION:-}" in
+      0)
+        command_status="$(key_value "$attempt_status" command_status)" || return 1
+        validation_status="$(key_value "$attempt_status" validation_status)" ||
+          return 1
+        recovery_status="$(key_value "$attempt_status" recovery_status)" || return 1
+        printf '%s\n%s\n' "$attempt_name.json" "$attempt_name.stderr.log" \
+          >>"$files" || return 1
+        case "$command_status:$validation_status:$recovery_status" in
+          0:passed:passed|0:failed:passed)
+            printf '%s\n' \
+              "$attempt_name-recovered.prom" \
+              "$attempt_name-recovered-sample-01.prom" \
+              "$attempt_name-recovered-sample-02.prom" \
+              "$attempt_name-recovered-samples.log" >>"$files" || return 1
+            ;;
+          0:passed:failed)
+            printf '%s-recovered-samples.log\n' "$attempt_name" >>"$files" || return 1
+            if [[ -e "$BUNDLE_DIR/$attempt_name-recovered.prom" ]]; then
+              printf '%s\n' \
+                "$attempt_name-recovered.prom" \
+                "$attempt_name-recovered-sample-01.prom" \
+                "$attempt_name-recovered-sample-02.prom" >>"$files" || return 1
+            fi
+            ;;
+          0:failed:not-run|[1-9]*:not-run:not-run) ;;
+          *) return 1 ;;
+        esac
+        ;;
+      1)
+        deletion_reused="$(key_value "$attempt_status" deletion_reused)" || return 1
+        recovery_status="$(key_value "$attempt_status" recovery_status)" || return 1
+        if [[ "$deletion_reused" == false ]]; then
+          output_reference="$(key_value \
+            "$attempt_status" deletion_output_reference)" || return 1
+          stderr_reference="$(key_value \
+            "$attempt_status" deletion_stderr_reference)" || return 1
+          printf '%s\n%s\n' "$output_reference" "$stderr_reference" \
+            >>"$files" || return 1
+        elif [[ "$deletion_reused" != true ]]; then
+          return 1
+        fi
+        case "$recovery_status" in
+          passed)
+            printf '%s\n' \
+              "$attempt_name-recovered.prom" \
+              "$attempt_name-recovered-sample-01.prom" \
+              "$attempt_name-recovered-sample-02.prom" \
+              "$attempt_name-recovered-samples.log" >>"$files" || return 1
+            ;;
+          failed)
+            printf '%s-recovered-samples.log\n' "$attempt_name" >>"$files" || return 1
+            ;;
+          not-run) ;;
+          *) return 1 ;;
+        esac
+        ;;
+      *) return 1 ;;
+    esac
+  done
+}
+
 validate_raw_v3_exact_closure() {
   local -r kind="$1"
   local expected_files="$TMP_DIR/raw-v3-files.expected"
@@ -5096,7 +6454,7 @@ validate_raw_v3_exact_closure() {
   local command_status=""
   local validation_status=""
   local recovery_status=""
-  local monitor_status=""
+  local barrier_status=""
   local attempts=""
   local cleanup_status=""
   local -i attempt=0
@@ -5198,8 +6556,6 @@ validate_raw_v3_exact_closure() {
       map-pressure-pressure-prepare.json map-pressure-pressure-prepare.stderr.log \
       map-pressure-pressure-fill.json map-pressure-pressure-fill.stderr.log \
       map-pressure-pressure-cleanup.json map-pressure-pressure-cleanup.stderr.log \
-      map-pressure-pressure-monitor.log map-pressure-pressure-pressured.prom \
-      map-pressure-pressure-traffic-complete.prom \
       map-pressure-pressure-recovered.prom \
       map-pressure-pressure-recovered-sample-01.prom \
       map-pressure-pressure-recovered-sample-02.prom \
@@ -5251,6 +6607,27 @@ validate_raw_v3_exact_closure() {
       compose-uninstrumented-control.yaml \
       >>"$expected_files" || return 1
 
+    case "${RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION:-}" in
+      0)
+        printf '%s\n' \
+          map-pressure-pressure-monitor.log \
+          map-pressure-pressure-pressured.prom \
+          map-pressure-pressure-traffic-complete.prom \
+          >>"$expected_files" || return 1
+        ;;
+      1)
+        printf '%s\n' \
+          map-pressure-pressure-verify.json \
+          map-pressure-pressure-verify.stderr.log \
+          map-pressure-pressure-barrier-ready.txt \
+          map-pressure-pressure-barrier-release.txt \
+          map-pressure-pressure-barrier-status.json \
+          map-pressure-pressure-container-inspections.json \
+          >>"$expected_files" || return 1
+        ;;
+      *) return 1 ;;
+    esac
+
     for control in permanent-absence-disabled permanent-absence \
       helper-attach-bridge-disabled helper-attach-failure helper-attach-recovery \
       instrumented-control uninstrumented-control; do
@@ -5280,75 +6657,7 @@ validate_raw_v3_exact_closure() {
       done
     done
 
-    cleanup_status="$(find -- "$BUNDLE_DIR" -mindepth 1 -maxdepth 1 -type f \
-      -name 'map-pressure-pressure-cleanup-attempt-??.status' -print |
-      LC_ALL=C sort | tail -n 1)" || return 1
-    [[ "${cleanup_status##*/}" =~ ^map-pressure-pressure-cleanup-attempt-0([1-3])\.status$ ]] ||
-      return 1
-    final_attempt="${BASH_REMATCH[1]}"
-    for ((attempt = 1; attempt <= final_attempt; attempt++)); do
-      printf -v attempt_name 'map-pressure-pressure-cleanup-attempt-%02d' "$attempt"
-      printf '%s\n' "$attempt_name.json" "$attempt_name.stderr.log" \
-        "$attempt_name.status" >>"$expected_files" || return 1
-      attempt_status="$BUNDLE_DIR/$attempt_name.status"
-      validate_key_value_file "$attempt_status" || return 1
-      [[ "$(awk 'END { print NR + 0 }' "$attempt_status")" == 4 &&
-        "$(cut -d= -f1 -- "$attempt_status" | LC_ALL=C sort | tr '\n' ' ')" == \
-          'command_status monitor_status recovery_status validation_status ' ]] ||
-        return 1
-      command_status="$(key_value "$attempt_status" command_status)" || return 1
-      validation_status="$(key_value "$attempt_status" validation_status)" ||
-        return 1
-      recovery_status="$(key_value "$attempt_status" recovery_status)" || return 1
-      monitor_status="$(key_value "$attempt_status" monitor_status)" || return 1
-      [[ "$command_status" =~ ^(0|[1-9][0-9]{0,2})$ &&
-        "$monitor_status" == 0 ]] || return 1
-      ((command_status <= 255)) || return 1
-      case "$command_status:$validation_status:$recovery_status" in
-        0:passed:passed)
-          ((attempt == final_attempt)) || return 1
-          printf '%s\n' \
-            "$attempt_name-recovered.prom" \
-            "$attempt_name-recovered-sample-01.prom" \
-            "$attempt_name-recovered-sample-02.prom" \
-            "$attempt_name-recovered-samples.log" \
-            >>"$expected_files" || return 1
-          ;;
-        0:passed:failed)
-          ((attempt < final_attempt)) || return 1
-          if [[ -e "$BUNDLE_DIR/$attempt_name-recovered.prom" ||
-            -e "$BUNDLE_DIR/$attempt_name-recovered-sample-01.prom" ||
-            -e "$BUNDLE_DIR/$attempt_name-recovered-sample-02.prom" ]]; then
-            [[ -f "$BUNDLE_DIR/$attempt_name-recovered.prom" &&
-              ! -L "$BUNDLE_DIR/$attempt_name-recovered.prom" &&
-              -f "$BUNDLE_DIR/$attempt_name-recovered-sample-01.prom" &&
-              ! -L "$BUNDLE_DIR/$attempt_name-recovered-sample-01.prom" &&
-              -f "$BUNDLE_DIR/$attempt_name-recovered-sample-02.prom" &&
-              ! -L "$BUNDLE_DIR/$attempt_name-recovered-sample-02.prom" ]] ||
-              return 1
-            printf '%s\n' \
-              "$attempt_name-recovered.prom" \
-              "$attempt_name-recovered-sample-01.prom" \
-              "$attempt_name-recovered-sample-02.prom" \
-              >>"$expected_files" || return 1
-          fi
-          printf '%s-recovered-samples.log\n' "$attempt_name" \
-            >>"$expected_files" || return 1
-          ;;
-        0:failed:passed)
-          ((attempt < final_attempt)) || return 1
-          printf '%s\n' \
-            "$attempt_name-recovered.prom" \
-            "$attempt_name-recovered-sample-01.prom" \
-            "$attempt_name-recovered-sample-02.prom" \
-            "$attempt_name-recovered-samples.log" >>"$expected_files" || return 1
-          ;;
-        0:failed:not-run|[1-9]*:not-run:not-run)
-          ((attempt < final_attempt)) || return 1
-          ;;
-        *) return 1 ;;
-      esac
-    done
+    raw_v3_manifest_add_pressure_cleanup_attempts "$expected_files" || return 1
 
     for label in "${normal_scenarios[@]}"; do
       if [[ "$label" == coalesced-bridge || "$label" == timeout-retry ]]; then
@@ -5431,6 +6740,14 @@ validate_raw_v3_exact_closure() {
       scenario-security-status.json >>"$expected_statuses" || return 1
 
     for label in w3c-match late-attach extension-controls; do
+      if [[ "${RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION:-}" == 1 ]]; then
+        raw_v3_manifest_add_phase "$expected_files" "$expected_directories" \
+          "$label-obi-pre-stop" full-live || return 1
+        raw_v3_manifest_add_pair \
+          "$expected_files" "$expected_pairs" "$label-pre-stop" || return 1
+      elif [[ "${RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION:-}" != 0 ]]; then
+        return 1
+      fi
       raw_v3_manifest_add_phase "$expected_files" "$expected_directories" \
         "$label-obi-running" full-live || return 1
       raw_v3_manifest_add_phase "$expected_files" "$expected_directories" \
@@ -5494,8 +6811,13 @@ validate_raw_v3_exact_closure() {
     raw_v3_manifest_add_phase "$expected_files" "$expected_directories" \
       helper-attach-recovery java-only || return 1
 
-    raw_v3_manifest_add_phase "$expected_files" "$expected_directories" \
-      pressure-pressured full-live || return 1
+    if [[ "${RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION:-}" == 0 ]]; then
+      raw_v3_manifest_add_phase "$expected_files" "$expected_directories" \
+        pressure-pressured full-live || return 1
+    elif [[ "${RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION:-}" != 1 ]]; then
+      return 1
+    fi
+
     raw_v3_manifest_add_phase "$expected_files" "$expected_directories" \
       final full-unavailable-java || return 1
 
@@ -5781,6 +7103,9 @@ validate_raw_v3_bundle() {
       die "raw v3 stress metric-pair phase authority is invalid"
     }
     validate_raw_pressure_evidence || die "raw v3 pressure evidence is invalid"
+    validate_raw_stopped_admission_pre_stop_contract || {
+      die "raw v3 stopped-boundary pre-stop admission authority is invalid"
+    }
     validate_raw_resource_recovery || {
       die "raw v3 container-leader resource recovery evidence is invalid"
     }
@@ -5794,6 +7119,9 @@ validate_raw_v3_bundle() {
   fi
   validate_raw_v3_exact_closure "$kind" || {
     die "raw v3 file and directory closure is invalid"
+  }
+  validate_raw_handoff_admission_contract || {
+    die "raw v3 handoff-admission metric contract is invalid"
   }
 }
 

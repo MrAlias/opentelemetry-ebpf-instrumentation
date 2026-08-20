@@ -206,8 +206,9 @@ concurrency. It does not measure application instrumentation, request latency
 or throughput, process CPU, RSS/native/direct-memory, FD/thread/map growth,
 run-to-run variance, or native-sanitizer behavior. `ThreadMXBean` allocated-byte
 samples are bounded Java observations, not JFR/NMT or native-memory evidence.
-The retained result below is focused non-acceptance evidence: it advances
-issues #11, #18, #20, and #37 and closes none.
+The retained result below is focused non-acceptance evidence: it advances the
+linked benchmark issue and related transport and lifecycle issues, and closes
+none of them.
 
 Build the packaged agent first. On an otherwise idle privileged cgroup-v2 host,
 create a fresh artifact path in an existing owner-private directory and run:
@@ -317,14 +318,26 @@ getsockopt and Unix hit paths, getsockopt and Unix stale paths, Unix timeout,
 and getsockopt pressure. These artifacts use
 `bounded_correctness_observed_once`; they intentionally contain no application
 throughput or p50/p95/p99 claim. The pressure observation retains exact-parent
-and root counts, bounded capacity rejection, verified non-eviction for the
-non-evicting hash map, cleanup, and two canonical recovery Prometheus samples.
-Validation parses the baseline, pressured, traffic-complete, recovery samples,
-canonical recovered sample, and recovery-attempt log; it requires one stable
-map ID/type/capacity, the declared occupancy predicates, exactly two terminal
-consecutive recovery samples, and exact log/sample reconciliation. Nonempty or
-garbage files cannot satisfy that contract. It is one correctness observation,
-not a pressure performance benchmark.
+and root counts, bounded capacity rejection, exact post-traffic content
+preservation for the non-evicting hash map, cleanup, and two canonical recovery
+Prometheus samples. The runner privately retains an owner-only canonical
+container inspection covering the running and terminal scenario lifecycle.
+Validation checks its exact identity/image/command/labels/mount/runtime/state
+shape and binds its SHA-256 and byte size through both the barrier and scenario
+status. That private artifact and its identifiers are deliberately absent from
+`path-observation.json` and `lookup-paths.json`. Validation also parses the
+read-only preparation record, empty
+baseline, exact full fill, an extra key rejected only by the kernel's `E2BIG`
+capacity result, ordered key/value SHA-256,
+ready/fill/release barrier, post-traffic verification, admission counters,
+cleanup, canonical recovered sample, and recovery-attempt log. It requires one
+stable map ID/type/capacity; PID `0` and namespace `0` for the impossible
+synthetic key space; the same full-map digest before and after traffic; positive
+bounded `handoff_admission/overload`; zero
+`handoff_admission/ambiguous`; exactly two terminal consecutive recovery
+samples; and exact log/sample reconciliation. Nonempty or garbage files cannot
+satisfy that contract. It is one correctness observation, not a pressure
+performance benchmark.
 
 The native fixture executes 1,000 warmups and 10,000 measured operations for
 each getsockopt and Unix hit/miss/failure series and reports native p50/p95/p99.
@@ -575,20 +588,33 @@ Repeat with `--transport unix`; use the full `all` suite for the disabled,
 uninstrumented, W3C/no-state, miss, timeout, async-handoff, redispatch,
 virtual-thread, Netty, and restart controls. The pressure helper discovers the
 live non-evicting handoff-claim `HASH` map and records the exact map and JVM
-cleanup identity before mutation. It then arms cleanup, inserts tagged `OPEN`
-admission tickets until the first bounded capacity rejection, and scans every
-successful synthetic key to prove that none was evicted. Values use fresh
-monotonic observations tied to the one unambiguous live JVM incarnation. During 128
-concurrent marked handoff requests it checks once per second that exact-map
-occupancy remains above the pre-fill baseline without requiring exact capacity.
-The monitor retains an independent terminal sample and stops when the exact
-aggregate TCP-inject outcome total proves that outbound request publication,
-rather than later trace polling, is complete. It is reaped before removing only the
-deterministic keys reconstructed from the captured PID, namespace, and
-non-secret per-run token base, verifies every synthetic key is absent, then
-retains two consecutive at-or-below-baseline samples within a bounded TTL-aware
-recovery deadline. Canonical cleanup evidence is promoted only after that
-recovery gate passes. The incarnation capability is never written to evidence.
+cleanup identity before mutation. A private scenario process first publishes a
+ready record. The helper then arms cleanup and fills the impossible PID-zero,
+namespace-zero synthetic key space with exactly `max_entries` tagged `OPEN`
+tickets. It requires an empty baseline, one extra key rejected specifically by
+the kernel's `E2BIG` capacity result, exact lookup of every admitted key, and an
+ordered key/value SHA-256 before atomically publishing
+the scenario release. Values use fresh monotonic observations tied to the one
+unambiguous live JVM incarnation, while the impossible key identity keeps the
+production sweeper from reclaiming the controlled entries or real traffic from
+colliding with them. After all 128 marked handoff requests finish, a second scan
+requires the same map/process identity, all `max_entries` values, the same
+content digest, and the extra key still absent. The pressure delta must also
+contain at least one `handoff_admission/overload`, no
+`handoff_admission/ambiguous`, and no more admission failures than the
+request-count-derived bound. This admission signal is auxiliary; it is not
+added to upstream or retrieval conservation. Cleanup removes only the
+deterministic synthetic keys reconstructed from the non-secret per-run token
+base, verifies the full set plus the rejected key is absent, then retains two
+consecutive at-or-below-baseline samples within a bounded TTL-aware recovery
+deadline. Canonical cleanup evidence is promoted only after that recovery gate
+passes. The exact running and terminal container inspections are retained as a
+canonical owner-only `0600` raw artifact; the barrier and scenario status each
+bind its filename, SHA-256, and byte size. The inspection includes the private
+barrier session, container/image identity, command, labels, control-mount leaf,
+runtime flags, and lifecycle timestamps. Neither it nor those private values is
+published in normalized lookup observations or the seven-file bounded claims.
+The incarnation capability is likewise never published.
 Pressure results report exact hits and explicit Java roots separately: every
 nonzero parent must identify the exact Apache client, exact hits plus roots must
 equal the request count, and wrong-parent and unresolved counts must be zero.

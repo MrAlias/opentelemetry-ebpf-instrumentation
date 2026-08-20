@@ -133,20 +133,30 @@ transport and remains untouched.
   then require the legitimate exact parent assertion to pass.
 - Fill the discovered live non-evicting handoff-claim `HASH` map until its first
   bounded capacity rejection, after retaining its exact map and JVM cleanup
-  identity and arming cleanup. Derive synthetic keys and tagged `OPEN` values
-  from the one unambiguous live JVM PID/namespace/incarnation, scan every
-  successfully admitted synthetic key to prove that none was evicted, and
-  monitor exact-map occupancy above its
-  pre-fill baseline once per second through the exact aggregate TCP-inject
-  outcome total, retaining the terminal metric sample independently of later
-  trace polling. Remove only those deterministic keys, verify every one is
+  identity and arming cleanup. Use PID `0` and PID namespace `0` for an
+  impossible production key space while retaining the real JVM identity only
+  for map selection and cleanup authorization. Require an empty baseline,
+  exactly `max_entries` tagged `OPEN` values, one extra key rejected specifically
+  by the kernel's `E2BIG` capacity result, and a deterministic ordered key/value
+  SHA-256. Start the marked scenario behind a
+  private ready barrier, publish its release only after the fill proof, then
+  scan all entries after traffic and require the same digest, exact full count,
+  and still-absent extra key. Independently require positive bounded
+  `handoff_admission/overload` and zero `handoff_admission/ambiguous`; do not add
+  this auxiliary signal to upstream or retrieval conservation. Remove only the
+  deterministic synthetic keys, verify every one plus the rejected key is
   absent, then retain two consecutive at-or-below-baseline samples within a
   bounded TTL-aware recovery deadline. Classify every nonzero Java parent as an
   exact hit and only a true Java root as an explicit root, then reconcile those
-  outcomes with the actual bridge upstream/retrieval reasons and Java counts
-  using transport-aware conservation. Promote canonical cleanup evidence only
-  after that recovery gate passes. Evidence never records the incarnation
-  capability.
+  outcomes with the actual bridge upstream/retrieval reasons and Java counts.
+  Promote canonical cleanup evidence only after that recovery gate passes.
+  Retain the scenario's exact running and successful terminal Docker
+  inspections as one canonical owner-only `0600` raw artifact. Require its
+  immutable identity/image/command/labels/mount/runtime fields and lifecycle
+  transition, and bind its exact filename, SHA-256, and byte size in both the
+  barrier and scenario status. Evidence never records that inspection, its
+  container identifiers, the incarnation capability, or the private barrier
+  session in the normalized observation or public claim projection.
 - Restart only the `obi` service and preserve old descriptors long enough to
   test stale endpoint behavior.
 - Run `fd-port-reuse` to reuse one client ephemeral port across reconnects,
@@ -184,10 +194,17 @@ or credential topology; do not mark it pass.
   The harness binds that result to a stable Docker container identity and uses
   only the returned claim-map ID for host-global metric lookup. The helper
   bounds accepted capacity, uses fresh monotonic timestamps, and never emits
-  the JVM incarnation capability. Cleanup instead scans only the captured PID,
-  namespace, and random per-run token range, validates each matching key's
-  incarnation and open ticket, deletes the exact full keys, and verifies that
-  no key in that bounded range remains after the JVM identity entry disappears.
+  the JVM incarnation capability. Synthetic claim keys deliberately use PID
+  `0` and namespace `0`, so the production sweeper skips them and real JVM
+  traffic cannot collide with them. Cleanup scans only that synthetic key space
+  and the random per-run token range, validates each matching open ticket,
+  deletes the exact full set, and verifies that the set plus the rejected extra
+  key is absent. The retained real JVM identity still binds map selection and
+  cleanup authority. The separate private scenario-container inspection is
+  mode `0600`, single-link, canonical, size-bounded, and descriptor-bound to the
+  barrier and scenario status; projected lookup summaries and public claims
+  must not disclose its name, session, control-mount leaf, or container/image
+  identity.
 - The Unix fault responder is an acceptance-only, single-request-at-a-time
   service with named stale/malformed, timeout, disconnect, overload,
   truncation, envelope, version, and zero-ID modes. It uses strict request ABI

@@ -409,7 +409,7 @@ runbook="$7"
 source <(head -n -1 -- "$fixture_builders")
 trap - EXIT
 TEST_TMP_DIR="$builder_work"
-create_raw_v3_acceptance_fixture "$repository" "$revision" "$acceptance"
+create_raw_v3_acceptance_fixture "$repository" "$revision" "$acceptance" 1
 create_raw_v3_assertion_fixture "$repository" "$revision" "$assertion"
 source_tree_sha256="$(awk -F= '$1 == "source_tree_sha256" { print $2 }' \
   "$acceptance/environment.txt")"
@@ -627,17 +627,44 @@ expect_claim_bundle_rejection() {
 
 assert_raw_sensitive_artifacts_absent() {
   local -r output="$1"
+  local -r acceptance="$2"
+  local -r inspections="$acceptance/map-pressure-pressure-container-inspections.json"
   local relative=""
   local found=""
+  local private_value=""
+  local container_id=""
+  local image_id=""
+  local -a private_values=()
   local -a forbidden=(
     failure-context.txt
     scenario-assertion-failure.json
     scenario-assertion-failure-status.json
     map-pressure-pressure-prepare.json
+    map-pressure-pressure-prepare.stderr.log
     map-pressure-pressure-fill.json
+    map-pressure-pressure-fill.stderr.log
+    map-pressure-pressure-verify.json
+    map-pressure-pressure-verify.stderr.log
     map-pressure-pressure-cleanup.json
+    map-pressure-pressure-cleanup.stderr.log
+    map-pressure-pressure-cleanup-attempt-01.json
+    map-pressure-pressure-cleanup-attempt-01.stderr.log
+    map-pressure-pressure-cleanup-attempt-01.status
+    map-pressure-pressure-barrier-ready.txt
+    map-pressure-pressure-barrier-release.txt
+    map-pressure-pressure-barrier-status.json
+    map-pressure-pressure-container-inspections.json
     map-pressure-pressure-monitor.log
+    map-pressure-pressure-pressured.prom
+    map-pressure-pressure-traffic-complete.prom
+    map-pressure-pressure-recovered.prom
+    map-pressure-pressure-recovered-sample-01.prom
+    map-pressure-pressure-recovered-sample-02.prom
     map-pressure-pressure-recovered-samples.log
+    scenario-pressure.json
+    scenario-pressure-status.json
+    scenario-pressure.stderr.log
+    phases/pressure-after/obi-metrics.delta
     receive-cursor-map-tls-boundary-before.json
     receive-cursor-map-tls-boundary-after.json
     receive-cursor-map-tls-boundary-status.json
@@ -652,8 +679,33 @@ assert_raw_sensitive_artifacts_absent() {
   done
   found="$(find -- "$output" -type f \
     \( -name '*.stderr.log' -o -name '*.pem' -o -name '*.key' \
-      -o -name '*.jar' -o -name 'failure-context.txt' \) -print -quit)"
+      -o -name '*.jar' -o -name 'failure-context.txt' \
+      -o -name 'map-pressure-pressure-*' -o -name 'scenario-pressure*' \
+      -o -path '*/phases/pressure-*/*' \) -print -quit)"
   [[ -z "$found" ]] || die "raw-sensitive artifact escaped projection: $found"
+
+  [[ -f "$inspections" && ! -L "$inspections" ]] ||
+    die "private pressure container inspection fixture is unavailable"
+  mapfile -t private_values < <(jq -er '
+    [.session, .running.identity.name, .running.mount.source_leaf] | .[]
+  ' "$inspections")
+  (( ${#private_values[@]} == 3 )) ||
+    die "private pressure container inspection fixture is incomplete"
+  for private_value in "${private_values[@]}"; do
+    [[ -n "$private_value" ]] ||
+      die "private pressure container inspection fixture has an empty discriminator"
+    if grep -R -F -- "$private_value" "$output" >/dev/null; then
+      die "private pressure container inspection content escaped projection"
+    fi
+  done
+  container_id="$(jq -er '.running.identity.id' "$inspections")" ||
+    die "private pressure container ID is unavailable"
+  image_id="$(jq -er '.running.identity.image_id' "$inspections")" ||
+    die "private pressure image ID is unavailable"
+  if grep -R -F -- "\"id\":\"$container_id\"" "$output" >/dev/null ||
+    grep -R -F -- "\"image_id\":\"$image_id\"" "$output" >/dev/null; then
+    die "private pressure container identity escaped projection"
+  fi
 }
 
 replace_environment_architecture() {
@@ -754,8 +806,10 @@ test_success_and_determinism() {
   run_portable_claim_verifier "$first"
   assert_sealed_output "$first"
   assert_exact_claim_closure "$first"
-  assert_raw_sensitive_artifacts_absent "$first"
+  assert_raw_sensitive_artifacts_absent "$first" "$acceptance"
   jq -e '
+    .issue_32.producer_status_roster.boundary_count == 35 and
+    .issue_32.producer_status_roster.status_entry_count == 56 and
     .issue_34.scenarios[8] as $timeout |
     $timeout.name == "timeout-retry" and
     $timeout.reconciliation == {outcome:"reason_coded_drop",reason:"timeout"} and
@@ -1880,7 +1934,8 @@ main() {
   git -C "$repository" config user.email 'retained-projection-test@example.invalid'
   git -C "$repository" config user.name 'Retained Projection Test'
   git -C "$repository" config commit.gpgSign false
-  mkdir -p -- "$fixture_scripts" "$repository/.github/workflows"
+  mkdir -p -- "$fixture_scripts" "$repository/.github/workflows" \
+    "$repository/examples/apache-java-https"
   cp -- "$PROJECTOR_SOURCE" "$fixture_projector"
   cp -- "$VERIFIER_SOURCE" "$fixture_real_verifier"
   cp -- "$AGENT_DOWNLOAD_SOURCE" "$fixture_agent_download"
@@ -1889,6 +1944,8 @@ main() {
   write_verifier_wrapper "$fixture_verifier"
   printf '%s\n' 'name: synthetic acceptance claims' \
     >"$repository/.github/workflows/java_remote_parent_acceptance_claims.yml"
+  printf '%s\n' 'PRESSURE_TRAFFIC_CONTRACT_VERSION=1' \
+    >"$repository/examples/apache-java-https/run.sh"
   printf 'tested source\n' >"$repository/source.txt"
   commit_fixture "$repository" 'Create synthetic projector authority'
   revision="$(git -C "$repository" rev-parse HEAD)"

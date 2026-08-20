@@ -5,7 +5,9 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -30,14 +32,15 @@ const (
 )
 
 type config struct {
-	mapID                uint
-	expectedMaxEntries   uint
-	expectedProcessMapID uint
-	mode                 string
-	seed                 uint
-	processPID           uint
-	processNamespace     uint
-	tokenBase            uint64
+	mapID                 uint
+	expectedMaxEntries    uint
+	expectedProcessMapID  uint
+	mode                  string
+	seed                  uint
+	processPID            uint
+	processNamespace      uint
+	tokenBase             uint64
+	expectedContentSHA256 string
 }
 
 type result struct {
@@ -52,9 +55,12 @@ type result struct {
 	ProcessPID              uint32 `json:"process_pid"`
 	ProcessNamespace        uint32 `json:"process_namespace"`
 	TokenBase               uint64 `json:"token_base"`
+	SyntheticPID            uint32 `json:"synthetic_pid"`
+	SyntheticNamespace      uint32 `json:"synthetic_namespace"`
 	Touched                 uint32 `json:"touched"`
 	CapacityRejectedEntries uint32 `json:"capacity_rejected_entries,omitempty"`
 	VerifiedPresentEntries  uint32 `json:"verified_present_entries,omitempty"`
+	ContentSHA256           string `json:"content_sha256,omitempty"`
 	CleanupVerified         bool   `json:"cleanup_verified,omitempty"`
 	VerifiedAbsentEntries   uint32 `json:"verified_absent_entries,omitempty"`
 }
@@ -88,7 +94,7 @@ func parseFlags() (config, error) {
 	flag.UintVar(&cfg.mapID, "map-id", 0, "live eBPF map ID")
 	flag.UintVar(&cfg.expectedMaxEntries, "expected-max-entries", 0, "expected live map capacity")
 	flag.UintVar(&cfg.expectedProcessMapID, "expected-process-map-id", 0, "prepared process map ID")
-	flag.StringVar(&cfg.mode, "mode", "prepare", "prepare, fill, or cleanup")
+	flag.StringVar(&cfg.mode, "mode", "prepare", "prepare, fill, verify, or cleanup")
 	flag.UintVar(&cfg.seed, "seed", 1, "per-run synthetic token namespace seed")
 	flag.UintVar(&cfg.processPID, "process-pid", 0, "prepared live JVM process ID")
 	flag.UintVar(
@@ -98,6 +104,12 @@ func parseFlags() (config, error) {
 		"prepared live JVM PID namespace",
 	)
 	flag.Uint64Var(&cfg.tokenBase, "token-base", 0, "prepared synthetic token base")
+	flag.StringVar(
+		&cfg.expectedContentSHA256,
+		"expected-content-sha256",
+		"",
+		"fill result content digest required by verify mode",
+	)
 	flag.Parse()
 
 	if flag.NArg() != 0 {
@@ -128,20 +140,31 @@ func validateConfig(cfg config) error {
 	if uint64(cfg.processNamespace) > uint64(^uint32(0)) {
 		return errors.New("process-namespace exceeds 32 bits")
 	}
-	if cfg.mode != "prepare" && cfg.mode != "fill" && cfg.mode != "cleanup" {
-		return errors.New("mode must be prepare, fill, or cleanup")
+	if cfg.mode != "prepare" && cfg.mode != "fill" && cfg.mode != "verify" &&
+		cfg.mode != "cleanup" {
+		return errors.New("mode must be prepare, fill, verify, or cleanup")
 	}
 	if cfg.mode == "prepare" &&
 		(cfg.mapID != 0 || cfg.expectedMaxEntries != 0 || cfg.expectedProcessMapID != 0 ||
-			cfg.processPID == 0 || cfg.processNamespace == 0 || cfg.tokenBase != 0) {
+			cfg.processPID == 0 || cfg.processNamespace == 0 || cfg.tokenBase != 0 ||
+			cfg.expectedContentSHA256 != "") {
 		return errors.New("prepare requires only process-pid and process-namespace")
 	}
-	if cfg.mode == "fill" &&
+	if (cfg.mode == "fill" || cfg.mode == "verify") &&
 		(cfg.mapID == 0 || cfg.expectedMaxEntries == 0 || cfg.expectedProcessMapID == 0 ||
 			cfg.processPID == 0 || cfg.processNamespace == 0 || cfg.tokenBase == 0) {
 		return errors.New(
-			"fill requires map-id, expected-max-entries, expected-process-map-id, process-pid, process-namespace, and token-base",
+			cfg.mode + " requires map-id, expected-max-entries, expected-process-map-id, process-pid, process-namespace, and token-base",
 		)
+	}
+	if cfg.mode == "verify" {
+		decoded, err := hex.DecodeString(cfg.expectedContentSHA256)
+		if err != nil || len(decoded) != sha256.Size ||
+			cfg.expectedContentSHA256 != fmt.Sprintf("%x", decoded) {
+			return errors.New("verify requires a lowercase 64-hex expected-content-sha256")
+		}
+	} else if cfg.expectedContentSHA256 != "" {
+		return errors.New("expected-content-sha256 is valid only in verify mode")
 	}
 	if cfg.mode == "cleanup" &&
 		(cfg.mapID == 0 || cfg.expectedMaxEntries == 0 || cfg.processPID == 0 ||
@@ -231,7 +254,7 @@ func runWithDependencies(cfg config, dependencies runDependencies) (result, erro
 	}
 	entryCount := info.MaxEntries + 1
 	tokenBase := cfg.tokenBase
-	if cfg.mode == "fill" {
+	if cfg.mode == "fill" || cfg.mode == "verify" {
 		processes, discoveredMapID, openErr := dependencies.openProcessMap(mapID)
 		if openErr != nil {
 			return result{}, openErr
@@ -312,6 +335,28 @@ func runWithDependencies(cfg config, dependencies runDependencies) (result, erro
 		output.CleanupVerified = true
 		return output, nil
 	}
+	if cfg.mode == "verify" {
+		output.VerifiedPresentEntries, output.VerifiedAbsentEntries,
+			output.ContentSHA256, err = verifySyntheticEntries(
+			identity,
+			tokenBase,
+			info.MaxEntries,
+			func(key []byte, value *[targetValueSize]byte) error {
+				return target.Lookup(key, value)
+			},
+		)
+		if err != nil {
+			return result{}, err
+		}
+		if output.ContentSHA256 != cfg.expectedContentSHA256 {
+			return result{}, fmt.Errorf(
+				"synthetic content digest changed: expected %s, got %s",
+				cfg.expectedContentSHA256,
+				output.ContentSHA256,
+			)
+		}
+		return output, nil
+	}
 	for index := uint32(0); index < entryCount; index++ {
 		key := syntheticKey(identity, tokenBase, index)
 		switch cfg.mode {
@@ -346,13 +391,21 @@ func runWithDependencies(cfg config, dependencies runDependencies) (result, erro
 		if filledEntries == 0 {
 			return result{}, errors.New("map reached capacity before admitting a synthetic ticket")
 		}
-		output.VerifiedPresentEntries, err = verifySyntheticEntriesPresent(
+		if filledEntries != info.MaxEntries {
+			cleanupFailedFill()
+			return result{}, fmt.Errorf(
+				"map rejected capacity after %d synthetic entries, expected %d",
+				filledEntries,
+				info.MaxEntries,
+			)
+		}
+		output.VerifiedPresentEntries, output.VerifiedAbsentEntries,
+			output.ContentSHA256, err = verifySyntheticEntries(
 			identity,
 			tokenBase,
 			filledEntries,
-			func(key []byte) error {
-				var value [targetValueSize]byte
-				return target.Lookup(key, &value)
+			func(key []byte, value *[targetValueSize]byte) error {
+				return target.Lookup(key, value)
 			},
 		)
 		if err != nil {
@@ -397,9 +450,9 @@ func cleanupSyntheticEntries(
 		if !syntheticKeyInRange(entry.key, identity, tokenBase, entryCount) {
 			continue
 		}
-		if !syntheticEntryValueMatchesKey(entry) {
-			return 0, 0, errors.New("synthetic entry has an invalid incarnation or ticket")
-		}
+		// PID/namespace zero and the per-run token range are the cleanup
+		// authority. Delete an owned key even if its value was corrupted so a
+		// failed verification cannot make recovery permanently impossible.
 		if uint32(len(keys)) >= entryCount {
 			return 0, 0, errors.New("synthetic entry scan exceeded its bounded token range")
 		}
@@ -426,8 +479,9 @@ func syntheticKeyInRange(
 	key [targetKeySize]byte, identity processIdentity, tokenBase uint64, entryCount uint32,
 ) bool {
 	if entryCount == 0 ||
-		binary.LittleEndian.Uint32(key[0:4]) != identity.pid ||
-		binary.LittleEndian.Uint32(key[4:8]) != identity.namespace {
+		identity.pid == 0 || identity.namespace == 0 ||
+		binary.LittleEndian.Uint32(key[0:4]) != 0 ||
+		binary.LittleEndian.Uint32(key[4:8]) != 0 {
 		return false
 	}
 	token := binary.LittleEndian.Uint64(key[8:16])
@@ -445,28 +499,48 @@ func syntheticEntryValueMatchesKey(entry targetEntry) bool {
 }
 
 func isCapacityRejection(err error) bool {
-	return errors.Is(err, syscall.E2BIG) || errors.Is(err, syscall.ENOSPC)
+	return errors.Is(err, syscall.E2BIG)
 }
 
-func verifySyntheticEntriesPresent(
+func verifySyntheticEntries(
 	identity processIdentity,
 	tokenBase uint64,
 	entryCount uint32,
-	lookup func([]byte) error,
-) (uint32, error) {
+	lookup func([]byte, *[targetValueSize]byte) error,
+) (uint32, uint32, string, error) {
+	digest := sha256.New()
 	presentEntries := uint32(0)
 	for index := uint32(0); index < entryCount; index++ {
-		err := lookup(syntheticKey(identity, tokenBase, index))
+		key := syntheticKey(identity, tokenBase, index)
+		var value [targetValueSize]byte
+		err := lookup(key, &value)
 		switch {
 		case err == nil:
+			var entry targetEntry
+			copy(entry.key[:], key)
+			entry.value = value
+			if !syntheticEntryValueMatchesKey(entry) ||
+				binary.LittleEndian.Uint64(key[16:24]) != identity.incarnation {
+				return 0, 0, "", fmt.Errorf("synthetic entry %d changed", index)
+			}
+			_, _ = digest.Write(key)
+			_, _ = digest.Write(value[:])
 			presentEntries++
 		case errors.Is(err, ebpf.ErrKeyNotExist):
-			return 0, fmt.Errorf("synthetic entry %d was evicted", index)
+			return 0, 0, "", fmt.Errorf("synthetic entry %d was evicted", index)
 		default:
-			return 0, fmt.Errorf("lookup synthetic entry %d: %w", index, err)
+			return 0, 0, "", fmt.Errorf("lookup synthetic entry %d: %w", index, err)
 		}
 	}
-	return presentEntries, nil
+	var rejectedValue [targetValueSize]byte
+	err := lookup(syntheticKey(identity, tokenBase, entryCount), &rejectedValue)
+	if err == nil {
+		return 0, 0, "", errors.New("capacity-plus-one synthetic entry became present")
+	}
+	if !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return 0, 0, "", fmt.Errorf("lookup capacity-plus-one synthetic entry: %w", err)
+	}
+	return presentEntries, 1, hex.EncodeToString(digest.Sum(nil)), nil
 }
 
 func openProcessMap(targetID ebpf.MapID) (*ebpf.Map, ebpf.MapID, error) {
@@ -944,8 +1018,11 @@ func validateTarget(info *ebpf.MapInfo, expectedMaxEntries uint32) error {
 
 func syntheticKey(identity processIdentity, tokenBase uint64, index uint32) []byte {
 	key := make([]byte, targetKeySize)
-	binary.LittleEndian.PutUint32(key[0:4], identity.pid)
-	binary.LittleEndian.PutUint32(key[4:8], identity.namespace)
+	// PID and namespace zero are impossible for a live producer execution key.
+	// The production sweep skips these synthetic entries while the real JVM
+	// identity remains independently pinned for map discovery and verification.
+	binary.LittleEndian.PutUint32(key[0:4], 0)
+	binary.LittleEndian.PutUint32(key[4:8], 0)
 	binary.LittleEndian.PutUint64(key[8:16], syntheticToken(tokenBase, index))
 	binary.LittleEndian.PutUint64(key[16:24], identity.incarnation)
 	return key

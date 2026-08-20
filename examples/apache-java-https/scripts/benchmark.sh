@@ -84,6 +84,8 @@ readonly W3C_DISCARD_CELLS=(getsockopt-w3c)
 readonly PRESSURE_REQUESTS=128
 readonly PRESSURE_MAP_MAX_SUPPORTED_ENTRIES=50000
 readonly PRESSURE_RECOVERY_REQUIRED_SAMPLES=2
+readonly PRESSURE_ADMISSION_MAX_EVENTS_PER_REQUEST=9
+readonly PRESSURE_CONTAINER_INSPECTIONS_MAX_BYTES=32768
 readonly PROC_CGROUP_CONTAINER_BINDING="full_container_id_at_non_hex_boundaries"
 
 OUTPUT_DIR=""
@@ -1065,10 +1067,18 @@ cell_spec() {
       CELL_MEASUREMENT_REQUESTS="$PRESSURE_REQUESTS"
       CELL_BOUNDED_PATH=true
       CELL_EXTRA_RUNNER_FILES=(
+        map-pressure-pressure-prepare.json
+        map-pressure-pressure-prepare.stderr.log
         map-pressure-pressure-fill.json
+        map-pressure-pressure-fill.stderr.log
+        map-pressure-pressure-verify.json
+        map-pressure-pressure-verify.stderr.log
+        map-pressure-pressure-barrier-ready.txt
+        map-pressure-pressure-barrier-release.txt
+        map-pressure-pressure-barrier-status.json
+        map-pressure-pressure-container-inspections.json
         map-pressure-pressure-cleanup.json
-        map-pressure-pressure-pressured.prom
-        map-pressure-pressure-traffic-complete.prom
+        map-pressure-pressure-cleanup.stderr.log
         map-pressure-pressure-recovered.prom
         map-pressure-pressure-recovered-sample-01.prom
         map-pressure-pressure-recovered-sample-02.prom
@@ -3236,7 +3246,8 @@ helper_idle_metric_delta_json() {
   report_before="$(helper_idle_report_value "$before")" || return 1
   report_after="$(helper_idle_report_value "$after")" || return 1
   ((report_after > report_before)) || return 1
-  for name in tcp-candidate tcp-inject tcp-stage tcp-handoff getsockopt-take getsockopt-discard; do
+  for name in tcp-candidate tcp-inject tcp-stage tcp-handoff \
+    tcp-handoff_admission getsockopt-take getsockopt-discard; do
     case "$name" in
       tcp-*)
         operation="${name#tcp-}"
@@ -3319,7 +3330,7 @@ helper_idle_metric_delta_json() {
         interpretation: "informative_only_not_a_retrieval_outcome_reconciliation"
       },
       assertion: {
-        tcp_upstream_candidate_inject_stage_handoff_delta_zero: true,
+        tcp_upstream_candidate_inject_stage_handoff_and_admission_delta_zero: true,
         getsockopt_take_discard_delta_zero: true
       }
     }' >"$output"
@@ -5097,22 +5108,16 @@ pressure_map_sample_json() {
 
 pressure_recovery_evidence_json() {
   local -r runner_directory="$1"
-  local -r fill_file="$runner_directory/map-pressure-pressure-fill.json"
+  local -r prepare_file="$runner_directory/map-pressure-pressure-prepare.json"
   local -r baseline_file="$runner_directory/phases/pressure-before/obi-metrics.prom"
-  local -r pressured_file="$runner_directory/map-pressure-pressure-pressured.prom"
-  local -r traffic_file="$runner_directory/map-pressure-pressure-traffic-complete.prom"
   local -r recovered_file="$runner_directory/map-pressure-pressure-recovered.prom"
   local -r recovery_log="$runner_directory/map-pressure-pressure-recovered-samples.log"
   local map_id=""
   local max_entries=""
   local map_type=""
   local baseline_json=""
-  local pressured_json=""
-  local traffic_json=""
   local recovered_json=""
   local baseline_entries=""
-  local pressured_entries=""
-  local traffic_entries=""
   local recovered_entries=""
   local sample_file=""
   local sample_json=""
@@ -5122,9 +5127,9 @@ pressure_recovery_evidence_json() {
   local -a sample_files=()
   local -a sample_entries=()
 
-  map_id="$(jq -er '.map_id' "$fill_file")" || return 1
-  max_entries="$(jq -er '.max_entries' "$fill_file")" || return 1
-  map_type="$(jq -er '.map_type | ascii_downcase' "$fill_file")" || return 1
+  map_id="$(jq -er '.map_id' "$prepare_file")" || return 1
+  max_entries="$(jq -er '.max_entries' "$prepare_file")" || return 1
+  map_type="$(jq -er '.map_type | ascii_downcase' "$prepare_file")" || return 1
   map_id="$(normalize_decimal "$map_id" 4294967295 false)" || return 1
   max_entries="$(normalize_decimal \
     "$max_entries" "$PRESSURE_MAP_MAX_SUPPORTED_ENTRIES" false)" || return 1
@@ -5132,24 +5137,13 @@ pressure_recovery_evidence_json() {
     -f "$recovery_log" && ! -L "$recovery_log" ]] || return 1
   baseline_json="$(pressure_map_sample_json \
     "$baseline_file" "$map_id" "$max_entries" "$map_type")" || return 1
-  pressured_json="$(pressure_map_sample_json \
-    "$pressured_file" "$map_id" "$max_entries" "$map_type")" || return 1
-  traffic_json="$(pressure_map_sample_json \
-    "$traffic_file" "$map_id" "$max_entries" "$map_type")" || return 1
   recovered_json="$(pressure_map_sample_json \
     "$recovered_file" "$map_id" "$max_entries" "$map_type")" || return 1
   baseline_entries="$(jq -er '.entries' <<<"$baseline_json")" || return 1
-  pressured_entries="$(jq -er '.entries' <<<"$pressured_json")" || return 1
-  traffic_entries="$(jq -er '.entries' <<<"$traffic_json")" || return 1
   recovered_entries="$(jq -er '.entries' <<<"$recovered_json")" || return 1
   baseline_entries="$(normalize_decimal "$baseline_entries" "$max_entries" true)" || return 1
-  pressured_entries="$(normalize_decimal "$pressured_entries" "$max_entries" true)" || return 1
-  traffic_entries="$(normalize_decimal "$traffic_entries" "$max_entries" true)" || return 1
   recovered_entries="$(normalize_decimal "$recovered_entries" "$max_entries" true)" || return 1
-  ((baseline_entries < max_entries &&
-    pressured_entries > baseline_entries && pressured_entries <= max_entries &&
-    traffic_entries > baseline_entries && traffic_entries <= max_entries &&
-    recovered_entries <= baseline_entries)) || return 1
+  ((baseline_entries == 0 && recovered_entries == 0)) || return 1
   shopt -s nullglob
   sample_files=("$runner_directory"/map-pressure-pressure-recovered-sample-*.prom)
   shopt -u nullglob
@@ -5221,7 +5215,6 @@ pressure_recovery_evidence_json() {
   sample_entries_json="$(printf '%s\n' "${sample_entries[@]}" | jq -s 'map(tonumber)')" || return 1
   jq -cn --argjson map_id "$map_id" --arg map_type "$map_type" \
     --argjson max_entries "$max_entries" --argjson baseline "$baseline_entries" \
-    --argjson pressured "$pressured_entries" --argjson traffic "$traffic_entries" \
     --argjson recovered "$recovered_entries" \
     --argjson samples "$sample_entries_json" --argjson attempts "$attempts" '
       {
@@ -5230,25 +5223,336 @@ pressure_recovery_evidence_json() {
         map_type: $map_type,
         max_entries: $max_entries,
         baseline_entries: $baseline,
-        pressured_entries: $pressured,
-        traffic_complete_entries: $traffic,
         recovery_sample_count: ($samples | length),
         recovery_sample_entries: $samples,
         recovered_entries: $recovered,
         recovery_log_attempts: $attempts
       }
-    '
+  '
+}
+
+pressure_artifact_sha256() {
+  local -r input="$1"
+  local digest=""
+
+  [[ -f "$input" && ! -L "$input" ]] || return 1
+  digest="$(sha256sum -- "$input")" || return 1
+  digest="${digest%% *}"
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "$digest"
+}
+
+validate_pressure_control_file() {
+  local -r input="$1"
+  local -r expected="$2"
+  local -a lines=()
+
+  [[ -f "$input" && ! -L "$input" ]] || return 1
+  mapfile -t lines <"$input" || return 1
+  ((${#lines[@]} == 1)) || return 1
+  [[ "${lines[0]}" == "$expected" && "$(stat -Lc '%s' -- "$input")" == \
+    "$((${#expected} + 1))" ]]
+}
+
+validate_pressure_container_inspections() {
+  local -r runner_directory="$1"
+  local -r artifact="$runner_directory/map-pressure-pressure-container-inspections.json"
+  local -r environment_file="$runner_directory/environment.txt"
+  local canonical=""
+  local project=""
+  local tls=""
+  local seed=""
+  local owner_gid=""
+  local identity=""
+  local device=""
+  local inode=""
+  local owner=""
+  local mode=""
+  local links=""
+  local size=""
+  local extra=""
+  local -a lines=()
+
+  [[ -f "$artifact" && ! -L "$artifact" ]] || return 1
+  identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- "$artifact")" || return 1
+  IFS=: read -r device inode owner mode links size extra <<<"$identity"
+  [[ -z "$extra" && "$device" =~ ^[0-9]+$ && "$inode" =~ ^[1-9][0-9]*$ &&
+    "$owner" == "$EUID" && "$mode" == 600 && "$links" == 1 &&
+    "$size" =~ ^[1-9][0-9]*$ &&
+    "$size" -le "$PRESSURE_CONTAINER_INSPECTIONS_MAX_BYTES" ]] || return 1
+  mapfile -t lines <"$artifact" || return 1
+  ((${#lines[@]} == 1)) || return 1
+  canonical="$(jq -cS . <<<"${lines[0]}")" || return 1
+  [[ "${lines[0]}" == "$canonical" && "$size" == "$((${#canonical} + 1))" &&
+    "$(stat -Lc '%d:%i:%u:%a:%h:%s' -- "$artifact")" == "$identity" ]] ||
+    return 1
+
+  project="$(runner_environment_value "$environment_file" compose_project)" ||
+    return 1
+  tls="$(runner_environment_value "$environment_file" tls_protocol)" || return 1
+  seed="$(runner_environment_value "$environment_file" scenario_seed)" || return 1
+  [[ "$project" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ &&
+    "$tls" =~ ^TLSv1\.[23]$ && "$seed" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+  owner_gid="$(id -g)" || return 1
+  [[ "$owner_gid" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+
+  jq -e --arg project "$project" --arg tls "$tls" --arg seed "$seed" \
+    --arg owner_uid "$EUID" --arg owner_gid "$owner_gid" \
+    --argjson requests "$PRESSURE_REQUESTS" '
+    def uint32:
+      type == "number" and isfinite and floor == . and
+      . >= 0 and . <= 4294967295;
+    def uint32_decimal:
+      type == "string" and test("^(0|[1-9][0-9]*)$") and
+      (tonumber >= 0 and tonumber <= 4294967295);
+    def timestamp_parts:
+      capture("^(?<base>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\\.(?<fraction>[0-9]{0,8}[1-9]))?Z$") as $parts |
+      ($parts.base + "Z" | fromdateiso8601) as $seconds |
+      select(($seconds | todateiso8601) == ($parts.base + "Z")) |
+      [$seconds, (((($parts.fraction // "") + "000000000")[0:9]) | tonumber)];
+    . as $root |
+    $root.running as $running |
+    $root.terminal as $terminal |
+    ($running.config.user | split(":")) as $user |
+    ($running.state.started_at | timestamp_parts) as $started |
+    ($terminal.state.finished_at | timestamp_parts) as $finished |
+    keys == ["running", "scenario_label", "schema", "session", "status",
+      "terminal", "wait_exit_code"] and
+    .schema == "pressure-scenario-container-inspections-v1" and
+    .status == "passed" and .scenario_label == "pressure" and
+    (.session | type == "string" and test("^[0-9a-f]{32}$")) and
+    .wait_exit_code == 0 and
+    ($running | keys == ["config", "identity", "labels", "mount", "runtime",
+      "state"]) and
+    ($terminal | keys == ["config", "identity", "labels", "mount", "runtime",
+      "state"]) and
+    ($running | del(.state)) == ($terminal | del(.state)) and
+    ($running.identity |
+      keys == ["id", "image_id", "image_reference", "name"] and
+      (.id | type == "string" and test("^[0-9a-f]{64}$") and
+        . != ("0" * 64)) and
+      (.image_id | type == "string" and test("^sha256:[0-9a-f]{64}$") and
+        . != ("sha256:" + ("0" * 64))) and
+      .image_reference == "obi-apache-java-https-tracecheck:local" and
+      .name == ("/" + $project + "-pressure-scenario-" +
+        ($root.session[0:12]))) and
+    ($running.config |
+      keys == ["cmd", "entrypoint", "path", "user"] and
+      .entrypoint == ["/trace-scenario"] and .path == "/trace-scenario" and
+      .cmd == ["--scenario", "pressure", "--expected-tls", $tls,
+        "--seed", $seed, "--requests", ($requests | tostring), "--timeout",
+        "75s", "--pressure-control-dir", "/run/obi-demo/pressure-control",
+        "--pressure-control-session", $root.session,
+        "--pressure-control-timeout", "255s"] and
+      .user == ($owner_uid + ":" + $owner_gid)) and
+    ($user | length == 2 and all(.[]; uint32_decimal)) and
+    ($running.labels |
+      keys == ["oneoff", "owner", "project", "service"] and
+      .oneoff == "True" and .owner == "acceptance-demo-v1" and
+      .project == $project and .service == "scenario") and
+    ($running.mount |
+      keys == ["destination", "rw", "source_leaf", "type"] and
+      .type == "bind" and .rw == true and
+      .destination == "/run/obi-demo/pressure-control" and
+      .source_leaf == (".pressure-control." + $root.session)) and
+    ($running.runtime |
+      keys == ["attach_stdin", "network_mode", "open_stdin", "pid_mode",
+        "privileged", "restart_policy", "stdin_once", "tty"] and
+      .attach_stdin == false and .network_mode == "host" and
+      .open_stdin == false and .pid_mode == "" and .privileged == false and
+      .restart_policy == "none" and .stdin_once == false and .tty == false) and
+    ($running.state |
+      keys == ["dead", "error", "exit_code", "finished_at", "host_pid",
+        "oom_killed", "restart_count", "running", "started_at", "status"] and
+      .dead == false and .error == "" and .exit_code == 0 and
+      .finished_at == "0001-01-01T00:00:00Z" and
+      (.host_pid | uint32 and . >= 1) and .oom_killed == false and
+      .restart_count == 0 and .running == true and .status == "running" and
+      .started_at != "0001-01-01T00:00:00Z") and
+    ($terminal.state |
+      keys == ["dead", "error", "exit_code", "finished_at", "host_pid",
+        "oom_killed", "restart_count", "running", "started_at", "status"] and
+      .dead == false and .error == "" and .exit_code == 0 and
+      .host_pid == 0 and .oom_killed == false and .restart_count == 0 and
+      .running == false and .status == "exited" and
+      .started_at == $running.state.started_at and
+      .finished_at != "0001-01-01T00:00:00Z") and
+    $finished > $started
+  ' "$artifact" >/dev/null
+}
+
+validate_pressure_barrier_artifacts() {
+  local -r runner_directory="$1"
+  local -r result="$runner_directory/scenario-pressure.json"
+  local -r status="$runner_directory/scenario-pressure-status.json"
+  local -r fill="$runner_directory/map-pressure-pressure-fill.json"
+  local -r verify="$runner_directory/map-pressure-pressure-verify.json"
+  local -r ready="$runner_directory/map-pressure-pressure-barrier-ready.txt"
+  local -r release="$runner_directory/map-pressure-pressure-barrier-release.txt"
+  local -r barrier="$runner_directory/map-pressure-pressure-barrier-status.json"
+  local -r inspections="$runner_directory/map-pressure-pressure-container-inspections.json"
+  local session=""
+  local canonical=""
+  local ready_sha256=""
+  local release_sha256=""
+  local fill_sha256=""
+  local verify_sha256=""
+  local result_sha256=""
+  local status_sha256=""
+  local inspections_sha256=""
+  local inspections_size=""
+
+  [[ -f "$barrier" && ! -L "$barrier" ]] || return 1
+  session="$(jq -er '.session' "$barrier")" || return 1
+  [[ "$session" =~ ^[0-9a-f]{32}$ ]] || return 1
+  validate_pressure_control_file "$ready" "pressure-ready-v1:$session" || return 1
+  validate_pressure_control_file "$release" "pressure-release-v1:$session" || return 1
+  validate_pressure_container_inspections "$runner_directory" || return 1
+  canonical="$(jq -cS . "$barrier")" || return 1
+  [[ "$(wc -l <"$barrier")" == 1 && "$(<"$barrier")" == "$canonical" ]] || return 1
+  ready_sha256="$(pressure_artifact_sha256 "$ready")" || return 1
+  release_sha256="$(pressure_artifact_sha256 "$release")" || return 1
+  fill_sha256="$(pressure_artifact_sha256 "$fill")" || return 1
+  verify_sha256="$(pressure_artifact_sha256 "$verify")" || return 1
+  result_sha256="$(pressure_artifact_sha256 "$result")" || return 1
+  status_sha256="$(pressure_artifact_sha256 "$status")" || return 1
+  inspections_sha256="$(pressure_artifact_sha256 "$inspections")" || return 1
+  inspections_size="$(stat -Lc '%s' -- "$inspections")" || return 1
+  [[ "$inspections_size" =~ ^[1-9][0-9]*$ &&
+    "$inspections_size" -le "$PRESSURE_CONTAINER_INSPECTIONS_MAX_BYTES" ]] ||
+    return 1
+
+  jq -e \
+    --arg ready_sha256 "$ready_sha256" \
+    --arg release_sha256 "$release_sha256" \
+    --arg fill_sha256 "$fill_sha256" \
+    --arg verify_sha256 "$verify_sha256" \
+    --arg result_sha256 "$result_sha256" \
+    --arg status_sha256 "$status_sha256" \
+    --arg inspections_sha256 "$inspections_sha256" \
+    --argjson inspections_size "$inspections_size" \
+    --slurpfile inspection "$inspections" \
+    --argjson requests "$PRESSURE_REQUESTS" \
+    --argjson admission_maximum \
+      "$((PRESSURE_REQUESTS * PRESSURE_ADMISSION_MAX_EVENTS_PER_REQUEST))" '
+      keys == ["container", "container_inspections", "control", "fill",
+        "scenario_label", "schema", "sequence", "session", "status",
+        "traffic", "verification"] and
+      .schema == "pressure-traffic-barrier-v1" and .status == "passed" and
+      .scenario_label == "pressure" and
+      .sequence == ["scenario_ready", "capacity_fill_verified",
+        "release_published", "scenario_reaped",
+        "post_traffic_content_verified"] and
+      (.control |
+        keys == ["ready_reference", "ready_sha256", "release_reference",
+          "release_sha256"] and
+        .ready_reference == "map-pressure-pressure-barrier-ready.txt" and
+        .ready_sha256 == $ready_sha256 and
+        .release_reference == "map-pressure-pressure-barrier-release.txt" and
+        .release_sha256 == $release_sha256) and
+      (.container |
+        keys == ["host_pid", "id", "started_at", "user"] and
+        (.id | type == "string" and test("^[0-9a-f]{64}$")) and
+        (.host_pid | type == "string" and test("^[1-9][0-9]*$")) and
+        (.started_at | type == "string" and test("^[0-9TZ:.-]{20,64}$")) and
+        (.user | type == "string" and
+          test("^(0|[1-9][0-9]*):(0|[1-9][0-9]*)$"))) and
+      (.container_inspections |
+        keys == ["reference", "sha256", "size_bytes"] and
+        .reference == "map-pressure-pressure-container-inspections.json" and
+        .sha256 == $inspections_sha256 and
+        .size_bytes == $inspections_size) and
+      $inspection[0].session == .session and
+      .container == {
+        host_pid: ($inspection[0].running.state.host_pid | tostring),
+        id: $inspection[0].running.identity.id,
+        started_at: $inspection[0].running.state.started_at,
+        user: $inspection[0].running.config.user
+      } and
+      (.fill |
+        keys == ["baseline_entries", "capacity_rejected_entries",
+          "content_sha256", "map_id", "max_entries", "reference", "sha256",
+          "synthetic_namespace", "synthetic_pid", "touched",
+          "verified_absent_entries", "verified_present_entries"] and
+        .reference == "map-pressure-pressure-fill.json" and
+        .sha256 == $fill_sha256 and
+        (.map_id | type == "string" and test("^[1-9][0-9]*$")) and
+        .baseline_entries == 0 and .synthetic_pid == 0 and
+        .synthetic_namespace == 0 and .touched == .max_entries and
+        .verified_present_entries == .max_entries and
+        .verified_absent_entries == 1 and .capacity_rejected_entries == 1 and
+        (.content_sha256 | type == "string" and test("^[0-9a-f]{64}$"))) and
+      (.verification as $verification | .fill as $fill |
+        ($verification |
+          keys == ["content_sha256", "map_id", "reference", "sha256",
+            "synthetic_namespace", "synthetic_pid",
+            "verified_absent_entries", "verified_present_entries"] and
+          .reference == "map-pressure-pressure-verify.json" and
+          .sha256 == $verify_sha256 and .map_id == $fill.map_id and
+          .synthetic_pid == 0 and .synthetic_namespace == 0 and
+          .verified_present_entries == $fill.max_entries and
+          .verified_absent_entries == 1 and
+          .content_sha256 == $fill.content_sha256)) and
+      (.traffic |
+        keys == ["exact_hit_count", "explicit_root_count",
+          "handoff_admission_ambiguous_count",
+          "handoff_admission_maximum_count",
+          "handoff_admission_overload_count", "request_count",
+          "result_reference", "result_sha256", "status_reference",
+          "status_sha256", "unresolved_count", "wrong_parent_count"] and
+        .result_reference == "scenario-pressure.json" and
+        .result_sha256 == $result_sha256 and
+        .status_reference == "scenario-pressure-status.json" and
+        .status_sha256 == $status_sha256 and .request_count == $requests and
+        .exact_hit_count + .explicit_root_count == $requests and
+        .explicit_root_count >= 1 and .wrong_parent_count == 0 and
+        .unresolved_count == 0 and
+        .handoff_admission_overload_count >= 1 and
+        .handoff_admission_overload_count <= $admission_maximum and
+        .handoff_admission_ambiguous_count == 0 and
+        .handoff_admission_maximum_count == $admission_maximum)
+    ' "$barrier" >/dev/null || return 1
+
+  jq -e -s '
+    .[0].fill.map_id == (.[1].map_id | tostring) and
+    .[0].fill.max_entries == .[1].max_entries and
+    .[0].fill.touched == .[1].touched and
+    .[0].fill.content_sha256 == .[1].content_sha256 and
+    .[0].verification.map_id == (.[2].map_id | tostring) and
+    .[0].verification.verified_present_entries ==
+      .[2].verified_present_entries and
+    .[0].verification.content_sha256 == .[2].content_sha256 and
+    .[0].traffic.exact_hit_count ==
+      .[3].pressure_correlation.exact_hit_count and
+    .[0].traffic.explicit_root_count ==
+      .[3].pressure_correlation.explicit_root_count and
+    .[0].traffic.handoff_admission_overload_count ==
+      .[4].pressure_correlation.bridge.handoff_admission_outcome_counts.overload and
+    .[4].pressure_correlation.barrier_reference ==
+      "map-pressure-pressure-barrier-status.json" and
+    .[4].pressure_correlation.container_inspections ==
+      .[0].container_inspections and
+    .[5].session == .[0].session
+  ' "$barrier" "$fill" "$verify" "$result" "$status" "$inspections" \
+    >/dev/null
 }
 
 validate_pressure_cell_artifacts() {
   local -r runner_directory="$1"
   local -r result_file="$runner_directory/scenario-pressure.json"
   local -r status_file="$runner_directory/scenario-pressure-status.json"
+  local -r prepare_file="$runner_directory/map-pressure-pressure-prepare.json"
   local -r fill_file="$runner_directory/map-pressure-pressure-fill.json"
+  local -r verify_file="$runner_directory/map-pressure-pressure-verify.json"
   local -r cleanup_file="$runner_directory/map-pressure-pressure-cleanup.json"
   local recovery_evidence=""
 
-  jq -se --argjson requests "$PRESSURE_REQUESTS" '
+  jq -se --argjson requests "$PRESSURE_REQUESTS" \
+    --argjson inspections_maximum "$PRESSURE_CONTAINER_INSPECTIONS_MAX_BYTES" \
+    --argjson admission_maximum \
+      "$((PRESSURE_REQUESTS * PRESSURE_ADMISSION_MAX_EVENTS_PER_REQUEST))" '
+    def positive_integer:
+      type == "number" and isfinite and floor == . and . > 0;
     length == 2 and
     .[0] as $status |
     .[1] as $result |
@@ -5280,55 +5584,111 @@ validate_pressure_cell_artifacts() {
         .take_valid_count + .attributable_absence_count == $requests and
         .take_valid_count == $status.pressure_correlation.trace.exact_hit_count and
         .attributable_absence_count == $status.pressure_correlation.trace.explicit_root_count) and
-      (.pressure_correlation.bridge | type == "object")) and
+      (.pressure_correlation.bridge |
+        type == "object" and .transport == "getsockopt" and
+        (.handoff_admission_outcome_counts |
+          keys == ["ambiguous", "maximum", "overload"] and
+          (.overload | positive_integer) and .overload <= .maximum and
+          .ambiguous == 0 and .maximum == $admission_maximum)) and
+      (.pressure_correlation.container_inspections |
+        keys == ["reference", "sha256", "size_bytes"] and
+        .reference == "map-pressure-pressure-container-inspections.json" and
+        (.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+        (.size_bytes | type == "number" and isfinite and floor == . and
+          . >= 1 and . <= $inspections_maximum)) and
+      .pressure_correlation.barrier_reference ==
+        "map-pressure-pressure-barrier-status.json") and
     ($result |
       .status == "passed" and
+      .request_count == $requests and
       (.pressure_correlation | type == "object") and
-      .pressure_correlation == $status.pressure_correlation.trace)
+      .pressure_correlation == $status.pressure_correlation.trace and
+      .pressure_correlation.explicit_root_count >= 1)
   ' "$status_file" "$result_file" >/dev/null || return 1
   jq -se --argjson max_supported_entries "$PRESSURE_MAP_MAX_SUPPORTED_ENTRIES" '
     def nonnegative_integer:
       type == "number" and isfinite and floor == . and . >= 0;
     def positive_integer: nonnegative_integer and . > 0;
-    length == 2 and
-    .[0] as $fill |
-    .[1] as $cleanup |
-    ($fill |
+    length == 4 and
+    .[0] as $prepare |
+    .[1] as $fill |
+    .[2] as $verify |
+    .[3] as $cleanup |
+    ($prepare |
       ((keys | sort) == [
-        "capacity_rejected_entries", "kernel_name", "map_id", "map_name",
-        "map_type", "max_entries", "mode", "process_map_id",
-        "process_namespace", "process_pid", "status", "token_base", "touched",
-        "verified_present_entries"
+        "kernel_name", "map_id", "map_name", "map_type", "max_entries",
+        "mode", "process_map_id", "process_namespace", "process_pid",
+        "status", "synthetic_namespace", "synthetic_pid", "token_base",
+        "touched"
       ]) and
-      .status == "passed" and .mode == "fill" and
+      .status == "passed" and .mode == "prepare" and
       .map_name == "java_remote_parent_handoff_claims" and
       .kernel_name == "java_remote_par" and .map_type == "Hash" and
       (.map_id | positive_integer) and (.max_entries | positive_integer) and
       .max_entries <= $max_supported_entries and
       (.process_map_id | positive_integer) and (.process_pid | positive_integer) and
       (.process_namespace | positive_integer) and (.token_base | positive_integer) and
-      (.touched | positive_integer) and
-      .touched <= .max_entries and
+      .synthetic_pid == 0 and .synthetic_namespace == 0 and .touched == 0) and
+    ($fill |
+      ((keys | sort) == [
+        "capacity_rejected_entries", "content_sha256", "kernel_name",
+        "map_id", "map_name", "map_type", "max_entries", "mode",
+        "process_map_id", "process_namespace", "process_pid", "status",
+        "synthetic_namespace", "synthetic_pid", "token_base", "touched",
+        "verified_absent_entries", "verified_present_entries"
+      ]) and
+      .status == "passed" and .mode == "fill" and
+      .map_name == $prepare.map_name and .kernel_name == $prepare.kernel_name and
+      .map_type == $prepare.map_type and .map_id == $prepare.map_id and
+      .max_entries == $prepare.max_entries and
+      .process_map_id == $prepare.process_map_id and
+      .process_pid == $prepare.process_pid and
+      .process_namespace == $prepare.process_namespace and
+      .token_base == $prepare.token_base and .synthetic_pid == 0 and
+      .synthetic_namespace == 0 and .touched == .max_entries and
       .capacity_rejected_entries == 1 and
-      .verified_present_entries == .touched) and
+      .verified_present_entries == .max_entries and
+      .verified_absent_entries == 1 and
+      (.content_sha256 | type == "string" and test("^[0-9a-f]{64}$"))) and
+    ($verify |
+      ((keys | sort) == [
+        "content_sha256", "kernel_name", "map_id", "map_name", "map_type",
+        "max_entries", "mode", "process_map_id", "process_namespace",
+        "process_pid", "status", "synthetic_namespace", "synthetic_pid",
+        "token_base", "touched", "verified_absent_entries",
+        "verified_present_entries"
+      ]) and
+      .status == "passed" and .mode == "verify" and
+      .map_name == $prepare.map_name and .kernel_name == $prepare.kernel_name and
+      .map_type == $prepare.map_type and .map_id == $prepare.map_id and
+      .max_entries == $prepare.max_entries and
+      .process_map_id == $prepare.process_map_id and
+      .process_pid == $prepare.process_pid and
+      .process_namespace == $prepare.process_namespace and
+      .token_base == $prepare.token_base and .synthetic_pid == 0 and
+      .synthetic_namespace == 0 and .touched == 0 and
+      .verified_present_entries == $prepare.max_entries and
+      .verified_absent_entries == 1 and
+      .content_sha256 == $fill.content_sha256) and
     ($cleanup |
       ((keys | sort) == [
         "cleanup_verified", "kernel_name", "map_id", "map_name", "map_type",
         "max_entries", "mode", "process_map_id", "process_namespace",
-        "process_pid", "status", "token_base", "touched",
-        "verified_absent_entries"
+        "process_pid", "status", "synthetic_namespace", "synthetic_pid",
+        "token_base", "touched", "verified_absent_entries"
       ]) and
       .status == "passed" and .mode == "cleanup" and
-      .map_name == $fill.map_name and .kernel_name == $fill.kernel_name and
-      .map_type == $fill.map_type and .process_map_id == 0 and
-      .map_id == $fill.map_id and .max_entries == $fill.max_entries and
-      .process_pid == $fill.process_pid and
-      .process_namespace == $fill.process_namespace and
-      .token_base == $fill.token_base and
-      .cleanup_verified == true and
+      .map_name == $prepare.map_name and .kernel_name == $prepare.kernel_name and
+      .map_type == $prepare.map_type and .process_map_id == 0 and
+      .map_id == $prepare.map_id and .max_entries == $prepare.max_entries and
+      .process_pid == $prepare.process_pid and
+      .process_namespace == $prepare.process_namespace and
+      .token_base == $prepare.token_base and .synthetic_pid == 0 and
+      .synthetic_namespace == 0 and .cleanup_verified == true and
       .verified_absent_entries == .max_entries + 1 and
-      (.touched | nonnegative_integer) and .touched <= $fill.touched)
-  ' "$fill_file" "$cleanup_file" >/dev/null || return 1
+      .touched == $prepare.max_entries)
+  ' "$prepare_file" "$fill_file" "$verify_file" "$cleanup_file" >/dev/null || return 1
+  validate_pressure_barrier_artifacts "$runner_directory" || return 1
   recovery_evidence="$(pressure_recovery_evidence_json "$runner_directory")" || return 1
   jq -e --argjson required "$PRESSURE_RECOVERY_REQUIRED_SAMPLES" '
     .recovery_sample_count == $required and
@@ -5339,7 +5699,10 @@ validate_pressure_cell_artifacts() {
 canonical_pressure_observation_json() {
   local -r runner_directory="$1"
   local -r status_file="$runner_directory/scenario-pressure-status.json"
+  local -r prepare_file="$runner_directory/map-pressure-pressure-prepare.json"
   local -r fill_file="$runner_directory/map-pressure-pressure-fill.json"
+  local -r verify_file="$runner_directory/map-pressure-pressure-verify.json"
+  local -r barrier_file="$runner_directory/map-pressure-pressure-barrier-status.json"
   local -r cleanup_file="$runner_directory/map-pressure-pressure-cleanup.json"
   local recovery_evidence=""
 
@@ -5347,31 +5710,46 @@ canonical_pressure_observation_json() {
   recovery_evidence="$(pressure_recovery_evidence_json "$runner_directory")" || return 1
   jq -cn \
     --slurpfile status "$status_file" \
+    --slurpfile prepare "$prepare_file" \
     --slurpfile fill "$fill_file" \
+    --slurpfile verify "$verify_file" \
+    --slurpfile barrier "$barrier_file" \
     --slurpfile cleanup "$cleanup_file" \
     --argjson recovery "$recovery_evidence" '
       {
         bounded: true,
+        pressure_contract_version: 1,
+        barrier_schema: $barrier[0].schema,
+        barrier_sequence: $barrier[0].sequence,
         exact_hit_count: $status[0].pressure_correlation.trace.exact_hit_count,
         explicit_root_count: $status[0].pressure_correlation.trace.explicit_root_count,
         wrong_parent_count: $status[0].pressure_correlation.trace.wrong_parent_count,
         unresolved_count: $status[0].pressure_correlation.trace.unresolved_count,
         take_valid_count: $status[0].pressure_correlation.java_reconciliation_target.take_valid_count,
         attributable_absence_count: $status[0].pressure_correlation.java_reconciliation_target.attributable_absence_count,
-        map_name: $fill[0].map_name,
-        map_type: $fill[0].map_type,
+        handoff_admission_overload_count: $status[0].pressure_correlation.bridge.handoff_admission_outcome_counts.overload,
+        handoff_admission_ambiguous_count: $status[0].pressure_correlation.bridge.handoff_admission_outcome_counts.ambiguous,
+        handoff_admission_maximum_count: $status[0].pressure_correlation.bridge.handoff_admission_outcome_counts.maximum,
+        map_name: $prepare[0].map_name,
+        map_type: $prepare[0].map_type,
         map_id: $recovery.map_id,
         kernel_map_name: $recovery.kernel_map_name,
         kernel_map_type: $recovery.map_type,
-        max_entries: $fill[0].max_entries,
+        max_entries: $prepare[0].max_entries,
+        synthetic_pid: $prepare[0].synthetic_pid,
+        synthetic_namespace: $prepare[0].synthetic_namespace,
         touched_entries: $fill[0].touched,
         capacity_rejected_entries: $fill[0].capacity_rejected_entries,
-        verified_present_entries: $fill[0].verified_present_entries,
+        fill_verified_present_entries: $fill[0].verified_present_entries,
+        fill_verified_absent_entries: $fill[0].verified_absent_entries,
+        content_sha256: $fill[0].content_sha256,
+        post_traffic_verified_present_entries: $verify[0].verified_present_entries,
+        post_traffic_verified_absent_entries: $verify[0].verified_absent_entries,
+        post_traffic_content_sha256: $verify[0].content_sha256,
+        post_traffic_content_verified: true,
         cleanup_verified: $cleanup[0].cleanup_verified,
-        verified_absent_entries: $cleanup[0].verified_absent_entries,
+        cleanup_verified_absent_entries: $cleanup[0].verified_absent_entries,
         occupancy_before_fill: $recovery.baseline_entries,
-        occupancy_pressured: $recovery.pressured_entries,
-        occupancy_traffic_complete: $recovery.traffic_complete_entries,
         occupancy_recovery_samples: $recovery.recovery_sample_entries,
         occupancy_recovered: $recovery.recovered_entries,
         recovery_log_attempts: $recovery.recovery_log_attempts,
@@ -5759,46 +6137,66 @@ validate_path_observation_schema() {
       .observation.result_status == "passed";
     def pressure_is_exact:
       (.pressure |
-        .occupancy_before_fill as $baseline_entries |
         type == "object" and
         ((keys | sort) == [
-          "attributable_absence_count", "bounded", "capacity_rejected_entries",
-          "cleanup_verified", "exact_hit_count", "explicit_root_count",
-          "kernel_map_name", "kernel_map_type", "map_id", "map_name",
-          "map_type", "max_entries", "occupancy_before_fill",
-          "occupancy_pressured", "occupancy_recovered",
-          "occupancy_recovery_samples", "occupancy_traffic_complete",
-          "recovery_log_attempts", "recovery_samples", "take_valid_count",
-          "touched_entries", "unresolved_count", "verified_absent_entries",
-          "verified_present_entries", "wrong_parent_count"
+          "attributable_absence_count", "barrier_schema", "barrier_sequence",
+          "bounded", "capacity_rejected_entries", "cleanup_verified",
+          "cleanup_verified_absent_entries", "content_sha256",
+          "exact_hit_count", "explicit_root_count",
+          "fill_verified_absent_entries", "fill_verified_present_entries",
+          "handoff_admission_ambiguous_count",
+          "handoff_admission_maximum_count",
+          "handoff_admission_overload_count", "kernel_map_name",
+          "kernel_map_type", "map_id", "map_name", "map_type", "max_entries",
+          "occupancy_before_fill", "occupancy_recovered",
+          "occupancy_recovery_samples", "post_traffic_content_sha256",
+          "post_traffic_content_verified",
+          "post_traffic_verified_absent_entries",
+          "post_traffic_verified_present_entries", "pressure_contract_version",
+          "recovery_log_attempts", "recovery_samples", "synthetic_namespace",
+          "synthetic_pid", "take_valid_count", "touched_entries",
+          "unresolved_count", "wrong_parent_count"
         ]) and
         all(.[];
           type == "boolean" or type == "string" or nonnegative_integer or
-          (type == "array" and all(.[]; nonnegative_integer))) and
-        .bounded == true and .map_name == "java_remote_parent_handoff_claims" and
+          (type == "array" and
+            all(.[]; type == "string" or nonnegative_integer))) and
+        .bounded == true and .pressure_contract_version == 1 and
+        .barrier_schema == "pressure-traffic-barrier-v1" and
+        .barrier_sequence == ["scenario_ready", "capacity_fill_verified",
+          "release_published", "scenario_reaped",
+          "post_traffic_content_verified"] and
+        .map_name == "java_remote_parent_handoff_claims" and
         .kernel_map_name == "java_remote_par" and .map_type == "Hash" and
         .kernel_map_type == "hash" and (.map_id | positive_integer) and
         (.max_entries | positive_integer) and
         .max_entries <= $pressure_max_supported_entries and
-        (.touched_entries | positive_integer) and
-        .touched_entries <= .max_entries and
-        .occupancy_before_fill < .max_entries and
-        .occupancy_pressured > .occupancy_before_fill and
-        .occupancy_pressured <= .max_entries and
-        .occupancy_traffic_complete > .occupancy_before_fill and
-        .occupancy_traffic_complete <= .max_entries and
-        .occupancy_recovered <= .occupancy_before_fill and
+        .synthetic_pid == 0 and .synthetic_namespace == 0 and
+        .touched_entries == .max_entries and .occupancy_before_fill == 0 and
+        .occupancy_recovered == 0 and
         (.occupancy_recovery_samples | length) == $recovery_samples and
-        all(.occupancy_recovery_samples[]; . <= $baseline_entries) and
+        all(.occupancy_recovery_samples[]; . == 0) and
         .occupancy_recovery_samples[-1] == .occupancy_recovered and
         (.recovery_log_attempts | positive_integer) and
         .recovery_log_attempts >= $recovery_samples and
         .capacity_rejected_entries == 1 and
-        .verified_present_entries == .touched_entries and
+        .fill_verified_present_entries == .max_entries and
+        .fill_verified_absent_entries == 1 and
+        (.content_sha256 | test("^[0-9a-f]{64}$")) and
+        .post_traffic_verified_present_entries == .max_entries and
+        .post_traffic_verified_absent_entries == 1 and
+        .post_traffic_content_sha256 == .content_sha256 and
+        .post_traffic_content_verified == true and
         .cleanup_verified == true and
-        .verified_absent_entries == .max_entries + 1 and
+        .cleanup_verified_absent_entries == .max_entries + 1 and
         .recovery_samples == $recovery_samples and
+        .handoff_admission_overload_count >= 1 and
+        .handoff_admission_overload_count <=
+          .handoff_admission_maximum_count and
+        .handoff_admission_ambiguous_count == 0 and
+        .handoff_admission_maximum_count == ($pressure_requests * 9) and
         .wrong_parent_count == 0 and .unresolved_count == 0 and
+        .explicit_root_count >= 1 and
         .exact_hit_count + .explicit_root_count == $pressure_requests and
         .take_valid_count + .attributable_absence_count == $pressure_requests and
         .take_valid_count == .exact_hit_count and

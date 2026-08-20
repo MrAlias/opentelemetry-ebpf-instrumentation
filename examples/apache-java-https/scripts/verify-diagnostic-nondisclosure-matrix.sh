@@ -29,7 +29,7 @@ readonly MAX_TRANSPORT_BYTES=256
 readonly MAX_CANARY_BYTES=16384
 readonly JAVA_COUNTER_LIMIT=999999999
 readonly MAX_RAW_CELL_BYTES=536870912
-readonly MAX_PAIR_SERIES=792
+readonly MAX_PAIR_SERIES=864
 readonly EMPTY_SHA256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 readonly PUBLIC_WORKFLOW_NAME="Java diagnostic nondisclosure matrix"
 readonly PUBLIC_WORKFLOW_PATH=".github/workflows/java_diagnostic_nondisclosure.yml"
@@ -1138,7 +1138,8 @@ validate_w3c_status() {
 metric_label_allowed() {
   case "$1:$2" in
     transport:tcp|transport:getsockopt|transport:unix|transport:disabled|\
-    operation:stage|operation:candidate|operation:handoff|operation:inject|\
+    operation:stage|operation:candidate|operation:handoff|\
+    operation:handoff_admission|operation:inject|\
     operation:take|operation:discard|operation:negotiate|operation:availability|\
     operation:cleanup|operation:evict|operation:report|\
     status:unknown|status:valid|status:missing|status:stale|status:unsupported|\
@@ -1291,7 +1292,17 @@ validate_metric_pair() {
   bounded_regular_file "$directory/obi-metric-pairs/w3c.json" 1048576 1 || return 1
   actual="$(jq -ce -s 'if length == 1 and (.[0] | type == "object") then .[0] else error("pair must be one object") end' \
     "$directory/obi-metric-pairs/w3c.json")" || return 1
-  [[ "$(<"$directory/obi-metric-pairs/w3c.json")" == "$actual" && "$actual" == "$expected_payload" ]]
+  [[ "$(<"$directory/obi-metric-pairs/w3c.json")" == "$actual" && "$actual" == "$expected_payload" ]] ||
+    return 1
+  jq -e '
+    [.series[] | select(.operation == "handoff_admission")] as $rows |
+    ($rows | length) <= 2 and
+    all($rows[];
+      .transport == "tcp" and
+      (.status == "overload" or .status == "ambiguous") and
+      .before == "0" and .after == "0" and .delta == "0") and
+    ([$rows[].status] | length == (unique | length))
+  ' <<<"$actual" >/dev/null
 }
 
 validate_boundary_authority() {

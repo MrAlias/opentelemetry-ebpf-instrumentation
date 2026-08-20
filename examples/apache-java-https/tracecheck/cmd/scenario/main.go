@@ -55,6 +55,9 @@ type config struct {
 	coalescedSourceService string
 	javaService            string
 	restartControlDir      string
+	pressureControlDir     string
+	pressureControlSession string
+	pressureControlTimeout time.Duration
 }
 
 type requestCase struct {
@@ -443,7 +446,11 @@ func main() {
 
 func mainExitCode() int {
 	cfg := parseFlags()
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.timeout)
+	ctx := context.Background()
+	cancel := func() {}
+	if cfg.scenario != "pressure" {
+		ctx, cancel = context.WithTimeout(ctx, cfg.timeout)
+	}
 	defer cancel()
 
 	result, err := run(ctx, cfg)
@@ -494,6 +501,9 @@ func parseFlags() config {
 	flag.StringVar(&cfg.coalescedSourceService, "coalesced-source-service", "coalesced-source", "coalesced source service.name")
 	flag.StringVar(&cfg.javaService, "java-service", "java-backend", "Java service.name")
 	flag.StringVar(&cfg.restartControlDir, "restart-control-dir", "", "shared restart-fault control directory")
+	flag.StringVar(&cfg.pressureControlDir, "pressure-control-dir", "", "shared pressure control directory")
+	flag.StringVar(&cfg.pressureControlSession, "pressure-control-session", "", "pressure control session token")
+	flag.DurationVar(&cfg.pressureControlTimeout, "pressure-control-timeout", 0, "pressure ready-to-release phase timeout")
 	flag.Parse()
 	flag.Visit(func(visited *flag.Flag) {
 		if visited.Name == "request-timeout" {
@@ -536,6 +546,24 @@ func parseFlags() config {
 	}
 	if cfg.scenario != "restart-fault" && cfg.restartControlDir != "" {
 		fmt.Fprintln(os.Stderr, "--restart-control-dir requires restart-fault")
+		os.Exit(2)
+	}
+	if cfg.scenario == "pressure" {
+		if cfg.pressureControlDir == "" || cfg.pressureControlSession == "" {
+			fmt.Fprintln(os.Stderr, "pressure requires --pressure-control-dir and --pressure-control-session")
+			os.Exit(2)
+		}
+		if cfg.pressureControlTimeout <= 0 || cfg.pressureControlTimeout > 10*time.Minute {
+			fmt.Fprintln(os.Stderr, "pressure requires --pressure-control-timeout between 1ns and 10m")
+			os.Exit(2)
+		}
+		if _, err := newPressureControl(cfg.pressureControlDir, cfg.pressureControlSession); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+	} else if cfg.pressureControlDir != "" || cfg.pressureControlSession != "" ||
+		cfg.pressureControlTimeout != 0 {
+		fmt.Fprintln(os.Stderr, "pressure control options require pressure")
 		os.Exit(2)
 	}
 	if err := validateAssertionMode(cfg); err != nil {
@@ -690,6 +718,12 @@ func expectedPrimaryJavaFaultStatus(faultMode string) (string, bool) {
 
 func run(ctx context.Context, cfg config) (*runResult, error) {
 	result := &runResult{Scenario: cfg.scenario, Seed: cfg.seed, StartedAt: time.Now().UTC()}
+	parentContext := ctx
+	var pressureControlCancel context.CancelFunc
+	if cfg.scenario == "pressure" {
+		ctx, pressureControlCancel = context.WithTimeout(ctx, cfg.pressureControlTimeout)
+		defer pressureControlCancel()
+	}
 	if cfg.scenario == "concurrency" {
 		result.AssertionMode = concurrencyAssertionMode(cfg)
 	}
@@ -712,6 +746,23 @@ func run(ctx context.Context, cfg config) (*runResult, error) {
 		return result, err
 	}
 	result.RequestCount = len(requests)
+	if cfg.scenario == "pressure" {
+		control, controlErr := newPressureControl(
+			cfg.pressureControlDir,
+			cfg.pressureControlSession,
+		)
+		if controlErr != nil {
+			return result, controlErr
+		}
+		if controlErr := control.awaitRelease(ctx); controlErr != nil {
+			return result, controlErr
+		}
+		pressureControlCancel()
+		trafficContext, trafficCancel := context.WithTimeout(parentContext, cfg.timeout)
+		defer trafficCancel()
+		ctx = trafficContext
+		result.StartedAt = time.Now().UTC()
+	}
 
 	responses, latencies, elapsed, evidence, err := sendRunRequests(ctx, cfg, requests)
 	result.ConnectionEvidence = evidence

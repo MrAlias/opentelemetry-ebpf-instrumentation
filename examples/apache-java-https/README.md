@@ -95,7 +95,10 @@ both be zero. Aggregate bridge metrics preserve the actual upstream and
 retrieval failure reasons, while Java diagnostics account for valid retrievals,
 roots, and the independent diagnostic self-probe. Transport-aware conservation
 checks reconcile those layers without treating every root as a bridge
-`take/missing` result.
+`take/missing` result. A dedicated admission counter independently requires at
+least one capacity-driven `handoff_admission/overload`, no ambiguous admission
+failure, and a request-count-derived upper bound; it is auxiliary and is not
+added to either conservation equation.
 
 All selected spans must have the scenario's exact endpoint and exact random
 marker value in addition to the expected `service.name` and span kind. Prefix,
@@ -234,8 +237,10 @@ requires the deliberate assertion control to exit `2`, performs scoped cleanup,
 and proves a final clean checkout. Every command's exact combined output digest,
 exit status, and duration is sealed into an owner-private canonical receipt.
 
-Raw run directories, command logs, and that receipt are never artifacts. The
-projector validates them in its private transaction, emits only `README.md`,
+Raw run directories, command logs, the owner-only pressure container inspection
+(`map-pressure-pressure-container-inspections.json`), and that receipt are never
+public artifacts. The projector validates them in its private transaction,
+emits only `README.md`,
 `SANITIZATION.md`, `acceptance-claims.json`, `authority-summary.json`,
 `derivation-receipt.json`, `verify.sh`, and `SHA256SUMS`, and destroys the raw
 transaction before the campaign re-verifies the public bundle. A separate
@@ -330,14 +335,17 @@ OBI metrics, complete bounded OBI log, and complete bounded Java log. It
 reconstructed the request, context, and credential canaries from pinned source
 and W3C evidence and found zero matches; the six raw surfaces remain private.
 
-The `obi_java_remote_parent_operations_total` label contract permits four
-transports × eleven operations × eighteen statuses, or at most 792 distinct
-label tuples. The exact
+The current `obi_java_remote_parent_operations_total` label contract permits
+four transports × twelve operations × eighteen statuses, or at most 864
+distinct label tuples. The twelfth operation is the auxiliary
+`handoff_admission` capacity signal. The exact
 `obi_instrumentation_errors_total{error_type="attaching_java_agent",process_name="java"}`
-tuple is projected separately as one fixed scalar and is not part of that 792
-bound. This summary-only `focused_non_acceptance` record closes issue #39; it
-does not populate the full acceptance or compatibility matrix, expand issue #38,
-or close issue #40.
+tuple is projected separately as one fixed scalar and is not part of that 864
+bound. The retained diagnostic matrix predates `handoff_admission` and checked
+the then-current eleven-operation, 792-tuple contract. That historical
+summary-only `focused_non_acceptance` record closes issue #39; it does not
+populate the full acceptance or compatibility matrix, expand issue #38, or
+close issue #40.
 
 Container base images are pinned by digest. The repository Java build exports
 the separately reviewed `obi-java-agent.jar` helper and
@@ -405,8 +413,10 @@ The default `all` suite runs, in order:
   retained and boundedly classified as exact, absent, or one fixed
   reason-coded root, while any wrong parent fails the run;
 - non-evicting handoff-claim capacity rejection under sustained concurrent
-  pressure, with every admitted synthetic ticket verified present and exact
-  hits and explicit roots reconciled across trace, bridge, and Java diagnostics;
+  pressure, with the exact PID-zero/namespace-zero synthetic map contents
+  digest-stable through traffic, a positive bounded admission-overload signal,
+  zero ambiguous admission failures, and exact hits and explicit roots
+  reconciled across trace, bridge, and Java diagnostics;
 - servlet async and executor handoff across varied hop counts, cancellation,
   rejection, and timeout paths;
 - Java 21 virtual-thread migration, mixed execution, and cancellation paths;
@@ -817,16 +827,27 @@ Every run retains a timestamped directory under `.runtime/results/` with:
   two consecutive samples in which both maps are at steady baseline, and the
   same evidence embedded in the scenario status;
 - live pressure-helper output naming the exact BPF map ID, capacity, non-secret
-  JVM PID/namespace identity, complete fill count, and scanned eviction count;
-  a read-only preparation record retained before mutation; once-per-second
-  above-prefill-baseline monitoring through an independently counted aggregate
-  TCP-inject outcome boundary and its terminal metric sample; exact per-request
-  and aggregate parent outcomes with zero wrong or unresolved parents; actual
-  reason-coded upstream and retrieval failures; and transport-aware aggregate
-  reconciliation with Java diagnostics;
-  synthetic-key cleanup verification; and both samples from the final
-  steady-recovery gate, with canonical cleanup/recovery evidence promoted only
-  when the complete gate passes;
+  JVM cleanup identity, and a read-only preparation record retained before
+  mutation; an empty baseline and an exact full fill in the impossible
+  PID-zero/namespace-zero synthetic key space; one extra admission rejected
+  specifically by the kernel's `E2BIG` capacity result;
+  and an ordered key/value SHA-256 over all admitted entries;
+  a private ready/fill/release barrier that starts the scenario before the fill
+  and releases it only after the full-map proof;
+  container inspection evidence binding the running identity, immutable image,
+  command, labels, control mount and runtime flags to the successful terminal
+  state; its exact SHA-256 and byte size are bound in both the barrier and
+  scenario status and the owner-only `0600` artifact is retained with the raw
+  run, never the bounded public claim projection; exact per-request and aggregate
+  parent outcomes with zero wrong or unresolved parents; actual reason-coded
+  upstream and retrieval failures; positive bounded
+  `handoff_admission/overload`, zero `handoff_admission/ambiguous`, and
+  transport-aware aggregate reconciliation with Java diagnostics;
+  a post-traffic scan requiring the same 10,000 entries and the same content
+  digest with the extra key still absent; exact synthetic-key cleanup
+  verification; and both samples from the final steady-recovery gate, with
+  canonical cleanup/recovery evidence promoted only when the complete gate
+  passes;
 - per-mode runtime assertions for the official-agent/extension/OBI topology
   and the Java-service duplicate-suppression metric; after each normal OBI
   create/restart, a non-measured health request drives behavioral detection

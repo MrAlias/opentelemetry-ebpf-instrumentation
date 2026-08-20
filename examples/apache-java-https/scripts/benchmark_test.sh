@@ -336,6 +336,256 @@ write_pressure_map_metrics_fixture() {
   } >"$output"
 }
 
+write_pressure_contract_artifacts_fixture() {
+  local -r runner="$1"
+  local -r max_entries="$2"
+  local -r project="${3:-obi-test-pressure}"
+  local -r tls="${4:-TLSv1.3}"
+  local -r seed="${5:-20260721}"
+  local -r content_sha256="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  local -r session="0123456789abcdef0123456789abcdef"
+  local -r container_id="cdefcdefcdefcdefcdefcdefcdefcdefcdefcdefcdefcdefcdefcdefcdefcdef"
+  local -r result="$runner/scenario-pressure.json"
+  local -r status="$runner/scenario-pressure-status.json"
+  local -r inspections="$runner/map-pressure-pressure-container-inspections.json"
+  local owner_gid=""
+  local ready_sha256=""
+  local release_sha256=""
+  local fill_sha256=""
+  local verify_sha256=""
+  local result_sha256=""
+  local status_sha256=""
+  local inspections_sha256=""
+  local inspections_size=""
+
+  [[ "$max_entries" =~ ^[1-9][0-9]*$ &&
+    "$project" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ &&
+    "$tls" =~ ^TLSv1\.[23]$ && "$seed" =~ ^(0|[1-9][0-9]*)$ &&
+    -f "$result" && -f "$status" ]] || return 1
+  owner_gid="$(id -g)" || return 1
+  [[ "$owner_gid" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+  jq '.pressure_correlation = {
+    exact_hit_count: 127, explicit_root_count: 1,
+    wrong_parent_count: 0, unresolved_count: 0
+  }' "$result" >"$result.tmp" || return 1
+  mv -T -- "$result.tmp" "$result" || return 1
+  jq '.pressure_correlation = {
+    trace: {exact_hit_count: 127, explicit_root_count: 1,
+      wrong_parent_count: 0, unresolved_count: 0},
+    bridge: {
+      transport: "getsockopt",
+      handoff_admission_outcome_counts: {
+        overload: 5, ambiguous: 0, maximum: 1152
+      }
+    },
+    java_reconciliation_target: {take_valid_count: 127,
+      attributable_absence_count: 1, diagnostic_self_miss_count: 1},
+    barrier_reference: "map-pressure-pressure-barrier-status.json"
+  }' "$status" >"$status.tmp" || return 1
+  mv -T -- "$status.tmp" "$status" || return 1
+
+  jq -cn --argjson max_entries "$max_entries" '
+    {status: "passed", mode: "prepare", map_id: 41,
+     map_name: "java_remote_parent_handoff_claims", kernel_name: "java_remote_par",
+     map_type: "Hash", max_entries: $max_entries, process_map_id: 42,
+     process_pid: 43, process_namespace: 44, token_base: 1,
+     synthetic_pid: 0, synthetic_namespace: 0, touched: 0}
+  ' >"$runner/map-pressure-pressure-prepare.json" || return 1
+  jq -cn --argjson max_entries "$max_entries" \
+    --arg content_sha256 "$content_sha256" '
+    {status: "passed", mode: "fill", map_id: 41,
+     map_name: "java_remote_parent_handoff_claims", kernel_name: "java_remote_par",
+     map_type: "Hash", max_entries: $max_entries, process_map_id: 42,
+     process_pid: 43, process_namespace: 44, token_base: 1,
+     synthetic_pid: 0, synthetic_namespace: 0, touched: $max_entries,
+     capacity_rejected_entries: 1, verified_present_entries: $max_entries,
+     content_sha256: $content_sha256, verified_absent_entries: 1}
+  ' >"$runner/map-pressure-pressure-fill.json" || return 1
+  jq -cn --argjson max_entries "$max_entries" \
+    --arg content_sha256 "$content_sha256" '
+    {status: "passed", mode: "verify", map_id: 41,
+     map_name: "java_remote_parent_handoff_claims", kernel_name: "java_remote_par",
+     map_type: "Hash", max_entries: $max_entries, process_map_id: 42,
+     process_pid: 43, process_namespace: 44, token_base: 1,
+     synthetic_pid: 0, synthetic_namespace: 0, touched: 0,
+     verified_present_entries: $max_entries, content_sha256: $content_sha256,
+     verified_absent_entries: 1}
+  ' >"$runner/map-pressure-pressure-verify.json" || return 1
+  jq -cn --argjson max_entries "$max_entries" '
+    {status: "passed", mode: "cleanup", map_id: 41,
+     map_name: "java_remote_parent_handoff_claims", kernel_name: "java_remote_par",
+     map_type: "Hash", max_entries: $max_entries, process_map_id: 0,
+     process_pid: 43, process_namespace: 44, token_base: 1,
+     synthetic_pid: 0, synthetic_namespace: 0, touched: $max_entries,
+     cleanup_verified: true, verified_absent_entries: ($max_entries + 1)}
+  ' >"$runner/map-pressure-pressure-cleanup.json" || return 1
+  : >"$runner/map-pressure-pressure-prepare.stderr.log"
+  : >"$runner/map-pressure-pressure-fill.stderr.log"
+  : >"$runner/map-pressure-pressure-verify.stderr.log"
+  : >"$runner/map-pressure-pressure-cleanup.stderr.log"
+
+  printf 'pressure-ready-v1:%s\n' "$session" \
+    >"$runner/map-pressure-pressure-barrier-ready.txt"
+  printf 'pressure-release-v1:%s\n' "$session" \
+    >"$runner/map-pressure-pressure-barrier-release.txt"
+  jq -cS -n --arg project "$project" --arg tls "$tls" --arg seed "$seed" \
+    --arg session "$session" --arg container_id "$container_id" \
+    --arg user "$EUID:$owner_gid" --argjson requests 128 '
+    {
+      running: {
+        config: {
+          cmd: ["--scenario", "pressure", "--expected-tls", $tls,
+            "--seed", $seed, "--requests", ($requests | tostring),
+            "--timeout", "75s", "--pressure-control-dir",
+            "/run/obi-demo/pressure-control", "--pressure-control-session",
+            $session, "--pressure-control-timeout", "255s"],
+          entrypoint: ["/trace-scenario"], path: "/trace-scenario", user: $user
+        },
+        identity: {
+          id: $container_id, image_id: ("sha256:" + ("b" * 64)),
+          image_reference: "obi-apache-java-https-tracecheck:local",
+          name: ("/" + $project + "-pressure-scenario-" + ($session[0:12]))
+        },
+        labels: {oneoff: "True", owner: "acceptance-demo-v1",
+          project: $project, service: "scenario"},
+        mount: {destination: "/run/obi-demo/pressure-control", rw: true,
+          source_leaf: (".pressure-control." + $session), type: "bind"},
+        runtime: {attach_stdin: false, network_mode: "host", open_stdin: false,
+          pid_mode: "", privileged: false, restart_policy: "none",
+          stdin_once: false, tty: false},
+        state: {dead: false, error: "", exit_code: 0,
+          finished_at: "0001-01-01T00:00:00Z", host_pid: 4242,
+          oom_killed: false, restart_count: 0, running: true,
+          started_at: "2026-08-17T00:00:00.000000001Z", status: "running"}
+      },
+      scenario_label: "pressure",
+      schema: "pressure-scenario-container-inspections-v1",
+      session: $session,
+      status: "passed",
+      terminal: {
+        config: {
+          cmd: ["--scenario", "pressure", "--expected-tls", $tls,
+            "--seed", $seed, "--requests", ($requests | tostring),
+            "--timeout", "75s", "--pressure-control-dir",
+            "/run/obi-demo/pressure-control", "--pressure-control-session",
+            $session, "--pressure-control-timeout", "255s"],
+          entrypoint: ["/trace-scenario"], path: "/trace-scenario", user: $user
+        },
+        identity: {
+          id: $container_id, image_id: ("sha256:" + ("b" * 64)),
+          image_reference: "obi-apache-java-https-tracecheck:local",
+          name: ("/" + $project + "-pressure-scenario-" + ($session[0:12]))
+        },
+        labels: {oneoff: "True", owner: "acceptance-demo-v1",
+          project: $project, service: "scenario"},
+        mount: {destination: "/run/obi-demo/pressure-control", rw: true,
+          source_leaf: (".pressure-control." + $session), type: "bind"},
+        runtime: {attach_stdin: false, network_mode: "host", open_stdin: false,
+          pid_mode: "", privileged: false, restart_policy: "none",
+          stdin_once: false, tty: false},
+        state: {dead: false, error: "", exit_code: 0,
+          finished_at: "2026-08-17T00:00:01.000000001Z", host_pid: 0,
+          oom_killed: false, restart_count: 0, running: false,
+          started_at: "2026-08-17T00:00:00.000000001Z", status: "exited"}
+      },
+      wait_exit_code: 0
+    }
+  ' >"$inspections" || return 1
+  chmod 0600 -- "$inspections" || return 1
+  mkdir -p -- "$runner/phases/pressure-before"
+  write_pressure_map_metrics_fixture \
+    "$runner/phases/pressure-before/obi-metrics.prom" 0 "$max_entries"
+  write_pressure_map_metrics_fixture \
+    "$runner/map-pressure-pressure-recovered-sample-01.prom" 0 "$max_entries"
+  write_pressure_map_metrics_fixture \
+    "$runner/map-pressure-pressure-recovered-sample-02.prom" 0 "$max_entries"
+  command cp -- "$runner/map-pressure-pressure-recovered-sample-02.prom" \
+    "$runner/map-pressure-pressure-recovered.prom"
+  {
+    printf 'attempt=1 observed_at=2026-08-10T00:00:00Z entries=0 matched=true consecutive=1\n'
+    printf 'attempt=2 observed_at=2026-08-10T00:00:01Z entries=0 matched=true consecutive=2\n'
+  } >"$runner/map-pressure-pressure-recovered-samples.log"
+
+  ready_sha256="$(sha256sum <"$runner/map-pressure-pressure-barrier-ready.txt")" || return 1
+  release_sha256="$(sha256sum <"$runner/map-pressure-pressure-barrier-release.txt")" || return 1
+  fill_sha256="$(sha256sum <"$runner/map-pressure-pressure-fill.json")" || return 1
+  verify_sha256="$(sha256sum <"$runner/map-pressure-pressure-verify.json")" || return 1
+  result_sha256="$(sha256sum <"$result")" || return 1
+  inspections_sha256="$(sha256sum <"$inspections")" || return 1
+  inspections_size="$(stat -Lc '%s' -- "$inspections")" || return 1
+  ready_sha256="${ready_sha256%% *}"
+  release_sha256="${release_sha256%% *}"
+  fill_sha256="${fill_sha256%% *}"
+  verify_sha256="${verify_sha256%% *}"
+  result_sha256="${result_sha256%% *}"
+  inspections_sha256="${inspections_sha256%% *}"
+  jq --arg inspections_sha256 "$inspections_sha256" \
+    --argjson inspections_size "$inspections_size" '
+    .pressure_correlation.container_inspections = {
+      reference: "map-pressure-pressure-container-inspections.json",
+      sha256: $inspections_sha256,
+      size_bytes: $inspections_size
+    }
+  ' "$status" >"$status.tmp" || return 1
+  mv -T -- "$status.tmp" "$status" || return 1
+  status_sha256="$(sha256sum <"$status")" || return 1
+  status_sha256="${status_sha256%% *}"
+  jq -cS -n --arg session "$session" --argjson max_entries "$max_entries" \
+    --arg content_sha256 "$content_sha256" --arg ready_sha256 "$ready_sha256" \
+    --arg release_sha256 "$release_sha256" --arg fill_sha256 "$fill_sha256" \
+    --arg verify_sha256 "$verify_sha256" --arg result_sha256 "$result_sha256" \
+    --arg status_sha256 "$status_sha256" \
+    --arg inspections_sha256 "$inspections_sha256" \
+    --argjson inspections_size "$inspections_size" --arg user "$EUID:$owner_gid" \
+    --arg container_id "$container_id" '
+    {
+      schema: "pressure-traffic-barrier-v1", status: "passed",
+      scenario_label: "pressure", session: $session,
+      sequence: ["scenario_ready", "capacity_fill_verified",
+        "release_published", "scenario_reaped",
+        "post_traffic_content_verified"],
+      control: {
+        ready_reference: "map-pressure-pressure-barrier-ready.txt",
+        ready_sha256: $ready_sha256,
+        release_reference: "map-pressure-pressure-barrier-release.txt",
+        release_sha256: $release_sha256
+      },
+      container: {
+        id: $container_id, host_pid: "4242",
+        started_at: "2026-08-17T00:00:00.000000001Z", user: $user
+      },
+      container_inspections: {
+        reference: "map-pressure-pressure-container-inspections.json",
+        sha256: $inspections_sha256, size_bytes: $inspections_size
+      },
+      fill: {
+        reference: "map-pressure-pressure-fill.json", sha256: $fill_sha256,
+        map_id: "41", baseline_entries: 0, synthetic_pid: 0,
+        synthetic_namespace: 0, max_entries: $max_entries,
+        touched: $max_entries, verified_present_entries: $max_entries,
+        verified_absent_entries: 1, content_sha256: $content_sha256,
+        capacity_rejected_entries: 1
+      },
+      verification: {
+        reference: "map-pressure-pressure-verify.json", sha256: $verify_sha256,
+        map_id: "41", synthetic_pid: 0, synthetic_namespace: 0,
+        verified_present_entries: $max_entries, verified_absent_entries: 1,
+        content_sha256: $content_sha256
+      },
+      traffic: {
+        result_reference: "scenario-pressure.json", result_sha256: $result_sha256,
+        status_reference: "scenario-pressure-status.json",
+        status_sha256: $status_sha256, request_count: 128,
+        exact_hit_count: 127, explicit_root_count: 1,
+        handoff_admission_overload_count: 5,
+        handoff_admission_ambiguous_count: 0,
+        handoff_admission_maximum_count: 1152,
+        wrong_parent_count: 0, unresolved_count: 0
+      }
+    }
+  ' >"$runner/map-pressure-pressure-barrier-status.json"
+}
+
 fake_write_runner_artifacts() {
   local -r result_directory="$1"
   local -r transport="$2"
@@ -356,7 +606,6 @@ fake_write_runner_artifacts() {
   local tracked_patch_sha256=""
   local patch_identity_sha256=""
   local pressure_max_entries="${FAKE_PRESSURE_MAP_MAX_ENTRIES_OVERRIDE:-$FAKE_PRESSURE_MAP_MAX_ENTRIES}"
-  local pressure_touched_entries="$((pressure_max_entries - 1))"
   local index=0
 
   case "$scenario" in
@@ -490,61 +739,8 @@ fake_write_runner_artifacts() {
     elif [[ "$scenario" == w3c-fault ]]; then
       : >"$result_directory/w3c-fault-timeout-bridge.log"
     elif [[ "$scenario" == pressure ]]; then
-      jq '.pressure_correlation = {
-        exact_hit_count: 127, explicit_root_count: 1,
-        wrong_parent_count: 0, unresolved_count: 0
-      }' "$result_directory/scenario-pressure.json" \
-        >"$result_directory/scenario-pressure.json.tmp"
-      mv -T -- "$result_directory/scenario-pressure.json.tmp" \
-        "$result_directory/scenario-pressure.json"
-      jq '.pressure_correlation = {
-        trace: {exact_hit_count: 127, explicit_root_count: 1,
-          wrong_parent_count: 0, unresolved_count: 0},
-        bridge: {transport: "getsockopt"},
-        java_reconciliation_target: {take_valid_count: 127,
-          attributable_absence_count: 1, diagnostic_self_miss_count: 1}
-      }' "$result_directory/scenario-pressure-status.json" \
-        >"$result_directory/scenario-pressure-status.json.tmp"
-      mv -T -- "$result_directory/scenario-pressure-status.json.tmp" \
-        "$result_directory/scenario-pressure-status.json"
-      jq -n \
-        --argjson max_entries "$pressure_max_entries" \
-        --argjson touched_entries "$pressure_touched_entries" '
-        {status: "passed", mode: "fill",
-         map_name: "java_remote_parent_handoff_claims", kernel_name: "java_remote_par",
-         map_type: "Hash", map_id: 41, max_entries: $max_entries,
-         touched: $touched_entries,
-         capacity_rejected_entries: 1, verified_present_entries: $touched_entries,
-         process_map_id: 42, process_pid: 43, process_namespace: 44, token_base: 1}
-      ' >"$result_directory/map-pressure-pressure-fill.json"
-      jq -n --argjson max_entries "$pressure_max_entries" '
-        {status: "passed", mode: "cleanup", map_id: 41,
-         map_name: "java_remote_parent_handoff_claims", kernel_name: "java_remote_par",
-         map_type: "Hash", max_entries: $max_entries, process_map_id: 0,
-         process_pid: 43, process_namespace: 44, token_base: 1,
-         cleanup_verified: true, verified_absent_entries: ($max_entries + 1), touched: 0}
-      ' >"$result_directory/map-pressure-pressure-cleanup.json"
-      write_pressure_map_metrics_fixture \
-        "$result_directory/phases/pressure-before/obi-metrics.prom" \
-        1 "$pressure_max_entries"
-      write_pressure_map_metrics_fixture \
-        "$result_directory/map-pressure-pressure-pressured.prom" \
-        "$pressure_max_entries" "$pressure_max_entries"
-      write_pressure_map_metrics_fixture \
-        "$result_directory/map-pressure-pressure-traffic-complete.prom" \
-        "$pressure_touched_entries" "$pressure_max_entries"
-      write_pressure_map_metrics_fixture \
-        "$result_directory/map-pressure-pressure-recovered-sample-01.prom" \
-        1 "$pressure_max_entries"
-      write_pressure_map_metrics_fixture \
-        "$result_directory/map-pressure-pressure-recovered-sample-02.prom" \
-        1 "$pressure_max_entries"
-      command cp -- "$result_directory/map-pressure-pressure-recovered-sample-02.prom" \
-        "$result_directory/map-pressure-pressure-recovered.prom"
-      {
-        printf 'attempt=1 observed_at=2026-08-10T00:00:00Z entries=1 matched=true consecutive=1\n'
-        printf 'attempt=2 observed_at=2026-08-10T00:00:01Z entries=1 matched=true consecutive=2\n'
-      } >"$result_directory/map-pressure-pressure-recovered-samples.log"
+      write_pressure_contract_artifacts_fixture \
+        "$result_directory" "$pressure_max_entries" "$project" "$tls" "$SEED"
     fi
   elif [[ "$assertion_scenario" == w3c ]]; then
     fake_w3c_sentinel_result \
@@ -592,7 +788,7 @@ fake_write_runner_artifacts() {
     if [[ "$scenario" == pressure && "$index" == before ]]; then
       write_pressure_map_metrics_fixture \
         "$result_directory/phases/$assertion_scenario-$index/obi-metrics.prom" \
-        1 "$pressure_max_entries"
+        0 "$pressure_max_entries"
     else
       printf 'obi_java_remote_parent_operations_total 0\n' \
         >"$result_directory/phases/$assertion_scenario-$index/obi-metrics.prom"
@@ -2161,6 +2357,38 @@ getsockopt-pressure|getsockopt-pressure|getsockopt|pressure|128|128|pressure|pre
 EOF
 
   (
+    local observed=""
+    local expected=""
+
+    reset_options
+    cell_spec getsockopt-pressure
+    observed="$(printf '%s\n' "${CELL_EXTRA_RUNNER_FILES[@]}")"
+    expected="$(sed 's/^ *//' <<'EOF'
+      map-pressure-pressure-prepare.json
+      map-pressure-pressure-prepare.stderr.log
+      map-pressure-pressure-fill.json
+      map-pressure-pressure-fill.stderr.log
+      map-pressure-pressure-verify.json
+      map-pressure-pressure-verify.stderr.log
+      map-pressure-pressure-barrier-ready.txt
+      map-pressure-pressure-barrier-release.txt
+      map-pressure-pressure-barrier-status.json
+      map-pressure-pressure-container-inspections.json
+      map-pressure-pressure-cleanup.json
+      map-pressure-pressure-cleanup.stderr.log
+      map-pressure-pressure-recovered.prom
+      map-pressure-pressure-recovered-sample-01.prom
+      map-pressure-pressure-recovered-sample-02.prom
+      map-pressure-pressure-recovered-samples.log
+EOF
+    )"
+    [[ "$observed" == "$expected" ]]
+  ) || {
+    printf 'pressure retained runner artifact roster is not exact\n' >&2
+    return 1
+  }
+
+  (
     reset_options
     cell_spec getsockopt-helper-idle
     [[ "$CELL_PATH_CLASSIFICATION" == "" &&
@@ -2238,28 +2466,42 @@ write_path_observation_fixture() {
       pressure="$(jq -cn --argjson max_entries "$pressure_max_entries" '
         {
           bounded: true,
+          pressure_contract_version: 1,
+          barrier_schema: "pressure-traffic-barrier-v1",
+          barrier_sequence: ["scenario_ready", "capacity_fill_verified",
+            "release_published", "scenario_reaped",
+            "post_traffic_content_verified"],
           exact_hit_count: 127,
           explicit_root_count: 1,
           wrong_parent_count: 0,
           unresolved_count: 0,
           take_valid_count: 127,
           attributable_absence_count: 1,
+          handoff_admission_overload_count: 5,
+          handoff_admission_ambiguous_count: 0,
+          handoff_admission_maximum_count: 1152,
           map_name: "java_remote_parent_handoff_claims",
           map_type: "Hash",
           map_id: 41,
           kernel_map_name: "java_remote_par",
           kernel_map_type: "hash",
           max_entries: $max_entries,
-          touched_entries: ($max_entries - 1),
+          synthetic_pid: 0,
+          synthetic_namespace: 0,
+          touched_entries: $max_entries,
           capacity_rejected_entries: 1,
-          verified_present_entries: ($max_entries - 1),
+          fill_verified_present_entries: $max_entries,
+          fill_verified_absent_entries: 1,
+          content_sha256: ("a" * 64),
+          post_traffic_verified_present_entries: $max_entries,
+          post_traffic_verified_absent_entries: 1,
+          post_traffic_content_sha256: ("a" * 64),
+          post_traffic_content_verified: true,
           cleanup_verified: true,
-          verified_absent_entries: ($max_entries + 1),
-          occupancy_before_fill: 1,
-          occupancy_pressured: $max_entries,
-          occupancy_traffic_complete: ($max_entries - 1),
-          occupancy_recovery_samples: [1, 1],
-          occupancy_recovered: 1,
+          cleanup_verified_absent_entries: ($max_entries + 1),
+          occupancy_before_fill: 0,
+          occupancy_recovery_samples: [0, 0],
+          occupancy_recovered: 0,
           recovery_log_attempts: 2,
           recovery_samples: 2
         }
@@ -2400,11 +2642,18 @@ test_pressure_recovery_evidence_parses_canonical_samples_and_log() (
   local -r sample_two="$runner/map-pressure-pressure-recovered-sample-02.prom"
   local -r recovered="$runner/map-pressure-pressure-recovered.prom"
   local -r log="$runner/map-pressure-pressure-recovered-samples.log"
-  local -r pressured="$runner/map-pressure-pressure-pressured.prom"
+  local -r baseline="$runner/phases/pressure-before/obi-metrics.prom"
   local -r fill="$runner/map-pressure-pressure-fill.json"
+  local -r verify="$runner/map-pressure-pressure-verify.json"
+  local -r inspections="$runner/map-pressure-pressure-container-inspections.json"
+  local -r barrier="$runner/map-pressure-pressure-barrier-status.json"
+  local -r status="$runner/scenario-pressure-status.json"
   local -r invalid_observation="$root/path-observation.invalid.json"
   local evidence=""
   local canonical_pressure=""
+  local inspections_sha256=""
+  local inspections_size=""
+  local status_sha256=""
 
   mkdir -p -- "$root"
   write_path_observation_fixture "$observation" getsockopt-pressure
@@ -2416,10 +2665,9 @@ test_pressure_recovery_evidence_parses_canonical_samples_and_log() (
   jq -e '
     .map_id == 41 and .kernel_map_name == "java_remote_par" and
     .map_type == "hash" and .max_entries == 10000 and
-    .baseline_entries == 1 and .pressured_entries == 10000 and
-    .traffic_complete_entries == 9999 and
-    .recovery_sample_count == 2 and .recovery_sample_entries == [1, 1] and
-    .recovered_entries == 1 and .recovery_log_attempts == 2
+    .baseline_entries == 0 and
+    .recovery_sample_count == 2 and .recovery_sample_entries == [0, 0] and
+    .recovered_entries == 0 and .recovery_log_attempts == 2
   ' <<<"$evidence" >/dev/null || return 1
   validate_pressure_cell_artifacts "$runner" || return 1
   canonical_pressure="$(canonical_pressure_observation_json "$runner")" || return 1
@@ -2429,37 +2677,108 @@ test_pressure_recovery_evidence_parses_canonical_samples_and_log() (
     return 1
   }
   validate_path_observation_source_artifacts "$observation" || return 1
-  jq '.pressure.occupancy_pressured = 9999' "$observation" >"$invalid_observation"
+
+  mv -T -- "$inspections" "$inspections.missing" || return 1
+  if validate_pressure_cell_artifacts "$runner"; then
+    printf 'pressure validation accepted a missing container inspection artifact\n' >&2
+    return 1
+  fi
+  mv -T -- "$inspections.missing" "$inspections" || return 1
+
+  chmod 0644 -- "$inspections" || return 1
+  if validate_pressure_cell_artifacts "$runner"; then
+    printf 'pressure validation accepted public container inspection permissions\n' >&2
+    return 1
+  fi
+  chmod 0600 -- "$inspections" || return 1
+
+  command cp -- "$inspections" "$inspections.valid" || return 1
+  command cp -- "$status" "$status.valid" || return 1
+  command cp -- "$barrier" "$barrier.valid" || return 1
+  jq -cS '.terminal.state.running = true' "$inspections" \
+    >"$inspections.tmp" || return 1
+  mv -T -- "$inspections.tmp" "$inspections" || return 1
+  chmod 0600 -- "$inspections" || return 1
+  inspections_sha256="$(sha256sum <"$inspections")" || return 1
+  inspections_sha256="${inspections_sha256%% *}"
+  inspections_size="$(stat -Lc '%s' -- "$inspections")" || return 1
+  jq --arg sha256 "$inspections_sha256" --argjson size "$inspections_size" '
+    .pressure_correlation.container_inspections.sha256 = $sha256 |
+    .pressure_correlation.container_inspections.size_bytes = $size
+  ' "$status" >"$status.tmp" || return 1
+  mv -T -- "$status.tmp" "$status" || return 1
+  status_sha256="$(sha256sum <"$status")" || return 1
+  status_sha256="${status_sha256%% *}"
+  jq -cS --arg inspections_sha256 "$inspections_sha256" \
+    --argjson inspections_size "$inspections_size" \
+    --arg status_sha256 "$status_sha256" '
+    .container_inspections.sha256 = $inspections_sha256 |
+    .container_inspections.size_bytes = $inspections_size |
+    .traffic.status_sha256 = $status_sha256
+  ' "$barrier" >"$barrier.tmp" || return 1
+  mv -T -- "$barrier.tmp" "$barrier" || return 1
+  if validate_pressure_cell_artifacts "$runner"; then
+    printf 'pressure validation accepted an impossible terminal inspection state\n' >&2
+    return 1
+  fi
+  mv -T -- "$inspections.valid" "$inspections" || return 1
+  mv -T -- "$status.valid" "$status" || return 1
+  mv -T -- "$barrier.valid" "$barrier" || return 1
+
+  command cp -- "$barrier" "$barrier.valid" || return 1
+  jq -cS '.container_inspections.sha256 = ("f" * 64)' \
+    "$barrier" >"$barrier.tmp" || return 1
+  mv -T -- "$barrier.tmp" "$barrier" || return 1
+  if validate_pressure_cell_artifacts "$runner"; then
+    printf 'pressure validation accepted a stale barrier inspection descriptor\n' >&2
+    return 1
+  fi
+  mv -T -- "$barrier.valid" "$barrier" || return 1
+
+  command cp -- "$status" "$status.valid" || return 1
+  command cp -- "$barrier" "$barrier.valid" || return 1
+  jq '.pressure_correlation.container_inspections.sha256 = ("f" * 64)' \
+    "$status" >"$status.tmp" || return 1
+  mv -T -- "$status.tmp" "$status" || return 1
+  status_sha256="$(sha256sum <"$status")" || return 1
+  status_sha256="${status_sha256%% *}"
+  jq -cS --arg status_sha256 "$status_sha256" \
+    '.traffic.status_sha256 = $status_sha256' "$barrier" \
+    >"$barrier.tmp" || return 1
+  mv -T -- "$barrier.tmp" "$barrier" || return 1
+  if validate_pressure_cell_artifacts "$runner"; then
+    printf 'pressure validation accepted an unbound status inspection descriptor\n' >&2
+    return 1
+  fi
+  mv -T -- "$status.valid" "$status" || return 1
+  mv -T -- "$barrier.valid" "$barrier" || return 1
+
+  jq '.pressure.content_sha256 = ("b" * 64) |
+    .pressure.post_traffic_content_sha256 = ("b" * 64)' \
+    "$observation" >"$invalid_observation"
   validate_path_observation_schema "$invalid_observation" || return 1
   if validate_path_observation_source_artifacts "$invalid_observation"; then
-    printf 'pressure source validation accepted a stale derived occupancy\n' >&2
+    printf 'pressure source validation accepted a stale derived content digest\n' >&2
     return 1
   fi
 
   command cp -- "$fill" "$fill.valid"
   jq '.touched = 1 | .verified_present_entries = 1' "$fill" >"$fill.tmp"
   mv -T -- "$fill.tmp" "$fill"
-  validate_pressure_cell_artifacts "$runner" || {
-    printf 'production-valid mutated fill fixture was rejected before reconciliation\n' >&2
-    return 1
-  }
-  if validate_path_observation_source_artifacts "$observation"; then
-    printf 'pressure source validation accepted stale touched-entry evidence\n' >&2
+  if validate_pressure_cell_artifacts "$runner"; then
+    printf 'pressure validation accepted a partial rather than exact full-map fill\n' >&2
     return 1
   fi
   mv -T -- "$fill.valid" "$fill"
 
-  command cp -- "$pressured" "$pressured.occupancy-valid"
-  write_pressure_map_metrics_fixture "$pressured" 2
-  validate_pressure_cell_artifacts "$runner" || {
-    printf 'production-valid mutated pressure occupancy was rejected before reconciliation\n' >&2
-    return 1
-  }
-  if validate_path_observation_source_artifacts "$observation"; then
-    printf 'pressure source validation accepted stale pressured occupancy evidence\n' >&2
+  command cp -- "$verify" "$verify.valid"
+  jq '.content_sha256 = ("b" * 64)' "$verify" >"$verify.tmp"
+  mv -T -- "$verify.tmp" "$verify"
+  if validate_pressure_cell_artifacts "$runner"; then
+    printf 'pressure validation accepted changed post-traffic map content\n' >&2
     return 1
   fi
-  mv -T -- "$pressured.occupancy-valid" "$pressured"
+  mv -T -- "$verify.valid" "$verify"
 
   command cp -- "$sample_one" "$sample_one.valid"
   printf 'garbage\n' >"$sample_one"
@@ -2471,8 +2790,8 @@ test_pressure_recovery_evidence_parses_canonical_samples_and_log() (
 
   command cp -- "$log" "$log.valid"
   {
-    printf 'attempt=1 observed_at=2026-08-10T00:00:00Z entries=2 matched=true consecutive=1\n'
-    printf 'attempt=2 observed_at=2026-08-10T00:00:01Z entries=1 matched=true consecutive=2\n'
+    printf 'attempt=1 observed_at=2026-08-10T00:00:00Z entries=1 matched=false consecutive=0\n'
+    printf 'attempt=2 observed_at=2026-08-10T00:00:01Z entries=0 matched=true consecutive=1\n'
   } >"$log"
   if validate_pressure_cell_artifacts "$runner"; then
     printf 'pressure validation accepted a log/sample occupancy mismatch\n' >&2
@@ -2481,7 +2800,7 @@ test_pressure_recovery_evidence_parses_canonical_samples_and_log() (
   mv -T -- "$log.valid" "$log"
 
   command cp -- "$recovered" "$recovered.valid"
-  write_pressure_map_metrics_fixture "$recovered" 0
+  write_pressure_map_metrics_fixture "$recovered" 1
   if validate_pressure_cell_artifacts "$runner"; then
     printf 'pressure validation accepted a canonical/sample recovery mismatch\n' >&2
     return 1
@@ -2496,13 +2815,13 @@ test_pressure_recovery_evidence_parses_canonical_samples_and_log() (
   fi
   rm -f -- "$runner/map-pressure-pressure-recovered-sample-03.prom"
 
-  command cp -- "$pressured" "$pressured.valid"
-  write_pressure_map_metrics_fixture "$pressured" 1
+  command cp -- "$baseline" "$baseline.valid"
+  write_pressure_map_metrics_fixture "$baseline" 1
   if validate_pressure_cell_artifacts "$runner"; then
-    printf 'pressure validation accepted missing pressured occupancy\n' >&2
+    printf 'pressure validation accepted a nonempty pre-fill baseline\n' >&2
     return 1
   fi
-  mv -T -- "$pressured.valid" "$pressured"
+  mv -T -- "$baseline.valid" "$baseline"
 )
 
 test_pressure_capacity_is_live_bounded_and_exactly_reconciled() (
@@ -2511,7 +2830,7 @@ test_pressure_capacity_is_live_bounded_and_exactly_reconciled() (
   local observation=""
   local invalid_observation=""
   local runner=""
-  local pressured=""
+  local baseline=""
   local cleanup=""
 
   for capacity in 20000 50000; do
@@ -2554,7 +2873,7 @@ test_pressure_capacity_is_live_bounded_and_exactly_reconciled() (
   observation="$root/path-observation.json"
   invalid_observation="$root/path-observation.invalid.json"
   runner="$root/preflight/runner"
-  pressured="$runner/map-pressure-pressure-pressured.prom"
+  baseline="$runner/phases/pressure-before/obi-metrics.prom"
   cleanup="$runner/map-pressure-pressure-cleanup.json"
   mkdir -p -- "$root"
   write_path_observation_fixture "$observation" getsockopt-pressure
@@ -2570,13 +2889,13 @@ test_pressure_capacity_is_live_bounded_and_exactly_reconciled() (
     return 1
   fi
 
-  command cp -- "$pressured" "$pressured.valid"
-  write_pressure_map_metrics_fixture "$pressured" 10000 20000
+  command cp -- "$baseline" "$baseline.valid"
+  write_pressure_map_metrics_fixture "$baseline" 0 20000
   if validate_pressure_cell_artifacts "$runner"; then
     printf 'pressure artifacts accepted a metric capacity mismatch\n' >&2
     return 1
   fi
-  mv -T -- "$pressured.valid" "$pressured"
+  mv -T -- "$baseline.valid" "$baseline"
 
   command cp -- "$cleanup" "$cleanup.valid"
   jq '.max_entries = 9999 | .verified_absent_entries = 10000' \
@@ -3087,7 +3406,7 @@ materialize_path_observation_sources() {
   local status=""
   local value=0
   local pressure_max_entries=0
-  local pressure_touched_entries=0
+  local -r pressure_project="obi-test-pressure"
   local -a statuses=(
     unknown valid missing stale unsupported malformed version_mismatch ambiguous
     unauthorized already_consumed timeout overload transport_error disabled
@@ -3116,63 +3435,13 @@ materialize_path_observation_sources() {
   if [[ "$cell" == "getsockopt-pressure" ]]; then
     pressure_max_entries="$(jq -er '.pressure.max_entries' "$observation")" || return 1
     [[ "$pressure_max_entries" =~ ^[1-9][0-9]*$ ]] || return 1
-    pressure_touched_entries="$((pressure_max_entries - 1))"
-    jq '.pressure_correlation = {
-      exact_hit_count: 127, explicit_root_count: 1,
-      wrong_parent_count: 0, unresolved_count: 0
-    }' "$result_file" >"$result_file.tmp"
-    mv -T -- "$result_file.tmp" "$result_file"
     jq -n '
       {status: "passed", scenario: "pressure", exit_status: 0, metric_status: 0,
-       result: "scenario-pressure.json",
-       pressure_correlation: {
-         trace: {exact_hit_count: 127, explicit_root_count: 1,
-           wrong_parent_count: 0, unresolved_count: 0},
-         bridge: {transport: "getsockopt"},
-         java_reconciliation_target: {take_valid_count: 127,
-           attributable_absence_count: 1, diagnostic_self_miss_count: 1}
-       }}
+       result: "scenario-pressure.json"}
     ' >"$status_file"
-    jq -n \
-      --argjson max_entries "$pressure_max_entries" \
-      --argjson touched_entries "$pressure_touched_entries" '
-      {status: "passed", mode: "fill",
-       map_name: "java_remote_parent_handoff_claims", kernel_name: "java_remote_par",
-       map_type: "Hash", map_id: 41, max_entries: $max_entries,
-       touched: $touched_entries,
-       capacity_rejected_entries: 1, verified_present_entries: $touched_entries,
-       process_map_id: 42, process_pid: 43, process_namespace: 44, token_base: 1}
-    ' >"$cell_directory/preflight/runner/map-pressure-pressure-fill.json"
-    jq -n --argjson max_entries "$pressure_max_entries" '
-      {status: "passed", mode: "cleanup", map_id: 41,
-       map_name: "java_remote_parent_handoff_claims", kernel_name: "java_remote_par",
-       map_type: "Hash", max_entries: $max_entries, process_map_id: 0,
-       process_pid: 43, process_namespace: 44, token_base: 1,
-       cleanup_verified: true, verified_absent_entries: ($max_entries + 1), touched: 0}
-    ' >"$cell_directory/preflight/runner/map-pressure-pressure-cleanup.json"
-    mkdir -p -- "$cell_directory/preflight/runner/phases/pressure-before"
-    write_pressure_map_metrics_fixture \
-      "$cell_directory/preflight/runner/phases/pressure-before/obi-metrics.prom" \
-      1 "$pressure_max_entries"
-    write_pressure_map_metrics_fixture \
-      "$cell_directory/preflight/runner/map-pressure-pressure-pressured.prom" \
-      "$pressure_max_entries" "$pressure_max_entries"
-    write_pressure_map_metrics_fixture \
-      "$cell_directory/preflight/runner/map-pressure-pressure-traffic-complete.prom" \
-      "$pressure_touched_entries" "$pressure_max_entries"
-    write_pressure_map_metrics_fixture \
-      "$cell_directory/preflight/runner/map-pressure-pressure-recovered-sample-01.prom" \
-      1 "$pressure_max_entries"
-    write_pressure_map_metrics_fixture \
-      "$cell_directory/preflight/runner/map-pressure-pressure-recovered-sample-02.prom" \
-      1 "$pressure_max_entries"
-    command cp -- \
-      "$cell_directory/preflight/runner/map-pressure-pressure-recovered-sample-02.prom" \
-      "$cell_directory/preflight/runner/map-pressure-pressure-recovered.prom"
-    {
-      printf 'attempt=1 observed_at=2026-08-10T00:00:00Z entries=1 matched=true consecutive=1\n'
-      printf 'attempt=2 observed_at=2026-08-10T00:00:01Z entries=1 matched=true consecutive=2\n'
-    } >"$cell_directory/preflight/runner/map-pressure-pressure-recovered-samples.log"
+    write_pressure_contract_artifacts_fixture \
+      "$cell_directory/preflight/runner" "$pressure_max_entries" \
+      "$pressure_project" "$TLS_PROTOCOL" "$SEED"
   else
     jq -n --arg scenario "$scenario" --arg result "scenario-$label.json" '
       {status: "passed", scenario: $scenario, exit_status: 0,
@@ -3185,8 +3454,25 @@ materialize_path_observation_sources() {
     printf 't_%s before=0 after=%s delta=%s\n' "$status" "$value" "$value"
   done >"$diagnostics_file"
   jq -n '{}' >"$cell_directory/preflight/runner/provenance.json"
-  write_application_runner_source_fixture \
-    "$cell_directory/preflight/runner" bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  if [[ ! -e "$cell_directory/preflight/runner/source-state.txt" &&
+    ! -L "$cell_directory/preflight/runner/source-state.txt" &&
+    ! -e "$cell_directory/preflight/runner/environment.txt" &&
+    ! -L "$cell_directory/preflight/runner/environment.txt" ]]; then
+    write_application_runner_source_fixture \
+      "$cell_directory/preflight/runner" bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  else
+    [[ -f "$cell_directory/preflight/runner/source-state.txt" &&
+      ! -L "$cell_directory/preflight/runner/source-state.txt" &&
+      -f "$cell_directory/preflight/runner/environment.txt" &&
+      ! -L "$cell_directory/preflight/runner/environment.txt" ]] || return 1
+  fi
+  if [[ "$cell" == getsockopt-pressure ]]; then
+    {
+      printf 'compose_project=%s\n' "$pressure_project"
+      printf 'tls_protocol=%s\n' "$TLS_PROTOCOL"
+      printf 'scenario_seed=%s\n' "$SEED"
+    } >>"$cell_directory/preflight/runner/environment.txt"
+  fi
 }
 
 write_lookup_path_summary_fixture() {
@@ -3202,6 +3488,8 @@ write_lookup_path_summary_fixture() {
     write_normalized_native_jni_artifact_fixture \
       "$root/native-jni/benchmark.json" "$revision"
   fi
+  write_application_source_identity_artifact_fixture \
+    "$root" complete "$revision" "$REPO_ROOT"
   paths_json="$({
     for cell in "${PATH_OBSERVATION_CELLS[@]}"; do
       mkdir -p -- "$root/cells/$cell"
@@ -3215,8 +3503,6 @@ write_lookup_path_summary_fixture() {
       '
     done
   } | jq -s .)" || return 1
-  write_application_source_identity_artifact_fixture \
-    "$root" complete "$revision" "$REPO_ROOT"
   jq -n '
     {
       schema_version: 2,
@@ -4883,6 +5169,8 @@ test_helper_idle_bpf_metrics_require_constrained_deltas() (
   local -r after="$TEST_TMP_DIR/helper-idle-bpf-after.prom"
   local -r unavailable="$TEST_TMP_DIR/helper-idle-bpf-unavailable.prom"
   local -r duplicate="$TEST_TMP_DIR/helper-idle-bpf-duplicate.prom"
+  local -r before_zero="$TEST_TMP_DIR/helper-idle-bpf-before-zero.prom"
+  local -r after_zero="$TEST_TMP_DIR/helper-idle-bpf-after-zero.prom"
   local -r churn_before="$TEST_TMP_DIR/helper-idle-bpf-churn-before.prom"
   local -r churn_after="$TEST_TMP_DIR/helper-idle-bpf-churn-after.prom"
   local -r output="$TEST_TMP_DIR/helper-idle-bpf-deltas.json"
@@ -4921,16 +5209,35 @@ test_helper_idle_bpf_metrics_require_constrained_deltas() (
       {category: "tcp-inject", operation: "inject", transport: "tcp", expected_delta: 0},
       {category: "tcp-stage", operation: "stage", transport: "tcp", expected_delta: 0},
       {category: "tcp-handoff", operation: "handoff", transport: "tcp", expected_delta: 0},
+      {category: "tcp-handoff_admission", operation: "handoff_admission", transport: "tcp", expected_delta: 0},
       {category: "getsockopt-take", operation: "take", transport: "getsockopt", expected_delta: 0},
       {category: "getsockopt-discard", operation: "discard", transport: "getsockopt", expected_delta: 0}
     ]) and
     (.constrained_zero_deltas | all(.observed_delta == 0 and .expected_delta == 0)) and
+    (.constrained_zero_deltas[] |
+      select(.operation == "handoff_admission") |
+      .before_series == 0 and .after_series == 0) and
     .informative_getsockopt_negotiate_missing == {
       before_series: 1, after_series: 1, before: 1, after: 9, observed_delta: 8,
       interpretation: "informative_only_not_a_retrieval_outcome_reconciliation"
     }
   ' "$output" >/dev/null || {
     printf 'helper-idle BPF metrics lost the report and informative-negotiation distinction\n' >&2
+    return 1
+  }
+  rm -f -- "$output"
+  cp -- "$before" "$before_zero"
+  cp -- "$after" "$after_zero"
+  printf '%s\n' \
+    'obi_java_remote_parent_operations_total{operation="handoff_admission",status="ambiguous",transport="tcp"} 0' \
+    'obi_java_remote_parent_operations_total{operation="handoff_admission",status="overload",transport="tcp"} 0' \
+    >>"$before_zero"
+  printf '%s\n' \
+    'obi_java_remote_parent_operations_total{operation="handoff_admission",status="ambiguous",transport="tcp"} 0' \
+    'obi_java_remote_parent_operations_total{operation="handoff_admission",status="overload",transport="tcp"} 0' \
+    >>"$after_zero"
+  helper_idle_metric_delta_json "$before_zero" "$after_zero" "$output" || {
+    printf 'helper-idle BPF metrics rejected explicit zero admission rows\n' >&2
     return 1
   }
   rm -f -- "$output"
@@ -4954,6 +5261,20 @@ test_helper_idle_bpf_metrics_require_constrained_deltas() (
     fake_bpf_metrics_snapshot >"$after"
     if helper_idle_metric_delta_json "$before" "$after" "$output" >/dev/null 2>&1; then
       printf 'helper-idle BPF metrics accepted %s/%s activity\n' "$transport" "$operation" >&2
+      return 1
+    fi
+  done
+  printf '13 0 0 0 0 0 0 9\n' >"$state"
+  fake_bpf_metrics_snapshot >"$after"
+  for mutation in ambiguous overload; do
+    cp -- "$after" "$after.$mutation"
+    printf '%s\n' \
+      "obi_java_remote_parent_operations_total{operation=\"handoff_admission\",status=\"$mutation\",transport=\"tcp\"} 1" \
+      >>"$after.$mutation"
+    if helper_idle_metric_delta_json \
+      "$before" "$after.$mutation" "$output" >/dev/null 2>&1; then
+      printf 'helper-idle BPF metrics accepted handoff admission %s activity\n' \
+        "$mutation" >&2
       return 1
     fi
   done
@@ -6107,12 +6428,13 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
       {category: "tcp-inject", operation: "inject", transport: "tcp", expected_delta: 0},
       {category: "tcp-stage", operation: "stage", transport: "tcp", expected_delta: 0},
       {category: "tcp-handoff", operation: "handoff", transport: "tcp", expected_delta: 0},
+      {category: "tcp-handoff_admission", operation: "handoff_admission", transport: "tcp", expected_delta: 0},
       {category: "getsockopt-take", operation: "take", transport: "getsockopt", expected_delta: 0},
       {category: "getsockopt-discard", operation: "discard", transport: "getsockopt", expected_delta: 0}
     ]) and
     (.constrained_zero_deltas | all(.observed_delta == 0 and .expected_delta == 0)) and
     .assertion == {
-      tcp_upstream_candidate_inject_stage_handoff_delta_zero: true,
+      tcp_upstream_candidate_inject_stage_handoff_and_admission_delta_zero: true,
       getsockopt_take_discard_delta_zero: true
     }
   ' "$output/cells/getsockopt-helper-idle/sustained-helper-idle/obi-metrics-deltas.json" \
@@ -6322,7 +6644,6 @@ test_complete_mode_fake_run_publishes_resolvable_bounded_evidence() {
   local -r source_tree_manifest="$TEST_TMP_DIR/fake-complete-source-tree.manifest"
   # Exercise publication with a supported capacity that differs from the default fixture.
   local -r pressure_max_entries="${FAKE_PRESSURE_MAP_MAX_ENTRIES_OVERRIDE:-20000}"
-  local -r pressure_touched_entries="$((pressure_max_entries - 1))"
   local revision=""
   local git_tree=""
   local command_name=""
@@ -6451,6 +6772,27 @@ test_complete_mode_fake_run_publishes_resolvable_bounded_evidence() {
   }
   validate_lookup_path_summary_schema \
     "$output/lookup-paths.json" "$fake_root" || return 1
+  [[ -f "$output/cells/getsockopt-pressure/preflight/runner/map-pressure-pressure-container-inspections.json" &&
+    ! -L "$output/cells/getsockopt-pressure/preflight/runner/map-pressure-pressure-container-inspections.json" &&
+    "$(stat -Lc '%a' -- "$output/cells/getsockopt-pressure/preflight/runner/map-pressure-pressure-container-inspections.json")" == 600 ]] || {
+    printf 'complete fake run did not privately retain the exact pressure container inspection artifact\n' >&2
+    return 1
+  }
+  jq -e '
+    .retained_files |
+    index("map-pressure-pressure-container-inspections.json") != null
+  ' "$output/cells/getsockopt-pressure/preflight/runner/provenance.json" \
+    >/dev/null || {
+    printf 'pressure runner provenance omitted the private inspection artifact\n' >&2
+    return 1
+  }
+  if grep -Eq \
+    'map-pressure-pressure-container-inspections\.json|0123456789abcdef0123456789abcdef|\.pressure-control\.0123456789abcdef0123456789abcdef|cdefcdefcdefcdefcdefcdefcdefcdefcdefcdefcdefcdefcdefcdefcdefcdef' \
+    "$output/lookup-paths.json" \
+    "$output/cells/getsockopt-pressure/path-observation.json"; then
+    printf 'normalized pressure observations disclosed private container inspection data\n' >&2
+    return 1
+  fi
   validate_native_jni_benchmark_schema "$output/native-jni/benchmark.json" || return 1
   validate_application_source_identity_schema \
     "$output/application-source-identity.json" "$fake_root" || return 1
@@ -6459,8 +6801,7 @@ test_complete_mode_fake_run_publishes_resolvable_bounded_evidence() {
       "getsockopt-stale", "unix-stale", "unix-timeout", "getsockopt-pressure"
     ]' "$output/application-source-identity.json" >/dev/null || return 1
   jq -e \
-    --argjson pressure_max_entries "$pressure_max_entries" \
-    --argjson pressure_touched_entries "$pressure_touched_entries" '
+    --argjson pressure_max_entries "$pressure_max_entries" '
     (.paths | length) == 6 and
     all(.paths[];
       (.source_artifact | test("^cells/[^/]+/path-observation\\.json$")) and
@@ -6476,10 +6817,16 @@ test_complete_mode_fake_run_publishes_resolvable_bounded_evidence() {
     (.paths[] | select(.observation.cell == "getsockopt-pressure") |
       .observation.pressure |
       .map_id == 41 and .kernel_map_name == "java_remote_par" and
-      .occupancy_before_fill == 1 and
-      .occupancy_pressured == $pressure_max_entries and
-      .occupancy_traffic_complete == $pressure_touched_entries and
-      .occupancy_recovery_samples == [1, 1] and .occupancy_recovered == 1 and
+      .pressure_contract_version == 1 and .synthetic_pid == 0 and
+      .synthetic_namespace == 0 and .occupancy_before_fill == 0 and
+      .touched_entries == $pressure_max_entries and
+      .fill_verified_present_entries == $pressure_max_entries and
+      .post_traffic_verified_present_entries == $pressure_max_entries and
+      .content_sha256 == .post_traffic_content_sha256 and
+      .handoff_admission_overload_count == 5 and
+      .handoff_admission_ambiguous_count == 0 and
+      .handoff_admission_maximum_count == 1152 and
+      .occupancy_recovery_samples == [0, 0] and .occupancy_recovered == 0 and
       .recovery_samples == 2 and .recovery_log_attempts == 2)
   ' "$output/lookup-paths.json" >/dev/null || return 1
   jq -e '.status == "clean_and_stable" and
@@ -6520,6 +6867,7 @@ main() {
     test_manifest_bootstrap_survives_second_locality_query_failure
     test_benchmark_documentation_binds_partial_status_to_mralias_issue
     test_proc_snapshot_requires_container_starttime_and_cgroup_identity
+    test_bounded_path_cell_mapping_is_exact
     test_pressure_recovery_evidence_parses_canonical_samples_and_log
     test_pressure_capacity_is_live_bounded_and_exactly_reconciled
     test_application_source_identity_is_exact_across_core_and_complete_cells

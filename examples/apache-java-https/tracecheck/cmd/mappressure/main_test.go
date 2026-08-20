@@ -4,6 +4,8 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -26,8 +28,8 @@ func TestSyntheticKeysAreBoundedAndDeterministic(t *testing.T) {
 	require.Len(t, first, targetKeySize)
 	assert.Equal(t, first, repeated)
 	assert.NotEqual(t, first, second)
-	assert.Equal(t, identity.pid, binary.LittleEndian.Uint32(first[0:4]))
-	assert.Equal(t, identity.namespace, binary.LittleEndian.Uint32(first[4:8]))
+	assert.Zero(t, binary.LittleEndian.Uint32(first[0:4]))
+	assert.Zero(t, binary.LittleEndian.Uint32(first[4:8]))
 	assert.EqualValues(t, 700, binary.LittleEndian.Uint64(first[8:16]))
 	assert.EqualValues(t, 701, binary.LittleEndian.Uint64(second[8:16]))
 	assert.Equal(t, identity.incarnation, binary.LittleEndian.Uint64(first[16:24]))
@@ -70,6 +72,9 @@ func TestValidateConfigRequiresModeSpecificIdentity(t *testing.T) {
 		processNamespace:   202,
 		tokenBase:          700,
 	}
+	validVerify := validFill
+	validVerify.mode = "verify"
+	validVerify.expectedContentSHA256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 	tests := []struct {
 		name    string
@@ -78,6 +83,7 @@ func TestValidateConfigRequiresModeSpecificIdentity(t *testing.T) {
 	}{
 		{name: "prepare", cfg: config{mode: "prepare", processPID: 101, processNamespace: 202}},
 		{name: "fill", cfg: validFill},
+		{name: "verify", cfg: validVerify},
 		{name: "cleanup", cfg: validCleanup},
 		{name: "invalid mode", cfg: config{mode: "invalid"}, wantErr: true},
 		{name: "prepare missing process identity", cfg: config{mode: "prepare"}, wantErr: true},
@@ -89,6 +95,17 @@ func TestValidateConfigRequiresModeSpecificIdentity(t *testing.T) {
 		{name: "missing process PID", cfg: func() config { cfg := validFill; cfg.processPID = 0; return cfg }(), wantErr: true},
 		{name: "missing process namespace", cfg: func() config { cfg := validFill; cfg.processNamespace = 0; return cfg }(), wantErr: true},
 		{name: "missing token base", cfg: func() config { cfg := validFill; cfg.tokenBase = 0; return cfg }(), wantErr: true},
+		{name: "verify missing digest", cfg: func() config { cfg := validVerify; cfg.expectedContentSHA256 = ""; return cfg }(), wantErr: true},
+		{name: "verify uppercase digest", cfg: func() config {
+			cfg := validVerify
+			cfg.expectedContentSHA256 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+			return cfg
+		}(), wantErr: true},
+		{name: "fill unexpected digest", cfg: func() config {
+			cfg := validFill
+			cfg.expectedContentSHA256 = validVerify.expectedContentSHA256
+			return cfg
+		}(), wantErr: true},
 		{name: "cleanup process map ID", cfg: func() config { cfg := validCleanup; cfg.expectedProcessMapID = 42; return cfg }(), wantErr: true},
 		{name: "capacity too large", cfg: config{mode: "fill", mapID: 41, expectedMaxEntries: maxPressureEntries + 1, expectedProcessMapID: 42, processPID: 101, processNamespace: 202, tokenBase: 700}, wantErr: true},
 	}
@@ -168,7 +185,7 @@ func TestResultJSONLocksModeSpecificEvidenceSchema(t *testing.T) {
 		{
 			name: "prepare",
 			got:  func() result { output := base; output.Mode = "prepare"; return output }(),
-			want: `{"status":"passed","mode":"prepare","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":10,"process_map_id":42,"process_pid":101,"process_namespace":202,"token_base":18446744073709551605,"touched":0}`,
+			want: `{"status":"passed","mode":"prepare","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":10,"process_map_id":42,"process_pid":101,"process_namespace":202,"token_base":18446744073709551605,"synthetic_pid":0,"synthetic_namespace":0,"touched":0}`,
 		},
 		{
 			name: "fill",
@@ -178,9 +195,23 @@ func TestResultJSONLocksModeSpecificEvidenceSchema(t *testing.T) {
 				output.Touched = 10
 				output.CapacityRejectedEntries = 1
 				output.VerifiedPresentEntries = 10
+				output.ContentSHA256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+				output.VerifiedAbsentEntries = 1
 				return output
 			}(),
-			want: `{"status":"passed","mode":"fill","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":10,"process_map_id":42,"process_pid":101,"process_namespace":202,"token_base":18446744073709551605,"touched":10,"capacity_rejected_entries":1,"verified_present_entries":10}`,
+			want: `{"status":"passed","mode":"fill","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":10,"process_map_id":42,"process_pid":101,"process_namespace":202,"token_base":18446744073709551605,"synthetic_pid":0,"synthetic_namespace":0,"touched":10,"capacity_rejected_entries":1,"verified_present_entries":10,"content_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","verified_absent_entries":1}`,
+		},
+		{
+			name: "verify",
+			got: func() result {
+				output := base
+				output.Mode = "verify"
+				output.VerifiedPresentEntries = 10
+				output.ContentSHA256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+				output.VerifiedAbsentEntries = 1
+				return output
+			}(),
+			want: `{"status":"passed","mode":"verify","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":10,"process_map_id":42,"process_pid":101,"process_namespace":202,"token_base":18446744073709551605,"synthetic_pid":0,"synthetic_namespace":0,"touched":0,"verified_present_entries":10,"content_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","verified_absent_entries":1}`,
 		},
 		{
 			name: "cleanup",
@@ -193,7 +224,7 @@ func TestResultJSONLocksModeSpecificEvidenceSchema(t *testing.T) {
 				output.VerifiedAbsentEntries = 11
 				return output
 			}(),
-			want: `{"status":"passed","mode":"cleanup","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":10,"process_map_id":0,"process_pid":101,"process_namespace":202,"token_base":18446744073709551605,"touched":9,"cleanup_verified":true,"verified_absent_entries":11}`,
+			want: `{"status":"passed","mode":"cleanup","map_id":41,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":10,"process_map_id":0,"process_pid":101,"process_namespace":202,"token_base":18446744073709551605,"synthetic_pid":0,"synthetic_namespace":0,"touched":9,"cleanup_verified":true,"verified_absent_entries":11}`,
 		},
 	}
 
@@ -400,14 +431,16 @@ func TestRunFillResultCarriesExactPreparedProcessEvidence(t *testing.T) {
 		updateCalls++
 		assert.Equal(t, ebpf.UpdateNoExist, flags)
 		if updateCalls == 2 {
-			return syscall.ENOSPC
+			return syscall.E2BIG
 		}
 		copy(insertedKey[:], key.([]byte))
 		copy(insertedValue[:], value.([]byte))
 		return nil
 	}
 	target.lookup = func(key, value interface{}) error {
-		assert.Equal(t, insertedKey[:], key.([]byte))
+		if !bytes.Equal(insertedKey[:], key.([]byte)) {
+			return ebpf.ErrKeyNotExist
+		}
 		copy(value.(*[targetValueSize]byte)[:], insertedValue[:])
 		return nil
 	}
@@ -436,6 +469,8 @@ func TestRunFillResultCarriesExactPreparedProcessEvidence(t *testing.T) {
 	)
 
 	require.NoError(t, err)
+	digestInput := append(append([]byte{}, insertedKey[:]...), insertedValue[:]...)
+	expectedContentSHA256 := fmt.Sprintf("%x", sha256.Sum256(digestInput))
 	assert.Equal(t, result{
 		Status:                  "passed",
 		Mode:                    "fill",
@@ -451,12 +486,14 @@ func TestRunFillResultCarriesExactPreparedProcessEvidence(t *testing.T) {
 		Touched:                 1,
 		CapacityRejectedEntries: 1,
 		VerifiedPresentEntries:  1,
+		ContentSHA256:           expectedContentSHA256,
+		VerifiedAbsentEntries:   1,
 	}, output)
 	assert.NotZero(t, output.ProcessMapID)
 	assert.NotZero(t, output.ProcessPID)
 	assert.NotZero(t, output.ProcessNamespace)
-	assert.Equal(t, processPID, binary.LittleEndian.Uint32(insertedKey[0:4]))
-	assert.Equal(t, processNS, binary.LittleEndian.Uint32(insertedKey[4:8]))
+	assert.Zero(t, binary.LittleEndian.Uint32(insertedKey[0:4]))
+	assert.Zero(t, binary.LittleEndian.Uint32(insertedKey[4:8]))
 	assert.Equal(t, incarnation, binary.LittleEndian.Uint64(insertedKey[16:24]))
 	assert.Equal(t, 2, updateCalls)
 	assert.Equal(t, 1, target.closeCalls)
@@ -621,42 +658,77 @@ func processIdentityLookup(incarnation uint64) func(key, value interface{}) erro
 	}
 }
 
-func TestVerifySyntheticEntriesPresentRequiresEveryKey(t *testing.T) {
-	identity := processIdentity{pid: 101, namespace: 202}
+func TestVerifySyntheticEntriesRequiresExactContentAndRejectedKeyAbsence(t *testing.T) {
+	identity := processIdentity{pid: 101, namespace: 202, incarnation: 303}
 	tokenBase := uint64(700)
 
-	present, err := verifySyntheticEntriesPresent(
+	present, absent, digest, err := verifySyntheticEntries(
 		identity,
 		tokenBase,
 		3,
-		func([]byte) error { return nil },
+		func(key []byte, value *[targetValueSize]byte) error {
+			index := binary.LittleEndian.Uint64(key[8:16]) - tokenBase
+			if index >= 3 {
+				return ebpf.ErrKeyNotExist
+			}
+			copy(value[:], claimValue(12345+index, identity.incarnation))
+			return nil
+		},
 	)
 
 	require.NoError(t, err)
 	assert.EqualValues(t, 3, present)
+	assert.EqualValues(t, 1, absent)
+	assert.Regexp(t, `^[0-9a-f]{64}$`, digest)
 
-	_, err = verifySyntheticEntriesPresent(
+	_, _, _, err = verifySyntheticEntries(
 		identity,
 		tokenBase,
 		3,
-		func(key []byte) error {
+		func(key []byte, value *[targetValueSize]byte) error {
 			if binary.LittleEndian.Uint64(key[8:16]) == tokenBase+1 {
 				return fmt.Errorf("lookup: %w", ebpf.ErrKeyNotExist)
 			}
+			copy(value[:], claimValue(12345, identity.incarnation))
 			return nil
 		},
 	)
 	require.EqualError(t, err, "synthetic entry 1 was evicted")
+
+	_, _, _, err = verifySyntheticEntries(
+		identity,
+		tokenBase,
+		1,
+		func(key []byte, value *[targetValueSize]byte) error {
+			copy(value[:], claimValue(12345, identity.incarnation))
+			return nil
+		},
+	)
+	require.EqualError(t, err, "capacity-plus-one synthetic entry became present")
+
+	_, _, _, err = verifySyntheticEntries(
+		identity,
+		tokenBase,
+		1,
+		func(key []byte, value *[targetValueSize]byte) error {
+			if binary.LittleEndian.Uint64(key[8:16]) > tokenBase {
+				return ebpf.ErrKeyNotExist
+			}
+			copy(value[:], claimValue(12345, 404))
+			return nil
+		},
+	)
+	require.EqualError(t, err, "synthetic entry 0 changed")
 }
 
-func TestVerifySyntheticEntriesPresentRejectsLookupErrors(t *testing.T) {
+func TestVerifySyntheticEntriesRejectsLookupErrors(t *testing.T) {
 	lookupErr := errors.New("lookup failed")
 	lookupCount := 0
-	_, err := verifySyntheticEntriesPresent(
-		processIdentity{pid: 101, namespace: 202},
+	_, _, _, err := verifySyntheticEntries(
+		processIdentity{pid: 101, namespace: 202, incarnation: 303},
 		700,
 		4,
-		func([]byte) error {
+		func([]byte, *[targetValueSize]byte) error {
 			lookupCount++
 			return lookupErr
 		},
@@ -665,9 +737,9 @@ func TestVerifySyntheticEntriesPresentRejectsLookupErrors(t *testing.T) {
 	require.ErrorIs(t, err, lookupErr)
 }
 
-func TestCapacityRejectionRecognizesKernelHashMapErrors(t *testing.T) {
+func TestCapacityRejectionRecognizesOnlyKernelHashMapCapacityError(t *testing.T) {
 	assert.True(t, isCapacityRejection(fmt.Errorf("update: %w", syscall.E2BIG)))
-	assert.True(t, isCapacityRejection(fmt.Errorf("update: %w", syscall.ENOSPC)))
+	assert.False(t, isCapacityRejection(fmt.Errorf("update: %w", syscall.ENOSPC)))
 	assert.False(t, isCapacityRejection(ebpf.ErrKeyExist))
 }
 
@@ -675,13 +747,17 @@ func TestCleanupSyntheticEntriesUsesFullLiveIncarnationKeys(t *testing.T) {
 	identity := processIdentity{pid: 101, namespace: 202}
 	matchingIdentity := processIdentity{pid: 101, namespace: 202, incarnation: 303}
 	otherIncarnation := processIdentity{pid: 101, namespace: 202, incarnation: 404}
-	otherProcess := processIdentity{pid: 102, namespace: 202, incarnation: 303}
+	realProcessEntry := targetEntryForTest(
+		processIdentity{pid: 102, namespace: 202, incarnation: 303}, 700,
+	)
+	binary.LittleEndian.PutUint32(realProcessEntry.key[0:4], 102)
+	binary.LittleEndian.PutUint32(realProcessEntry.key[4:8], 202)
 	entries := []targetEntry{
 		targetEntryForTest(matchingIdentity, 700),
 		targetEntryForTest(otherIncarnation, 701),
 		targetEntryForTest(otherIncarnation, 699),
 		targetEntryForTest(otherIncarnation, 703),
-		targetEntryForTest(otherProcess, 700),
+		realProcessEntry,
 	}
 	deleted := make(map[[targetKeySize]byte]struct{})
 	collect := func() ([]targetEntry, error) {
@@ -716,7 +792,7 @@ func TestCleanupSyntheticEntriesUsesFullLiveIncarnationKeys(t *testing.T) {
 	assert.NotContains(t, deleted, entries[4].key)
 }
 
-func TestCleanupSyntheticEntriesRejectsInvalidInRangeEntry(t *testing.T) {
+func TestCleanupSyntheticEntriesRemovesCorruptedOwnedEntry(t *testing.T) {
 	identity := processIdentity{pid: 101, namespace: 202}
 	valid := targetEntryForTest(
 		processIdentity{pid: 101, namespace: 202, incarnation: 303}, 700,
@@ -741,16 +817,23 @@ func TestCleanupSyntheticEntriesRejectsInvalidInRangeEntry(t *testing.T) {
 			mutate(&invalid)
 			deleteCalled := false
 
-			_, _, err := cleanupSyntheticEntries(
+			touched, verified, err := cleanupSyntheticEntries(
 				identity,
 				700,
 				3,
-				func() ([]targetEntry, error) { return []targetEntry{invalid}, nil },
+				func() ([]targetEntry, error) {
+					if deleteCalled {
+						return nil, nil
+					}
+					return []targetEntry{invalid}, nil
+				},
 				func([]byte) error { deleteCalled = true; return nil },
 			)
 
-			require.EqualError(t, err, "synthetic entry has an invalid incarnation or ticket")
-			assert.False(t, deleteCalled)
+			require.NoError(t, err)
+			assert.EqualValues(t, 1, touched)
+			assert.EqualValues(t, 3, verified)
+			assert.True(t, deleteCalled)
 		})
 	}
 }

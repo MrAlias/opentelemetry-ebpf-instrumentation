@@ -65,19 +65,34 @@ two historical bundles `otel-getsockopt-tls13-7482d908` and
 `otel-unix-tls12-acedb68a` predate the `availability` rename, so their OBI
 metric deltas can contain `operation="select"`. In those historical revisions,
 `select` means only OBI-side transport readiness or preference; it is neither
-Java helper selection nor proof that a request used that transport. The current
+Java helper selection nor proof that a request used that transport. The retained
 issue #34 supplement `otel-getsockopt-tls13-8282d2ed`, the full primary
 `otel-getsockopt-tls13-e8db066a`, and the prior
 `otel-getsockopt-tls13-c9d14356`, `otel-getsockopt-tls12-c7209e43`,
 `otel-unix-tls12-bd1c9327`, and `splunk-getsockopt-tls13-47237792` bundles use
 `operation="availability"` and retain V2 Java transport-configuration
 snapshots. The prior
-`otel-getsockopt-tls13-94221a91` bundle uses the same current schema. The
-current schema has an
-eleven-operation, 792-series upper bound, as documented in the [Java
-remote-parent bridge guide](../../../devdocs/java-remote-parent-bridge.md).
-Checksum verification preserves the checked-in artifact set; it does not
-recast their historical schema.
+`otel-getsockopt-tls13-94221a91` bundle uses that same historical
+availability/V2 schema. Those immutable bundles predate
+`operation="handoff_admission"` and retain their then-current
+eleven-operation, 792-series bound. The current source contract has a
+twelve-operation, 864-series upper bound, including `handoff_admission`, as
+documented in the [Java remote-parent bridge
+guide](../../../devdocs/java-remote-parent-bridge.md). Checksum verification
+preserves the checked-in artifact set; it does not recast their historical
+schema.
+
+The current raw-v3 pressure contract also retains
+`map-pressure-pressure-container-inspections.json` privately. Its canonical
+running/terminal lifecycle is bound by exact SHA-256 and byte-size descriptors
+in the raw barrier and scenario status. It is not part of any historical bundle
+listed below, any normalized lookup observation, or the public claims-v1
+closure. The public projector remains exactly seven files, and its producer
+status roster remains 35 boundaries and 56 status entries. Public commitment
+bytes may still change: the private manifest commitment changes, and the
+descriptor-bearing pressure status changes its existing producer-roster
+digest. Those changes propagate to the authority, claims, derivation receipt,
+evidence ID, and checksum manifest without adding a public field or file.
 
 | Evidence | Result | Matrix cell |
 | --- | --- | --- |

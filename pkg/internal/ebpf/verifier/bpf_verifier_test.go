@@ -40,7 +40,11 @@ import (
 var (
 	specCache   sync.Map // map[uintptr]*ebpf.CollectionSpec keyed by loadFn pointer
 	specCacheMu sync.Mutex
-	btfCache    = btf.NewCache()
+	// cilium/ebpf's Cache is safe to call concurrently, but the split-BTF
+	// decoder Specs returned from it lazily inflate their shared base without
+	// taking the base decoder lock. Keep each cache exclusive to one collection
+	// load while still amortising kernel BTF decoding across later subtests.
+	btfCachePool = sync.Pool{New: func() any { return btf.NewCache() }}
 )
 
 func cachedSpec(t *testing.T, loadFn func() (*ebpf.CollectionSpec, error)) *ebpf.CollectionSpec {
@@ -98,6 +102,8 @@ func loadAndVerify(t *testing.T, name string, loadFn func() (*ebpf.CollectionSpe
 			}
 		}
 
+		btfCache := btfCachePool.Get().(*btf.Cache)
+		defer btfCachePool.Put(btfCache)
 		coll, err := ebpf.NewCollectionWithOptions(spec, ebpf.CollectionOptions{
 			Programs: ebpf.ProgramOptions{
 				// Increase log buffer so verifier rejections are not truncated.
@@ -198,18 +204,34 @@ func TestBPFVerifierWithConstants(t *testing.T) {
 		{"tcp_max_captured_bytes", []any{uint32(0), uint32(65536)}},
 	})
 
+	// nodejs_runtime_metrics_enabled only gates the decode path in nodejs.c,
+	// which shares no code with the constants above except the debug and
+	// traceparent machinery — a dedicated small matrix keeps the nodejs path
+	// verified in both states without doubling the full generictracer
+	// cross-product.
+	forEachCombination(t, "generictracer/BpfNodejs", generictracerbpf.LoadBpf, []constOption{
+		{"g_bpf_debug", []any{true, false}},
+		{"g_bpf_traceparent_enabled", []any{true, false}},
+		{"nodejs_runtime_metrics_enabled", []any{uint64(0), uint64(1)}},
+	})
+
 	// gotracer
 	forEachCombination(t, "gotracer/Bpf", gotracerbpf.LoadBpf, []constOption{
 		{"g_bpf_debug", []any{true, false}},
 		{"g_bpf_traceparent_enabled", []any{true, false}},
 		{"g_bpf_header_propagation", []any{true, false}},
 		{"java_remote_parent_enabled", javaRemoteParentValues},
+		{"g_bpf_probe_write_user_enabled", []any{true}},
 		{"g_bpf_loop_enabled", []any{ebpfcommon.SupportsEBPFLoops(slog.Default(), false)}},
 		{"capture_header_buffer", []any{int32(0), int32(1)}},
 		{"high_request_volume", []any{uint32(0), uint32(1)}},
 		{"max_transaction_time", []any{uint64(0), uint64(60_000_000_000)}},
 		{"http_max_captured_bytes", []any{uint32(0), uint32(262144)}},
 		{"tcp_max_captured_bytes", []any{uint32(0), uint32(65536)}},
+	})
+	loadAndVerify(t, "gotracer/Bpf/no-write-user", gotracerbpf.LoadBpf, map[string]any{
+		"g_bpf_header_propagation":       true,
+		"g_bpf_probe_write_user_enabled": false,
 	})
 
 	// tpinjector

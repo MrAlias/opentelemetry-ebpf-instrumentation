@@ -60,6 +60,20 @@ func openNodeELF(t *testing.T, pid int) *elf.File {
 	return f
 }
 
+func exactSignalCheck(t *testing.T, pid int, ef *elf.File) signalCheckResult {
+	t.Helper()
+	procDir, err := os.Open(fmt.Sprintf("/proc/%d", pid))
+	if err != nil {
+		t.Fatalf("open exact proc directory: %v", err)
+	}
+	defer procDir.Close()
+	dev, ino, err := procs.ExecutableIdentityFromProcFD(int(procDir.Fd()))
+	if err != nil {
+		t.Fatalf("read exact executable identity: %v", err)
+	}
+	return hasUserSIGUSR1Handler(int(procDir.Fd()), dev, ino, ef)
+}
+
 func TestHasUserSIGUSR1Handler_NoHandler(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("requires root to read /proc/<pid>/mem")
@@ -74,7 +88,7 @@ func TestHasUserSIGUSR1Handler_NoHandler(t *testing.T) {
 
 	ef := openNodeELF(t, cmd.Process.Pid)
 
-	result := hasUserSIGUSR1Handler(cmd.Process.Pid, ef)
+	result := exactSignalCheck(t, cmd.Process.Pid, ef)
 	if result != signalCheckNotFound {
 		t.Errorf("expected signalCheckNotFound, got %d", result)
 	}
@@ -92,7 +106,7 @@ func TestHasUserSIGUSR1Handler_WithHandler(t *testing.T) {
 
 	ef := openNodeELF(t, cmd.Process.Pid)
 
-	result := hasUserSIGUSR1Handler(cmd.Process.Pid, ef)
+	result := exactSignalCheck(t, cmd.Process.Pid, ef)
 	if result != signalCheckFound {
 		t.Errorf("expected signalCheckFound, got %d", result)
 	}
@@ -110,7 +124,7 @@ func TestHasUserSIGUSR1Handler_OtherSignalOnly(t *testing.T) {
 
 	ef := openNodeELF(t, cmd.Process.Pid)
 
-	result := hasUserSIGUSR1Handler(cmd.Process.Pid, ef)
+	result := exactSignalCheck(t, cmd.Process.Pid, ef)
 	if result != signalCheckNotFound {
 		t.Errorf("expected signalCheckNotFound, got %d", result)
 	}

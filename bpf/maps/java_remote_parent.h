@@ -3858,7 +3858,7 @@ static __always_inline u64 java_remote_parent_stage(const connection_info_t *con
 
     if (!java_remote_parent_data_hook_is_ready() || !connection || !connection_netns ||
         !connection_netns_cookie || !socket_cookie || !incoming_generation || !incoming ||
-        !incoming->valid || incoming->provenance != k_tp_provenance_tcp_exact_flags ||
+        !incoming->valid || tp_info_pid_provenance(incoming) != k_tp_provenance_tcp_exact_flags ||
         !valid_trace(incoming->tp.trace_id) || !valid_span(incoming->tp.span_id)) {
         java_remote_parent_stat_add(k_java_remote_parent_stat_stage_malformed);
         return 0;

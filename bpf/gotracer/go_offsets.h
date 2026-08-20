@@ -6,7 +6,7 @@
 #include <bpfcore/vmlinux.h>
 #include <bpfcore/bpf_helpers.h>
 #include <bpfcore/bpf_core_read.h>
-
+#include <common/pin_internal.h>
 #include <gotracer/go_constants.h>
 
 // To be injected from the user space during the eBPF program load & initialization
@@ -20,6 +20,7 @@ typedef enum {
     // http
     _url_ptr_pos,
     _path_ptr_pos,
+    _raw_query_ptr_pos,
     _host_ptr_pos,
     _scheme_ptr_pos,
     _method_ptr_pos,
@@ -88,6 +89,8 @@ typedef enum {
     _span_context_trace_id_pos,
     _span_context_span_id_pos,
     _span_context_trace_flags_pos,
+    _auto_sdk_span_context_pos,
+    _auto_sdk_activation_supported,
     // go runtime channels
     _hchan_qcount_pos,
     _hchan_dataqsiz_pos,
@@ -144,6 +147,16 @@ typedef enum {
     _runtime_heap_stats_delta_large_alloc_count_pos,
     _runtime_heap_stats_delta_small_alloc_count_pos,
     _runtime_heap_stats_delta_small_free_count_pos,
+    _runtime_sched_ngsys_pos,
+    _runtime_sched_gfree_stack_pos,
+    _runtime_sched_gfree_no_stack_pos,
+    _runtime_p_gfree_pos,
+    _runtime_glist_size_pos,
+    _runtime_gc_controller_heap_goal_pos,
+    _runtime_sched_time_to_run_pos,
+    _runtime_sched_stw_total_time_gc_pos,
+    _runtime_time_histogram_underflow_pos,
+    _runtime_time_histogram_overflow_pos,
     _last_go_offset,
 } go_offset_const;
 
@@ -167,34 +180,38 @@ typedef struct off_table {
     u64 table[_last_go_offset];
 } off_table_t;
 
-typedef struct go_offsets_key {
+typedef struct go_executable_key {
     u64 dev;
     u64 ino;
-} go_offsets_key_t;
-
-static __always_inline u64 encode_stat_device(u32 dev) {
-    const u32 major = dev >> 20;
-    const u32 minor = dev & ((1U << 20) - 1);
-
-    // Match new_encode_dev(), which is the st_dev representation returned to userspace.
-    return (u64)((minor & 0xffU) | (major << 8) | ((minor & ~0xffU) << 12));
-}
+} go_executable_key_t;
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __type(key, go_offsets_key_t);
+    __type(key, go_executable_key_t);
     __type(value, off_table_t); // the offset table
     __uint(max_entries, MAX_GO_PROGRAMS);
+    __uint(pinning, OBI_PIN_INTERNAL);
 } go_offsets_map SEC(".maps");
+
+static __always_inline bool go_executable_key(struct inode *inode, go_executable_key_t *key) {
+    if (!inode) {
+        return false;
+    }
+
+    key->dev = (u64)BPF_CORE_READ(inode, i_sb, s_dev);
+    key->ino = (u64)BPF_CORE_READ(inode, i_ino);
+    return key->ino != 0;
+}
 
 static __always_inline off_table_t *get_offsets_table() {
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+
     struct inode *inode = BPF_CORE_READ(task, mm, exe_file, f_inode);
-    const u32 dev = (u32)BPF_CORE_READ(inode, i_sb, s_dev);
-    const go_offsets_key_t key = {
-        .dev = encode_stat_device(dev),
-        .ino = (u64)BPF_CORE_READ(inode, i_ino),
-    };
+    go_executable_key_t key = {};
+    if (!go_executable_key(inode, &key)) {
+        return NULL;
+    }
+
     return (off_table_t *)bpf_map_lookup_elem(&go_offsets_map, &key);
 }
 

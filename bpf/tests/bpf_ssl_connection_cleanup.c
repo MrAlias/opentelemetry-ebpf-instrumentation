@@ -340,7 +340,7 @@ static tp_info_pid_t trace(u32 pid) {
         .pid = pid,
         .valid = 1,
         .req_type = EVENT_HTTP_CLIENT,
-        .provenance = k_tp_provenance_ssl_prewrite,
+        .state = TP_INFO_PID_STATE_PROVENANCE(k_tp_provenance_ssl_prewrite),
     };
     result.tp.trace_id[0] = 1;
     result.tp.span_id[0] = 2;
@@ -831,7 +831,7 @@ static void test_prewrite_structural_validation_rejects_malformed_trace_state(vo
                   "a noncanonical trace-valid marker is malformed");
 
     value = valid_ssl_prewrite();
-    value.trace.provenance = k_tp_provenance_tcp_exact_flags;
+    tp_info_pid_set_provenance(&value.trace, k_tp_provenance_tcp_exact_flags);
     assert_int_eq(0,
                   ssl_prewrite_shared_value_structurally_valid(&value),
                   "another trace provenance is malformed");

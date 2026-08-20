@@ -38,6 +38,9 @@ func instrumentableFromModuleMap(moduleName string) svc.InstrumentableType {
 	if strings.HasSuffix(moduleName, "/node") || moduleName == "node" {
 		return svc.InstrumentableNodejs
 	}
+	if strings.HasSuffix(moduleName, "/deno") || moduleName == "deno" {
+		return svc.InstrumentableDeno
+	}
 	if rubyModule.MatchString(moduleName) {
 		return svc.InstrumentableRuby
 	}

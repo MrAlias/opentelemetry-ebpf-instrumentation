@@ -831,7 +831,7 @@ func (p *Tracer) removePIDOwner(key uint64, owner *exec.FileInfo) error {
 	)
 }
 
-func (p *Tracer) AllowPID(pid app.PID, ns uint32, fi, owner *exec.FileInfo) {
+func (p *Tracer) AllowPID(pid app.PID, ns uint32, fi, owner *exec.FileInfo) bool {
 	p.pidsMU.Lock()
 	defer p.pidsMU.Unlock()
 	if owner == nil {
@@ -839,7 +839,7 @@ func (p *Tracer) AllowPID(pid app.PID, ns uint32, fi, owner *exec.FileInfo) {
 	}
 	if owner == nil {
 		p.log.Error("allow pid: exact process owner is unavailable", "pid", pid)
-		return
+		return false
 	}
 
 	hostPID := uint32(pid)
@@ -849,7 +849,7 @@ func (p *Tracer) AllowPID(pid app.PID, ns uint32, fi, owner *exec.FileInfo) {
 	lifecycleEpoch, epochCreated, err := p.establishPIDLifecycleEpoch(hostPID, hasCurrentAdmission)
 	if err != nil {
 		p.log.Error("allow pid: cannot establish process lifecycle epoch", "pid", pid, "error", err)
-		return
+		return false
 	}
 	lifecycleCommitted := hasCurrentAdmission
 	defer func() {
@@ -871,20 +871,20 @@ func (p *Tracer) AllowPID(pid app.PID, ns uint32, fi, owner *exec.FileInfo) {
 			"generation_epoch", currentGeneration.LifecycleEpoch,
 			"current_epoch", lifecycleEpoch,
 		)
-		return
+		return false
 	}
 
 	processGeneration, err := processGenerationForOwner(owner, lifecycleEpoch)
 	if err != nil {
 		p.log.Error("allow pid: exact process generation is unavailable", "pid", pid, "error", err)
-		return
+		return false
 	}
 
 	pk := p.pidKey(ns, uint32(pid))
 	nsPids, err := ebpfcommon.NamespacedPIDsForOwner(pid, owner)
 	if err != nil {
 		p.log.Error("allow pid: error finding namespaced pids", "error", err)
-		return
+		return false
 	}
 
 	aliases := make([]uint64, 0, len(nsPids))
@@ -927,7 +927,7 @@ func (p *Tracer) AllowPID(pid app.PID, ns uint32, fi, owner *exec.FileInfo) {
 	if tracked {
 		if !addPredecessor(previousKey) {
 			p.log.Error("allow pid: current process admission has no exact owner", "pid", pid)
-			return
+			return false
 		}
 		previousGeneration, generationErr := processGenerationForOwner(
 			p.pidOwners[previousKey],
@@ -941,7 +941,7 @@ func (p *Tracer) AllowPID(pid app.PID, ns uint32, fi, owner *exec.FileInfo) {
 				"owner_generation", previousGeneration.ProcessInstanceId,
 				"error", generationErr,
 			)
-			return
+			return false
 		}
 		if p.pidOwners[previousKey] != owner &&
 			previousGeneration.ProcessInstanceId == processGeneration.ProcessInstanceId {
@@ -950,7 +950,7 @@ func (p *Tracer) AllowPID(pid app.PID, ns uint32, fi, owner *exec.FileInfo) {
 				"pid", pid,
 				"generation", processGeneration.ProcessInstanceId,
 			)
-			return
+			return false
 		}
 	} else if processGenerationPresent(currentGeneration) {
 		p.log.Error(
@@ -958,12 +958,12 @@ func (p *Tracer) AllowPID(pid app.PID, ns uint32, fi, owner *exec.FileInfo) {
 			"pid", pid,
 			"generation", currentGeneration.ProcessInstanceId,
 		)
-		return
+		return false
 	}
 	if _, registeredAtNewKey := p.pidOwners[pk]; registeredAtNewKey {
 		if !addPredecessor(pk) {
 			p.log.Error("allow pid: replacement key has no exact owner", "pid", pid, "ns", ns)
-			return
+			return false
 		}
 	}
 
@@ -992,7 +992,7 @@ func (p *Tracer) AllowPID(pid app.PID, ns uint32, fi, owner *exec.FileInfo) {
 		desiredOwner:  owner,
 	}); err != nil {
 		p.log.Error("allow pid: failed to update BPF PID admission", "pid", pid, "error", err)
-		return
+		return false
 	}
 
 	for _, predecessor := range predecessors {
@@ -1013,6 +1013,7 @@ func (p *Tracer) AllowPID(pid app.PID, ns uint32, fi, owner *exec.FileInfo) {
 	p.pidOwners[pk] = owner
 	p.pidKeysByHostPID[hostPID] = pk
 	lifecycleCommitted = true
+	return true
 }
 
 func (p *Tracer) BlockPID(pid app.PID, ns uint32, _ *exec.FileInfo, owner *exec.FileInfo) {

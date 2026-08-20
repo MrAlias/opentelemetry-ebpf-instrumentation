@@ -76,11 +76,11 @@ func New(pidFilter ebpfcommon.ServiceFilter, cfg *obi.Config, metrics imetrics.R
 	}
 }
 
-func (p *Tracer) AllowPID(pid app.PID, ns uint32, fi, owner *exec.FileInfo) {
+func (p *Tracer) AllowPID(pid app.PID, ns uint32, fi, owner *exec.FileInfo) bool {
 	if owner == nil {
 		owner = fi
 	}
-	p.pidsFilter.AllowPID(pid, ns, fi, owner, ebpfcommon.PIDTypeKProbes)
+	return p.pidsFilter.AllowPID(pid, ns, fi, owner, ebpfcommon.PIDTypeKProbes)
 }
 
 func (p *Tracer) BlockPID(pid app.PID, ns uint32, fi, owner *exec.FileInfo) {

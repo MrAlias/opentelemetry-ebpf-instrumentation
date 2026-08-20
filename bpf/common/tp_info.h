@@ -29,14 +29,66 @@ typedef struct tp_info {
     u8 _pad[7];
 } tp_info_t;
 
+// how a client span got its parent, decided where the parent is adopted
+enum parent_status : u8 {
+    // no parent was found
+    k_parent_status_none = 0,
+    // the parent request was still being served when this span started
+    k_parent_status_live = 1,
+    // the parent request may already have ended when this span started: once a
+    // response is under way only its content says where it ends, so userspace
+    // settles the link against the parent span's real end timestamp
+    k_parent_status_conditional = 2,
+};
+
+_Static_assert(k_parent_status_conditional == 2,
+               "value mirrored in pkg/ebpf/common (parentStatusConditional)");
+
 typedef struct tp_info_pid {
     tp_info_t tp;
     u32 pid;
     u8 valid;
     u8 written;
     u8 req_type;
-    u8 provenance;
+    u8 state;
 } tp_info_pid_t;
+
+#define TP_INFO_PID_PROVENANCE_MASK 0x03
+#define TP_INFO_PID_RESPONSE_SENT_MASK 0x04
+#define TP_INFO_PID_STATE_PROVENANCE(provenance) ((u8)(provenance) & TP_INFO_PID_PROVENANCE_MASK)
+
+_Static_assert(sizeof(tp_info_pid_t) == 56, "tp_info_pid_t ABI size must remain stable");
+
+static __always_inline enum tp_provenance tp_info_pid_provenance(const tp_info_pid_t *info) {
+    return info ? (enum tp_provenance)(info->state & TP_INFO_PID_PROVENANCE_MASK)
+                : k_tp_provenance_unknown;
+}
+
+static __always_inline void tp_info_pid_set_provenance(tp_info_pid_t *info,
+                                                       enum tp_provenance provenance) {
+    if (info) {
+        info->state = (info->state & ~TP_INFO_PID_PROVENANCE_MASK) |
+                      ((u8)provenance & TP_INFO_PID_PROVENANCE_MASK);
+    }
+}
+
+static __always_inline void tp_info_pid_reset_state(tp_info_pid_t *info,
+                                                    enum tp_provenance provenance) {
+    if (info) {
+        info->state = TP_INFO_PID_STATE_PROVENANCE(provenance);
+    }
+}
+
+static __always_inline u8 tp_info_pid_response_sent(const tp_info_pid_t *info) {
+    return info && !!(info->state & TP_INFO_PID_RESPONSE_SENT_MASK);
+}
+
+static __always_inline void tp_info_pid_set_response_sent(tp_info_pid_t *info, u8 response_sent) {
+    if (info) {
+        info->state = response_sent ? info->state | TP_INFO_PID_RESPONSE_SENT_MASK
+                                    : info->state & ~TP_INFO_PID_RESPONSE_SENT_MASK;
+    }
+}
 
 static __always_inline u8 valid_span(const unsigned char *span_id) {
     return *((u64 *)span_id) != 0;
@@ -63,7 +115,7 @@ static __always_inline u8 apply_incoming_trace_candidate(tp_info_t *server,
     }
     __builtin_memcpy(server->trace_id, candidate->tp.trace_id, sizeof(server->trace_id));
     __builtin_memcpy(server->parent_id, candidate->tp.span_id, sizeof(server->parent_id));
-    if (candidate->provenance == k_tp_provenance_tcp_exact_flags) {
+    if (tp_info_pid_provenance(candidate) == k_tp_provenance_tcp_exact_flags) {
         server->flags = candidate->tp.flags;
     }
     return 1;

@@ -241,7 +241,7 @@ static __always_inline u8 ssl_prewrite_local_owner_expired(u8 pending,
 static __always_inline u8 ssl_prewrite_trace_valid(const tp_info_pid_t *trace, u32 pid) {
     return trace && trace->valid == 1 && trace->pid == pid &&
            trace->req_type == EVENT_HTTP_CLIENT &&
-           trace->provenance == k_tp_provenance_ssl_prewrite &&
+           tp_info_pid_provenance(trace) == k_tp_provenance_ssl_prewrite &&
            (*((const u64 *)trace->tp.trace_id) != 0 ||
             *((const u64 *)(trace->tp.trace_id + sizeof(u64))) != 0) &&
            *((const u64 *)trace->tp.span_id) != 0;

@@ -6,10 +6,11 @@ JAVA_REMOTE_PARENT_VECTORS ?= $(abspath $(MAKEFILE_DIR)/../../testdata/java-remo
 
 sources = $(wildcard *.c)
 targets = $(sources:.c=) test_java_vt_identity_disabled
+headers = $(shell find .. -name '*.h')
 
 all: $(targets)
 
-%: %.c
+%: %.c $(headers)
 	$(CC) $(CFLAGS) -o $@ $< $(LFLAGS)
 
 test_java_vt_identity_disabled: test_java_vt_identity.c
@@ -40,6 +41,18 @@ check-java-remote-parent: test_java_remote_parent test_incoming_trace_collision 
 	./test_java_exit_cleanup
 	./test_java_tls_thread_mapping
 	./bpf_ssl_connection_cleanup
+
+.PHONY: test
+test: $(targets)
+	@set -e; for t in $(targets); do \
+		echo "### running $$t"; \
+		if [ "$$t" = test_java_remote_parent ]; then \
+			./$$t "$(JAVA_REMOTE_PARENT_VECTORS)"; \
+		else \
+			./$$t; \
+		fi; \
+	done
+	@echo "All BPF unit tests passed"
 
 .PHONY: clean
 clean:

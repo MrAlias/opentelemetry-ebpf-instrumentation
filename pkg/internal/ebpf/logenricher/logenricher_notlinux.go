@@ -22,8 +22,10 @@ import (
 
 type Tracer struct{}
 
-func New(_ *obi.Config) *Tracer                                                    { return nil }
-func (p *Tracer) AllowPID(_ app.PID, _ uint32, _ *exec.FileInfo, _ *exec.FileInfo) {}
+func New(_ *obi.Config) *Tracer { return nil }
+func (p *Tracer) AllowPID(_ app.PID, _ uint32, _ *exec.FileInfo, _ *exec.FileInfo) bool {
+	return true
+}
 func (p *Tracer) BlockPID(_ app.PID, _ uint32, _ *exec.FileInfo, _ *exec.FileInfo) {}
 func (p *Tracer) LoadSpecs() ([]*ebpfcommon.SpecBundle, error)                     { return nil, nil }
 func (p *Tracer) AddCloser(_ ...io.Closer)                                         {}

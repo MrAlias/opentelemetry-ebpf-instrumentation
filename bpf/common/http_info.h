@@ -40,10 +40,12 @@ typedef struct http_info {
     u8 has_large_buffers;
     u8 direction;
     u8 submitted;
+    enum parent_status parent_status;
     enum event_source_type event_source;
     u8 ssl_prewrite_pending;
-    u8 _pad;
 } http_info_t;
+
+_Static_assert(sizeof(http_info_t) == 416, "http_info_t ABI size must remain stable");
 
 static __always_inline u8 http_info_begin_request(http_info_t *info, u8 packet_type, u8 direction) {
     if (!info || packet_type != PACKET_TYPE_REQUEST || info->status || info->start_monotime_ns) {

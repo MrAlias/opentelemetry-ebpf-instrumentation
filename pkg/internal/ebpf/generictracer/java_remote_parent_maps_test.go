@@ -343,7 +343,7 @@ func TestJavaRemoteParentLifecycleTailFitsRHEL96CombinedStack(t *testing.T) {
 		unregistered   = "handle_java_unregistered_lifecycle_ioctl"
 		frameQuantum   = 16
 		stackBudget    = legacyBPFStackLimit - frameQuantum
-		lifecycleSlots = 21
+		lifecycleSlots = 24
 	)
 
 	for _, object := range []struct {

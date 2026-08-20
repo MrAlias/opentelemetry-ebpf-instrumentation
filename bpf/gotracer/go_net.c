@@ -25,6 +25,7 @@
 #include <common/go_addr_key.h>
 #include <common/http_types.h>
 #include <common/lw_thread.h>
+#include <common/preempt_guard.h>
 #include <common/protocol_defs.h>
 #include <common/tp_info.h>
 #include <common/trace_helpers.h>
@@ -42,6 +43,7 @@
 #include <gotracer/types/net_args.h>
 #include <gotracer/types/nethttp.h>
 
+#include <gotracer/maps/go_persist_conn.h>
 #include <gotracer/maps/nethttp.h>
 #include <gotracer/maps/ongoing_fd_reads.h>
 #include <gotracer/maps/ongoing_large_buffers.h>
@@ -52,7 +54,7 @@
 #include <shared/obi_ctx.h>
 
 SEC("uprobe/netFdRead")
-int obi_uprobe_netFdRead(struct pt_regs *ctx) {
+int GUARDED_PROG(obi_uprobe_netFdRead, struct pt_regs *, ctx) {
     void *goroutine_addr = GOROUTINE_PTR(ctx);
     bpf_dbg_printk(
         "=== uprobe/netFdRead goroutine_addr=%lx, fd=%llx === ", goroutine_addr, GO_PARAM1(ctx));
@@ -84,13 +86,13 @@ int obi_uprobe_netFdRead(struct pt_regs *ctx) {
         return 0;
     }
 
-    bpf_tail_call(ctx, &jump_table, k_tail_continue_netfd_read);
+    preempt_guarded_tail_call(ctx, &jump_table, k_tail_continue_netfd_read);
     return 0;
 }
 
 // k_tail_continue_netfd_read
 SEC("uprobe/netFdRead_cont")
-int obi_continue_netfd_read(struct pt_regs *ctx) {
+int GUARDED_PROG(obi_continue_netfd_read, struct pt_regs *, ctx) {
     void *goroutine_addr = GOROUTINE_PTR(ctx);
     bpf_dbg_printk("=== uprobe/netFdRead_cont goroutine_addr=%lx ===", goroutine_addr);
 
@@ -135,7 +137,7 @@ int obi_continue_netfd_read(struct pt_regs *ctx) {
 }
 
 SEC("uprobe/netFdReadRet")
-int obi_uprobe_netFdReadRet(struct pt_regs *ctx) {
+int GUARDED_PROG(obi_uprobe_netFdReadRet, struct pt_regs *, ctx) {
     void *goroutine_addr = GOROUTINE_PTR(ctx);
     bpf_dbg_printk("=== uprobe/proc netFD read returns goroutine %lx === ", goroutine_addr);
 
@@ -151,7 +153,7 @@ int obi_uprobe_netFdReadRet(struct pt_regs *ctx) {
             return 0;
         } else if (net_ptr && net_ptr->byte_ptr) {
             send_http_large_buffers_if_needed(
-                &net_ptr->p_conn.conn, (void *)net_ptr->byte_ptr, len, TCP_RECV);
+                &g_key, &net_ptr->p_conn.conn, (void *)net_ptr->byte_ptr, len, TCP_RECV);
         }
 
         return 0;
@@ -189,7 +191,7 @@ int obi_uprobe_netFdReadRet(struct pt_regs *ctx) {
 }
 
 SEC("uprobe/netFdWrite")
-int obi_uprobe_netFdWrite(struct pt_regs *ctx) {
+int GUARDED_PROG(obi_uprobe_netFdWrite, struct pt_regs *, ctx) {
     const u64 id = bpf_get_current_pid_tgid();
 
     void *goroutine_addr = GOROUTINE_PTR(ctx);
@@ -219,6 +221,10 @@ int obi_uprobe_netFdWrite(struct pt_regs *ctx) {
 
         p_conn.pid = pid_from_pid_tgid(id);
 
+        // an http client request being written: hand the connection to the request
+        // goroutine and claim it, so this write is not reported a second time
+        persist_conn_publish(&g_key, &p_conn.conn);
+
         u16 orig_dport = p_conn.conn.d_port;
         sort_connection_info(&p_conn.conn);
 
@@ -228,7 +234,7 @@ int obi_uprobe_netFdWrite(struct pt_regs *ctx) {
             cleanup_duplicate_generic_events_sorted(&p_conn);
 
             if (!http_large_buffer_skip(len)) {
-                send_http_large_buffers_if_needed(&p_conn.conn, (void *)buf, len, TCP_SEND);
+                send_http_large_buffers_if_needed(&g_key, &p_conn.conn, (void *)buf, len, TCP_SEND);
             }
             return 0;
         }
@@ -249,7 +255,7 @@ int obi_uprobe_netFdWrite(struct pt_regs *ctx) {
 }
 
 SEC("uprobe/netFdClose")
-int obi_uprobe_netFdClose(struct pt_regs *ctx) {
+int GUARDED_PROG(obi_uprobe_netFdClose, struct pt_regs *, ctx) {
     bpf_dbg_printk("=== uprobe/proc netFD close goroutine %lx === ", GOROUTINE_PTR(ctx));
 
     void *fd_ptr = GO_PARAM1(ctx);
@@ -258,19 +264,24 @@ int obi_uprobe_netFdClose(struct pt_regs *ctx) {
         return 0;
     }
 
-    connection_info_t conn = {0};
+    go_large_buffer_key_t key = {
+        .stream_id = 0, // HTTP/1 state
+    };
 
-    if (!get_conn_info_from_fd(fd_ptr, &conn, false)) {
+    // HTTP2 will remain in the LRU map and get kicked out, the connection + streamId will
+    // not repeat and if it does we clean-up on new connection + stream setup_http2_client_conn.
+
+    if (!get_conn_info_from_fd(fd_ptr, &key.conn, false)) {
         return 0;
     }
 
-    sort_connection_info(&conn);
+    sort_connection_info(&key.conn);
 
-    bpf_map_delete_elem(&ongoing_large_buffers, &conn);
+    bpf_map_delete_elem(&ongoing_large_buffers, &key);
 
-    dbg_print_http_connection_info(&conn);
+    dbg_print_http_connection_info(&key.conn);
 
-    remove_go_handled_connection(&conn);
+    remove_go_handled_connection(&key.conn);
 
     return 0;
 }

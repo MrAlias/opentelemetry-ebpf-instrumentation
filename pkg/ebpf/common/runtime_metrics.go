@@ -7,13 +7,14 @@ import (
 	"context"
 	"log/slog"
 
-	jvmruntime "go.opentelemetry.io/obi/pkg/appolly/app/runtime"
+	appruntime "go.opentelemetry.io/obi/pkg/appolly/app/runtime"
 	"go.opentelemetry.io/obi/pkg/ebpf/ringbuf"
 )
 
 type RuntimeMetricSender interface {
 	SendGoRuntimeMetricRecord(context.Context, *ringbuf.Record, ServiceFilter) error
-	SendJVMRuntimeMetrics(context.Context, []jvmruntime.JVMRuntimeEvent)
+	SendJVMRuntimeMetrics(context.Context, []appruntime.JVMRuntimeEvent)
+	SendNodejsRuntimeMetrics(context.Context, []appruntime.NodejsRuntimeEvent)
 }
 
 // RuntimeMetricRecordHandler lets tracers decode runtime metric records whose
@@ -23,7 +24,8 @@ type RuntimeMetricRecordHandler func(context.Context, *ringbuf.Record) (bool, er
 func IsGoRuntimeMetricRecord(record *ringbuf.Record) bool {
 	return record != nil &&
 		len(record.RawSample) > 0 &&
-		record.RawSample[0] == EventTypeGoRuntimeMetric
+		(record.RawSample[0] == EventTypeGoRuntimeMetric ||
+			record.RawSample[0] == EventTypeGoRuntimeHistogram)
 }
 
 func HandleRuntimeMetricsRecord(
@@ -40,7 +42,7 @@ func HandleRuntimeMetricsRecord(
 
 	eventType := record.RawSample[0]
 	switch eventType {
-	case EventTypeGoRuntimeMetric:
+	case EventTypeGoRuntimeMetric, EventTypeGoRuntimeHistogram:
 		if eventContext == nil || eventContext.RuntimeMetrics == nil {
 			return true, nil
 		}
@@ -58,6 +60,19 @@ func HandleRuntimeMetricsRecord(
 				return true, nil
 			}
 		}
+		return true, nil
+	case EventTypeNodejsEventLoop:
+		if eventContext == nil || eventContext.RuntimeMetrics == nil {
+			return true, nil
+		}
+		event, err := ParseNodejsEventLoopRecord(record)
+		if err != nil {
+			return true, err
+		}
+		if !DecorateNodejsRuntimeEvent(filter, &event) {
+			return true, nil
+		}
+		eventContext.RuntimeMetrics.SendNodejsRuntimeMetrics(ctx, []appruntime.NodejsRuntimeEvent{event})
 		return true, nil
 	default:
 		return false, nil

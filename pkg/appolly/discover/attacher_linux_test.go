@@ -23,6 +23,7 @@ import (
 	"go.opentelemetry.io/obi/pkg/export/imetrics"
 	"go.opentelemetry.io/obi/pkg/internal/helpers/maps"
 	"go.opentelemetry.io/obi/pkg/internal/procs"
+	"go.opentelemetry.io/obi/pkg/internal/testutil"
 	"go.opentelemetry.io/obi/pkg/obi"
 	"go.opentelemetry.io/obi/pkg/pipe/msg"
 )
@@ -53,7 +54,7 @@ func TestCommonTracersPrunedAfterLoadFailure(t *testing.T) {
 		log:                slog.With("component", t.Name()),
 		Metrics:            imetrics.NoopReporter{},
 		commonTracers:      []ebpf.Tracer{okTracer, failedTracer},
-		existingTracers:    map[execpkg.FileID]*ebpf.ProcessTracer{},
+		existingTracers:    map[execpkg.FileID]executableTracer{},
 		processInstances:   maps.MultiCounter[execpkg.FileID]{},
 		OutputTracerEvents: tracerEvents,
 	}
@@ -74,8 +75,9 @@ func TestCommonTracersPrunedAfterLoadFailure(t *testing.T) {
 	assert.NotEmpty(t, okTracer.allowed)
 	assert.Empty(t, failedTracer.allowed)
 
-	ta.existingTracers[fileInfo.ID()] = tracer
-	ta.processInstances.Inc(fileInfo.ID())
+	key := executableKey(fileInfo)
+	ta.existingTracers[key] = executableTracer{tracer: tracer, generation: 1}
+	recordTestProcessInstance(ta, key, fileInfo)
 
 	ta.notifyProcessDeletion(ie)
 	assert.NotEmpty(t, okTracer.blocked)
@@ -141,6 +143,80 @@ func TestExistingTracerAttachFailureDoesNotAdmitPID(t *testing.T) {
 	}}, reporter.records)
 }
 
+func TestRejectedReplacementDeletionDoesNotRetireAdmittedInstance(t *testing.T) {
+	attachErr := errors.New("required shared-library probe failed")
+	program := &recordingTracer{}
+	tracer := &ebpf.ProcessTracer{
+		Type:     ebpf.Generic,
+		Programs: []ebpf.Tracer{program},
+	}
+	const reusedPID = app.PID(42)
+	first := execpkg.New(execpkg.Init{
+		CmdExePath:        "/bin/test",
+		Pid:               reusedPID,
+		Dev:               7,
+		Ino:               1234,
+		Ns:                17,
+		ProcessInstanceID: 1,
+	})
+	replacement := execpkg.New(execpkg.Init{
+		CmdExePath:        "/bin/test",
+		Pid:               reusedPID,
+		Dev:               7,
+		Ino:               1234,
+		Ns:                17,
+		ProcessInstanceID: 2,
+	})
+	reporter := &instrumentationErrorRecorder{}
+	tracerEvents := msg.NewQueue[Event[*ebpf.Instrumentable]](msg.ChannelBufferLen(1))
+	events := tracerEvents.Subscribe()
+	attacher := &traceAttacher{
+		log:                slog.With("component", t.Name()),
+		Metrics:            reporter,
+		existingTracers:    map[execpkg.FileID]executableTracer{},
+		OutputTracerEvents: tracerEvents,
+		newExecutableInstanceFn: func(_ *ebpf.ProcessTracer, ie *ebpf.Instrumentable) error {
+			if ie.FileInfo == replacement {
+				return attachErr
+			}
+			return nil
+		},
+	}
+	key := first.ID()
+	attacher.existingTracers[key] = executableTracer{tracer: tracer, generation: 1}
+	firstInstrumentable := &ebpf.Instrumentable{FileInfo: first, PIDOwner: first}
+	replacementInstrumentable := &ebpf.Instrumentable{
+		FileInfo: replacement,
+		PIDOwner: replacement,
+	}
+
+	require.True(t, attacher.activateExistingTracer(tracer, firstInstrumentable))
+	recordTestProcessInstance(attacher, key, first)
+	require.False(t, attacher.activateExistingTracer(tracer, replacementInstrumentable))
+	require.NotSame(t, first, replacement)
+	require.Equal(t, first.ID(), replacement.ID())
+	require.Equal(t, []string{"test"}, reporter.instrumented)
+
+	attacher.notifyProcessDeletion(replacementInstrumentable)
+	attacher.notifyProcessDeletion(replacementInstrumentable)
+	require.Same(t, tracer, attacher.existingTracers[key].tracer)
+	require.Equal(t, 1, *attacher.processInstances[key])
+	require.Empty(t, reporter.uninstrumented)
+	require.Contains(t, attacher.admittedProcessInstances, first)
+	require.NotContains(t, attacher.admittedProcessInstances, replacement)
+	require.Equal(t, []*execpkg.FileInfo{replacement, replacement}, program.blockedFiles)
+
+	attacher.notifyProcessDeletion(firstInstrumentable)
+	event := testutil.ReadChannel(t, events, testTimeout)
+	require.Equal(t, EventDeleted, event.Type)
+	require.Same(t, first, event.Obj.PIDOwnerFileInfo())
+	require.Equal(t, []string{"test"}, reporter.uninstrumented)
+	require.NotContains(t, attacher.existingTracers, key)
+	require.Empty(t, attacher.processInstances)
+	require.Empty(t, attacher.admittedProcessInstances)
+	require.Equal(t, []*execpkg.FileInfo{replacement, replacement, first}, program.blockedFiles)
+}
+
 func TestNewTracerAttachFailureAbortsWithoutCommittingCommonState(t *testing.T) {
 	attachErr := errors.New("required executable probe failed")
 	program := &recordingTracer{}
@@ -192,7 +268,7 @@ func TestReusableTracerAttachFailureDoesNotPublishExecutableOrPID(t *testing.T) 
 	attacher := &traceAttacher{
 		log:             slog.With("component", t.Name()),
 		Metrics:         &instrumentationErrorRecorder{},
-		existingTracers: map[execpkg.FileID]*ebpf.ProcessTracer{},
+		existingTracers: map[execpkg.FileID]executableTracer{},
 		loadExecutableFn: func(*ebpf.Instrumentable) (*link.Executable, bool) {
 			return nil, true
 		},

@@ -82,8 +82,17 @@ type pidAliasCandidate struct {
 	rank      int
 }
 
+// PIDAdmissionCommit performs process-scoped cleanup that must succeed after
+// exact-owner validation but before a replacement admission becomes visible.
+type PIDAdmissionCommit func() bool
+
 type ServiceFilter interface {
-	AllowPID(app.PID, uint32, *exec.FileInfo, *exec.FileInfo, PIDType)
+	// AllowPID returns true only when the requested exact process owner remains
+	// admitted after the post-publication lifetime check. A different live owner
+	// for the same numeric PID does not make a rejected replacement successful.
+	// Optional commit callbacks run under the admission lock after that check;
+	// any false result rolls the candidate back before it becomes observable.
+	AllowPID(app.PID, uint32, *exec.FileInfo, *exec.FileInfo, PIDType, ...PIDAdmissionCommit) bool
 	BlockPID(app.PID, uint32, *exec.FileInfo, *exec.FileInfo)
 	ValidPID(app.PID, uint32, PIDType) bool
 	Filter(inputSpans []request.Span) []request.Span
@@ -137,10 +146,11 @@ func (pf *PIDsFilter) AllowPID(
 	fi *exec.FileInfo,
 	owner *exec.FileInfo,
 	pidType PIDType,
-) {
+	commit ...PIDAdmissionCommit,
+) bool {
 	pf.mux.Lock()
 	defer pf.mux.Unlock()
-	pf.addPID(pid, ns, fi, owner, pidType)
+	return pf.addPID(pid, ns, fi, owner, pidType, commit)
 }
 
 func (pf *PIDsFilter) BlockPID(
@@ -242,14 +252,15 @@ func (pf *PIDsFilter) addPID(
 	fi *exec.FileInfo,
 	owner *exec.FileInfo,
 	t PIDType,
-) {
+	commit []PIDAdmissionCommit,
+) bool {
 	if owner == nil {
 		owner = fi
 	}
 	allPids, err := NamespacedPIDsForOwner(pid, owner)
 	if err != nil {
 		pf.log.Debug("Error looking up namespaced pids", "pid", pid, "error", err)
-		return
+		return false
 	}
 
 	aliases := rankedPIDAliases(allPids)
@@ -257,6 +268,7 @@ func (pf *PIDsFilter) addPID(
 
 	admission := pf.admissions[pid]
 	var predecessor *pidAdmission
+	var previousSameOwner *pidAdmission
 	if admission != nil && admission.owner != owner {
 		// Keep the predecessor as a transactional fallback until the replacement
 		// passes its post-publication exact-owner check. A successful replacement
@@ -280,6 +292,7 @@ func (pf *PIDsFilter) addPID(
 		// Repeated notifications for one exact lifetime merge tracer types, but
 		// do not refresh its sequence and jump ahead of an equally ranked newer
 		// process. Remove the old alias set before publishing the refreshed one.
+		previousSameOwner = clonePIDAdmission(admission)
 		pf.removeAdmissionCandidates(admission)
 	}
 
@@ -290,25 +303,56 @@ func (pf *PIDsFilter) addPID(
 	pf.admissions[pid] = admission
 	pf.addAdmissionCandidates(admission)
 
-	if err := pf.revalidatePublishedOwner(pid, owner); err != nil {
+	rollback := func(restoreSameOwner bool) {
 		// The lock makes the pointer check invariant today; retain it so this
 		// cleanup stays owner-conditional if validation is later moved outside the
 		// critical section.
 		if current := pf.admissions[pid]; current == admission && current.owner == owner {
 			delete(pf.admissions, pid)
 			pf.removeAdmissionCandidates(admission)
-			if predecessor != nil {
+			if predecessor != nil && pf.revalidatePublishedOwner(pid, predecessor.owner) == nil {
 				pf.admissions[pid] = predecessor
+			} else if predecessor != nil {
+				// Never revive a predecessor merely because the candidate failed.
+				// PID reuse ordinarily makes the predecessor stale, while injected
+				// validation failures can still leave a genuinely live predecessor.
+				pf.removeAdmissionCandidates(predecessor)
+			} else if restoreSameOwner && previousSameOwner != nil {
+				pf.admissions[pid] = previousSameOwner
+				pf.addAdmissionCandidates(previousSameOwner)
 			}
 		}
+	}
+	if err := pf.revalidatePublishedOwner(pid, owner); err != nil {
+		rollback(false)
 		pf.log.Debug("Exact process owner changed after publishing PID aliases",
 			"pid", pid, "error", err)
-		return
+		return false
+	}
+	for _, commitAdmission := range commit {
+		if commitAdmission != nil && !commitAdmission() {
+			rollback(true)
+			pf.log.Debug("PID admission commit failed", "pid", pid)
+			return false
+		}
 	}
 
 	if predecessor != nil {
 		pf.removeAdmissionCandidates(predecessor)
 	}
+	return true
+}
+
+func clonePIDAdmission(admission *pidAdmission) *pidAdmission {
+	if admission == nil {
+		return nil
+	}
+	cloned := *admission
+	cloned.aliases = make(map[app.PID]int, len(admission.aliases))
+	for alias, rank := range admission.aliases {
+		cloned.aliases[alias] = rank
+	}
+	return &cloned
 }
 
 func (pf *PIDsFilter) removePID(pid app.PID, nsid uint32, owner *exec.FileInfo) {
@@ -484,7 +528,14 @@ func (pf *IdentityPidsFilter) AllowPID(
 	_ *exec.FileInfo,
 	_ *exec.FileInfo,
 	_ PIDType,
-) {
+	commit ...PIDAdmissionCommit,
+) bool {
+	for _, commitAdmission := range commit {
+		if commitAdmission != nil && !commitAdmission() {
+			return false
+		}
+	}
+	return true
 }
 
 func (pf *IdentityPidsFilter) BlockPID(

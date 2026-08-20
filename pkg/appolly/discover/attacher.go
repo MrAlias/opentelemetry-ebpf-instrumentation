@@ -47,9 +47,15 @@ type traceAttacher struct {
 	// that we don't remove the BPF resources of an executable until all their instances are removed
 	// are stopped
 	processInstances maps.MultiCounter[discexec.FileID]
+	// admittedProcessInstances binds each exact discovery-event lifetime to the
+	// successful creation event that incremented processInstances. A rejected
+	// creation can still be followed by a deletion from the discovery pipeline;
+	// without this receipt that deletion could retire an unrelated live instance
+	// of the same executable. This map is owned by the single attacher loop.
+	admittedProcessInstances map[*discexec.FileInfo]discexec.FileID
 
 	// keeps a copy of all the tracers for a given executable identity
-	existingTracers     map[discexec.FileID]*ebpf.ProcessTracer
+	existingTracers     map[discexec.FileID]executableTracer
 	nodeInjector        nodeExecutableInjector
 	javaInjector        javaExecutableInjector
 	javaAttachMu        sync.Mutex
@@ -105,7 +111,16 @@ type javaExecutableInjector interface {
 }
 
 type nodeExecutableInjector interface {
-	NewExecutable(*ebpf.Instrumentable)
+	PrepareExecutable(*ebpf.Instrumentable) (nodejs.PreparedExecutable, error)
+}
+
+type executableTracer struct {
+	tracer     *ebpf.ProcessTracer
+	generation uint64
+}
+
+func executableKey(fileInfo *discexec.FileInfo) ebpf.ExecutableKey {
+	return ebpf.ExecutableKey{Dev: fileInfo.Dev(), Ino: fileInfo.Ino()}
 }
 
 func traceAttacherProvider(ta *traceAttacher) swarm.InstanceFunc {
@@ -114,7 +129,7 @@ func traceAttacherProvider(ta *traceAttacher) swarm.InstanceFunc {
 
 func (ta *traceAttacher) attacherLoop(_ context.Context) (swarm.RunFunc, error) {
 	ta.log = slog.With("component", "discover.traceAttacher")
-	ta.existingTracers = map[discexec.FileID]*ebpf.ProcessTracer{}
+	ta.existingTracers = map[discexec.FileID]executableTracer{}
 	ta.nodeInjector = nodejs.NewNodeInjector(ta.Cfg)
 	javaInjector, err := javaagent.NewJavaInjector(ta.Cfg)
 	if err != nil {
@@ -123,6 +138,7 @@ func (ta *traceAttacher) attacherLoop(_ context.Context) (swarm.RunFunc, error) 
 		ta.javaInjector = javaInjector
 	}
 	ta.processInstances = maps.MultiCounter[discexec.FileID]{}
+	ta.admittedProcessInstances = map[*discexec.FileInfo]discexec.FileID{}
 	ta.javaAttachments = make(map[*discexec.FileInfo]*javaAttachOperation)
 	ta.EbpfEventContext.CommonPIDsFilter = ebpfcommon.NewPIDsFilter(&ta.Cfg.Discovery, slog.With("component", "ebpfCommon.CommonPIDsFilter"), ta.Metrics)
 	if ta.RuntimeMetrics != nil {
@@ -146,7 +162,8 @@ func (ta *traceAttacher) attacherLoop(_ context.Context) (swarm.RunFunc, error) 
 					"exec", instr.Obj.FileInfo.CmdExePath(), "pid", instr.Obj.FileInfo.Pid())
 				switch instr.Type {
 				case EventCreated:
-					if len(ta.admissiblePIDs(&instr.Obj)) == 0 {
+					eventOwner := instr.Obj.PIDOwnerFileInfo()
+					if eventOwner == nil || ebpfcommon.ValidateProcessOwner(eventOwner.Pid(), eventOwner) != nil {
 						ta.log.Debug("no live exact process lifetime remains for created event",
 							"pid", instr.Obj.FileInfo.Pid())
 						if instr.Obj.FileInfo.ELF() != nil {
@@ -157,7 +174,10 @@ func (ta *traceAttacher) attacherLoop(_ context.Context) (swarm.RunFunc, error) 
 					javaPrepared := ta.prepareProcessSpecificInjection(&instr.Obj)
 
 					if ok := ta.getTracer(&instr.Obj); ok {
-						ta.processInstances.Inc(instr.Obj.FileInfo.ID())
+						ta.injectNodeAfterAdmission(&instr.Obj)
+						ta.recordProcessInstance(
+							instr.Obj.PIDOwnerFileInfo(), instr.Obj.FileInfo.ID(),
+						)
 						if javaPrepared != nil {
 							ta.startJavaAttachment(ctx, &instr.Obj, javaPrepared)
 						}
@@ -186,16 +206,17 @@ func (ta *traceAttacher) prepareProcessSpecificInjection(
 	if ie == nil || ie.FileInfo == nil {
 		return nil
 	}
-	pid := ie.FileInfo.Pid()
-	if err := ebpfcommon.ValidateProcessOwner(pid, ie.PIDOwnerFor(pid)); err != nil {
+	eventOwner := ie.PIDOwnerFileInfo()
+	if eventOwner == nil {
+		return nil
+	}
+	pid := eventOwner.Pid()
+	if err := ebpfcommon.ValidateProcessOwner(pid, eventOwner); err != nil {
 		if ta.log != nil {
 			ta.log.Debug("process lifetime changed before process-specific injection",
 				"pid", pid, "error", err)
 		}
 		return nil
-	}
-	if ta.nodeInjector != nil {
-		ta.nodeInjector.NewExecutable(ie)
 	}
 	if ta.javaInjector == nil {
 		return nil
@@ -209,6 +230,34 @@ func (ta *traceAttacher) prepareProcessSpecificInjection(
 		return nil
 	}
 	return prepared
+}
+
+// injectNodeAfterAdmission prepares the process-specific capability only after
+// the exact discovery-event owner has passed the tracer admission gate. The
+// prepared operation owns independent proc, pidfd, netns, and executable
+// handles, so retiring FileInfo after this call cannot redirect its work.
+func (ta *traceAttacher) injectNodeAfterAdmission(ie *ebpf.Instrumentable) {
+	if ta.nodeInjector == nil || ie == nil {
+		return
+	}
+	prepared, err := ta.nodeInjector.PrepareExecutable(ie)
+	if err != nil {
+		if ta.log != nil {
+			ta.log.Warn("unable to prepare exact Node.js injection target", "error", err)
+		}
+		return
+	}
+	if prepared == nil {
+		return
+	}
+	defer func() {
+		if err := prepared.Close(); err != nil && ta.log != nil {
+			ta.log.Warn("unable to close exact Node.js injection target", "error", err)
+		}
+	}()
+	if err := prepared.NewExecutable(); err != nil && ta.log != nil {
+		ta.log.Warn("unable to inject Node.js agent into exact admitted target", "error", err)
+	}
 }
 
 func (ta *traceAttacher) startJavaAttachment(
@@ -317,7 +366,9 @@ func (ta *traceAttacher) handleJavaAttachResult(ie *ebpf.Instrumentable, err err
 
 //nolint:cyclop
 func (ta *traceAttacher) getTracer(ie *ebpf.Instrumentable) bool {
-	if tracer, ok := ta.existingTracers[ie.FileInfo.ID()]; ok {
+	key := ie.FileInfo.ID()
+	if existing, ok := ta.existingTracers[key]; ok {
+		tracer := existing.tracer
 		ta.log.Debug("new process for already instrumented executable",
 			"pid", ie.FileInfo.Pid(),
 			"child", ie.ChildPids,
@@ -373,7 +424,7 @@ func (ta *traceAttacher) getTracer(ie *ebpf.Instrumentable) bool {
 				ta.Metrics,
 			))
 		}
-	case svc.InstrumentableNodejs, svc.InstrumentableJava, svc.InstrumentableJavaNative, svc.InstrumentableRuby, svc.InstrumentablePython, svc.InstrumentableDotnet, svc.InstrumentableGeneric, svc.InstrumentableRust, svc.InstrumentablePHP, svc.InstrumentableCPP:
+	case svc.InstrumentableNodejs, svc.InstrumentableDeno, svc.InstrumentableJava, svc.InstrumentableJavaNative, svc.InstrumentableRuby, svc.InstrumentablePython, svc.InstrumentableDotnet, svc.InstrumentableGeneric, svc.InstrumentableRust, svc.InstrumentablePHP, svc.InstrumentableCPP:
 		if ta.reusableTracer != nil {
 			return ta.reuseTracer(ta.reusableTracer, ie)
 		}
@@ -410,7 +461,8 @@ func (ta *traceAttacher) getTracer(ie *ebpf.Instrumentable) bool {
 		return false
 	}
 
-	if !ta.activateNewTracer(tracer, exe, ie) {
+	finishExecutable, ok := ta.prepareNewTracerExecutable(tracer, exe, ie)
+	if !ok {
 		return false
 	}
 
@@ -419,13 +471,40 @@ func (ta *traceAttacher) getTracer(ie *ebpf.Instrumentable) bool {
 		"child", ie.ChildPids,
 		"cmd", ie.FileInfo.CmdExePath(),
 		"type", ie.Type)
-	// allowing the tracer to forward traces from the discovered PID and its children processes
-	ta.monitorPIDs(tracer, ie)
-	ta.existingTracers[ie.FileInfo.ID()] = tracer
+	return ta.commitNewTracerAdmission(tracer, ie, key, finishExecutable)
+}
+
+func (ta *traceAttacher) commitNewTracerAdmission(
+	tracer *ebpf.ProcessTracer,
+	ie *ebpf.Instrumentable,
+	key discexec.FileID,
+	finishExecutable func(bool) error,
+) bool {
+	// Exact PID admission is the final commit point. Until it succeeds, the
+	// ProcessTracer and common-tracer selection remain private to this attempt.
+	additionalTracers := []*ebpf.ProcessTracer(nil)
+	if tracer.Type == ebpf.Generic && ta.reusableTracer != nil {
+		additionalTracers = append(additionalTracers, ta.reusableTracer)
+	}
+	if !ta.monitorPIDs(tracer, ie, additionalTracers...) {
+		if err := finishExecutable(false); err != nil {
+			ta.log.Warn("rolling back admission-rejected executable failed", "error", err)
+		}
+		if abortErr := ta.abortProcessTracer(tracer); abortErr != nil {
+			ta.log.Warn("couldn't fully abort admission-rejected process tracer", "error", abortErr)
+		}
+		ie.Tracer = nil
+		return false
+	}
+	_ = finishExecutable(true)
+	ta.dropUnloadedTracers(tracer.Programs)
+	ie.Tracer = tracer
+	ta.existingTracers[key] = executableTracer{
+		tracer:     tracer,
+		generation: ie.ExecutableGeneration,
+	}
 	if tracer.Type == ebpf.Generic {
-		if ta.reusableTracer != nil {
-			ta.monitorPIDs(ta.reusableTracer, ie)
-		} else {
+		if ta.reusableTracer == nil {
 			ta.reusableTracer = tracer
 		}
 	} else {
@@ -440,11 +519,14 @@ func (ta *traceAttacher) activateExistingTracer(
 	tracer *ebpf.ProcessTracer,
 	ie *ebpf.Instrumentable,
 ) bool {
+	var finishProbes func(bool) error
 	if tracer.Type == ebpf.Generic {
 		// Generic tracers instrument shared libraries. A second process using the
 		// same executable can have a different module set, so attach those probes
 		// before publishing any PID admission for this process lifetime.
-		if !ta.updateTracerProbes(tracer, ie) {
+		var ok bool
+		finishProbes, ok = ta.prepareTracerProbes(tracer, ie)
+		if !ok {
 			ta.log.Debug(".done", "success", false)
 			return false
 		}
@@ -452,9 +534,21 @@ func (ta *traceAttacher) activateExistingTracer(
 
 	// PID admission is the commit point: no tracer sees this process until every
 	// required process-specific probe has attached successfully.
-	ta.monitorPIDs(tracer, ie)
+	additionalTracers := []*ebpf.ProcessTracer(nil)
 	if tracer.Type != ebpf.Generic {
-		ta.monitorPIDs(ta.reusableGoTracer, ie)
+		additionalTracers = append(additionalTracers, ta.reusableGoTracer)
+	}
+	if !ta.monitorPIDs(tracer, ie, additionalTracers...) {
+		if finishProbes != nil {
+			if err := finishProbes(false); err != nil {
+				ta.log.Warn("rolling back admission-rejected executable instance failed", "error", err)
+			}
+		}
+		ta.log.Debug(".done", "success", false)
+		return false
+	}
+	if finishProbes != nil {
+		_ = finishProbes(true)
 	}
 	ta.Metrics.InstrumentProcess(ie.FileInfo.ExecutableName())
 	ta.log.Debug(".done", "success", true)
@@ -466,7 +560,21 @@ func (ta *traceAttacher) activateNewTracer(
 	exe *link.Executable,
 	ie *ebpf.Instrumentable,
 ) bool {
-	if err := ta.newExecutable(tracer, exe, ie); err != nil {
+	finish, ok := ta.prepareNewTracerExecutable(tracer, exe, ie)
+	if !ok {
+		return false
+	}
+	_ = finish(true)
+	return true
+}
+
+func (ta *traceAttacher) prepareNewTracerExecutable(
+	tracer *ebpf.ProcessTracer,
+	exe *link.Executable,
+	ie *ebpf.Instrumentable,
+) (func(bool) error, bool) {
+	finish, err := ta.prepareExecutable(tracer, exe, ie)
+	if err != nil {
 		ta.log.Debug("failed to attach process-specific probes for new tracer",
 			"pid", ie.FileInfo.Pid(), "error", err)
 		ta.Metrics.InstrumentationError(
@@ -476,14 +584,10 @@ func (ta *traceAttacher) activateNewTracer(
 		if abortErr := ta.abortProcessTracer(tracer); abortErr != nil {
 			ta.log.Warn("couldn't fully abort rejected process tracer", "error", abortErr)
 		}
-		return false
+		return nil, false
 	}
 
-	// Common tracer selection and downstream Run ownership become durable only
-	// after the executable-specific attach transaction commits.
-	ta.dropUnloadedTracers(tracer.Programs)
-	ie.Tracer = tracer
-	return true
+	return finish, true
 }
 
 // dropUnloadedTracers keeps only the common tracers that survived ProcessTracer.Init in
@@ -505,6 +609,8 @@ func (ta *traceAttacher) withCommonTracersGroup(tracers []ebpf.Tracer) []ebpf.Tr
 
 	ta.commonTracers = newCommonTracersGroup(ta.Cfg, ta.Metrics, ta.EbpfEventContext.CommonPIDsFilter)
 
+	// ProcessTracer.AllowPID treats Programs[0] as the exact admission owner;
+	// common feature tracers must remain supplementary and therefore appended.
 	return append(tracers, ta.commonTracers...)
 }
 
@@ -554,25 +660,28 @@ func (ta *traceAttacher) loadExecutable(ie *ebpf.Instrumentable) (*link.Executab
 	return exe, true
 }
 
-func (ta *traceAttacher) newExecutable(
+func (ta *traceAttacher) prepareExecutable(
 	tracer *ebpf.ProcessTracer,
 	exe *link.Executable,
 	ie *ebpf.Instrumentable,
-) error {
+) (func(bool) error, error) {
 	if ta.newExecutableFn != nil {
-		return ta.newExecutableFn(tracer, exe, ie)
+		if err := ta.newExecutableFn(tracer, exe, ie); err != nil {
+			return nil, err
+		}
+		return func(bool) error { return nil }, nil
 	}
-	return tracer.NewExecutable(exe, ie)
-}
-
-func (ta *traceAttacher) newExecutableInstance(
-	tracer *ebpf.ProcessTracer,
-	ie *ebpf.Instrumentable,
-) error {
-	if ta.newExecutableInstanceFn != nil {
-		return ta.newExecutableInstanceFn(tracer, ie)
+	transaction, err := tracer.PrepareExecutable(exe, ie)
+	if err != nil {
+		return nil, err
 	}
-	return tracer.NewExecutableInstance(ie)
+	return func(commit bool) error {
+		if commit {
+			transaction.Commit()
+			return nil
+		}
+		return transaction.Rollback()
+	}, nil
 }
 
 func (ta *traceAttacher) abortProcessTracer(tracer *ebpf.ProcessTracer) error {
@@ -588,7 +697,8 @@ func (ta *traceAttacher) reuseTracer(tracer *ebpf.ProcessTracer, ie *ebpf.Instru
 		return false
 	}
 
-	if err := ta.newExecutable(tracer, exe, ie); err != nil {
+	finishExecutable, err := ta.prepareExecutable(tracer, exe, ie)
+	if err != nil {
 		ta.log.Debug("Failed to attach uprobes for new executable", "pid", ie.FileInfo.Pid(), "error", err)
 		ta.Metrics.InstrumentationError(
 			ie.FileInfo.ExecutableName(),
@@ -603,21 +713,40 @@ func (ta *traceAttacher) reuseTracer(tracer *ebpf.ProcessTracer, ie *ebpf.Instru
 		"cmd", ie.FileInfo.CmdExePath(),
 		"language", ie.Type)
 
-	ta.monitorPIDs(tracer, ie)
-	ta.existingTracers[ie.FileInfo.ID()] = tracer
+	if !ta.monitorPIDs(tracer, ie) {
+		if rollbackErr := finishExecutable(false); rollbackErr != nil {
+			ta.log.Warn("rolling back admission-rejected reusable executable failed", "error", rollbackErr)
+		}
+		return false
+	}
+	_ = finishExecutable(true)
+	ta.existingTracers[ie.FileInfo.ID()] = executableTracer{
+		tracer:     tracer,
+		generation: ie.ExecutableGeneration,
+	}
 	ta.Metrics.InstrumentProcess(ie.FileInfo.ExecutableName())
 
 	return true
 }
 
-func (ta *traceAttacher) updateTracerProbes(tracer *ebpf.ProcessTracer, ie *ebpf.Instrumentable) bool {
-	if err := ta.newExecutableInstance(tracer, ie); err != nil {
+func (ta *traceAttacher) prepareTracerProbes(
+	tracer *ebpf.ProcessTracer,
+	ie *ebpf.Instrumentable,
+) (func(bool) error, bool) {
+	var transaction ebpf.ExecutableInstanceTransaction
+	var err error
+	if ta.newExecutableInstanceFn != nil {
+		err = ta.newExecutableInstanceFn(tracer, ie)
+	} else {
+		transaction, err = tracer.PrepareExecutableInstance(ie)
+	}
+	if err != nil {
 		ta.log.Debug("Failed to attach uprobes", "pid", ie.FileInfo.Pid(), "error", err)
 		ta.Metrics.InstrumentationError(
 			ie.FileInfo.ExecutableName(),
 			imetrics.InstrumentationErrorAttachingUprobe,
 		)
-		return false
+		return nil, false
 	}
 
 	ta.log.Debug("reusing Generic tracer for",
@@ -626,37 +755,106 @@ func (ta *traceAttacher) updateTracerProbes(tracer *ebpf.ProcessTracer, ie *ebpf
 		"cmd", ie.FileInfo.CmdExePath(),
 		"language", ie.Type)
 
+	return func(commit bool) error {
+		if transaction == nil {
+			return nil
+		}
+		if commit {
+			transaction.Commit()
+			return nil
+		}
+		return transaction.Rollback()
+	}, true
+}
+
+func (ta *traceAttacher) updateTracerProbes(tracer *ebpf.ProcessTracer, ie *ebpf.Instrumentable) bool {
+	finish, ok := ta.prepareTracerProbes(tracer, ie)
+	if !ok {
+		return false
+	}
+	_ = finish(true)
 	return true
 }
 
-func (ta *traceAttacher) monitorPIDs(tracer *ebpf.ProcessTracer, ie *ebpf.Instrumentable) {
+func (ta *traceAttacher) monitorPIDs(
+	tracer *ebpf.ProcessTracer,
+	ie *ebpf.Instrumentable,
+	additionalTracers ...*ebpf.ProcessTracer,
+) bool {
 	ie.CopyToServiceAttributes()
 	pids := ta.admissiblePIDs(ie)
+	if len(pids) == 0 {
+		return false
+	}
 
-	if ta.DynamicPIDSelector != nil {
-		for _, process := range pids {
-			ta.DynamicPIDSelector.RegisterFileInfo(process.pid, ie.FileInfo, process.owner)
+	processTracers := make([]*ebpf.ProcessTracer, 0, len(additionalTracers)+1)
+	seenProcessTracers := map[*ebpf.ProcessTracer]struct{}{}
+	for _, candidate := range append([]*ebpf.ProcessTracer{tracer}, additionalTracers...) {
+		if candidate == nil {
+			continue
+		}
+		if _, seen := seenProcessTracers[candidate]; seen {
+			continue
+		}
+		seenProcessTracers[candidate] = struct{}{}
+		processTracers = append(processTracers, candidate)
+	}
+
+	programs := map[ebpf.Tracer]struct{}{}
+	for _, processTracer := range processTracers {
+		for _, program := range processTracer.Programs {
+			programs[program] = struct{}{}
+		}
+	}
+	commonTracers := make([]ebpf.Tracer, 0, len(ta.commonTracers))
+	if ta.commonTracersLoaded {
+		for _, commonTracer := range ta.commonTracers {
+			if _, included := programs[commonTracer]; !included {
+				commonTracers = append(commonTracers, commonTracer)
+			}
 		}
 	}
 
-	// allowing the tracer to forward traces from the discovered PID and its children processes
-	for _, process := range pids {
-		tracer.AllowPID(process.pid, process.ns, ie.FileInfo, process.owner)
+	admitted := make([]admissiblePID, 0, len(pids))
+	allow := func(process admissiblePID) bool {
+		if len(processTracers) == 0 ||
+			!processTracers[0].AllowPID(process.pid, process.ns, ie.FileInfo, process.owner) {
+			return false
+		}
+		for _, processTracer := range processTracers[1:] {
+			processTracer.AllowPID(process.pid, process.ns, ie.FileInfo, process.owner)
+		}
+		for _, commonTracer := range commonTracers {
+			commonTracer.AllowPID(process.pid, process.ns, ie.FileInfo, process.owner)
+		}
+		admitted = append(admitted, process)
+		return true
 	}
 
-	for _, ct := range ta.commonTracers {
-		for _, process := range pids {
-			ct.AllowPID(process.pid, process.ns, ie.FileInfo, process.owner)
+	// admissiblePIDs always puts the exact discovery-event owner first. Do not
+	// touch parent/child candidates until that owner has committed successfully:
+	// BlockPID is owner-scoped, not reference-counted, so speculative ancillary
+	// admissions could otherwise retire an independently live admission.
+	if !allow(pids[0]) {
+		return false
+	}
+	for _, process := range pids[1:] {
+		allow(process)
+	}
+
+	if ta.DynamicPIDSelector != nil {
+		for _, process := range admitted {
+			ta.DynamicPIDSelector.RegisterFileInfo(process.pid, ie.FileInfo, process.owner)
 		}
 	}
 
 	if ta.SpanSignalsShortcut != nil {
 		snap := ie.FileInfo.ServiceAttrs()
-		spans := make([]request.Span, 0, len(pids))
+		spans := make([]request.Span, 0, len(admitted))
 		// the forwarded signal must include
 		// - Service, which includes several metadata about the process
 		// - PID namespace, to allow further kubernetes decoration
-		for _, process := range pids {
+		for _, process := range admitted {
 			service := snap
 			service.ProcPID = process.pid
 			spans = append(spans, request.Span{
@@ -669,6 +867,7 @@ func (ta *traceAttacher) monitorPIDs(tracer *ebpf.ProcessTracer, ie *ebpf.Instru
 			ta.SpanSignalsShortcut.Send(spans)
 		}
 	}
+	return true
 }
 
 type admissiblePID struct {
@@ -681,16 +880,31 @@ func (ta *traceAttacher) admissiblePIDs(ie *ebpf.Instrumentable) []admissiblePID
 	if ie == nil || ie.FileInfo == nil {
 		return nil
 	}
-	candidates := make([]app.PID, 0, len(ie.ChildPids)+1)
-	candidates = append(candidates, ie.FileInfo.Pid())
+	eventOwner := ie.PIDOwnerFileInfo()
+	if eventOwner == nil {
+		return nil
+	}
+	candidates := make([]app.PID, 0, len(ie.ChildPids)+2)
+	candidates = append(candidates, eventOwner.Pid(), ie.FileInfo.Pid())
 	candidates = append(candidates, ie.ChildPids...)
 	admissible := make([]admissiblePID, 0, len(candidates))
+	seen := map[app.PID]struct{}{}
 	for _, pid := range candidates {
+		if _, duplicate := seen[pid]; duplicate {
+			continue
+		}
+		seen[pid] = struct{}{}
 		owner := ie.PIDOwnerFor(pid)
+		if pid == eventOwner.Pid() {
+			owner = eventOwner
+		}
 		if err := ebpfcommon.ValidateProcessOwner(pid, owner); err != nil {
 			if ta.log != nil {
 				ta.log.Debug("process lifetime changed before PID admission",
 					"pid", pid, "error", err)
+			}
+			if pid == eventOwner.Pid() {
+				return nil
 			}
 			continue
 		}
@@ -701,6 +915,38 @@ func (ta *traceAttacher) admissiblePIDs(ie *ebpf.Instrumentable) []admissiblePID
 		})
 	}
 	return admissible
+}
+
+func (ta *traceAttacher) recordProcessInstance(
+	owner *discexec.FileInfo,
+	executable discexec.FileID,
+) {
+	if owner == nil {
+		return
+	}
+	if ta.processInstances == nil {
+		ta.processInstances = maps.MultiCounter[discexec.FileID]{}
+	}
+	if ta.admittedProcessInstances == nil {
+		ta.admittedProcessInstances = map[*discexec.FileInfo]discexec.FileID{}
+	}
+	ta.admittedProcessInstances[owner] = executable
+	ta.processInstances.Inc(executable)
+}
+
+func (ta *traceAttacher) takeProcessInstance(
+	pidOwner *discexec.FileInfo,
+	tracerOwner *discexec.FileInfo,
+) (discexec.FileID, bool) {
+	if pidOwner == nil || tracerOwner == nil {
+		return discexec.FileID{}, false
+	}
+	executable, ok := ta.admittedProcessInstances[pidOwner]
+	if !ok || executable != tracerOwner.ID() {
+		return discexec.FileID{}, false
+	}
+	delete(ta.admittedProcessInstances, pidOwner)
+	return executable, true
 }
 
 func (ta *traceAttacher) unregisterDynamicFileInfo(ie *ebpf.Instrumentable) {
@@ -728,7 +974,28 @@ func (ta *traceAttacher) notifyProcessDeletion(ie *ebpf.Instrumentable) {
 		return
 	}
 	deletedPID := pidOwner.Pid()
-	if tracer, ok := ta.existingTracers[tracerOwner.ID()]; ok {
+	key := tracerOwner.ID()
+	if existing, ok := ta.existingTracers[key]; ok {
+		tracer := existing.tracer
+		// notifying the tracer to block any trace from that PID
+		// to avoid that a new process reusing this PID could send traces
+		// unless explicitly allowed
+		tracer.BlockPID(deletedPID, pidOwner.Ns(), tracerOwner, pidOwner)
+		for _, ct := range ta.commonTracers {
+			ct.BlockPID(deletedPID, pidOwner.Ns(), tracerOwner, pidOwner)
+		}
+	}
+
+	admittedKey, admitted := ta.takeProcessInstance(pidOwner, tracerOwner)
+	if !admitted {
+		return
+	}
+	if admittedKey != key {
+		return
+	}
+	if existing, ok := ta.existingTracers[key]; ok {
+		tracer := existing.tracer
+		ie.ExecutableGeneration = existing.generation
 		ta.log.Info("process ended for already instrumented executable",
 			"cmd", tracerOwner.CmdExePath(),
 			"pid", deletedPID,
@@ -737,25 +1004,20 @@ func (ta *traceAttacher) notifyProcessDeletion(ie *ebpf.Instrumentable) {
 			"type", ie.Type,
 			"service", tracerOwner.ServiceAttrs().UID.Name,
 		)
-		// notifying the tracer to block any trace from that PID
-		// to avoid that a new process reusing this PID could send traces
-		// unless explicitly allowed
 		ta.Metrics.UninstrumentProcess(tracerOwner.ExecutableName())
-		tracer.BlockPID(deletedPID, pidOwner.Ns(), tracerOwner, pidOwner)
-		for _, ct := range ta.commonTracers {
-			ct.BlockPID(deletedPID, pidOwner.Ns(), tracerOwner, pidOwner)
-		}
 
 		// if there are no more trace instances for a program, we need to notify that
 		// the tracer needs to be stopped and deleted.
 		// We don't remove kernel-based traces as there is only one tracer per host
-		if ta.processInstances.Dec(tracerOwner.ID()) == 0 {
-			delete(ta.existingTracers, tracerOwner.ID())
+		if ta.processInstances.Dec(key) == 0 {
+			delete(ta.existingTracers, key)
 			ie.Tracer = tracer
 			ta.OutputTracerEvents.Send(Event[*ebpf.Instrumentable]{Type: EventDeleted, Obj: ie})
 		} else {
 			ta.OutputTracerEvents.Send(Event[*ebpf.Instrumentable]{Type: EventInstanceDeleted, Obj: ie})
 		}
+	} else {
+		ta.processInstances.Dec(key)
 	}
 }
 

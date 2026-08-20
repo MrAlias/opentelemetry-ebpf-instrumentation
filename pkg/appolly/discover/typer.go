@@ -224,12 +224,6 @@ func (t *typer) makeServiceAttrs(processMatch *ProcessMatch) svc.Attrs {
 		}
 	}
 
-	routesCfg := t.cfg.Routes
-	wildcard := byte('*')
-	if routesCfg.WildcardChar != "" {
-		wildcard = routesCfg.WildcardChar[0]
-	}
-
 	s := svc.Attrs{
 		UID: svc.UID{
 			Name:      name,
@@ -240,11 +234,54 @@ func (t *typer) makeServiceAttrs(processMatch *ProcessMatch) svc.Attrs {
 		DynamicSelectorPID: processMatch.DynamicSelectorPID,
 		ExportModes:        exportModes,
 		Sampler:            samplerFromConfig(samplerConfig),
-		PathTrie:           clusterurl.NewPathTrie(routesCfg.MaxPathSegmentCardinality, wildcard),
 		Features:           svcFeatures,
 		LogEnricherEnabled: processMatch.LogEnricherEnabled(),
+		SDKLanguage:        svc.InstrumentableGeneric,
 	}
 
+	routesCfg := t.cfg.Routes
+	if routesCfg != nil && routesCfg.Directional != nil {
+		policies := routesCfg.DirectionalPolicies()
+		var overrides *services.DirectionalRoutePolicyOverrides
+		if routesConfig != nil {
+			overrides = routesConfig.PolicyOverrides
+		}
+		if routesCfg.DirectionalRuleOnly {
+			if overrides == nil {
+				return s
+			}
+			if overrides.Incoming != nil {
+				s.IncomingRoutePolicy = svc.NewRoutePolicy(
+					overrides.Incoming.Apply(policies.Incoming))
+			}
+			if overrides.Outgoing != nil {
+				s.OutgoingRoutePolicy = svc.NewRoutePolicy(
+					overrides.Outgoing.Apply(policies.Outgoing))
+			}
+			return s
+		}
+		if overrides != nil && overrides.Incoming != nil {
+			s.IncomingRoutePolicy = svc.NewRoutePolicy(overrides.Incoming.Apply(policies.Incoming))
+		} else if routesCfg.HasIncomingPolicy() {
+			s.IncomingPathTrie = svc.NewRoutePathTrie(policies.Incoming)
+		}
+		if overrides != nil && overrides.Outgoing != nil {
+			s.OutgoingRoutePolicy = svc.NewRoutePolicy(overrides.Outgoing.Apply(policies.Outgoing))
+		} else if routesCfg.HasOutgoingPolicy() {
+			s.OutgoingPathTrie = svc.NewRoutePathTrie(policies.Outgoing)
+		}
+		return s
+	}
+
+	wildcard := byte('*')
+	maxPathSegmentCardinality := 0
+	if routesCfg != nil {
+		maxPathSegmentCardinality = routesCfg.MaxPathSegmentCardinality
+		if routesCfg.WildcardChar != "" {
+			wildcard = routesCfg.WildcardChar[0]
+		}
+	}
+	s.PathTrie = clusterurl.NewPathTrie(maxPathSegmentCardinality, wildcard)
 	if routesConfig != nil {
 		s.SetCustomRoutes(routesConfig)
 	}
@@ -297,6 +334,10 @@ func (t *typer) FilterClassify(evs []Event[ProcessMatch]) []Event[ebpf.Instrumen
 
 func (t *typer) classifyInstrumentable(discovered *exec.FileInfo) ebpf.Instrumentable {
 	inst := t.asInstrumentable(discovered)
+	// FileInfo can be substituted with a parent executable. Keep the exact
+	// discovery-event lifetime separately so its eventual deletion cannot
+	// consume another instance of the same executable.
+	inst.PIDOwner = discovered
 	inst.PIDOwners = make(map[app.PID]*exec.FileInfo, len(inst.ChildPids)+1)
 	for _, pid := range append([]app.PID{inst.FileInfo.Pid()}, inst.ChildPids...) {
 		owner := t.currentPids[pid]
@@ -511,12 +552,20 @@ func (t *typer) inspectOffsets(execElf *exec.FileInfo) (*goexec.Offsets, bool, e
 	return offsets, true, nil
 }
 
+var supportOnlyGoProbeSymbols = map[string]struct{}{
+	"context.WithValue": {},
+}
+
 func isGoProxy(offsets *goexec.Offsets) bool {
 	for f := range offsets.Funcs {
-		// if we find anything of interest other than the Go runtime, we consider this a valid application
-		if !strings.HasPrefix(f, "runtime.") {
-			return false
+		if strings.HasPrefix(f, "runtime.") {
+			continue
 		}
+		if _, ok := supportOnlyGoProbeSymbols[f]; ok {
+			continue
+		}
+
+		return false
 	}
 
 	return true
@@ -535,6 +584,9 @@ func (t *typer) loadAllGoFunctionNames() {
 		t.addGoFunctionName(uniqueFunctions, symbolName)
 	}
 	for _, symbolName := range gotracer.GoRuntimeMetricProbeSymbols() {
+		t.addGoFunctionName(uniqueFunctions, symbolName)
+	}
+	for _, symbolName := range gotracer.GoAutoSDKActivationProbeSymbols() {
 		t.addGoFunctionName(uniqueFunctions, symbolName)
 	}
 }

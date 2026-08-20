@@ -12,6 +12,7 @@ import (
 	"go.opentelemetry.io/obi/internal/config/schema"
 	"go.opentelemetry.io/obi/pkg/appolly/services"
 	"go.opentelemetry.io/obi/pkg/config"
+	"go.opentelemetry.io/obi/pkg/export/instrumentations"
 	"go.opentelemetry.io/obi/pkg/filter"
 	"go.opentelemetry.io/obi/pkg/transform"
 )
@@ -39,7 +40,16 @@ func TestV2ToRuntimeHTTPRoutesRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NotNil(t, got.Routes)
-	require.Equal(t, cfg.Routes, got.Routes)
+	// A symmetric global routes config round-trips back to the global
+	// representation the user authored, not a directional one.
+	require.Nil(t, got.Routes.Directional)
+	require.Equal(t, cfg.Routes.Unmatch, got.Routes.Unmatch)
+	require.Equal(t, cfg.Routes.Patterns, got.Routes.Patterns)
+	require.Equal(t, cfg.Routes.IgnorePatterns, got.Routes.IgnorePatterns)
+	require.Equal(t, cfg.Routes.IgnoredEvents, got.Routes.IgnoredEvents)
+	require.Equal(t, cfg.Routes.WildcardChar, got.Routes.WildcardChar)
+	require.Equal(t, cfg.Routes.MaxPathSegmentCardinality, got.Routes.MaxPathSegmentCardinality)
+	require.Equal(t, cfg.Routes.DirectionalPolicies(), got.Routes.DirectionalPolicies())
 	require.Equal(t, cfg.Discovery.RouteHarvesterTimeout, got.Discovery.RouteHarvesterTimeout)
 	require.Equal(t, cfg.Discovery.DisabledRouteHarvesters, got.Discovery.DisabledRouteHarvesters)
 	require.Equal(t, cfg.Discovery.RouteHarvestConfig.JavaHarvestDelay, got.Discovery.RouteHarvestConfig.JavaHarvestDelay)
@@ -65,6 +75,244 @@ func TestV2ToRuntimeHTTPNilRoutesRoundTrip(t *testing.T) {
 	require.Equal(t, cfg.Discovery.RouteHarvesterTimeout, got.Discovery.RouteHarvesterTimeout)
 	require.Equal(t, cfg.Discovery.DisabledRouteHarvesters, got.Discovery.DisabledRouteHarvesters)
 	require.Equal(t, cfg.Discovery.RouteHarvestConfig.JavaHarvestDelay, got.Discovery.RouteHarvestConfig.JavaHarvestDelay)
+}
+
+func TestV2ToRuntimeHTTPRuleRoutesWithoutGlobalRoutes(t *testing.T) {
+	t.Parallel()
+
+	cfg := defaultRuntimeConfig()
+	cfg.Routes = nil
+	_, ext := RuntimeToV2(&cfg)
+
+	incomingPatterns := []string{"/orders/{id}"}
+	incomingIgnored := []string{"/health"}
+	ext.Capture.Rules = append(ext.Capture.Rules, schema.Rule{
+		Action: schema.CaptureActionInclude,
+		Match: schema.RuleMatch{
+			Process: schema.RuleProcessMatch{ExePathGlob: []string{"/srv/*"}},
+		},
+		Refine: schema.RuleRefinement{
+			HTTP: &schema.HTTPRefinement{
+				Routes: schema.HTTPRefinementRoutes{
+					Incoming: &schema.HTTPRoutePolicy{
+						Patterns:        &incomingPatterns,
+						IgnoredPatterns: &incomingIgnored,
+					},
+				},
+			},
+		},
+	})
+
+	got, err := V2ToRuntime(ext)
+	require.NoError(t, err)
+	require.NotNil(t, got.Routes)
+	require.NotNil(t, got.Routes.Directional)
+	require.True(t, got.Routes.DirectionalRuleOnly)
+	require.Equal(t, services.UnmatchUnset, got.Routes.Directional.Incoming.Unmatch)
+	require.Equal(t, services.UnmatchUnset, got.Routes.Directional.Outgoing.Unmatch)
+
+	var ruleRoutes *services.CustomRoutesConfig
+	for i := range got.Discovery.Instrument {
+		if got.Discovery.Instrument[i].Routes != nil {
+			ruleRoutes = got.Discovery.Instrument[i].Routes
+			break
+		}
+	}
+	require.NotNil(t, ruleRoutes)
+	require.NotNil(t, ruleRoutes.PolicyOverrides)
+	require.Equal(t, incomingPatterns, *ruleRoutes.PolicyOverrides.Incoming.Patterns)
+	require.Equal(t, incomingIgnored, *ruleRoutes.PolicyOverrides.Incoming.IgnorePatterns)
+
+	_, roundTrip := RuntimeToV2(got)
+	require.Nil(t, roundTrip.Capture.Instrumentation.HTTP.Routes.Incoming)
+	require.Nil(t, roundTrip.Capture.Instrumentation.HTTP.Routes.Outgoing)
+}
+
+func TestV2ToRuntimeImportsDirectionalHTTPRoutes(t *testing.T) {
+	t.Parallel()
+
+	incomingUnmatched := services.UnmatchPath
+	incomingPatterns := []string{"/orders/{id}"}
+	incomingIgnored := []string{"/health"}
+	incomingIgnoreMode := services.IgnoreTraces
+	incomingWildcard := "#"
+	incomingCardinality := 7
+	outgoingUnmatched := services.UnmatchWildcard
+	outgoingPatterns := []string{"/inventory/{id}"}
+
+	got, err := V2ToRuntime(&schema.Extension{
+		Version: schema.SupportedVersion,
+		Capture: schema.Capture{
+			Instrumentation: schema.Instrumentation{
+				HTTP: schema.HTTPInstrumentation{
+					Routes: schema.HTTPRoutes{
+						Incoming: &schema.HTTPRoutePolicy{
+							Unmatched:                 &incomingUnmatched,
+							Patterns:                  &incomingPatterns,
+							IgnoredPatterns:           &incomingIgnored,
+							IgnoreMode:                &incomingIgnoreMode,
+							WildcardChar:              &incomingWildcard,
+							MaxPathSegmentCardinality: &incomingCardinality,
+						},
+						Outgoing: &schema.HTTPRoutePolicy{
+							Unmatched: &outgoingUnmatched,
+							Patterns:  &outgoingPatterns,
+						},
+					},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, got.Routes)
+	require.NotNil(t, got.Routes.Directional)
+	require.False(t, got.Routes.DirectionalRuleOnly)
+
+	policies := got.Routes.DirectionalPolicies()
+	require.Equal(t, incomingUnmatched, policies.Incoming.Unmatch)
+	require.Equal(t, incomingPatterns, policies.Incoming.Patterns)
+	require.Equal(t, incomingIgnored, policies.Incoming.IgnorePatterns)
+	require.Equal(t, incomingIgnoreMode, policies.Incoming.IgnoredEvents)
+	require.Equal(t, incomingWildcard, policies.Incoming.WildcardChar)
+	require.Equal(t, incomingCardinality, policies.Incoming.MaxPathSegmentCardinality)
+	require.Equal(t, outgoingUnmatched, policies.Outgoing.Unmatch)
+	require.Equal(t, outgoingPatterns, policies.Outgoing.Patterns)
+}
+
+func TestV2ToRuntimePreservesAbsentGlobalHTTPDirection(t *testing.T) {
+	t.Parallel()
+
+	cfg := defaultRuntimeConfig()
+	_, ext := RuntimeToV2(&cfg)
+	incomingPatterns := []string{"/orders/{id}"}
+	ext.Capture.Instrumentation.HTTP.Routes.Incoming = &schema.HTTPRoutePolicy{
+		Patterns: &incomingPatterns,
+	}
+	ext.Capture.Instrumentation.HTTP.Routes.Outgoing = nil
+
+	got, err := V2ToRuntime(ext)
+	require.NoError(t, err)
+	require.NotNil(t, got.Routes)
+	require.True(t, got.Routes.HasIncomingPolicy())
+	require.False(t, got.Routes.HasOutgoingPolicy())
+
+	policies := got.Routes.DirectionalPolicies()
+	require.Equal(t, incomingPatterns, policies.Incoming.Patterns)
+	require.Empty(t, policies.Incoming.Unmatch)
+	require.Empty(t, policies.Incoming.WildcardChar)
+	require.Zero(t, policies.Incoming.MaxPathSegmentCardinality)
+
+	_, roundTrip := RuntimeToV2(got)
+	require.NotNil(t, roundTrip.Capture.Instrumentation.HTTP.Routes.Incoming)
+	require.Nil(t, roundTrip.Capture.Instrumentation.HTTP.Routes.Outgoing)
+}
+
+func TestV2ToRuntimePreservesAbsentGlobalHTTPDirectionWithRule(t *testing.T) {
+	t.Parallel()
+
+	cfg := defaultRuntimeConfig()
+	_, ext := RuntimeToV2(&cfg)
+	incomingPatterns := []string{"/orders/{id}"}
+	ext.Capture.Instrumentation.HTTP.Routes.Incoming = &schema.HTTPRoutePolicy{
+		Patterns: &incomingPatterns,
+	}
+	ext.Capture.Instrumentation.HTTP.Routes.Outgoing = nil
+
+	rulePatterns := []string{"/inventory/{id}"}
+	ext.Capture.Rules = append(ext.Capture.Rules, schema.Rule{
+		Action: schema.CaptureActionInclude,
+		Match: schema.RuleMatch{
+			Process: schema.RuleProcessMatch{ExePathGlob: []string{"/srv/*"}},
+		},
+		Refine: schema.RuleRefinement{
+			HTTP: &schema.HTTPRefinement{
+				Routes: schema.HTTPRefinementRoutes{
+					Outgoing: &schema.HTTPRoutePolicy{Patterns: &rulePatterns},
+				},
+			},
+		},
+	})
+
+	got, err := V2ToRuntime(ext)
+	require.NoError(t, err)
+	require.NotNil(t, got.Routes)
+	require.False(t, got.Routes.DirectionalRuleOnly)
+	require.True(t, got.Routes.HasIncomingPolicy())
+	require.False(t, got.Routes.HasOutgoingPolicy())
+
+	policies := got.Routes.DirectionalPolicies()
+	require.Empty(t, policies.Incoming.Unmatch)
+	require.Equal(t, services.UnmatchUnset, policies.Outgoing.Unmatch)
+
+	_, roundTrip := RuntimeToV2(got)
+	require.NotNil(t, roundTrip.Capture.Instrumentation.HTTP.Routes.Incoming)
+	require.Nil(t, roundTrip.Capture.Instrumentation.HTTP.Routes.Outgoing)
+}
+
+func TestV2ToRuntimeRejectsInvalidDirectionalHTTPRoutes(t *testing.T) {
+	t.Parallel()
+
+	invalidUnmatched := services.RouteUnmatch("invalid")
+	_, err := V2ToRuntime(&schema.Extension{
+		Version: schema.SupportedVersion,
+		Capture: schema.Capture{
+			Instrumentation: schema.Instrumentation{
+				HTTP: schema.HTTPInstrumentation{
+					Routes: schema.HTTPRoutes{
+						Incoming: &schema.HTTPRoutePolicy{Unmatched: &invalidUnmatched},
+					},
+				},
+			},
+		},
+	})
+	require.EqualError(t, err, `capture.instrumentation.http.routes.incoming.unmatched has invalid value "invalid"`)
+}
+
+func TestV2ToRuntimeValidatesDirectionalHTTPWildcard(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name     string
+		wildcard string
+		wantErr  string
+	}{
+		{name: "empty"},
+		{name: "ASCII", wildcard: "#"},
+		{
+			name:     "NUL",
+			wildcard: "\x00",
+			wantErr: "capture.instrumentation.http.routes.incoming.wildcard_char " +
+				"must be empty or contain one nonzero ASCII byte",
+		},
+		{
+			name:     "Unicode",
+			wildcard: "•",
+			wantErr: "capture.instrumentation.http.routes.incoming.wildcard_char " +
+				"must be empty or contain one nonzero ASCII byte",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := V2ToRuntime(&schema.Extension{
+				Version: schema.SupportedVersion,
+				Capture: schema.Capture{
+					Instrumentation: schema.Instrumentation{
+						HTTP: schema.HTTPInstrumentation{
+							Routes: schema.HTTPRoutes{
+								Incoming: &schema.HTTPRoutePolicy{WildcardChar: &tc.wildcard},
+							},
+						},
+					},
+				},
+			})
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.EqualError(t, err, tc.wantErr)
+		})
+	}
 }
 
 func TestV2ToRuntimeHTTPPayloadExtractionRoundTrip(t *testing.T) {
@@ -133,7 +381,7 @@ func TestV2ToRuntimeHTTPPayloadExtractionRoundTrip(t *testing.T) {
 	require.Equal(t, http.Enrichment.Rules, gotHTTP.Enrichment.Rules)
 }
 
-func TestV2ToRuntimeHTTPApplicationFiltersRoundTrip(t *testing.T) {
+func TestV2ToRuntimeApplicationFiltersMigratesLegacyRuntimeConfig(t *testing.T) {
 	t.Parallel()
 
 	statusCode := 500
@@ -144,20 +392,31 @@ func TestV2ToRuntimeHTTPApplicationFiltersRoundTrip(t *testing.T) {
 	}
 
 	_, ext := RuntimeToV2(&cfg)
+	require.NotNil(t, ext.Capture.Instrumentation.Aerospike)
+	require.Equal(
+		t,
+		ext.Capture.Instrumentation.HTTP.Filters,
+		ext.Capture.Instrumentation.Aerospike.Filters,
+	)
 
 	got, err := V2ToRuntime(ext)
 	require.NoError(t, err)
 
-	require.Equal(t, cfg.Filters.Application, got.Filters.Application)
+	require.Empty(t, got.Filters.Application)
+	require.Len(t, got.Filters.ApplicationByInstrumentation, len(protocolMappings))
+	for _, mapping := range protocolMappings {
+		require.Equal(t, filter.SignalAttributeFamilyConfig{
+			Traces:  cfg.Filters.Application,
+			Metrics: cfg.Filters.Application,
+		}, got.Filters.ApplicationByInstrumentation[mapping.instr])
+	}
 }
 
-func TestV2ToRuntimeHTTPApplicationFiltersImportsOneSignal(t *testing.T) {
+func TestV2ToRuntimeApplicationFiltersAcceptOneSignal(t *testing.T) {
 	t.Parallel()
 
-	statusCode := 500
 	filters := schema.AttributeFilters{
-		"http.status_code": {Equals: &statusCode},
-		"service.name":     {Match: "checkout-*"},
+		"service.name": {Match: "checkout-*"},
 	}
 
 	got, err := V2ToRuntime(&schema.Extension{
@@ -173,18 +432,21 @@ func TestV2ToRuntimeHTTPApplicationFiltersImportsOneSignal(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-
-	require.Equal(t, filter.AttributeFamilyConfig{
-		"http.status_code": {Equals: &statusCode},
-		"service.name":     {Match: "checkout-*"},
-	}, got.Filters.Application)
+	require.Empty(t, got.Filters.Application)
+	require.Equal(t, filter.InstrumentationAttributeFamilyConfig{
+		instrumentations.InstrumentationHTTP: {
+			Traces: filter.AttributeFamilyConfig{
+				"service.name": {Match: "checkout-*"},
+			},
+		},
+	}, got.Filters.ApplicationByInstrumentation)
 }
 
-func TestV2ToRuntimeHTTPApplicationFiltersRejectsConflictingSignals(t *testing.T) {
+func TestV2ToRuntimeApplicationFiltersAcceptDifferentSignals(t *testing.T) {
 	t.Parallel()
 
 	statusCode := 500
-	_, err := V2ToRuntime(&schema.Extension{
+	got, err := V2ToRuntime(&schema.Extension{
 		Version: schema.SupportedVersion,
 		Capture: schema.Capture{
 			Instrumentation: schema.Instrumentation{
@@ -202,7 +464,136 @@ func TestV2ToRuntimeHTTPApplicationFiltersRejectsConflictingSignals(t *testing.T
 		},
 	})
 
-	require.ErrorContains(t, err, "capture.instrumentation.http.filters")
+	require.NoError(t, err)
+	require.Equal(t, filter.SignalAttributeFamilyConfig{
+		Traces: filter.AttributeFamilyConfig{
+			"service.name": {Match: "checkout-*"},
+		},
+		Metrics: filter.AttributeFamilyConfig{
+			"http.status_code": {Equals: &statusCode},
+		},
+	}, got.Filters.ApplicationByInstrumentation[instrumentations.InstrumentationHTTP])
+}
+
+func TestV2ToRuntimeApplicationFiltersAcceptProtocolScope(t *testing.T) {
+	t.Parallel()
+
+	got, err := V2ToRuntime(&schema.Extension{
+		Version: schema.SupportedVersion,
+		Capture: schema.Capture{
+			Instrumentation: schema.Instrumentation{
+				GRPC: schema.ProtocolInstrumentation{
+					Filters: schema.SignalFilters{
+						Traces: schema.AttributeFilters{
+							"service.name": {Match: "checkout-*"},
+						},
+					},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, filter.InstrumentationAttributeFamilyConfig{
+		instrumentations.InstrumentationGRPC: {
+			Traces: filter.AttributeFamilyConfig{
+				"service.name": {Match: "checkout-*"},
+			},
+		},
+	}, got.Filters.ApplicationByInstrumentation)
+}
+
+func TestV2ToRuntimeApplicationFiltersAcceptDifferentProtocols(t *testing.T) {
+	t.Parallel()
+
+	statusCode := 500
+	got, err := V2ToRuntime(&schema.Extension{
+		Version: schema.SupportedVersion,
+		Capture: schema.Capture{
+			Instrumentation: schema.Instrumentation{
+				HTTP: schema.HTTPInstrumentation{
+					Filters: schema.SignalFilters{
+						Traces: schema.AttributeFilters{
+							"http.status_code": {Equals: &statusCode},
+						},
+					},
+				},
+				GRPC: schema.ProtocolInstrumentation{
+					Filters: schema.SignalFilters{
+						Traces: schema.AttributeFilters{
+							"service.name": {Match: "checkout-*"},
+						},
+					},
+				},
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, filter.SignalAttributeFamilyConfig{
+		Traces: filter.AttributeFamilyConfig{
+			"http.status_code": {Equals: &statusCode},
+		},
+	}, got.Filters.ApplicationByInstrumentation[instrumentations.InstrumentationHTTP])
+	require.Equal(t, filter.SignalAttributeFamilyConfig{
+		Traces: filter.AttributeFamilyConfig{
+			"service.name": {Match: "checkout-*"},
+		},
+	}, got.Filters.ApplicationByInstrumentation[instrumentations.InstrumentationGRPC])
+}
+
+func TestV2ToRuntimeApplicationFiltersAcceptAerospikeSignals(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		signal string
+		mutate func(*schema.AerospikeInstrumentation)
+	}{
+		{
+			name:   "traces",
+			signal: "traces",
+			mutate: func(aerospike *schema.AerospikeInstrumentation) {
+				aerospike.Filters.Traces = schema.AttributeFilters{
+					"service.name": {Match: "checkout-*"},
+				}
+			},
+		},
+		{
+			name:   "metrics",
+			signal: "metrics",
+			mutate: func(aerospike *schema.AerospikeInstrumentation) {
+				aerospike.Filters.Metrics = schema.AttributeFilters{
+					"service.name": {Match: "checkout-*"},
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			aerospike := &schema.AerospikeInstrumentation{}
+			test.mutate(aerospike)
+			got, err := V2ToRuntime(&schema.Extension{
+				Version: schema.SupportedVersion,
+				Capture: schema.Capture{
+					Instrumentation: schema.Instrumentation{Aerospike: aerospike},
+				},
+			})
+			require.NoError(t, err)
+
+			gotFilters := got.Filters.ApplicationByInstrumentation[instrumentations.InstrumentationAerospike]
+			if test.signal == "traces" {
+				require.Equal(t, filter.AttributeFamilyConfig{
+					"service.name": {Match: "checkout-*"},
+				}, gotFilters.Traces)
+				require.Empty(t, gotFilters.Metrics)
+			} else {
+				require.Equal(t, filter.AttributeFamilyConfig{
+					"service.name": {Match: "checkout-*"},
+				}, gotFilters.Metrics)
+				require.Empty(t, gotFilters.Traces)
+			}
+		})
+	}
 }
 
 func TestV2ToRuntimeHTTPPayloadExtractionRejectsUnknownEnabled(t *testing.T) {

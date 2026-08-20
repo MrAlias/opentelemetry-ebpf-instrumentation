@@ -124,6 +124,14 @@ type recordingHandler struct {
 	record      Record
 }
 
+func privateTempDir(tb testing.TB) string {
+	tb.Helper()
+	tempDir := tb.TempDir
+	directory := tempDir()
+	require.NoError(tb, os.Chmod(directory, 0o700))
+	return directory
+}
+
 func validTestRecord() Record {
 	record := Record{
 		Status:              StatusValid,
@@ -158,7 +166,7 @@ func (h *recordingHandler) HandleAuthenticated(
 }
 
 func TestFallbackServerAuthenticatesAndHandlesRequest(t *testing.T) {
-	socketPath := filepath.Join(t.TempDir(), "bridge.sock")
+	socketPath := filepath.Join(privateTempDir(t), "bridge.sock")
 	identity := Identity{TID: 7, PID: 5, Namespace: 3}
 	handler := &recordingHandler{record: validTestRecord()}
 	server, err := NewServer(ServerOptions{
@@ -203,7 +211,7 @@ func TestFallbackServerRateLimitsSequentialFloodAndRecovers(t *testing.T) {
 		nil,
 		nil,
 	)
-	socketPath := filepath.Join(t.TempDir(), "bridge.sock")
+	socketPath := filepath.Join(privateTempDir(t), "bridge.sock")
 	server, err := NewServer(ServerOptions{
 		SocketPath: socketPath,
 		SocketGID:  -1,
@@ -244,7 +252,7 @@ func TestFallbackServerRateLimitsSequentialFloodAndRecovers(t *testing.T) {
 
 func TestFallbackServerRateLimiterBoundsPeerStateAndRecovers(t *testing.T) {
 	server, err := NewServer(ServerOptions{
-		SocketPath: filepath.Join(t.TempDir(), "bridge.sock"),
+		SocketPath: filepath.Join(privateTempDir(t), "bridge.sock"),
 		SocketGID:  -1,
 		Timeout:    time.Second,
 	}, &recordingHandler{})
@@ -292,7 +300,7 @@ func TestFallbackServerRateLimiterBoundsPeerStateAndRecovers(t *testing.T) {
 }
 
 func TestFallbackServerRejectsEveryPartialRequest(t *testing.T) {
-	socketPath := filepath.Join(t.TempDir(), "bridge.sock")
+	socketPath := filepath.Join(privateTempDir(t), "bridge.sock")
 	handler := &recordingHandler{}
 	server, err := NewServer(ServerOptions{
 		SocketPath: socketPath,
@@ -343,7 +351,7 @@ func TestFallbackServerUsesOneRequestPrefixPerConnection(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			socketPath := filepath.Join(t.TempDir(), "bridge.sock")
+			socketPath := filepath.Join(privateTempDir(t), "bridge.sock")
 			handler := &recordingHandler{record: Record{Status: StatusMissing}}
 			server, err := NewServer(ServerOptions{
 				SocketPath: socketPath,
@@ -375,7 +383,7 @@ func TestFallbackServerUsesOneRequestPrefixPerConnection(t *testing.T) {
 }
 
 func TestFallbackServerRejectsInvalidRequestFields(t *testing.T) {
-	socketPath := filepath.Join(t.TempDir(), "bridge.sock")
+	socketPath := filepath.Join(privateTempDir(t), "bridge.sock")
 	handler := &recordingHandler{}
 	server, err := NewServer(ServerOptions{
 		SocketPath: socketPath,
@@ -436,7 +444,7 @@ func TestFallbackServerUnauthorizedRequestPreservesOneShotParent(t *testing.T) {
 		nil,
 		nil,
 	)
-	socketPath := filepath.Join(t.TempDir(), "bridge.sock")
+	socketPath := filepath.Join(privateTempDir(t), "bridge.sock")
 	server, err := NewServer(ServerOptions{
 		SocketPath: socketPath,
 		SocketGID:  -1,
@@ -478,7 +486,7 @@ func TestFallbackServerUnauthorizedRequestPreservesOneShotParent(t *testing.T) {
 }
 
 func TestFallbackServerRejectsMalformedRequest(t *testing.T) {
-	socketPath := filepath.Join(t.TempDir(), "bridge.sock")
+	socketPath := filepath.Join(privateTempDir(t), "bridge.sock")
 	handler := &recordingHandler{}
 	observed := make(chan observedOutcome, 1)
 	server, err := NewServer(ServerOptions{
@@ -510,7 +518,7 @@ func TestFallbackServerRejectsMalformedRequest(t *testing.T) {
 }
 
 func TestFallbackServerReportsRequestVersionMismatch(t *testing.T) {
-	socketPath := filepath.Join(t.TempDir(), "bridge.sock")
+	socketPath := filepath.Join(privateTempDir(t), "bridge.sock")
 	server, err := NewServer(ServerOptions{
 		SocketPath: socketPath,
 		SocketGID:  -1,
@@ -535,7 +543,7 @@ func TestFallbackServerReportsRequestVersionMismatch(t *testing.T) {
 }
 
 func TestFallbackServerNegotiatesRegisteredProcessIdentity(t *testing.T) {
-	socketPath := filepath.Join(t.TempDir(), "bridge.sock")
+	socketPath := filepath.Join(privateTempDir(t), "bridge.sock")
 	resolver := &calledResolver{}
 	server, err := NewServer(ServerOptions{
 		SocketPath: socketPath,
@@ -566,7 +574,7 @@ func TestFallbackServerNegotiatesRegisteredProcessIdentity(t *testing.T) {
 }
 
 func TestFallbackServerBoundsResolutionByRequestDeadline(t *testing.T) {
-	socketPath := filepath.Join(t.TempDir(), "bridge.sock")
+	socketPath := filepath.Join(privateTempDir(t), "bridge.sock")
 	server, err := NewServer(ServerOptions{
 		SocketPath: socketPath,
 		SocketGID:  -1,
@@ -590,7 +598,7 @@ func TestFallbackServerBoundsResolutionByRequestDeadline(t *testing.T) {
 }
 
 func TestFallbackServerDoesNotConsumeAfterResolutionCancellation(t *testing.T) {
-	socketPath := filepath.Join(t.TempDir(), "bridge.sock")
+	socketPath := filepath.Join(privateTempDir(t), "bridge.sock")
 	resolver := validAfterCancellationResolver{
 		identity: Identity{TID: 7, PID: 5, Namespace: 3},
 		started:  make(chan struct{}),
@@ -634,7 +642,7 @@ func TestFallbackServerDoesNotConsumeAfterResolutionCancellation(t *testing.T) {
 }
 
 func TestFallbackServerReportsIdentityResolutionOverload(t *testing.T) {
-	socketPath := filepath.Join(t.TempDir(), "bridge.sock")
+	socketPath := filepath.Join(privateTempDir(t), "bridge.sock")
 	server, err := NewServer(ServerOptions{
 		SocketPath: socketPath,
 		SocketGID:  -1,
@@ -660,7 +668,7 @@ func TestFallbackServerReportsIdentityResolutionOverload(t *testing.T) {
 }
 
 func TestFallbackServerPreAuthAdmissionLimitsOnePeerAndRecovers(t *testing.T) {
-	socketPath := filepath.Join(t.TempDir(), "bridge.sock")
+	socketPath := filepath.Join(privateTempDir(t), "bridge.sock")
 	handler := &recordingHandler{record: validTestRecord()}
 	observed := make(chan observedOutcome, 8)
 	server, err := NewServer(ServerOptions{
@@ -747,7 +755,7 @@ func TestFallbackServerPreAuthAdmissionLimitsOnePeerAndRecovers(t *testing.T) {
 
 func TestFallbackServerMaxConcurrentBoundsAllRequestPhases(t *testing.T) {
 	server, err := NewServer(ServerOptions{
-		SocketPath:    filepath.Join(t.TempDir(), "bridge.sock"),
+		SocketPath:    filepath.Join(privateTempDir(t), "bridge.sock"),
 		SocketGID:     -1,
 		Timeout:       time.Second,
 		MaxConcurrent: 4,
@@ -772,7 +780,7 @@ func TestFallbackServerMaxConcurrentBoundsAllRequestPhases(t *testing.T) {
 }
 
 func TestFallbackServerBoundsPreAuthReadDeadline(t *testing.T) {
-	socketPath := filepath.Join(t.TempDir(), "bridge.sock")
+	socketPath := filepath.Join(privateTempDir(t), "bridge.sock")
 	observed := make(chan observedOutcome, 1)
 	server, err := NewServer(ServerOptions{
 		SocketPath: socketPath,
@@ -834,7 +842,7 @@ func TestFallbackServerBoundsFailureLogs(t *testing.T) {
 }
 
 func TestFallbackServerRefusesNonSocketPath(t *testing.T) {
-	socketPath := filepath.Join(t.TempDir(), "bridge.sock")
+	socketPath := filepath.Join(privateTempDir(t), "bridge.sock")
 	require.NoError(t, os.WriteFile(socketPath, []byte("keep"), 0o600))
 
 	_, err := NewServer(ServerOptions{
@@ -849,7 +857,7 @@ func TestFallbackServerRefusesNonSocketPath(t *testing.T) {
 }
 
 func TestFallbackServerCreatesProtectedGroupSocket(t *testing.T) {
-	parent := filepath.Join(t.TempDir(), "bridge")
+	parent := filepath.Join(privateTempDir(t), "bridge")
 	socketPath := filepath.Join(parent, "bridge.sock")
 	server, err := NewServer(ServerOptions{
 		SocketPath: socketPath,
@@ -877,7 +885,7 @@ func TestFallbackServerCreatesProtectedGroupSocket(t *testing.T) {
 }
 
 func TestFallbackServerPreservesReplacementPathOnShutdown(t *testing.T) {
-	socketPath := filepath.Join(t.TempDir(), "bridge.sock")
+	socketPath := filepath.Join(privateTempDir(t), "bridge.sock")
 	server, err := NewServer(ServerOptions{
 		SocketPath: socketPath,
 		SocketGID:  -1,
@@ -901,7 +909,7 @@ func TestFallbackServerPreservesReplacementPathOnShutdown(t *testing.T) {
 }
 
 func TestRemoveSocketPathIfSameUsesFileIdentity(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "bridge.sock")
+	path := filepath.Join(privateTempDir(t), "bridge.sock")
 	directory, _, err := openSocketDirectory(filepath.Dir(path))
 	require.NoError(t, err)
 	guard := &guardedSocketPath{directory: directory, name: filepath.Base(path)}
@@ -919,7 +927,7 @@ func TestRemoveSocketPathIfSameUsesFileIdentity(t *testing.T) {
 }
 
 func TestFallbackServerSupportsProtectedAncestorSymlink(t *testing.T) {
-	root := t.TempDir()
+	root := privateTempDir(t)
 	target := filepath.Join(root, "run")
 	require.NoError(t, os.Mkdir(target, 0o700))
 	alias := filepath.Join(root, "var-run")
@@ -950,7 +958,7 @@ func TestFallbackServerSupportsProtectedAncestorSymlink(t *testing.T) {
 }
 
 func TestFallbackServerSupportsTrustedAliasInStickyParent(t *testing.T) {
-	root := t.TempDir()
+	root := privateTempDir(t)
 	target := filepath.Join(root, "target")
 	require.NoError(t, os.Mkdir(target, 0o700))
 	sticky := filepath.Join(root, "sticky")
@@ -969,7 +977,7 @@ func TestFallbackServerSupportsTrustedAliasInStickyParent(t *testing.T) {
 }
 
 func TestFallbackServerAncestorSwapCannotRedirectBind(t *testing.T) {
-	root := t.TempDir()
+	root := privateTempDir(t)
 	trusted := filepath.Join(root, "trusted")
 	attacker := filepath.Join(root, "attacker")
 	require.NoError(t, os.Mkdir(trusted, 0o700))
@@ -1012,7 +1020,7 @@ func TestFallbackServerAncestorSwapCannotRedirectBind(t *testing.T) {
 
 func TestFallbackServerRejectsUntrustedSocketDirectory(t *testing.T) {
 	t.Run("symlink in writable parent", func(t *testing.T) {
-		root := t.TempDir()
+		root := privateTempDir(t)
 		target := filepath.Join(root, "target")
 		require.NoError(t, os.Mkdir(target, 0o700))
 		writable := filepath.Join(root, "writable")
@@ -1046,7 +1054,7 @@ func TestFallbackServerRejectsUntrustedSocketDirectory(t *testing.T) {
 	})
 
 	t.Run("final socket symlink", func(t *testing.T) {
-		root := t.TempDir()
+		root := privateTempDir(t)
 		target := filepath.Join(root, "target")
 		require.NoError(t, os.WriteFile(target, []byte("keep"), 0o600))
 		socketPath := filepath.Join(root, "bridge.sock")
@@ -1064,7 +1072,7 @@ func TestFallbackServerRejectsUntrustedSocketDirectory(t *testing.T) {
 	})
 
 	t.Run("writable ancestor", func(t *testing.T) {
-		root := t.TempDir()
+		root := privateTempDir(t)
 		writable := filepath.Join(root, "writable")
 		parent := filepath.Join(writable, "bridge")
 		require.NoError(t, os.MkdirAll(parent, 0o700))
@@ -1079,7 +1087,7 @@ func TestFallbackServerRejectsUntrustedSocketDirectory(t *testing.T) {
 	})
 
 	t.Run("world accessible", func(t *testing.T) {
-		parent := filepath.Join(t.TempDir(), "bridge")
+		parent := filepath.Join(privateTempDir(t), "bridge")
 		require.NoError(t, os.Mkdir(parent, 0o755))
 		require.NoError(t, os.Chmod(parent, 0o755))
 
@@ -1092,7 +1100,7 @@ func TestFallbackServerRejectsUntrustedSocketDirectory(t *testing.T) {
 	})
 
 	t.Run("wrong group", func(t *testing.T) {
-		parent := filepath.Join(t.TempDir(), "bridge")
+		parent := filepath.Join(privateTempDir(t), "bridge")
 		require.NoError(t, os.Mkdir(parent, 0o700))
 
 		_, err := NewServer(ServerOptions{
@@ -1106,7 +1114,7 @@ func TestFallbackServerRejectsUntrustedSocketDirectory(t *testing.T) {
 
 func TestFallbackServerRejectsTimeoutOutsideNativeRange(t *testing.T) {
 	_, err := NewServer(ServerOptions{
-		SocketPath: filepath.Join(t.TempDir(), "bridge.sock"),
+		SocketPath: filepath.Join(privateTempDir(t), "bridge.sock"),
 		SocketGID:  -1,
 		Timeout:    maxTransportTimeout + time.Millisecond,
 	}, &recordingHandler{})
@@ -1143,7 +1151,7 @@ func TestProcIdentityResolverRejectsLiveThreadFromAnotherProcess(t *testing.T) {
 		attackerTID = uint32(42)
 		javaTID     = uint32(1)
 	)
-	root := t.TempDir()
+	root := privateTempDir(t)
 	sharedNamespace := filepath.Join(root, "shared-pid-namespace")
 	require.NoError(t, os.WriteFile(sharedNamespace, nil, 0o600))
 	writeProcess := func(pid int32, namespacePID uint32) {
@@ -1195,7 +1203,7 @@ func TestProcIdentityResolverHonorsCancellation(t *testing.T) {
 
 func TestProcIdentityResolverBoundsTaskDirectoryRead(t *testing.T) {
 	const peerPID = int32(123)
-	root := t.TempDir()
+	root := privateTempDir(t)
 	processDir := filepath.Join(root, "123")
 	taskDir := filepath.Join(processDir, "task")
 	require.NoError(t, os.MkdirAll(taskDir, 0o750))
@@ -1213,7 +1221,7 @@ func TestProcIdentityResolverCachesValidatedThreadLookup(t *testing.T) {
 		peerPID      = int32(123)
 		namespaceTID = uint32(7)
 	)
-	root := t.TempDir()
+	root := privateTempDir(t)
 	processDir := filepath.Join(root, "123")
 	taskDir := filepath.Join(processDir, "task")
 	namespaceDir := filepath.Join(processDir, "ns")
@@ -1243,7 +1251,7 @@ func TestProcIdentityResolverCachesValidatedThreadLookup(t *testing.T) {
 
 func TestProcIdentityResolverRetainsValidatedPartialScanOnTimeout(t *testing.T) {
 	const peerPID = int32(123)
-	root := t.TempDir()
+	root := privateTempDir(t)
 	processDir := filepath.Join(root, "123")
 	taskDir := filepath.Join(processDir, "task")
 	namespaceDir := filepath.Join(processDir, "ns")
@@ -1288,7 +1296,7 @@ func TestProcIdentityResolverSerializesConcurrentColdScansPerPeer(t *testing.T) 
 		threads = 50
 		callers = 16
 	)
-	root := t.TempDir()
+	root := privateTempDir(t)
 	processDir := filepath.Join(root, "123")
 	taskDir := filepath.Join(processDir, "task")
 	namespaceDir := filepath.Join(processDir, "ns")
@@ -1352,7 +1360,7 @@ func BenchmarkProcIdentityResolverCold(b *testing.B) {
 	for _, threads := range []int{50, 200, 1000} {
 		b.Run(fmt.Sprintf("threads-%d", threads), func(b *testing.B) {
 			const peerPID = int32(123)
-			root := b.TempDir()
+			root := privateTempDir(b)
 			processDir := filepath.Join(root, "123")
 			taskDir := filepath.Join(processDir, "task")
 			namespaceDir := filepath.Join(processDir, "ns")

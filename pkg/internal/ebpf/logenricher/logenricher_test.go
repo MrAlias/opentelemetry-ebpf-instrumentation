@@ -37,6 +37,13 @@ import (
 	"go.opentelemetry.io/obi/pkg/obi"
 )
 
+const (
+	bpfMapLogEnricherGenerations     = "log_enricher_generations"
+	bpfMapLogEnricherLifecycleEpochs = "log_enricher_lifecycle_epochs"
+	bpfProgLogEnricherProcessExec    = "obi_log_enricher_process_exec"
+	bpfProgLogEnricherProcessExit    = "obi_log_enricher_process_exit"
+)
+
 //go:embed bpf_x86_bpfel.o
 var logEnricherBPFX86Object []byte
 
@@ -208,14 +215,14 @@ func TestLogEnricherGenerationABI(t *testing.T) {
 
 	spec, err := LoadBpf()
 	require.NoError(t, err)
-	mapSpec := spec.Maps[BpfMapLogEnricherGenerations]
+	mapSpec := spec.Maps[bpfMapLogEnricherGenerations]
 	require.NotNil(t, mapSpec)
 	require.Equal(t, ebpf.Hash, mapSpec.Type)
 	require.Equal(t, uint32(4), mapSpec.KeySize)
 	require.Equal(t, uint32(40), mapSpec.ValueSize)
 	require.Equal(t, uint32(1<<12), mapSpec.MaxEntries)
 
-	epochMapSpec := spec.Maps[BpfMapLogEnricherLifecycleEpochs]
+	epochMapSpec := spec.Maps[bpfMapLogEnricherLifecycleEpochs]
 	require.NotNil(t, epochMapSpec)
 	require.Equal(t, ebpf.Hash, epochMapSpec.Type)
 	require.Equal(t, uint32(4), epochMapSpec.KeySize)
@@ -256,8 +263,8 @@ func TestProcessLifecycleTracepointsAdvanceEpochBeforeDisarm(t *testing.T) {
 			spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(object.data))
 			require.NoError(t, err)
 			for _, programName := range []string{
-				BpfProgObiLogEnricherProcessExec,
-				BpfProgObiLogEnricherProcessExit,
+				bpfProgLogEnricherProcessExec,
+				bpfProgLogEnricherProcessExit,
 			} {
 				program := spec.Programs[programName]
 				require.NotNil(t, program)
@@ -277,9 +284,9 @@ func requireLifecycleRetirementOrdering(t *testing.T, program *ebpf.ProgramSpec)
 	atomicIndices := make([]int, 0, 2)
 	for index, instruction := range program.Instructions {
 		switch instruction.Reference() {
-		case BpfMapLogEnricherLifecycleEpochs:
+		case bpfMapLogEnricherLifecycleEpochs:
 			lifecycleMapIndex = index
-		case BpfMapLogEnricherGenerations:
+		case bpfMapLogEnricherGenerations:
 			generationMapIndex = index
 		}
 		if instruction.IsBuiltinCall() {

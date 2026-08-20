@@ -44,7 +44,8 @@ type Instrumentable struct {
 	Offsets     *goexec.Offsets
 	Tracer      *ProcessTracer
 
-	LogEnricherEnabled bool
+	LogEnricherEnabled   bool
+	ExecutableGeneration uint64
 }
 
 // PIDOwnerFor returns the exact lifetime token for pid on a creation event.
@@ -93,7 +94,8 @@ type PIDsAccounter interface {
 	// AllowPID notifies the tracer to accept traces from the given PID, sharing
 	// the FileInfo so mutable service state (flags, harvested routes, k8s
 	// metadata) goes through its synchronized API.
-	AllowPID(app.PID, uint32, *exec.FileInfo, *exec.FileInfo)
+	// The result reports whether this exact process lifetime was admitted.
+	AllowPID(app.PID, uint32, *exec.FileInfo, *exec.FileInfo) bool
 	// BlockPID notifies the tracer to stop accepting traces from the process
 	// lifetime identified by the provided FileInfo. After receiving them via
 	// ringbuffer, it should discard them. The exact lifetime identity prevents
@@ -184,30 +186,50 @@ const (
 	Generic
 )
 
+// ExecutableKey identifies an executable across filesystems.
+type ExecutableKey = exec.FileID
+
 // ProcessTracer instruments an executable with eBPF and provides the eBPF readers
 // that will forward the traces to later stages in the pipeline
 // TODO: We need to pass the ELFInfo from this ProcessTracker to inside a Tracer
 // so that the GPU kernel event listener can find symbols names from addresses
 // in the ELF file.
 type ProcessTracer struct {
-	log              *slog.Logger
-	metrics          imetrics.Reporter
-	shutdownTimeout  time.Duration
-	bpffsPath        string
-	lifecycleMu      sync.Mutex
-	initializing     bool
-	runStarted       bool
-	aborted          bool
-	abortErr         error
-	abortFn          func() error
-	loadedClosers    []io.Closer
-	loadContext      *ebpfcommon.EBPFEventContext
-	loadMaps         map[string]*ebpf.Map
-	loadCapabilities ebpfcommon.TracerCapability
+	log                       *slog.Logger
+	metrics                   imetrics.Reporter
+	shutdownTimeout           time.Duration
+	bpffsPath                 string
+	lifecycleMu               sync.Mutex
+	initializing              bool
+	runStarted                bool
+	aborted                   bool
+	abortErr                  error
+	abortFn                   func() error
+	loadedClosers             []io.Closer
+	loadContext               *ebpfcommon.EBPFEventContext
+	loadMaps                  map[string]*ebpf.Map
+	loadCapabilities          ebpfcommon.TracerCapability
+	instrumentablesMu         sync.Mutex
+	nextExecutableGeneration  uint64
+	instrumentableGenerations map[ExecutableKey]uint64
 
 	Type            ProcessTracerType
-	Instrumentables map[exec.FileID]*instrumenter
+	Instrumentables map[ExecutableKey]*instrumenter
 	Programs        []Tracer
+}
+
+// ExecutableInstanceTransaction keeps newly attached instance-specific probes
+// provisional until exact process admission succeeds.
+type ExecutableInstanceTransaction interface {
+	Commit()
+	Rollback() error
+}
+
+// ExecutableTransaction keeps a newly instrumented executable provisional
+// until exact process admission succeeds.
+type ExecutableTransaction interface {
+	Commit()
+	Rollback() error
 }
 
 var (
@@ -280,14 +302,24 @@ func (pt *ProcessTracer) AllowPID(
 	ns uint32,
 	fi *exec.FileInfo,
 	owner *exec.FileInfo,
-) {
+) bool {
 	logEnricherEnabled := fi.LogEnricherEnabled()
 	for i := range pt.Programs {
-		if _, ok := pt.Programs[i].(*logenricher.Tracer); ok && !logEnricherEnabled {
+		program := pt.Programs[i]
+		if _, ok := program.(*logenricher.Tracer); ok && !logEnricherEnabled {
 			continue
 		}
-		pt.Programs[i].AllowPID(pid, ns, fi, owner)
+		if !program.AllowPID(pid, ns, fi, owner) {
+			// Tracer groups put their exact ServiceFilter-gated Generic/Go
+			// program first. Its result owns process admission. Later programs are
+			// optional feature-local accounters and roll back their own failed
+			// transaction without undoing an independently live core admission.
+			if i == 0 {
+				return false
+			}
+		}
 	}
+	return true
 }
 
 func (pt *ProcessTracer) BlockPID(

@@ -169,7 +169,7 @@ static u8 test_java_remote_parent_data_hook_is_ready(void) {
 static tp_info_pid_t valid_incoming_parent(void) {
     tp_info_pid_t incoming = {
         .valid = 1,
-        .provenance = k_tp_provenance_tcp_exact_flags,
+        .state = TP_INFO_PID_STATE_PROVENANCE(k_tp_provenance_tcp_exact_flags),
     };
     for (u32 index = 0; index < sizeof(incoming.tp.trace_id); index++) {
         incoming.tp.trace_id[index] = test_trace_seed + index;
@@ -197,7 +197,7 @@ static void test_invalid_stage_inputs_fail_before_publication(void) {
         } else if (invalid_case == invalid_stage_zero_span_id) {
             memset(incoming.tp.span_id, 0, sizeof(incoming.tp.span_id));
         } else if (invalid_case == invalid_stage_provenance) {
-            incoming.provenance = k_tp_provenance_tcp_legacy;
+            tp_info_pid_set_provenance(&incoming, k_tp_provenance_tcp_legacy);
         }
         const u64 socket_cookie =
             invalid_case == invalid_stage_socket_cookie ? 0 : test_socket_cookie;

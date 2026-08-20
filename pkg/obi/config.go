@@ -36,6 +36,7 @@ import (
 	"go.opentelemetry.io/obi/pkg/export/otel/perapp"
 	"go.opentelemetry.io/obi/pkg/export/prom"
 	"go.opentelemetry.io/obi/pkg/filter"
+	"go.opentelemetry.io/obi/pkg/health"
 	"go.opentelemetry.io/obi/pkg/internal/avoidedsvc"
 	"go.opentelemetry.io/obi/pkg/kube"
 	"go.opentelemetry.io/obi/pkg/kube/kubeflags"
@@ -226,7 +227,7 @@ var DefaultConfig = Config{
 		CacheLen: 1024,
 		CacheTTL: 5 * time.Minute,
 	},
-	Metrics: perapp.MetricsConfig{
+	Metrics: perapp.GlobalMetricsConfig{
 		Features: export.FeatureApplicationRED,
 	},
 	OTELMetrics: otelcfg.MetricsConfig{
@@ -286,7 +287,7 @@ var DefaultConfig = Config{
 		AvoidedServices: imetrics.AvoidedServicesConfig{
 			Limit: avoidedsvc.DefaultLimit,
 		},
-		Prometheus: imetrics.InternalPrometheusConfig{
+		Prometheus: imetrics.PrometheusEndpointConfig{
 			Port: 0, // disabled by default
 			Path: "/internal/metrics",
 		},
@@ -335,9 +336,10 @@ var DefaultConfig = Config{
 				Metadata: map[string]*services.GlobAttr{"k8s_namespace": &k8sDefaultNamespacesGlob},
 			},
 		},
-		MinProcessAge:         5 * time.Second,
-		DefaultOtlpGRPCPort:   4317,
-		RouteHarvesterTimeout: 10 * time.Second,
+		MinProcessAge:              5 * time.Second,
+		ProcessContextPollInterval: time.Second,
+		DefaultOtlpGRPCPort:        4317,
+		RouteHarvesterTimeout:      10 * time.Second,
 		RouteHarvestConfig: services.RouteHarvestingConfig{
 			JavaHarvestDelay: 5 * time.Second,
 		},
@@ -361,7 +363,8 @@ var DefaultConfig = Config{
 		SamplingInterval: time.Second,
 	},
 	HealthCheck: HealthCheckConfig{
-		Port: 0,
+		Port:          0,
+		ListenAddress: health.DefaultListenAddress,
 	},
 }
 
@@ -420,7 +423,7 @@ type Config struct {
 	ServiceNamespace string `yaml:"service_namespace" env:"OTEL_EBPF_SERVICE_NAMESPACE"`
 
 	// Metrics configures the progressive support of the OTEL declarative configuration.
-	Metrics perapp.MetricsConfig `yaml:"metrics"`
+	Metrics perapp.GlobalMetricsConfig `yaml:"metrics"`
 
 	// Discovery configuration
 	Discovery services.DiscoveryConfig `yaml:"discovery"`
@@ -462,9 +465,9 @@ type Config struct {
 // It is used to initialize resources that should be available if they are enabled
 // for any possible service match. Per-service features still decide whether each
 // service emits the corresponding metrics.
-func (c *Config) JoinMetricsConfig() *perapp.MetricsConfig {
+func (c *Config) JoinMetricsConfig() *perapp.GlobalMetricsConfig {
 	if c == nil {
-		return &perapp.MetricsConfig{}
+		return &perapp.GlobalMetricsConfig{}
 	}
 
 	mc := c.Metrics
@@ -477,9 +480,16 @@ func (c *Config) JoinMetricsConfig() *perapp.MetricsConfig {
 	return &mc
 }
 
+func (c *Config) AppRuntimeMetricsEnabled() bool {
+	return c != nil && c.JoinMetricsConfig().Features.AppRuntime()
+}
+
 type HealthCheckConfig struct {
 	// 0 (default) means disabled
 	Port int `yaml:"port" env:"OTEL_EBPF_HEALTH_CHECK_PORT" validate:"gte=0,lte=65535"`
+	// IP address the TCP health endpoint binds to. Defaults to 127.0.0.1. Set to 0.0.0.0
+	// or :: only when external probes require access.
+	ListenAddress string `yaml:"listen_address" env:"OTEL_EBPF_HEALTH_CHECK_LISTEN_ADDRESS" validate:"omitempty,ip" jsonschema:"type=string,format=ip"`
 	// when set, the health endpoint binds this unix socket (a filesystem path or a leading-'@'
 	// abstract name) instead of the TCP port
 	UnixSocketPath string `yaml:"unix_socket_path" env:"OTEL_EBPF_HEALTH_CHECK_UNIX_SOCKET_PATH"`
@@ -686,7 +696,14 @@ type HostIDConfig struct {
 }
 
 type NodeJSConfig struct {
+	// Enabled turns on the Node.js injector agent, used for trace-context
+	// propagation and runtime metrics. Setting it to false disables the
+	// injection entirely, runtime metrics included.
 	Enabled bool `yaml:"enabled" env:"OTEL_EBPF_NODEJS_ENABLED"`
+	// ManualSpans injects the span bridge (spanbridge.js) into Node.js
+	// processes, capturing spans the application creates through the
+	// OpenTelemetry API when no OpenTelemetry SDK is registered.
+	ManualSpans bool `yaml:"manual_spans" env:"OTEL_EBPF_NODEJS_MANUAL_SPANS"`
 }
 
 type JavaConfig struct {
@@ -986,13 +1003,9 @@ func (c *Config) ExternalLogger(handler slog.Handler, debugMode bool) {
 // 3 - Environment variables
 func LoadConfig(file io.Reader) (*Config, error) {
 	cfg := DefaultConfig
-	// Note: deep-copy each pointer field so YAML/env unmarshal cannot mutate DefaultConfig through shared
-	// pointers. This is a one-level copy: slice fields inside (e.g. Patterns, Sources) still share
-	// their underlying arrays, which is safe because YAML unmarshal replaces slices rather than
-	// appending to them.
+	// Deep-copy pointer fields so YAML/env unmarshal cannot mutate DefaultConfig through shared pointers.
 	if cfg.Routes != nil {
-		routesCopy := *cfg.Routes
-		cfg.Routes = &routesCopy
+		cfg.Routes = cfg.Routes.Clone()
 	}
 	if cfg.NameResolver != nil {
 		nrCopy := *cfg.NameResolver

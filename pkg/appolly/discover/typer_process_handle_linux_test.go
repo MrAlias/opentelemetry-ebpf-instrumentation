@@ -152,6 +152,7 @@ func TestTyperRetainsExactChildHandleWhenParentIsSelected(t *testing.T) {
 	instrumentable := ty.classifyInstrumentable(child)
 
 	require.Same(t, parent, instrumentable.FileInfo)
+	require.Same(t, child, instrumentable.PIDOwnerFileInfo())
 	require.Same(t, child, instrumentable.PIDOwnerFor(childPID))
 	require.Same(t, child, ty.pidOwners[childPID])
 	require.Same(t, parent, ty.tracerOwners[childPID])
@@ -186,6 +187,7 @@ func TestTyperRecordsExactOwnersAcrossGrandparentSubstitution(t *testing.T) {
 	instrumentable := ty.classifyInstrumentable(child)
 
 	require.Same(t, grandparent, instrumentable.FileInfo)
+	require.Same(t, child, instrumentable.PIDOwnerFileInfo())
 	require.Equal(t, []app.PID{childPID, parentPID}, instrumentable.ChildPids)
 	for pid, owner := range map[app.PID]*discexec.FileInfo{
 		grandparentPID: grandparent,

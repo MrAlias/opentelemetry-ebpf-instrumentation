@@ -1146,7 +1146,11 @@ func TestGenerateTracesAttributes(t *testing.T) {
 			ResponseModel: "gpt-5-mini-2025-08-07",
 			Temperature:   1.0,
 			TopP:          1.0,
-			Usage:         request.OpenAIUsage{InputTokens: 36, OutputTokens: 691, TotalTokens: 727},
+			Usage: request.OpenAIUsage{
+				InputTokens:  request.NewTokenCount(36),
+				OutputTokens: request.NewTokenCount(691),
+				TotalTokens:  request.NewTokenCount(727),
+			},
 			Request: request.OpenAIInput{
 				Input:        "How do I check if a Python object is an instance of a class?",
 				Instructions: "You are a coding assistant that talks like a pirate.",
@@ -1252,8 +1256,11 @@ func TestGenerateTracesAttributes(t *testing.T) {
 			ResponseModel: "gpt-5-mini-2025-08-07",
 			Temperature:   1.0,
 			TopP:          1.0,
-			Usage:         request.OpenAIUsage{InputTokens: 36, OutputTokens: 691},
-			Output:        []byte(`[{"type":"message","status":"completed","content":[{"type":"output_text","text":"Arrr!"}],"role":"assistant"}]`),
+			Usage: request.OpenAIUsage{
+				InputTokens:  request.NewTokenCount(36),
+				OutputTokens: request.NewTokenCount(691),
+			},
+			Output: []byte(`[{"type":"message","status":"completed","content":[{"type":"output_text","text":"Arrr!"}],"role":"assistant"}]`),
 			Request: request.OpenAIInput{
 				Input:        "How do I check if a Python object is an instance of a class?",
 				Instructions: "You are a coding assistant that talks like a pirate.",
@@ -1348,8 +1355,11 @@ func TestGenerateTracesAttributes(t *testing.T) {
 			OperationName: "chat",
 			ResponseModel: "gpt-4o-mini-2024-07-18",
 			Temperature:   1.0,
-			Usage:         request.OpenAIUsage{PromptTokens: 396, CompletionTokens: 816},
-			Choices:       []byte(`[{"index":0,"message":{"role":"assistant","content":"I now can give a great answer"},"finish_reason":"stop"}]`),
+			Usage: request.OpenAIUsage{
+				PromptTokens:     request.NewTokenCount(396),
+				CompletionTokens: request.NewTokenCount(816),
+			},
+			Choices: []byte(`[{"index":0,"message":{"role":"assistant","content":"I now can give a great answer"},"finish_reason":"stop"}]`),
 			Request: request.OpenAIInput{
 				Model:       "gpt-4o-mini",
 				Temperature: 1.0,
@@ -1422,10 +1432,10 @@ func TestGenerateTracesAttributes(t *testing.T) {
 			ResponseModel: "gpt-5-2025-06-01",
 			Temperature:   0.8,
 			Usage: request.OpenAIUsage{
-				PromptTokens:     100,
-				CompletionTokens: 50,
-				CompletionDetails: &request.OpenAICompletionDetails{
-					ReasoningTokens: 20,
+				PromptTokens:     request.NewTokenCount(100),
+				CompletionTokens: request.NewTokenCount(50),
+				OutputDetails: &request.OpenAIOutputTokensDetails{
+					ReasoningTokens: request.NewTokenCount(20),
 				},
 			},
 			Choices: []byte(`[{"finish_reason":"stop","message":{"role":"assistant","content":"Hi"}}]`),
@@ -1455,7 +1465,7 @@ func TestGenerateTracesAttributes(t *testing.T) {
 			ID:            "emb-abc",
 			OperationName: request.EmbeddingOperationName,
 			ResponseModel: "text-embedding-3-small",
-			Usage:         request.OpenAIUsage{PromptTokens: 10},
+			Usage:         request.OpenAIUsage{PromptTokens: request.NewTokenCount(10)},
 			Request: request.OpenAIInput{
 				Model:          "text-embedding-3-small",
 				Dimensions:     256,
@@ -1490,10 +1500,10 @@ func TestGenerateTracesAttributes(t *testing.T) {
 				Model:      "claude-sonnet-4-6",
 				StopReason: "end_turn",
 				Usage: request.AnthropicUsage{
-					InputTokens:              15,
-					OutputTokens:             35,
-					CacheCreationInputTokens: 100,
-					CacheReadInputTokens:     50,
+					InputTokens:              request.NewTokenCount(15),
+					OutputTokens:             request.NewTokenCount(35),
+					CacheCreationInputTokens: request.NewTokenCount(100),
+					CacheReadInputTokens:     request.NewTokenCount(50),
 				},
 			},
 		})
@@ -1535,8 +1545,8 @@ func TestGenerateTracesAttributes(t *testing.T) {
 				Content:   []byte(`[{"type":"text","text":"Quantum computing uses superposition."}]`),
 				RequestID: "req_011CZLkWqu2dABS8vFB9G6Lz",
 				Usage: request.AnthropicUsage{
-					InputTokens:  17,
-					OutputTokens: 37,
+					InputTokens:  request.NewTokenCount(17),
+					OutputTokens: request.NewTokenCount(37),
 				},
 				Error: &request.AnthropicError{
 					Type:    "authentication_error",
@@ -1608,8 +1618,8 @@ func TestGenerateTracesAttributes(t *testing.T) {
 				ResponseID:   "resp_abc123def456",
 				ModelVersion: "gemini-2.0-flash",
 				UsageMetadata: request.GeminiUsage{
-					PromptTokenCount:     12,
-					CandidatesTokenCount: 45,
+					PromptTokenCount:     request.NewTokenCount(12),
+					CandidatesTokenCount: request.NewTokenCount(45),
 				},
 				Candidates: []request.GeminiCandidate{
 					{FinishReason: "STOP"},
@@ -1638,8 +1648,8 @@ func TestGenerateTracesAttributes(t *testing.T) {
 			Output: request.GeminiResponse{
 				ModelVersion: "text-embedding-004",
 				UsageMetadata: request.GeminiUsage{
-					PromptTokenCount:     5,
-					CandidatesTokenCount: 0,
+					PromptTokenCount:     request.NewTokenCount(5),
+					CandidatesTokenCount: request.NewTokenCount(0),
 				},
 			},
 		})
@@ -1676,8 +1686,8 @@ func TestGenerateTracesAttributes(t *testing.T) {
 					},
 				},
 				UsageMetadata: request.GeminiUsage{
-					PromptTokenCount:     28,
-					CandidatesTokenCount: 8,
+					PromptTokenCount:     request.NewTokenCount(28),
+					CandidatesTokenCount: request.NewTokenCount(8),
 				},
 				Error: &request.GeminiError{
 					Code:    404,
@@ -1753,8 +1763,8 @@ func TestGenerateTracesAttributes(t *testing.T) {
 			},
 			ResponseModel: "qwen-plus",
 			Usage: request.OpenAIUsage{
-				PromptTokens:     12,
-				CompletionTokens: 8,
+				PromptTokens:     request.NewTokenCount(12),
+				CompletionTokens: request.NewTokenCount(8),
 			},
 		})
 
@@ -1781,8 +1791,8 @@ func TestGenerateTracesAttributes(t *testing.T) {
 			ResponseModel: "qwen-turbo",
 			Output:        []byte(`{"text":"eBPF runs in the kernel."}`),
 			Usage: request.OpenAIUsage{
-				InputTokens:  7,
-				OutputTokens: 6,
+				InputTokens:  request.NewTokenCount(7),
+				OutputTokens: request.NewTokenCount(6),
 			},
 		})
 
@@ -1839,8 +1849,8 @@ func TestGenerateTracesAttributes(t *testing.T) {
 		span := makeBedrockSpan(&request.VendorBedrock{
 			Model: "anthropic.claude-3-5-sonnet-20241022-v1:0",
 			Output: request.BedrockResponse{
-				InputTokens:  25,
-				OutputTokens: 18,
+				InputTokens:  request.NewTokenCount(25),
+				OutputTokens: request.NewTokenCount(18),
 				StopReason:   "end_turn",
 			},
 		})
@@ -1872,8 +1882,8 @@ func TestGenerateTracesAttributes(t *testing.T) {
 			Output: request.BedrockResponse{
 				Content:      []byte(`[{"type":"text","text":"eBPF runs sandboxed programs in the kernel."}]`),
 				StopReason:   "end_turn",
-				InputTokens:  25,
-				OutputTokens: 18,
+				InputTokens:  request.NewTokenCount(25),
+				OutputTokens: request.NewTokenCount(18),
 				ErrorType:    "ValidationException",
 				ErrorMessage: "The provided model identifier is invalid.",
 			},

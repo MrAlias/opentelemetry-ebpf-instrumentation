@@ -161,49 +161,62 @@ func ProcessIdentityFromProcFD(
 func ProcessStatFromProcFD(
 	procFD int,
 ) (pid, ppid app.PID, start uint64, state byte, resultErr error) {
+	pid, ppid, start, state, _, resultErr = ProcessStatWithFlagsFromProcFD(procFD)
+	return
+}
+
+// ProcessStatWithFlagsFromProcFD reads the identity, parent relationship, and
+// Linux task flags from a stable process-directory descriptor.
+func ProcessStatWithFlagsFromProcFD(
+	procFD int,
+) (pid, ppid app.PID, start uint64, state byte, flags uint64, resultErr error) {
 	fd, err := unix.Openat(procFD, "stat", unix.O_RDONLY|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return 0, 0, 0, 0, err
+		return 0, 0, 0, 0, 0, err
 	}
 	file := os.NewFile(uintptr(fd), "exact-process-stat")
 	if file == nil {
 		_ = unix.Close(fd)
-		return 0, 0, 0, 0, errors.New("creating exact process stat handle")
+		return 0, 0, 0, 0, 0, errors.New("creating exact process stat handle")
 	}
 	defer func() { resultErr = errors.Join(resultErr, file.Close()) }()
 
 	data, err := io.ReadAll(io.LimitReader(file, 64<<10))
 	if err != nil {
-		return 0, 0, 0, 0, err
+		return 0, 0, 0, 0, 0, err
 	}
 	stat := string(data)
 	firstSpace := strings.IndexByte(stat, ' ')
 	closeParen := strings.LastIndexByte(stat, ')')
 	if firstSpace <= 0 || closeParen < firstSpace || closeParen+1 >= len(stat) {
-		return 0, 0, 0, 0, errors.New("malformed exact process stat")
+		return 0, 0, 0, 0, 0, errors.New("malformed exact process stat")
 	}
 	parsedPID, err := strconv.ParseUint(stat[:firstSpace], 10, 32)
 	if err != nil {
-		return 0, 0, 0, 0, fmt.Errorf("parsing exact process PID: %w", err)
+		return 0, 0, 0, 0, 0, fmt.Errorf("parsing exact process PID: %w", err)
 	}
 	if parsedPID == 0 {
-		return 0, 0, 0, 0, errors.New("exact process PID is zero")
+		return 0, 0, 0, 0, 0, errors.New("exact process PID is zero")
 	}
 	fields := strings.Fields(stat[closeParen+1:])
 	// fields begins with field 3 (state), so field 22 (starttime) is index 19.
 	if len(fields) <= 19 || len(fields[0]) != 1 {
-		return 0, 0, 0, 0, errors.New("short exact process stat")
+		return 0, 0, 0, 0, 0, errors.New("short exact process stat")
 	}
 	parsedPPID, err := strconv.ParseUint(fields[1], 10, 32)
 	if err != nil {
-		return 0, 0, 0, 0, fmt.Errorf("parsing exact process parent PID: %w", err)
+		return 0, 0, 0, 0, 0, fmt.Errorf("parsing exact process parent PID: %w", err)
+	}
+	flags, err = strconv.ParseUint(fields[6], 10, 64)
+	if err != nil {
+		return 0, 0, 0, 0, 0, fmt.Errorf("parsing exact process flags: %w", err)
 	}
 	start, err = strconv.ParseUint(fields[19], 10, 64)
 	if err != nil {
-		return 0, 0, 0, 0, fmt.Errorf("parsing exact process start time: %w", err)
+		return 0, 0, 0, 0, 0, fmt.Errorf("parsing exact process start time: %w", err)
 	}
 	if start == 0 {
-		return 0, 0, 0, 0, errors.New("exact process start time is zero")
+		return 0, 0, 0, 0, 0, errors.New("exact process start time is zero")
 	}
-	return app.PID(parsedPID), app.PID(parsedPPID), start, fields[0][0], nil
+	return app.PID(parsedPID), app.PID(parsedPPID), start, fields[0][0], flags, nil
 }

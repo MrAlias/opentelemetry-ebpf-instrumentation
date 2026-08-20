@@ -93,7 +93,7 @@ enum incoming_trace_update_result : u8 {
 static __always_inline u8 incoming_trace_same_candidate(const tp_info_pid_t *left,
                                                         const tp_info_pid_t *right) {
     return left->valid && right->valid && left->tp.flags == right->tp.flags &&
-           left->provenance == right->provenance &&
+           tp_info_pid_provenance(left) == tp_info_pid_provenance(right) &&
            __builtin_memcmp(left->tp.trace_id, right->tp.trace_id, TRACE_ID_SIZE_BYTES) == 0 &&
            __builtin_memcmp(left->tp.span_id, right->tp.span_id, SPAN_ID_SIZE_BYTES) == 0;
 }

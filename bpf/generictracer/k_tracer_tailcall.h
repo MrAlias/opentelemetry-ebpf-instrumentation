@@ -6,13 +6,6 @@
 #include <bpfcore/vmlinux.h>
 #include <bpfcore/bpf_helpers.h>
 
-struct {
-    __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-    __type(key, u32);
-    __type(value, u32);
-    __uint(max_entries, 21);
-} jump_table SEC(".maps");
-
 enum {
     // HTTP/1
     k_tail_protocol_http = 0,
@@ -33,15 +26,27 @@ enum {
     k_tail_protocol_http2_grpc_handle_start_frame_server_finalize = 12,
     // Large buffer multi-batch emission
     k_tail_large_buf_emit_continue = 13,
+    k_tail_protocol_http2_grpc_handle_start_frame_server_commit = 14,
+    k_tail_protocol_http2_grpc_handle_start_frame_server_huffman = 15,
+    k_tail_protocol_http2_grpc_handle_start_frame_server_huffscan = 16,
     // Traceparent validation
-    k_tail_continue_protocol_http_tp_validate = 14,
+    k_tail_continue_protocol_http_tp_validate = 17,
     // Java remote-parent control carriers. These transactions are isolated
     // program roots so legacy kernels never accumulate the syscall parser's
     // stack with their replay/claim frames.
-    k_tail_java_task_capture = 15,
-    k_tail_java_task_relay_capture = 16,
-    k_tail_java_task_link = 17,
-    k_tail_java_control_cleanup = 18,
-    k_tail_java_threads = 19,
-    k_tail_java_lifecycle = 20,
+    k_tail_java_task_capture = 18,
+    k_tail_java_task_relay_capture = 19,
+    k_tail_java_task_link = 20,
+    k_tail_java_control_cleanup = 21,
+    k_tail_java_threads = 22,
+    k_tail_java_lifecycle = 23,
+
+    k_tail_count,
 };
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+    __type(key, u32);
+    __type(value, u32);
+    __uint(max_entries, k_tail_count);
+} jump_table SEC(".maps");

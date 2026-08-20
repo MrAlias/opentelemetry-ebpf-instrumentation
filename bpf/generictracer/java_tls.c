@@ -9,6 +9,7 @@
 #include <bpfcore/bpf_tracing.h>
 
 #include <common/connection_info.h>
+#include <common/preempt_guard.h>
 #include <common/protocol_defs.h>
 #include <common/sock_port_ns.h>
 #include <common/sockaddr.h>
@@ -1068,7 +1069,7 @@ java_control_tail_workspace_current(u8 operation) {
 }
 
 SEC("kprobe/sys_ioctl")
-int BPF_KPROBE(obi_java_lifecycle_tail) {
+int BPF_KPROBE_GUARDED(obi_java_lifecycle_tail) {
     java_control_tail_workspace_t *workspace = java_control_tail_workspace_owned();
     if (!workspace || (workspace->operation != k_ioctl_java_process_register &&
                        workspace->operation != k_ioctl_java_vt_mount &&
@@ -1161,7 +1162,7 @@ static __noinline void java_control_tail_dispatch_missed(u64 invocation_id) {
 }
 
 SEC("kprobe/sys_ioctl")
-int BPF_KPROBE(obi_java_task_capture_tail) {
+int BPF_KPROBE_GUARDED(obi_java_task_capture_tail) {
     java_control_tail_workspace_t *workspace =
         java_control_tail_workspace_current(k_ioctl_java_task_capture);
     if (!workspace) {
@@ -1174,7 +1175,7 @@ int BPF_KPROBE(obi_java_task_capture_tail) {
 }
 
 SEC("kprobe/sys_ioctl")
-int BPF_KPROBE(obi_java_task_relay_capture_tail) {
+int BPF_KPROBE_GUARDED(obi_java_task_relay_capture_tail) {
     java_control_tail_workspace_t *workspace =
         java_control_tail_workspace_current(k_ioctl_java_task_relay_capture);
     if (!workspace) {
@@ -1187,7 +1188,7 @@ int BPF_KPROBE(obi_java_task_relay_capture_tail) {
 }
 
 SEC("kprobe/sys_ioctl")
-int BPF_KPROBE(obi_java_task_link_tail) {
+int BPF_KPROBE_GUARDED(obi_java_task_link_tail) {
     java_control_tail_workspace_t *workspace =
         java_control_tail_workspace_current(k_ioctl_java_task_link);
     if (!workspace) {
@@ -1203,7 +1204,7 @@ int BPF_KPROBE(obi_java_task_link_tail) {
 }
 
 SEC("kprobe/sys_ioctl")
-int BPF_KPROBE(obi_java_threads_tail) {
+int BPF_KPROBE_GUARDED(obi_java_threads_tail) {
     java_control_tail_workspace_t *workspace =
         java_control_tail_workspace_current(k_ioctl_java_threads);
     if (!workspace) {
@@ -1223,7 +1224,7 @@ int BPF_KPROBE(obi_java_threads_tail) {
 }
 
 SEC("kprobe/sys_ioctl")
-int BPF_KPROBE(obi_java_control_cleanup_tail) {
+int BPF_KPROBE_GUARDED(obi_java_control_cleanup_tail) {
     java_control_tail_workspace_t *workspace = java_control_tail_workspace_owned();
     if (!workspace) {
         return 0;
@@ -1278,7 +1279,7 @@ static __always_inline int dispatch_java_control_cleanup_tail(struct pt_regs *ct
     if (prepare_java_control_cleanup_tail(
             uarg, operation, task, process_capability, invocation_id) ==
         k_java_control_tail_prepared) {
-        bpf_tail_call(ctx, &jump_table, k_tail_java_control_cleanup);
+        preempt_guarded_tail_call(ctx, &jump_table, k_tail_java_control_cleanup);
         java_control_tail_dispatch_missed(invocation_id);
     }
     java_control_tail_miss_legacy_cleanup(operation, task, invocation_id);
@@ -1342,7 +1343,7 @@ handle_java_data_operation_ioctl(struct pt_regs *ctx,
             java_remote_parent_select_data_dispatch(operation, data_hook_ready, file != NULL);
         if (!java_remote_parent_data_dispatch_has_bridge_authority(dispatch)) {
             if (prepare_java_data_ioctl(file, process_capability, uarg, operation)) {
-                bpf_tail_call(ctx, &jump_table, k_tail_handle_buf_with_args);
+                preempt_guarded_tail_call(ctx, &jump_table, k_tail_handle_buf_with_args);
             }
             return 0;
         }
@@ -1451,7 +1452,7 @@ handle_java_data_operation_ioctl(struct pt_regs *ctx,
             // frame after the noinline payload preflight has returned. A
             // successful dispatch replaces the whole BPF program; only a
             // preflight failure or a missed tail call reaches cleanup below.
-            bpf_tail_call(ctx, &jump_table, k_tail_handle_buf_with_args);
+            preempt_guarded_tail_call(ctx, &jump_table, k_tail_handle_buf_with_args);
         }
         java_remote_parent_state_t *cursor_scratch = java_remote_parent_stage_state_mem();
         java_remote_parent_receive_ioctl_workspace_t *workspace =
@@ -1514,7 +1515,7 @@ static __always_inline int handle_java_ioctl(struct pt_regs *ctx,
         if (java_remote_parent_control_tail_ready() &&
             prepare_java_lifecycle_tail(op_cmd, &task, process_capability, id) ==
                 k_java_control_tail_prepared) {
-            bpf_tail_call(ctx, &jump_table, k_tail_java_lifecycle);
+            preempt_guarded_tail_call(ctx, &jump_table, k_tail_java_lifecycle);
             java_control_tail_dispatch_missed(id);
         }
         // SetupTailCalls publishes the lifecycle slot before probe attachment.
@@ -1544,8 +1545,8 @@ static __always_inline int handle_java_ioctl(struct pt_regs *ctx,
                                    ? k_tail_java_task_relay_capture
                                : op_cmd == k_ioctl_java_task_link ? k_tail_java_task_link
                                                                   : k_tail_java_threads;
-            bpf_tail_call(ctx, &jump_table, target);
-            bpf_tail_call(ctx, &jump_table, k_tail_java_control_cleanup);
+            preempt_guarded_tail_call(ctx, &jump_table, target);
+            preempt_guarded_tail_call(ctx, &jump_table, k_tail_java_control_cleanup);
             java_control_tail_dispatch_missed(id);
             java_control_tail_miss_legacy_cleanup(op_cmd, &task, id);
             return 0;
@@ -1565,7 +1566,7 @@ static __always_inline int handle_java_ioctl(struct pt_regs *ctx,
 
 SEC("kprobe/sys_ioctl")
 // unsigned int fd, unsigned int cmd, void *arg
-int BPF_KPROBE(obi_kprobe_sys_ioctl) {
+int BPF_KPROBE_GUARDED(obi_kprobe_sys_ioctl) {
     const u64 id = bpf_get_current_pid_tgid();
 
     // sys_ioctl is retained for control packets and as a telemetry-only
@@ -1586,10 +1587,10 @@ int BPF_KPROBE(obi_kprobe_sys_ioctl) {
 
 SEC("kprobe/security_file_ioctl")
 // struct file *file, unsigned int cmd, unsigned long arg
-int BPF_KPROBE(obi_kprobe_security_file_ioctl,
-               struct file *file,
-               unsigned int cmd,
-               unsigned long arg) {
+int BPF_KPROBE_GUARDED(obi_kprobe_security_file_ioctl,
+                       struct file *file,
+                       unsigned int cmd,
+                       unsigned long arg) {
     if (cmd != k_ioctl_magic_id || !arg) {
         return 0;
     }

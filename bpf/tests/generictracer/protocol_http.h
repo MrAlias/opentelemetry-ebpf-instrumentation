@@ -10,6 +10,7 @@
 
 #include <common/connection_info.h>
 #include <common/event_defs.h>
+#include <common/trace_key.h>
 #include <common/tp_info.h>
 
 enum test_large_buf_action : u8 {
@@ -89,8 +90,10 @@ static __always_inline u8 http_info_complete(http_info_t *info) {
     return info && info->start_monotime_ns != 0 && info->status != 0 && info->pid.host_pid != 0;
 }
 
-static __always_inline void finish_http(http_info_t *info, pid_connection_info_t *pid_conn) {
+static __always_inline void
+finish_http(http_info_t *info, pid_connection_info_t *pid_conn, const trace_key_t *current_key) {
     (void)pid_conn;
+    (void)current_key;
 
     if (http_info_complete(info) && !info->submitted) {
         info->submitted = 1;
@@ -122,7 +125,7 @@ static __always_inline void terminate_http_request_if_needed(pid_connection_info
     test_terminated_connection = *pid_conn;
     cleanup_http_request_data(pid_conn, info);
     if (info && http_info_complete(info) && !info->submitted) {
-        finish_http(info, pid_conn);
+        finish_http(info, pid_conn, NULL);
     }
     cleanup_http_info(pid_conn);
 }

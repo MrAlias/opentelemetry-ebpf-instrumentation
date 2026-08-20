@@ -384,7 +384,7 @@ func TestFilter_PostPublishOwnerValidationFailureRestoresCollisionWinner(t *test
 	filter := NewPIDsFilter(
 		&services.DiscoveryConfig{}, slog.With("env", "testing"), &imetrics.NoopReporter{},
 	)
-	filter.AllowPID(incumbent.Pid(), ns, incumbent, incumbent, PIDTypeGo)
+	require.True(t, filter.AllowPID(incumbent.Pid(), ns, incumbent, incumbent, PIDTypeGo))
 
 	validationCalls := 0
 	filter.validatePublishedOwner = func(pid app.PID, owner *exec.FileInfo) error {
@@ -399,7 +399,7 @@ func TestFilter_PostPublishOwnerValidationFailureRestoresCollisionWinner(t *test
 		return errors.New("owner exited after alias lookup")
 	}
 
-	filter.AllowPID(rejected.Pid(), ns, rejected, rejected, PIDTypeKProbes)
+	assert.False(t, filter.AllowPID(rejected.Pid(), ns, rejected, rejected, PIDTypeKProbes))
 
 	require.Equal(t, 1, validationCalls)
 	assert.NotContains(t, filter.admissions, rejected.Pid())
@@ -408,6 +408,183 @@ func TestFilter_PostPublishOwnerValidationFailureRestoresCollisionWinner(t *test
 	assert.True(t, filter.ValidPID(7, ns, PIDTypeGo))
 	assert.False(t, filter.ValidPID(7, ns, PIDTypeKProbes))
 	require.Len(t, filter.candidates[ns][7], 1)
+}
+
+func TestFilter_PostPublishOwnerValidationFailureReportsRejectedReplacement(t *testing.T) {
+	originalReadNamespacePIDs := readNamespacePIDs
+	t.Cleanup(func() { readNamespacePIDs = originalReadNamespacePIDs })
+	lookups := 0
+	readNamespacePIDs = func(pid app.PID) ([]app.PID, error) {
+		lookups++
+		if lookups == 1 {
+			return []app.PID{pid, 7}, nil
+		}
+		return []app.PID{pid, 8}, nil
+	}
+
+	const pid = app.PID(3000)
+	const ns = uint32(33)
+	predecessor := exec.New(exec.Init{Pid: pid})
+	replacement := exec.New(exec.Init{Pid: pid})
+	filter := NewPIDsFilter(
+		&services.DiscoveryConfig{}, slog.With("env", "testing"), &imetrics.NoopReporter{},
+	)
+	require.True(t, filter.AllowPID(pid, ns, predecessor, predecessor, PIDTypeGo))
+
+	replacementValidationCalls := 0
+	predecessorValidationCalls := 0
+	filter.validatePublishedOwner = func(gotPID app.PID, owner *exec.FileInfo) error {
+		require.Equal(t, pid, gotPID)
+		if owner == replacement {
+			replacementValidationCalls++
+			require.Same(t, replacement, filter.admissions[pid].owner)
+			require.Same(t, replacement, filter.current[ns][pid].owner,
+				"the replacement must be checked at the post-publication boundary")
+			return errors.New("owner exited after alias lookup")
+		}
+		predecessorValidationCalls++
+		require.Same(t, predecessor, owner)
+		return nil
+	}
+
+	commitCalls := 0
+	admitted := filter.AllowPID(
+		pid, ns, replacement, replacement, PIDTypeKProbes,
+		func() bool {
+			commitCalls++
+			return true
+		},
+	)
+
+	require.Equal(t, 1, replacementValidationCalls)
+	require.Equal(t, 1, predecessorValidationCalls)
+	assert.Zero(t, commitCalls, "rejected exact owners must not retire process-scoped state")
+	assert.False(t, admitted, "a restored predecessor is not success for the rejected owner")
+	require.Same(t, predecessor, filter.admissions[pid].owner)
+	require.Same(t, predecessor, filter.current[ns][pid].owner)
+	require.Same(t, predecessor, filter.current[ns][7].owner)
+	assert.NotContains(t, filter.current[ns], app.PID(8))
+	assert.True(t, filter.ValidPID(pid, ns, PIDTypeGo))
+	assert.False(t, filter.ValidPID(pid, ns, PIDTypeKProbes))
+}
+
+func TestFilter_AdmissionCommitFailureDropsValidatedReplacementAndStalePredecessor(t *testing.T) {
+	originalReadNamespacePIDs := readNamespacePIDs
+	t.Cleanup(func() { readNamespacePIDs = originalReadNamespacePIDs })
+	lookups := 0
+	readNamespacePIDs = func(pid app.PID) ([]app.PID, error) {
+		lookups++
+		if lookups == 1 {
+			return []app.PID{pid, 7}, nil
+		}
+		return []app.PID{pid, 8}, nil
+	}
+
+	const pid = app.PID(3000)
+	const ns = uint32(33)
+	predecessor := exec.New(exec.Init{Pid: pid})
+	replacement := exec.New(exec.Init{Pid: pid})
+	filter := NewPIDsFilter(
+		&services.DiscoveryConfig{}, slog.With("env", "testing"), &imetrics.NoopReporter{},
+	)
+	require.True(t, filter.AllowPID(pid, ns, predecessor, predecessor, PIDTypeGo))
+	filter.validatePublishedOwner = func(_ app.PID, owner *exec.FileInfo) error {
+		if owner == predecessor {
+			return errors.New("predecessor lifetime is stale")
+		}
+		require.Same(t, replacement, owner)
+		return nil
+	}
+
+	commitCalls := 0
+	admitted := filter.AllowPID(
+		pid, ns, replacement, replacement, PIDTypeKProbes,
+		func() bool {
+			commitCalls++
+			require.Same(t, replacement, filter.current[ns][pid].owner)
+			return false
+		},
+	)
+
+	require.Equal(t, 1, commitCalls)
+	assert.False(t, admitted)
+	assert.NotContains(t, filter.admissions, pid)
+	assert.NotContains(t, filter.current[ns], pid)
+	assert.NotContains(t, filter.current[ns], app.PID(7))
+	assert.NotContains(t, filter.current[ns], app.PID(8))
+	assert.False(t, filter.ValidPID(pid, ns, PIDTypeGo))
+	assert.False(t, filter.ValidPID(pid, ns, PIDTypeKProbes))
+}
+
+func TestFilter_AdmissionCommitFailureRestoresRevalidatedPredecessor(t *testing.T) {
+	originalReadNamespacePIDs := readNamespacePIDs
+	t.Cleanup(func() { readNamespacePIDs = originalReadNamespacePIDs })
+	lookups := 0
+	readNamespacePIDs = func(pid app.PID) ([]app.PID, error) {
+		lookups++
+		if lookups == 1 {
+			return []app.PID{pid, 7}, nil
+		}
+		return []app.PID{pid, 8}, nil
+	}
+
+	const pid = app.PID(3000)
+	const ns = uint32(33)
+	predecessor := exec.New(exec.Init{Pid: pid})
+	replacement := exec.New(exec.Init{Pid: pid})
+	filter := NewPIDsFilter(
+		&services.DiscoveryConfig{}, slog.With("env", "testing"), &imetrics.NoopReporter{},
+	)
+	require.True(t, filter.AllowPID(pid, ns, predecessor, predecessor, PIDTypeGo))
+	filter.validatePublishedOwner = func(_ app.PID, owner *exec.FileInfo) error {
+		require.True(t, owner == predecessor || owner == replacement)
+		return nil
+	}
+
+	admitted := filter.AllowPID(
+		pid, ns, replacement, replacement, PIDTypeKProbes,
+		func() bool { return false },
+	)
+
+	assert.False(t, admitted)
+	require.Same(t, predecessor, filter.admissions[pid].owner)
+	require.Same(t, predecessor, filter.current[ns][pid].owner)
+	require.Same(t, predecessor, filter.current[ns][7].owner)
+	assert.NotContains(t, filter.current[ns], app.PID(8))
+	assert.True(t, filter.ValidPID(pid, ns, PIDTypeGo))
+	assert.False(t, filter.ValidPID(pid, ns, PIDTypeKProbes))
+}
+
+func TestFilter_AdmissionCommitFailureRestoresSameOwnerTypes(t *testing.T) {
+	originalReadNamespacePIDs := readNamespacePIDs
+	t.Cleanup(func() { readNamespacePIDs = originalReadNamespacePIDs })
+	readNamespacePIDs = func(pid app.PID) ([]app.PID, error) {
+		return []app.PID{pid, 7}, nil
+	}
+
+	const pid = app.PID(3000)
+	const ns = uint32(33)
+	owner := exec.New(exec.Init{Pid: pid})
+	filter := NewPIDsFilter(
+		&services.DiscoveryConfig{}, slog.With("env", "testing"), &imetrics.NoopReporter{},
+	)
+	require.True(t, filter.AllowPID(pid, ns, owner, owner, PIDTypeKProbes))
+	previous := filter.admissions[pid]
+
+	admitted := filter.AllowPID(
+		pid, ns, owner, owner, PIDTypeGo,
+		func() bool { return false },
+	)
+
+	assert.False(t, admitted)
+	restored := filter.admissions[pid]
+	require.NotNil(t, restored)
+	assert.NotSame(t, previous, restored, "rollback must restore an immutable precommit snapshot")
+	assert.Same(t, owner, restored.owner)
+	assert.Equal(t, PIDTypeKProbes, restored.pidTypes)
+	assert.True(t, filter.ValidPID(pid, ns, PIDTypeKProbes))
+	assert.False(t, filter.ValidPID(pid, ns, PIDTypeGo))
+	require.Same(t, owner, filter.current[ns][7].owner)
 }
 
 func TestFilter_NewNSLater(t *testing.T) {
@@ -511,6 +688,28 @@ func TestFilter_ExportsOTelDetectionReportsAvoidedTraceServiceOnce(t *testing.T)
 	assert.True(t, fi.ExportsOTelTraces())
 	assert.Empty(t, reporter.metrics)
 	assert.Equal(t, []avoidedServiceRecord{expected}, reporter.traces)
+}
+
+func TestFilter_ExportsOTelDetectionUndecodedPath(t *testing.T) {
+	const defaultOtlpPort = 4317
+	pf := NewPIDsFilter(&services.DiscoveryConfig{}, slog.With("env", "testing"), &imetrics.NoopReporter{})
+
+	fi := exec.New(exec.Init{})
+	// Undecoded :path on the shared OTLP gRPC port identifies no signal, so repeated
+	// exports must not accumulate both flags.
+	span := request.Span{
+		Type: request.EventTypeGRPCClient, HostPort: defaultOtlpPort,
+		Method: "GET", Path: "*", RequestStart: 100, End: 200, Status: 0,
+	}
+
+	pf.checkIfExportsOTel(fi, &span, defaultOtlpPort)
+	pf.checkIfExportsOTel(fi, &span, defaultOtlpPort)
+
+	assert.False(t, fi.ExportsOTelMetrics())
+	assert.False(t, fi.ExportsOTelTraces())
+
+	pf.checkIfExportsOTelSpanMetrics(fi, &span, defaultOtlpPort)
+	assert.False(t, fi.ExportsOTelMetricsSpan())
 }
 
 func TestFilter_ExportsOTelSpanDetection(t *testing.T) {

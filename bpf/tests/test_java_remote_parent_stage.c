@@ -808,7 +808,7 @@ static tp_info_pid_t raw_parent(unsigned char flags) {
     tp_info_pid_t incoming = {
         .tp = {.ts = test_candidate_timestamp, .flags = flags},
         .valid = 1,
-        .provenance = k_tp_provenance_tcp_exact_flags,
+        .state = TP_INFO_PID_STATE_PROVENANCE(k_tp_provenance_tcp_exact_flags),
     };
     for (u32 index = 0; index < sizeof(incoming.tp.trace_id); index++) {
         incoming.tp.trace_id[index] = test_trace_seed + index;

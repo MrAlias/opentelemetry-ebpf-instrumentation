@@ -7,6 +7,7 @@
 #include <bpfcore/bpf_helpers.h>
 
 #include <common/algorithm.h>
+#include <common/preempt_guard.h>
 
 #include <generictracer/ssl_defs.h>
 
@@ -183,7 +184,7 @@ int obi_ssl_process_exit(void *ctx) {
 }
 
 SEC("uretprobe/libssl.so:SSL_new")
-int BPF_URETPROBE(obi_uretprobe_ssl_new, void *ssl) {
+int BPF_URETPROBE_GUARDED(obi_uretprobe_ssl_new, void *ssl) {
     (void)ctx;
 
     const u64 id = bpf_get_current_pid_tgid();
@@ -200,7 +201,7 @@ int BPF_URETPROBE(obi_uretprobe_ssl_new, void *ssl) {
 // SSL_read_ex sets an argument pointer with the number of bytes read, while SSL_read returns
 // the number of bytes read.
 SEC("uprobe/libssl.so:SSL_read")
-int BPF_UPROBE(obi_uprobe_ssl_read, void *ssl, const void *buf, int num) {
+int BPF_UPROBE_GUARDED(obi_uprobe_ssl_read, void *ssl, const void *buf, int num) {
     (void)ctx;
     (void)num;
 
@@ -233,7 +234,7 @@ int BPF_UPROBE(obi_uprobe_ssl_read, void *ssl, const void *buf, int num) {
 }
 
 SEC("uretprobe/libssl.so:SSL_read")
-int BPF_URETPROBE(obi_uretprobe_ssl_read, int ret) {
+int BPF_URETPROBE_GUARDED(obi_uretprobe_ssl_read, int ret) {
     const u64 id = bpf_get_current_pid_tgid();
 
     if (!valid_pid(id)) {
@@ -248,11 +249,11 @@ int BPF_URETPROBE(obi_uretprobe_ssl_read, int ret) {
 }
 
 SEC("uprobe/libssl.so:SSL_read_ex")
-int BPF_UPROBE(obi_uprobe_ssl_read_ex,
-               void *ssl,
-               const void *buf,
-               int num,
-               size_t *readbytes) { //NOLINT(readability-non-const-parameter)
+int BPF_UPROBE_GUARDED(obi_uprobe_ssl_read_ex,
+                       void *ssl,
+                       const void *buf,
+                       int num,
+                       size_t *readbytes) { //NOLINT(readability-non-const-parameter)
     (void)ctx;
     (void)num;
 
@@ -286,7 +287,7 @@ int BPF_UPROBE(obi_uprobe_ssl_read_ex,
 }
 
 SEC("uretprobe/libssl.so:SSL_read_ex")
-int BPF_URETPROBE(obi_uretprobe_ssl_read_ex, int ret) {
+int BPF_URETPROBE_GUARDED(obi_uretprobe_ssl_read_ex, int ret) {
     const u64 id = bpf_get_current_pid_tgid();
 
     if (!valid_pid(id)) {
@@ -304,7 +305,7 @@ int BPF_URETPROBE(obi_uretprobe_ssl_read_ex, int ret) {
 // SSL_write_ex sets an argument pointer with the number of bytes written, while SSL_write returns
 // the number of bytes written.
 SEC("uprobe/libssl.so:SSL_write")
-int BPF_UPROBE(obi_uprobe_ssl_write, void *ssl, const void *buf, int num) {
+int BPF_UPROBE_GUARDED(obi_uprobe_ssl_write, void *ssl, const void *buf, int num) {
     (void)ctx;
     (void)num;
 
@@ -322,7 +323,7 @@ int BPF_UPROBE(obi_uprobe_ssl_write, void *ssl, const void *buf, int num) {
 }
 
 SEC("uretprobe/libssl.so:SSL_write")
-int BPF_URETPROBE(obi_uretprobe_ssl_write, int ret) {
+int BPF_URETPROBE_GUARDED(obi_uretprobe_ssl_write, int ret) {
     const u64 id = bpf_get_current_pid_tgid();
     ssl_args_t saved = {};
     if (!take_outer_ssl_write(id, k_ssl_write_api_write, &saved)) {
@@ -339,7 +340,7 @@ int BPF_URETPROBE(obi_uretprobe_ssl_write, int ret) {
 }
 
 SEC("uretprobe/libSystem.Security.Cryptography.Native.OpenSsl.so:CryptoNative_SslWrite")
-int BPF_URETPROBE(obi_uretprobe_crypto_native_ssl_write, int ret) {
+int BPF_URETPROBE_GUARDED(obi_uretprobe_crypto_native_ssl_write, int ret) {
     const u64 id = bpf_get_current_pid_tgid();
     ssl_args_t saved = {};
     if (!take_outer_ssl_write(id, k_ssl_write_api_crypto_native, &saved)) {
@@ -355,7 +356,7 @@ int BPF_URETPROBE(obi_uretprobe_crypto_native_ssl_write, int ret) {
 }
 
 SEC("uprobe/libSystem.Security.Cryptography.Native.OpenSsl.so:CryptoNative_SslWrite")
-int BPF_UPROBE(obi_uprobe_crypto_native_ssl_write, void *ssl, const void *buf, int num) {
+int BPF_UPROBE_GUARDED(obi_uprobe_crypto_native_ssl_write, void *ssl, const void *buf, int num) {
     const u64 id = bpf_get_current_pid_tgid();
     if (!valid_pid(id)) {
         return 0;
@@ -366,11 +367,11 @@ int BPF_UPROBE(obi_uprobe_crypto_native_ssl_write, void *ssl, const void *buf, i
 }
 
 SEC("uprobe/libssl.so:SSL_write_ex")
-int BPF_UPROBE(obi_uprobe_ssl_write_ex,
-               void *ssl,
-               const void *buf,
-               size_t num,
-               size_t *written) { //NOLINT(readability-non-const-parameter)
+int BPF_UPROBE_GUARDED(obi_uprobe_ssl_write_ex,
+                       void *ssl,
+                       const void *buf,
+                       size_t num,
+                       size_t *written) { //NOLINT(readability-non-const-parameter)
     (void)ctx;
     (void)num;
 
@@ -396,12 +397,12 @@ int BPF_UPROBE(obi_uprobe_ssl_write_ex,
 }
 
 SEC("uprobe/libssl.so:SSL_write_ex2")
-int BPF_UPROBE(obi_uprobe_ssl_write_ex2,
-               void *ssl,
-               const void *buf,
-               size_t num,
-               u64 flags,
-               size_t *written) { //NOLINT(readability-non-const-parameter)
+int BPF_UPROBE_GUARDED(obi_uprobe_ssl_write_ex2,
+                       void *ssl,
+                       const void *buf,
+                       size_t num,
+                       u64 flags,
+                       size_t *written) { //NOLINT(readability-non-const-parameter)
     (void)ctx;
     (void)num;
 
@@ -427,7 +428,7 @@ int BPF_UPROBE(obi_uprobe_ssl_write_ex2,
 }
 
 SEC("uretprobe/libssl.so:SSL_write_ex")
-int BPF_URETPROBE(obi_uretprobe_ssl_write_ex, int ret) {
+int BPF_URETPROBE_GUARDED(obi_uretprobe_ssl_write_ex, int ret) {
     const u64 id = bpf_get_current_pid_tgid();
     ssl_args_t saved = {};
     if (!take_outer_ssl_write(id, k_ssl_write_api_write_ex, &saved)) {
@@ -452,7 +453,7 @@ int BPF_URETPROBE(obi_uretprobe_ssl_write_ex, int ret) {
 }
 
 SEC("uretprobe/libssl.so:SSL_write_ex2")
-int BPF_URETPROBE(obi_uretprobe_ssl_write_ex2, int ret) {
+int BPF_URETPROBE_GUARDED(obi_uretprobe_ssl_write_ex2, int ret) {
     const u64 id = bpf_get_current_pid_tgid();
     ssl_args_t saved = {};
     if (!take_outer_ssl_write(id, k_ssl_write_api_write_ex2, &saved)) {
@@ -477,7 +478,7 @@ int BPF_URETPROBE(obi_uretprobe_ssl_write_ex2, int ret) {
 }
 
 SEC("uprobe/libssl.so:SSL_shutdown")
-int BPF_UPROBE(obi_uprobe_ssl_shutdown, void *s) {
+int BPF_UPROBE_GUARDED(obi_uprobe_ssl_shutdown, void *s) {
     const u64 id = bpf_get_current_pid_tgid();
 
     if (!valid_pid(id)) {
@@ -491,7 +492,7 @@ int BPF_UPROBE(obi_uprobe_ssl_shutdown, void *s) {
 }
 
 SEC("uprobe/libSystem.Security.Cryptography.Native.OpenSsl.so:CryptoNative_SslShutdown")
-int BPF_UPROBE(obi_uprobe_crypto_native_ssl_shutdown, void *s) {
+int BPF_UPROBE_GUARDED(obi_uprobe_crypto_native_ssl_shutdown, void *s) {
     const u64 id = bpf_get_current_pid_tgid();
     if (!valid_pid(id)) {
         return 0;
@@ -501,7 +502,7 @@ int BPF_UPROBE(obi_uprobe_crypto_native_ssl_shutdown, void *s) {
 }
 
 SEC("uretprobe/libssl.so:SSL_shutdown")
-int BPF_URETPROBE(obi_uretprobe_ssl_shutdown, int ret) {
+int BPF_URETPROBE_GUARDED(obi_uretprobe_ssl_shutdown, int ret) {
     (void)ctx;
 
     const u64 id = bpf_get_current_pid_tgid();
@@ -539,7 +540,7 @@ int BPF_URETPROBE(obi_uretprobe_ssl_shutdown, int ret) {
 }
 
 SEC("uretprobe/libSystem.Security.Cryptography.Native.OpenSsl.so:CryptoNative_SslShutdown")
-int BPF_URETPROBE(obi_uretprobe_crypto_native_ssl_shutdown, int ret) {
+int BPF_URETPROBE_GUARDED(obi_uretprobe_crypto_native_ssl_shutdown, int ret) {
     (void)ctx;
 
     const u64 id = bpf_get_current_pid_tgid();

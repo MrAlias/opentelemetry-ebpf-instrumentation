@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -46,6 +47,18 @@ func TestValidateProcessOwnerRejectsExecutableMismatch(t *testing.T) {
 
 	err := ValidateProcessOwner(pid, owner)
 	require.ErrorContains(t, err, "exact process executable identity")
+}
+
+func TestValidateProcessOwnerRejectsExitingTask(t *testing.T) {
+	const (
+		pid   = app.PID(42)
+		start = uint64(1234)
+	)
+	owner, procDir, _ := fakeProcessOwner(t, pid, start)
+	writeFakeProcessStat(t, procDir, pid, start, linuxTaskFlagExiting)
+
+	err := ValidateProcessOwner(pid, owner)
+	require.ErrorContains(t, err, "flags 0x4")
 }
 
 func TestValidateProcessOwnerAllowsIncompleteExecutableIdentity(t *testing.T) {
@@ -199,13 +212,7 @@ func fakeProcessOwner(
 	require.NoError(t, os.WriteFile(executable, []byte("first"), 0o600))
 	require.NoError(t, os.WriteFile(replacement, []byte("second"), 0o600))
 	require.NoError(t, os.Symlink(executable, filepath.Join(procDir, "exe")))
-	stat := fmt.Sprintf(
-		"%d (fake process) S 1%s %d\n",
-		pid,
-		strings.Repeat(" 0", 17),
-		start,
-	)
-	require.NoError(t, os.WriteFile(filepath.Join(procDir, "stat"), []byte(stat), 0o600))
+	writeFakeProcessStat(t, procDir, pid, start, 0)
 	handle, err := os.Open(procDir)
 	require.NoError(t, err)
 	dev, ino := fileIdentity(t, executable)
@@ -218,6 +225,29 @@ func fakeProcessOwner(
 	})
 	t.Cleanup(func() { require.NoError(t, owner.CloseProcessHandle()) })
 	return owner, procDir, replacement
+}
+
+func writeFakeProcessStat(
+	t *testing.T,
+	procDir string,
+	pid app.PID,
+	start uint64,
+	flags uint64,
+) {
+	t.Helper()
+	fieldsBeforeStart := make([]string, 17)
+	for i := range fieldsBeforeStart {
+		fieldsBeforeStart[i] = "0"
+	}
+	// fieldsBeforeStart starts at field 5; Linux task flags are field 9.
+	fieldsBeforeStart[4] = strconv.FormatUint(flags, 10)
+	stat := fmt.Sprintf(
+		"%d (fake process) S 1 %s %d\n",
+		pid,
+		strings.Join(fieldsBeforeStart, " "),
+		start,
+	)
+	require.NoError(t, os.WriteFile(filepath.Join(procDir, "stat"), []byte(stat), 0o600))
 }
 
 func fileIdentity(t *testing.T, path string) (uint64, uint64) {

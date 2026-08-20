@@ -34,7 +34,11 @@ static __always_inline u8 prepare_ssl_prewrite_request(call_protocol_args_t *arg
             }
             return 0;
         }
+#ifdef OBI_HTTP_TERMINATION_CURRENT_KEY
+        finish_http(old_info, &args->pid_conn, NULL);
+#else
         finish_http(old_info, &args->pid_conn);
+#endif
         cleanup_http_info(&args->pid_conn);
     }
 

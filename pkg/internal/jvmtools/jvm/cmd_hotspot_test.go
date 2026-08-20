@@ -27,15 +27,107 @@ import (
 	"go.opentelemetry.io/obi/pkg/internal/procs"
 )
 
-func TestAttachContextReturnsCanceledContext(t *testing.T) {
+func alwaysRunForCurrentAttach(_ int64, fn func() error) error {
+	return fn()
+}
+
+func TestAttachReturnsCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)))
-
+	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil)
 	out, err := attacher.AttachContext(ctx, os.Getpid(), []string{"jcmd"}, true)
 	require.Nil(t, out)
 	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestTerminateWithoutInitIsSafe(t *testing.T) {
+	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil)
+	require.NoError(t, attacher.Terminate())
+	require.True(t, attacher.terminated)
+}
+
+func TestInitIsIdempotent(t *testing.T) {
+	originalGetEUID := getEUID
+	originalGetEGID := getEGID
+	t.Cleanup(func() {
+		getEUID = originalGetEUID
+		getEGID = originalGetEGID
+	})
+
+	euidCalls := 0
+	egidCalls := 0
+	getEUID = func() int {
+		euidCalls++
+		return 123
+	}
+	getEGID = func() int {
+		egidCalls++
+		return 456
+	}
+
+	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil)
+
+	attacher.Init()
+	require.NoError(t, attacher.Cleanup())
+	attacher.Init()
+
+	require.Equal(t, 1, euidCalls)
+	require.Equal(t, 1, egidCalls)
+	require.Equal(t, 123, attacher.myUID)
+	require.Equal(t, 456, attacher.myGID)
+	require.True(t, attacher.initialized)
+}
+
+func TestStaleAttachCannotChangeThreadCredentials(t *testing.T) {
+	originalSetCredentials := setAttachThreadCredentials
+	t.Cleanup(func() { setAttachThreadCredentials = originalSetCredentials })
+	var credentialChanges [][2]int
+	setAttachThreadCredentials = func(uid, gid int) error {
+		credentialChanges = append(credentialChanges, [2]int{uid, gid})
+		return nil
+	}
+
+	activeAttachID := int64(1)
+	var attachMu sync.Mutex
+	runIfCurrentAttach := func(attachID int64, fn func() error) error {
+		attachMu.Lock()
+		defer attachMu.Unlock()
+
+		if activeAttachID != attachID {
+			return nil
+		}
+
+		return fn()
+	}
+
+	oldAttacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil)
+	oldAttacher.ConfigureAttachLifecycle(activeAttachID, runIfCurrentAttach)
+	activeAttachID = 2
+	require.NoError(t, oldAttacher.changeThreadCredentials(789, 987))
+	require.Empty(t, credentialChanges)
+
+	newAttacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil)
+	newAttacher.ConfigureAttachLifecycle(activeAttachID, runIfCurrentAttach)
+	require.NoError(t, newAttacher.changeThreadCredentials(789, 987))
+	require.Equal(t, [][2]int{{789, 987}}, credentialChanges)
+}
+
+func TestTerminalCleanupPreventsLaterCredentialChanges(t *testing.T) {
+	originalSetCredentials := setAttachThreadCredentials
+	t.Cleanup(func() { setAttachThreadCredentials = originalSetCredentials })
+	credentialCalls := 0
+	setAttachThreadCredentials = func(int, int) error {
+		credentialCalls++
+		return nil
+	}
+
+	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil)
+	attacher.ConfigureAttachLifecycle(1, alwaysRunForCurrentAttach)
+	require.NoError(t, attacher.Terminate())
+	require.ErrorIs(t, attacher.changeThreadCredentials(789, 987), errTerminated)
+	require.Zero(t, credentialCalls)
+	require.True(t, attacher.terminated)
 }
 
 func TestStartAttachMechanismStopsOnContextCancellationAndRemovesAttachFile(t *testing.T) {
@@ -119,7 +211,7 @@ func TestHotspotFallbackStillValidatesExactPeer(t *testing.T) {
 		openJVMTargetPIDFD = originalOpen
 		signalJVMTargetPIDFD = originalSignal
 	})
-	target := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	target := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil)
 	require.NoError(t, target.BindTarget(os.Getpid(), start))
 	t.Cleanup(func() { require.NoError(t, target.CloseTarget()) })
 	require.Equal(t, -1, target.targetPIDFD)

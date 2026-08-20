@@ -60,6 +60,70 @@ func (f testCloserFunc) Close() error {
 	return f()
 }
 
+type rejectingAdmissionFilter struct {
+	ebpfcommon.IdentityPidsFilter
+	allowCalls int
+}
+
+func (f *rejectingAdmissionFilter) AllowPID(
+	app.PID,
+	uint32,
+	*exec.FileInfo,
+	*exec.FileInfo,
+	ebpfcommon.PIDType,
+	...ebpfcommon.PIDAdmissionCommit,
+) bool {
+	f.allowCalls++
+	return false
+}
+
+func TestAllowPIDRejectedExactOwnerDoesNotSupersedeJavaLifetime(t *testing.T) {
+	const pid = app.PID(9001)
+	const ns = uint32(1234)
+	key := javaAuthorizationKey{pid: pid, ns: ns}
+	predecessor := exec.New(exec.Init{
+		Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava}, Pid: pid,
+	})
+	predecessor.SetJavaAgentCapability(11)
+	predecessorEvent := &javaAuthorizationEvent{
+		sequence:  1,
+		file:      predecessor,
+		confirmed: true,
+	}
+	replacement := exec.New(exec.Init{
+		Service: svc.Attrs{SDKLanguage: svc.InstrumentableJava}, Pid: pid,
+	})
+	replacementGeneration := replacement.PrepareJavaAgentCapability(22)
+	filter := &rejectingAdmissionFilter{}
+	tracer := &Tracer{
+		log:        tlog(),
+		pidsFilter: filter,
+		javaAuthEvents: map[javaAuthorizationKey][]*javaAuthorizationEvent{
+			key: {predecessorEvent},
+		},
+		javaAuthLatest:   map[javaAuthorizationKey]uint64{key: predecessorEvent.sequence},
+		javaAuthSequence: predecessorEvent.sequence,
+	}
+
+	// This models PIDsFilter rolling back replacement after
+	// validatePublishedOwner fails. The predecessor keeps the numeric PID valid,
+	// but that must not authorize side effects for the rejected exact owner.
+	require.True(t, filter.ValidPID(pid, ns, ebpfcommon.PIDTypeKProbes))
+	tracer.AllowPID(pid, ns, replacement, replacement)
+
+	capability, err := replacement.WaitJavaAgentAuthorizationGeneration(
+		t.Context(), replacementGeneration,
+	)
+	require.NoError(t, err)
+	assert.Zero(t, capability)
+	assert.Equal(t, 1, filter.allowCalls)
+	require.Len(t, tracer.javaAuthEvents[key], 1)
+	assert.Same(t, predecessorEvent, tracer.javaAuthEvents[key][0])
+	assert.Equal(t, predecessorEvent.sequence, tracer.javaAuthLatest[key])
+	assert.Equal(t, uint64(11), predecessor.JavaAgentCapability())
+	assert.Nil(t, tracer.javaWorkersCtx, "a rejected exact owner must not start an authorization worker")
+}
+
 func TestJavaProcessIdentityUsesInnermostNamespacePID(t *testing.T) {
 	original := findJavaNamespacedPIDs
 	findJavaNamespacedPIDs = func(app.PID) ([]app.PID, error) {
@@ -1636,7 +1700,7 @@ func TestJavaControlTailReadinessUsesExactBooleanState(t *testing.T) {
 }
 
 func TestJavaLifecycleTailCallWiring(t *testing.T) {
-	const lifecycleSlot = 20
+	const lifecycleSlot = 23
 
 	lifecycle := &ebpf.Program{}
 	tracer := &Tracer{}
@@ -1709,6 +1773,18 @@ func TestSSLProcessExitCleanupIsAlwaysAttached(t *testing.T) {
 	tracepoints := (&Tracer{}).Tracepoints()
 	require.Contains(t, tracepoints, "sched/sched_process_exit")
 	assert.True(t, tracepoints["sched/sched_process_exit"].Required)
+}
+
+// Mirrors the _Static_assert in bpf/pid/pid.h.
+func TestPidFilterIndexSpaceFitsMap(t *testing.T) {
+	highestSegment := (primeHash - 1) / 64
+
+	assert.Less(t, highestSegment, maxConcurrentPids,
+		"primeHash %d needs %d segments but valid_pids holds %d",
+		primeHash, highestSegment+1, maxConcurrentPids)
+
+	// buildPidFilter must allocate a slot for every reachable segment.
+	assert.Len(t, (&Tracer{pidsFilter: fakeServiceFilter{}}).buildPidFilter(), maxConcurrentPids)
 }
 
 func TestParseJVMMemoryPoolRecordDecoratesServiceByPIDNamespace(t *testing.T) {
@@ -1798,6 +1874,36 @@ func TestProcessSharedRingbufRecordConsumesJVMRuntimeMetricRecordsWithoutForward
 			assert.Empty(t, span)
 		})
 	}
+}
+
+func TestProcessSharedRingbufRecordDispatchesRegisteredInternalEvent(t *testing.T) {
+	const testInternalEventType uint8 = 0xfe
+
+	eventContext := ebpfcommon.NewEBPFEventContext()
+	handled := false
+	eventContext.RegisterInternalEventHandler(
+		testInternalEventType,
+		func(*ringbuf.Record) error {
+			handled = true
+			return nil
+		},
+	)
+	tracer := &Tracer{
+		cfg:      &obi.Config{},
+		eventCtx: eventContext,
+	}
+
+	span, ignore, err := tracer.processSharedRingbufRecord(
+		context.Background(),
+		nil,
+		&tracer.cfg.EBPF,
+		&ringbuf.Record{RawSample: []byte{testInternalEventType}},
+	)
+
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.True(t, ignore)
+	assert.Empty(t, span)
 }
 
 func TestProcessSharedRingbufRecordDispatchesJVMMemoryPoolRecord(t *testing.T) {
@@ -1947,6 +2053,14 @@ func TestRawJVMEventLayoutsUseGeneratedBPFStructs(t *testing.T) {
 	assert.Equal(t, 200, int(unsafe.Sizeof(BpfJvmMemPoolGcEvent{})))
 }
 
+// Ties the clang-compiled layout of struct nodejs_eventloop_event (via the
+// bpf2go-generated type) to the size the hand-written mirror in
+// pkg/ebpf/common assumes; TestNodejsEventLoopRawABI pins the same number on
+// the Go side.
+func TestRawNodejsEventLayoutUsesGeneratedBPFStruct(t *testing.T) {
+	assert.Equal(t, 120, int(unsafe.Sizeof(BpfNodejsEventloopEvent{})))
+}
+
 func rawMemoryPoolPayload(t *testing.T, raw BpfJvmMemPoolGcEvent) []byte {
 	t.Helper()
 
@@ -1983,7 +2097,15 @@ type fakeServiceFilter struct {
 	currentPIDsCalls *int
 }
 
-func (f fakeServiceFilter) AllowPID(app.PID, uint32, *exec.FileInfo, *exec.FileInfo, ebpfcommon.PIDType) {
+func (f fakeServiceFilter) AllowPID(
+	app.PID,
+	uint32,
+	*exec.FileInfo,
+	*exec.FileInfo,
+	ebpfcommon.PIDType,
+	...ebpfcommon.PIDAdmissionCommit,
+) bool {
+	return true
 }
 func (f fakeServiceFilter) BlockPID(app.PID, uint32, *exec.FileInfo, *exec.FileInfo) {}
 func (f fakeServiceFilter) ValidPID(app.PID, uint32, ebpfcommon.PIDType) bool        { return false }

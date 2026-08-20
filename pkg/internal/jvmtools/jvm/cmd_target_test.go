@@ -46,7 +46,7 @@ func requireAnonymousPIDFD(t *testing.T, attacher *JAttacher) {
 func TestJAttacherBindsAndValidatesExactCurrentProcess(t *testing.T) {
 	start, err := procs.ProcessStartTime(app.PID(os.Getpid()))
 	require.NoError(t, err)
-	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil)
 
 	require.NoError(t, bindCurrentProcess(t, attacher, start))
 	assert.Equal(t, os.Getpid(), attacher.targetPID)
@@ -63,7 +63,7 @@ func TestJAttacherDuplicatesSuppliedDiscoveryProcFD(t *testing.T) {
 	require.NoError(t, err)
 	discoveryHandle, err := os.Open("/proc/self")
 	require.NoError(t, err)
-	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil)
 
 	err = attacher.BindTargetFromProcFD(
 		os.Getpid(), start, int(discoveryHandle.Fd()),
@@ -85,7 +85,7 @@ func TestJAttacherRejectsSuppliedProcFDForDifferentPID(t *testing.T) {
 	discoveryHandle, err := os.Open("/proc/self")
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, discoveryHandle.Close()) })
-	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil)
 
 	err = attacher.BindTargetFromProcFD(
 		os.Getpid()+1, start, int(discoveryHandle.Fd()),
@@ -98,7 +98,7 @@ func TestJAttacherRejectsSuppliedProcFDForDifferentPID(t *testing.T) {
 func TestJAttacherRejectsWrongStartAndReleasesPIDFD(t *testing.T) {
 	start, err := procs.ProcessStartTime(app.PID(os.Getpid()))
 	require.NoError(t, err)
-	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil)
 
 	err = bindCurrentProcess(t, attacher, start+1)
 	require.ErrorContains(t, err, "changed from start")
@@ -127,7 +127,7 @@ func TestJAttacherUsesStableProcFDWhenPIDFDOpenIsUnavailable(t *testing.T) {
 		openJVMTargetPIDFD = originalOpen
 		signalJVMTargetPIDFD = originalSignal
 	})
-	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil)
 
 	require.NoError(t, attacher.BindTarget(os.Getpid(), start))
 	assert.Equal(t, -1, attacher.targetPIDFD)
@@ -154,7 +154,7 @@ func TestJAttacherFailsClosedWithoutExactSignalSupport(t *testing.T) {
 		openJVMTargetPIDFD = originalOpen
 		signalJVMTargetPIDFD = originalSignal
 	})
-	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil)
 
 	err = attacher.BindTarget(os.Getpid(), start)
 	require.ErrorIs(t, err, unix.ENOSYS)
@@ -176,7 +176,7 @@ func TestValidateOpenJ9PeerRequiresAnonymousPIDFD(t *testing.T) {
 		openJVMTargetPIDFD = originalOpen
 		signalJVMTargetPIDFD = originalSignal
 	})
-	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil)
 	require.NoError(t, attacher.BindTarget(os.Getpid(), start))
 	t.Cleanup(func() { require.NoError(t, attacher.CloseTarget()) })
 	require.Equal(t, -1, attacher.targetPIDFD)
@@ -200,7 +200,7 @@ func TestStableProcFDDoesNotFollowExitedTarget(t *testing.T) {
 	originalOpen := openJVMTargetPIDFD
 	openJVMTargetPIDFD = func(int, int) (int, error) { return -1, unix.ENOSYS }
 	t.Cleanup(func() { openJVMTargetPIDFD = originalOpen })
-	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil)
 	require.NoError(t, attacher.BindTarget(process.Process.Pid, start))
 	t.Cleanup(func() { require.NoError(t, attacher.CloseTarget()) })
 
@@ -367,7 +367,7 @@ func stubOpenJ9SocketDiagnostics(
 func TestValidateOpenJ9PeerPinsExactTargetSocket(t *testing.T) {
 	start, err := procs.ProcessStartTime(app.PID(os.Getpid()))
 	require.NoError(t, err)
-	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil)
 	require.NoError(t, bindCurrentProcess(t, attacher, start))
 	requireAnonymousPIDFD(t, attacher)
 	t.Cleanup(func() { require.NoError(t, attacher.CloseTarget()) })
@@ -393,7 +393,7 @@ func TestValidateOpenJ9PeerPinsExactTargetSocket(t *testing.T) {
 func TestValidateOpenJ9PeerRejectsSameTupleWithDifferentSocketCookie(t *testing.T) {
 	start, err := procs.ProcessStartTime(app.PID(os.Getpid()))
 	require.NoError(t, err)
-	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil)
 	require.NoError(t, bindCurrentProcess(t, attacher, start))
 	requireAnonymousPIDFD(t, attacher)
 	t.Cleanup(func() { require.NoError(t, attacher.CloseTarget()) })
@@ -443,7 +443,7 @@ func TestVerifyOpenJ9CandidatePreservesCallerCancellation(t *testing.T) {
 func TestValidateOpenJ9PeerFailsClosedWithoutSocketDiagnostics(t *testing.T) {
 	start, err := procs.ProcessStartTime(app.PID(os.Getpid()))
 	require.NoError(t, err)
-	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil)
 	require.NoError(t, bindCurrentProcess(t, attacher, start))
 	requireAnonymousPIDFD(t, attacher)
 	t.Cleanup(func() { require.NoError(t, attacher.CloseTarget()) })
@@ -468,7 +468,7 @@ func TestValidateOpenJ9PeerFailsClosedWithoutSocketDiagnostics(t *testing.T) {
 func TestValidateOpenJ9PeerRejectsSocketOutsideTarget(t *testing.T) {
 	start, err := procs.ProcessStartTime(app.PID(os.Getpid()))
 	require.NoError(t, err)
-	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil)
 	require.NoError(t, bindCurrentProcess(t, attacher, start))
 	requireAnonymousPIDFD(t, attacher)
 	t.Cleanup(func() { require.NoError(t, attacher.CloseTarget()) })
@@ -488,7 +488,7 @@ func TestValidateOpenJ9PeerRejectsSocketOutsideTarget(t *testing.T) {
 func TestValidateOpenJ9PeerFailsClosedWithoutPIDFDGetFD(t *testing.T) {
 	start, err := procs.ProcessStartTime(app.PID(os.Getpid()))
 	require.NoError(t, err)
-	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil)
 	require.NoError(t, bindCurrentProcess(t, attacher, start))
 	requireAnonymousPIDFD(t, attacher)
 	t.Cleanup(func() { require.NoError(t, attacher.CloseTarget()) })
@@ -553,7 +553,7 @@ func TestOpenJ9VerificationRestoresPrivilegesForPIDFDGetFD(t *testing.T) {
 
 	start, err := procs.ProcessStartTime(app.PID(process.Process.Pid))
 	require.NoError(t, err)
-	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	attacher := NewJAttacher(slog.New(slog.NewTextHandler(io.Discard, nil)), 0, nil)
 	attacher.Init()
 	require.NoError(t, attacher.BindTarget(process.Process.Pid, start))
 	t.Cleanup(func() { require.NoError(t, attacher.CloseTarget()) })

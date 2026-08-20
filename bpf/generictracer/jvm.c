@@ -7,10 +7,11 @@
 #include <bpfcore/bpf_builtins.h>
 #include <bpfcore/bpf_helpers.h>
 #include <bpfcore/bpf_tracing.h>
+#include <bpfcore/utils.h>
 
 #include <generictracer/jvm.h>
-#include <common/algorithm.h>
 #include <common/event_defs.h>
+#include <common/preempt_guard.h>
 #include <common/ringbuf.h>
 #include <logger/bpf_dbg.h>
 #include <pid/pid.h>
@@ -62,7 +63,8 @@ jvm_read_usdt_string(unsigned char *dst, const unsigned char *src, long src_len)
         return -1;
     }
 
-    const u32 max_len = (u32)min((long)(k_jvm_raw_string_len - 1), src_len);
+    u32 max_len = (u32)src_len;
+    bpf_clamp_umax(max_len, k_jvm_raw_string_len - 1);
     if (bpf_probe_read_user(dst, max_len, src) != 0) {
         return -1;
     }
@@ -141,7 +143,7 @@ jvm_read_hotspot_usdt_arg(struct pt_regs *ctx, enum jvm_gc_when_type when, u64 a
 
 // https://github.com/openjdk/jdk/blob/jdk-21%2B35/src/hotspot/share/services/memoryManager.cpp#L230
 SEC("usdt/hotspot_mem_pool_gc_begin")
-int obi_usdt_hotspot_mem_pool_gc_begin(struct pt_regs *ctx) {
+int GUARDED_PROG(obi_usdt_hotspot_mem_pool_gc_begin, struct pt_regs *, ctx) {
     if (!jvm_runtime_metrics_are_enabled()) {
         return 0;
     }
@@ -187,7 +189,7 @@ int obi_usdt_hotspot_mem_pool_gc_begin(struct pt_regs *ctx) {
 
 // https://github.com/openjdk/jdk/blob/jdk-21%2B35/src/hotspot/share/services/memoryManager.cpp#L263
 SEC("usdt/hotspot_mem_pool_gc_end")
-int obi_usdt_hotspot_mem_pool_gc_end(struct pt_regs *ctx) {
+int GUARDED_PROG(obi_usdt_hotspot_mem_pool_gc_end, struct pt_regs *, ctx) {
     if (!jvm_runtime_metrics_are_enabled()) {
         return 0;
     }

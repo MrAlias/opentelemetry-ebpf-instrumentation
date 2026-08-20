@@ -14,6 +14,7 @@
 #include <common/iov_iter.h>
 #include <common/lw_thread.h>
 #include <common/msg_buffer.h>
+#include <common/preempt_guard.h>
 #include <common/protocol_defs.h>
 #include <common/sock_port_ns.h>
 #include <common/sockaddr.h>
@@ -65,7 +66,9 @@ volatile const u64 ssl_prewrite_max_age_ns = 30ULL * 1000 * 1000 * 1000;
 
 // Used by accept to grab the sock details
 SEC("kprobe/security_socket_accept")
-int BPF_KPROBE(obi_kprobe_security_socket_accept, struct socket *sock, struct socket *newsock) {
+int BPF_KPROBE_GUARDED(obi_kprobe_security_socket_accept,
+                       struct socket *sock,
+                       struct socket *newsock) {
     (void)ctx;
     (void)sock;
 
@@ -98,7 +101,7 @@ int BPF_KPROBE(obi_kprobe_security_socket_accept, struct socket *sock, struct so
 // Note: A current limitation is that likely we won't capture the first accept request. The
 // process may have already reached accept, before the instrumenter has launched.
 SEC("kretprobe/sys_accept4")
-int BPF_KRETPROBE(obi_kretprobe_sys_accept4, s32 fd) {
+int BPF_KRETPROBE_GUARDED(obi_kretprobe_sys_accept4, s32 fd) {
     (void)ctx;
 
     const u64 id = bpf_get_current_pid_tgid();
@@ -168,7 +171,7 @@ cleanup:
 }
 
 SEC("kprobe/sys_connect")
-int BPF_KPROBE(obi_kprobe_sys_connect) {
+int BPF_KPROBE_GUARDED(obi_kprobe_sys_connect) {
     const u64 id = bpf_get_current_pid_tgid();
 
     if (!valid_pid(id)) {
@@ -209,7 +212,7 @@ static __always_inline void store_sock_pid(struct sock *sk) {
 
 // Used by connect so that we can grab the sock details
 SEC("kprobe/tcp_connect")
-int BPF_KPROBE(obi_kprobe_tcp_connect, struct sock *sk) {
+int BPF_KPROBE_GUARDED(obi_kprobe_tcp_connect, struct sock *sk) {
     (void)ctx;
 
     const u64 id = bpf_get_current_pid_tgid();
@@ -240,7 +243,7 @@ int BPF_KPROBE(obi_kprobe_tcp_connect, struct sock *sk) {
 }
 
 SEC("kprobe/udp_sendmsg")
-int BPF_KPROBE(obi_kprobe_udp_sendmsg, struct sock *sk, struct msghdr *msg, size_t len) {
+int BPF_KPROBE_GUARDED(obi_kprobe_udp_sendmsg, struct sock *sk, struct msghdr *msg, size_t len) {
     (void)ctx;
 
     const u64 id = bpf_get_current_pid_tgid();
@@ -322,7 +325,7 @@ static __always_inline void setup_cp_support_conn_info(pid_connection_info_t *p_
 // We tap into sys_connect so we can track properly the processes doing
 // HTTP client calls
 SEC("kretprobe/sys_connect")
-int BPF_KRETPROBE(obi_kretprobe_sys_connect, int res) {
+int BPF_KRETPROBE_GUARDED(obi_kretprobe_sys_connect, int res) {
     (void)ctx;
 
     const u64 id = bpf_get_current_pid_tgid();
@@ -422,7 +425,7 @@ setup_connection_to_pid_mapping(u64 id, pid_connection_info_t *p_conn, u16 orig_
 // Main HTTP read and write operations are handled with tcp_sendmsg and tcp_recvmsg
 
 SEC("kprobe/sk_psock_msg_verdict")
-int BPF_KPROBE(obi_kprobe_sk_psock_msg_verdict, struct sock *sk) {
+int BPF_KPROBE_GUARDED(obi_kprobe_sk_psock_msg_verdict, struct sock *sk) {
     (void)ctx;
 
     if (!java_remote_parent_enabled || !sk) {
@@ -465,7 +468,7 @@ int BPF_KPROBE(obi_kprobe_sk_psock_msg_verdict, struct sock *sk) {
 // finish the request on the return of tcp_sendmsg. Therefore for any request less
 // than 1MB we just finish the request on the kprobe path.
 SEC("kprobe/tcp_sendmsg")
-int BPF_KPROBE(obi_kprobe_tcp_sendmsg, struct sock *sk, struct msghdr *msg, size_t size) {
+int BPF_KPROBE_GUARDED(obi_kprobe_tcp_sendmsg, struct sock *sk, struct msghdr *msg, size_t size) {
     const u64 id = bpf_get_current_pid_tgid();
 
     if (!valid_pid(id)) {
@@ -593,7 +596,7 @@ int BPF_KPROBE(obi_kprobe_tcp_sendmsg, struct sock *sk, struct msghdr *msg, size
 // This is a backup path kprobe in case tcp_sendmsg doesn't fire, which
 // happens on certain kernels if sk_msg is attached.
 SEC("kprobe/tcp_rate_check_app_limited")
-int BPF_KPROBE(obi_kprobe_tcp_rate_check_app_limited, struct sock *sk) {
+int BPF_KPROBE_GUARDED(obi_kprobe_tcp_rate_check_app_limited, struct sock *sk) {
     const u64 id = bpf_get_current_pid_tgid();
 
     if (!valid_pid(id)) {
@@ -676,7 +679,7 @@ int BPF_KPROBE(obi_kprobe_tcp_rate_check_app_limited, struct sock *sk) {
 // delayed. The code under the `if (size < KPROBES_LARGE_RESPONSE_LEN) {` block should do it
 // but it's possible that the kernel sends the data in smaller chunks.
 SEC("kretprobe/tcp_sendmsg")
-int BPF_KRETPROBE(obi_kretprobe_tcp_sendmsg, int sent_len) {
+int BPF_KRETPROBE_GUARDED(obi_kretprobe_tcp_sendmsg, int sent_len) {
     (void)ctx;
     const u64 id = bpf_get_current_pid_tgid();
 
@@ -822,16 +825,15 @@ static __always_inline void java_remote_parent_close_socket(struct sock *sk) {
     java_remote_parent_close_workspace_release(workspace, invocation_id);
 }
 
-static __noinline int
-java_remote_parent_tcp_close_main(struct pt_regs *ctx, struct sock *sk, long timeout) {
+static __noinline int java_remote_parent_tcp_close_main(struct pt_regs *ctx,
+                                                        struct sock *sk,
+                                                        long timeout,
+                                                        const u64 id) {
     (void)ctx;
     (void)timeout;
 
-    const u64 id = bpf_get_current_pid_tgid();
-
-    if (!valid_pid(id)) {
-        return 0;
-    }
+    trace_key_t current_key = {};
+    trace_key_from_pid_tid(&current_key);
 
     u64 sock_p = (u64)sk;
 
@@ -868,7 +870,7 @@ java_remote_parent_tcp_close_main(struct pt_regs *ctx, struct sock *sk, long tim
         unreadable = is_conn_unreadable(&info.conn);
     }
 
-    force_sent_event_mode(id, &sock_p, &info, unreadable, 0);
+    force_sent_event_mode(id, &sock_p, &info, unreadable, &current_key, 0);
 
     if (success) {
         //dbg_print_http_connection_info(&info.conn);
@@ -877,7 +879,7 @@ java_remote_parent_tcp_close_main(struct pt_regs *ctx, struct sock *sk, long tim
         // exact generation. Keep heavyweight owner cleanup out of the
         // baseline close program, where inlining the full lifecycle exceeds
         // legacy verifier map limits; userspace converges the fenced generation.
-        terminate_http_request_if_needed_mode(&info, 0);
+        terminate_http_request_if_needed_mode(&info, &current_key, 0);
         finish_ongoing_tcp_req_mode(&info, 0);
         bpf_map_delete_elem(&connection_tracker, &info.conn);
         const u64 netns_cookie = java_remote_parent_enabled ? sock_netns_cookie_from_sk(sk) : 0;
@@ -891,8 +893,12 @@ java_remote_parent_tcp_close_main(struct pt_regs *ctx, struct sock *sk, long tim
 }
 
 SEC("kprobe/tcp_close")
-int BPF_KPROBE(obi_kprobe_tcp_close, struct sock *sk, long timeout) {
-    return java_remote_parent_tcp_close_main(ctx, sk, timeout);
+int BPF_KPROBE_GUARDED(obi_kprobe_tcp_close, struct sock *sk, long timeout) {
+    const u64 id = bpf_get_current_pid_tgid();
+    if (!valid_pid(id)) {
+        return 0;
+    }
+    return java_remote_parent_tcp_close_main(ctx, sk, timeout, id);
 }
 
 // Keep Java remote-parent terminal cleanup in an independently attached
@@ -902,14 +908,14 @@ int BPF_KPROBE(obi_kprobe_tcp_close, struct sock *sk, long timeout) {
 // introducing a prog-array tail-call failure mode. Both programs are exact
 // and idempotent, so their kernel-defined attachment order is immaterial.
 SEC("kprobe/tcp_close")
-int BPF_KPROBE(obi_kprobe_java_remote_parent_tcp_close, struct sock *sk) {
+int BPF_KPROBE_GUARDED(obi_kprobe_java_remote_parent_tcp_close, struct sock *sk) {
     (void)ctx;
     java_remote_parent_close_socket(sk);
     return 0;
 }
 
 SEC("kprobe/sock_def_error_report")
-int BPF_KPROBE(obi_kprobe_sock_def_error_report, struct sock *sk) {
+int BPF_KPROBE_GUARDED(obi_kprobe_sock_def_error_report, struct sock *sk) {
     (void)ctx;
 
     const u64 id = bpf_get_current_pid_tgid();
@@ -972,12 +978,12 @@ static __always_inline void setup_recvmsg(u64 id, struct sock *sk, struct msghdr
 
 //int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags, int *addr_len)
 SEC("kprobe/tcp_recvmsg")
-int BPF_KPROBE(obi_kprobe_tcp_recvmsg,
-               struct sock *sk,
-               struct msghdr *msg,
-               size_t len,
-               int flags,
-               int *addr_len) { //NOLINT(readability-non-const-parameter)
+int BPF_KPROBE_GUARDED(obi_kprobe_tcp_recvmsg,
+                       struct sock *sk,
+                       struct msghdr *msg,
+                       size_t len,
+                       int flags,
+                       int *addr_len) { //NOLINT(readability-non-const-parameter)
     (void)ctx;
     (void)len;
     (void)flags;
@@ -1002,7 +1008,10 @@ int BPF_KPROBE(obi_kprobe_tcp_recvmsg,
 // the context propagation. This probe happens before tcp_recvmsg and wraps it
 // so if tcp_recvmsg happens, it will overwrite the data in the args.
 SEC("kprobe/sock_recvmsg")
-int BPF_KPROBE(obi_kprobe_sock_recvmsg, struct socket *sock, struct msghdr *msg, int flags) {
+int BPF_KPROBE_GUARDED(obi_kprobe_sock_recvmsg,
+                       struct socket *sock,
+                       struct msghdr *msg,
+                       int flags) {
     (void)ctx;
     (void)flags;
 
@@ -1029,7 +1038,7 @@ int BPF_KPROBE(obi_kprobe_sock_recvmsg, struct socket *sock, struct msghdr *msg,
 // the context propagation. When tcp_recvmsg happened, the args would be
 // cleaned up by that probe and this kprobe won't do anything.
 SEC("kretprobe/sock_recvmsg")
-int BPF_KRETPROBE(obi_kretprobe_sock_recvmsg, int copied_len) {
+int BPF_KRETPROBE_GUARDED(obi_kretprobe_sock_recvmsg, int copied_len) {
     (void)ctx;
 
     const u64 id = bpf_get_current_pid_tgid();
@@ -1218,7 +1227,7 @@ done:
 
 // backup path for the retprobe of recv msg not firing
 SEC("kprobe/tcp_cleanup_rbuf")
-int BPF_KPROBE(obi_kprobe_tcp_cleanup_rbuf, struct sock *sk, int copied) {
+int BPF_KPROBE_GUARDED(obi_kprobe_tcp_cleanup_rbuf, struct sock *sk, int copied) {
     const u64 id = bpf_get_current_pid_tgid();
 
     if (!valid_pid(id)) {
@@ -1240,7 +1249,7 @@ int BPF_KPROBE(obi_kprobe_tcp_cleanup_rbuf, struct sock *sk, int copied) {
 }
 
 SEC("kretprobe/tcp_recvmsg")
-int BPF_KRETPROBE(obi_kretprobe_tcp_recvmsg, int copied_len) {
+int BPF_KRETPROBE_GUARDED(obi_kretprobe_tcp_recvmsg, int copied_len) {
     const u64 id = bpf_get_current_pid_tgid();
 
     if (!valid_pid(id)) {
@@ -1310,7 +1319,7 @@ typedef struct sock_tailcall_ctx {
 SCRATCH_MEM(sock_tailcall_ctx);
 
 SEC("socket/http_filter")
-int obi_socket_flt_buf(struct __sk_buff *skb) {
+int GUARDED_PROG(obi_socket_flt_buf, struct __sk_buff *, skb) {
     (void)skb;
 
     sock_tailcall_ctx *t_ctx = sock_tailcall_ctx_mem();
@@ -1442,14 +1451,14 @@ int obi_socket_flt_buf(struct __sk_buff *skb) {
     return 0;
 }
 SEC("socket/http_filter")
-int obi_socket__http_filter(struct __sk_buff *skb) {
+int GUARDED_PROG(obi_socket__http_filter, struct __sk_buff *, skb) {
     protocol_info_t tcp = {};
     connection_info_t conn = {};
 
     const u8 success = read_sk_buff(skb, &tcp, &conn);
 
     if (is_dns(&conn)) {
-        bpf_tail_call_static(skb, &jump_table_skb, k_tail_socket_filter_dns);
+        preempt_guarded_tail_call_static(skb, &jump_table_skb, k_tail_socket_filter_dns);
         return 0;
     }
 
@@ -1471,14 +1480,14 @@ int obi_socket__http_filter(struct __sk_buff *skb) {
     t_ctx->conn = conn;
     t_ctx->tcp = tcp;
 
-    bpf_tail_call_static(skb, &sock_jump_table, k_tail_capture_sock_buf);
+    preempt_guarded_tail_call_static(skb, &sock_jump_table, k_tail_capture_sock_buf);
 
     return 0;
 }
 
 // k_tail_socket_filter_dns
 SEC("socket/http_dns_filter")
-int obi_socket__http_dns_filter(struct __sk_buff *skb) {
+int GUARDED_PROG(obi_socket__http_dns_filter, struct __sk_buff *, skb) {
     protocol_info_t tcp = {};
     connection_info_t conn = {};
 
@@ -1494,7 +1503,7 @@ int obi_socket__http_dns_filter(struct __sk_buff *skb) {
     and server_traces are keyed off the namespace:pid.
 */
 SEC("kretprobe/sys_clone")
-int BPF_KRETPROBE(obi_kretprobe_sys_clone, int tid) {
+int BPF_KRETPROBE_GUARDED(obi_kretprobe_sys_clone, int tid) {
     (void)ctx;
 
     const u64 id = bpf_get_current_pid_tgid();
@@ -1519,7 +1528,7 @@ int BPF_KRETPROBE(obi_kretprobe_sys_clone, int tid) {
 }
 
 SEC("kprobe/sys_exit")
-int BPF_KPROBE(obi_kprobe_sys_exit, int status) {
+int BPF_KPROBE_GUARDED(obi_kprobe_sys_exit, int status) {
     (void)ctx;
     (void)status;
 
@@ -1560,7 +1569,7 @@ int BPF_KPROBE(obi_kprobe_sys_exit, int status) {
 }
 
 SEC("kprobe/inet_csk_listen_stop")
-int BPF_KPROBE(obi_kprobe_inet_csk_listen_stop, struct sock *sk) {
+int BPF_KPROBE_GUARDED(obi_kprobe_inet_csk_listen_stop, struct sock *sk) {
     (void)ctx;
 
     const u64 id = bpf_get_current_pid_tgid();

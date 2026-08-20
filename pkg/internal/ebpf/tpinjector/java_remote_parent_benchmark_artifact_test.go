@@ -535,7 +535,9 @@ func TestBridgeBenchmarkArtifact(t *testing.T) {
 	})
 
 	t.Run("does not overwrite an artifact", func(t *testing.T) {
-		artifactPath := filepath.Join(t.TempDir(), "benchmark.json")
+		directory := t.TempDir()
+		require.NoError(t, os.Chmod(directory, 0o700))
+		artifactPath := filepath.Join(directory, "benchmark.json")
 		series := validBridgeBenchmarkArtifactSeries()
 		require.NoError(t, writeBridgeBenchmarkArtifact(artifactPath, series))
 		before, err := os.ReadFile(artifactPath)
@@ -559,7 +561,9 @@ func TestBridgeBenchmarkArtifact(t *testing.T) {
 	})
 
 	t.Run("writes an accurately reported gate failure", func(t *testing.T) {
-		artifactPath := filepath.Join(t.TempDir(), "benchmark.json")
+		directory := t.TempDir()
+		require.NoError(t, os.Chmod(directory, 0o700))
+		artifactPath := filepath.Join(directory, "benchmark.json")
 		series := validBridgeBenchmarkArtifactSeries()
 		series[0].P99NS = bridgeBenchmarkGetsockoptP99Limit.Nanoseconds()
 		series[0].LatencyGate.Passed = false

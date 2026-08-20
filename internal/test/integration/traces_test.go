@@ -170,6 +170,37 @@ func testHTTPTracesCommon(t *testing.T, doTraceID bool, httpCode int) {
 	require.Empty(t, traces)
 }
 
+func testHTTPTracesURLQuery(t *testing.T) {
+	// Ensure OBI is attached before sending the single marker request; this
+	// subtest may run first (e.g. filtered runs), without prior warm-up.
+	waitForTestComponents(t, instrumentedServiceStdURL)
+
+	// Use a unique marker value to avoid matching stale traces from earlier requests.
+	// "sig" is in the default redact list, so its value must appear as REDACTED.
+	ti.DoHTTPGet(t, instrumentedServiceStdURL+"/query-trace?obi_urlquery_test=1&sig=secret123", 200)
+
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		resp, err := http.Get(jaegerQueryURL + "?service=testserver&operation=GET%20%2Fquery-trace")
+		require.NoError(ct, err)
+		if resp == nil {
+			return
+		}
+		defer resp.Body.Close()
+		require.Equal(ct, http.StatusOK, resp.StatusCode)
+		var tq jaeger.TracesQuery
+		require.NoError(ct, json.NewDecoder(resp.Body).Decode(&tq))
+
+		traces := tq.FindBySpan(jaeger.Tag{Key: "url.query", Type: "string", Value: "obi_urlquery_test=1&sig=REDACTED"})
+		require.GreaterOrEqual(ct, len(traces), 1)
+
+		spans := traces[0].FindByOperationName("GET /query-trace", "server")
+		require.GreaterOrEqual(ct, len(spans), 1)
+		tag, ok := jaeger.FindIn(spans[0].Tags, "url.query")
+		require.True(ct, ok, "url.query tag missing from Go server span")
+		assert.Equal(ct, "obi_urlquery_test=1&sig=REDACTED", tag.Value)
+	}, testTimeout, 100*time.Millisecond)
+}
+
 func testGRPCTraces(t *testing.T) {
 	testGRPCTracesForServiceName(t, "testserver")
 }
@@ -315,7 +346,7 @@ func testHTTPTracesKProbes(t *testing.T) {
 
 	var trace jaeger.Trace
 	require.EventuallyWithT(t, func(ct *assert.CollectT) {
-		resp, err := http.Get(jaegerQueryURL + "?service=node&operation=GET%20%2Fbye")
+		resp, err := http.Get(jaegerQueryURL + "?service=testserver&operation=GET%20%2Fbye")
 		require.NoError(ct, err)
 		if resp == nil {
 			return
@@ -354,11 +385,11 @@ func testHTTPTracesKProbes(t *testing.T) {
 	assert.Empty(t, sd, sd.String())
 
 	process := trace.Processes[parent.ProcessID]
-	assert.Equal(t, "node", process.ServiceName)
+	assert.Equal(t, "testserver", process.ServiceName)
 
 	serviceInstance, ok := jaeger.FindIn(process.Tags, "service.instance.id")
 	require.Truef(t, ok, "service.instance.id not found in tags: %v", process.Tags)
-	assert.Regexp(t, `^obi:\d+$$`, serviceInstance.Value)
+	assert.Regexp(t, `^integration-test\.testserver\.`, serviceInstance.Value)
 
 	jaeger.Diff([]jaeger.Tag{
 		{Key: "otel.scope.name", Type: "string", Value: "go.opentelemetry.io/obi"},
@@ -486,7 +517,7 @@ func testHTTPTracesNestedCalls(t *testing.T) {
 	sd = client.Diff(
 		jaeger.Tag{Key: "http.request.method", Type: "string", Value: "GET"},
 		jaeger.Tag{Key: "http.response.status_code", Type: "int64", Value: float64(203)},
-		jaeger.Tag{Key: "url.full", Type: "string", Value: "http://localhost:8080/echoBack"},
+		jaeger.Tag{Key: "url.full", Type: "string", Value: "http://localhost:8080/echoBack?delay=20ms&status=203"},
 		jaeger.Tag{Key: "server.port", Type: "int64", Value: float64(8080)}, // client call is to 8080
 		jaeger.Tag{Key: "span.kind", Type: "string", Value: "client"},
 	)
@@ -1464,7 +1495,7 @@ func testHTTPTracesNestedManualSpans(t *testing.T) {
 	assert.Empty(t, sd, sd.String())
 }
 
-func testHTTPTracesNestedNodeJSLargeHTTPS(t *testing.T) {
+func testHTTPTracesNestedJSLargeHTTPS(t *testing.T) {
 	var parentID string
 
 	// Run a request, since we have a single app, we should see always all requests
@@ -1472,7 +1503,7 @@ func testHTTPTracesNestedNodeJSLargeHTTPS(t *testing.T) {
 
 	var trace jaeger.Trace
 	require.EventuallyWithT(t, func(ct *assert.CollectT) {
-		resp, err := http.Get(jaegerQueryURL + "?service=node&operation=GET%20%2Fapi%2Ftest-apm")
+		resp, err := http.Get(jaegerQueryURL + "?service=testserver&operation=GET%20%2Fapi%2Ftest-apm")
 		require.NoError(ct, err)
 		if resp == nil {
 			return
@@ -1509,29 +1540,24 @@ func testHTTPTracesNestedNodeJSLargeHTTPS(t *testing.T) {
 
 	res = trace.FindByOperationName("processing", "internal")
 
+	require.NotEmpty(t, res)
 	var processing *jaeger.Span
+	for i := range res {
+		r := &res[i]
+		// Check parenthood
+		p, ok := trace.ParentOf(r)
 
-	if len(res) > 0 {
-		for i := range res {
-			r := &res[i]
-			// Check parenthood
-			p, ok := trace.ParentOf(r)
-
-			if ok {
-				if p.TraceID == server.TraceID && p.SpanID == server.SpanID {
-					processing = r
-					break
-				}
+		if ok {
+			if p.TraceID == server.TraceID && p.SpanID == server.SpanID {
+				processing = r
+				break
 			}
 		}
 	}
-
-	if processing != nil {
-		children = trace.ChildrenOf(processing.SpanID)
-	}
-
+	require.NotNil(t, processing)
+	children = trace.ChildrenOf(processing.SpanID)
 	// We must see two children
-	require.Len(t, children, 2)
+	assert.Len(t, children, 2)
 }
 
 func testPythonAsyncEndpoint(t *testing.T, endpoint string, expectedClientCalls int) {

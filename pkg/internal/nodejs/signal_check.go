@@ -8,10 +8,10 @@ package nodejs // import "go.opentelemetry.io/obi/pkg/internal/nodejs"
 import (
 	"debug/elf"
 	"encoding/binary"
-	"fmt"
 	"os"
 
-	"go.opentelemetry.io/obi/pkg/appolly/app"
+	"golang.org/x/sys/unix"
+
 	"go.opentelemetry.io/obi/pkg/internal/procs"
 )
 
@@ -40,7 +40,14 @@ const (
 //
 // Returns signalCheckFound if a handler is detected, signalCheckNotFound if no handler,
 // or signalCheckFailed if the detection could not be performed (e.g. stripped symbols).
-func hasUserSIGUSR1Handler(pid int, elfFile *elf.File) signalCheckResult {
+func hasUserSIGUSR1Handler(
+	procFD int,
+	expectedDev, expectedIno uint64,
+	elfFile *elf.File,
+) signalCheckResult {
+	if procFD < 0 || elfFile == nil {
+		return signalCheckFailed
+	}
 	if elfFile.Class != elf.ELFCLASS64 {
 		return signalCheckFailed
 	}
@@ -60,16 +67,20 @@ func hasUserSIGUSR1Handler(pid int, elfFile *elf.File) signalCheckResult {
 	// base address from /proc/<pid>/maps.
 	runtimeAddr := symVAddr
 	if elfFile.Type == elf.ET_DYN {
-		base, err := procs.FindExeBaseAddr(app.PID(pid))
+		base, err := procs.FindExeLoadBiasFromProcFD(procFD, expectedDev, expectedIno)
 		if err != nil {
 			return signalCheckFailed
 		}
 		runtimeAddr = base + symVAddr
 	}
 
-	memPath := fmt.Sprintf("/proc/%d/mem", pid)
-	mem, err := os.Open(memPath)
+	memFD, err := unix.Openat(procFD, "mem", unix.O_RDONLY|unix.O_CLOEXEC, 0)
 	if err != nil {
+		return signalCheckFailed
+	}
+	mem := os.NewFile(uintptr(memFD), "exact-node-memory")
+	if mem == nil {
+		_ = unix.Close(memFD)
 		return signalCheckFailed
 	}
 	defer mem.Close()

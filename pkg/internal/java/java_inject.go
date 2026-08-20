@@ -60,6 +60,8 @@ type JavaInjector struct {
 	log                   *slog.Logger
 	cfg                   *obi.Config
 	remoteParentServerUID int
+	currentAttachID       int64
+	mu                    sync.Mutex
 }
 
 type javaAttacher interface {
@@ -70,6 +72,11 @@ type javaAttacher interface {
 	Init()
 	Cleanup() error
 	AttachContext(context.Context, int, []string, bool) (io.ReadCloser, error)
+}
+
+type lifecycleJavaAttacher interface {
+	ConfigureAttachLifecycle(int64, func(int64, func() error) error)
+	Terminate() error
 }
 
 // PreparedExecutable owns the exact process handle captured before Java
@@ -131,7 +138,7 @@ func (p *preparedExecutable) closeLocked() error {
 }
 
 var newJavaAttacher = func(log *slog.Logger) javaAttacher {
-	return jvm.NewJAttacher(log)
+	return jvm.NewJAttacher(log, 0, nil)
 }
 
 var (
@@ -203,6 +210,7 @@ func NewJavaInjector(cfg *obi.Config) (*JavaInjector, error) {
 		cfg:                   cfg,
 		log:                   slog.With("component", "javaagent.Injector"),
 		remoteParentServerUID: os.Geteuid(),
+		currentAttachID:       0,
 	}, nil
 }
 
@@ -330,6 +338,28 @@ func (i *JavaInjector) findTempDir(root string, ie *ebpf.Instrumentable) (string
 	return tmpDir, nil
 }
 
+func (i *JavaInjector) nextAttachID() int64 {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	i.currentAttachID++
+	return i.currentAttachID
+}
+
+func (i *JavaInjector) runIfCurrentAttach(
+	attachID int64,
+	fn func() error,
+) error {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	if i.currentAttachID != attachID {
+		return nil
+	}
+
+	return fn()
+}
+
 func (i *JavaInjector) NewExecutable(ie *ebpf.Instrumentable) error {
 	return i.NewExecutableContext(context.Background(), ie)
 }
@@ -357,7 +387,7 @@ func (i *JavaInjector) newExecutableContext(
 	ie *ebpf.Instrumentable,
 	attacher javaAttacher,
 	authorizationGeneration uint64,
-) error {
+) (resultErr error) {
 	readyCtx, cancelReady := context.WithTimeout(parent, javaAuthorizationReadyTimeout)
 	var capability uint64
 	var err error
@@ -386,6 +416,11 @@ func (i *JavaInjector) newExecutableContext(
 	if err := validateJavaTargetLifetime(ie.FileInfo); err != nil {
 		return err
 	}
+	attachID := i.nextAttachID()
+	if lifecycle, ok := attacher.(lifecycleJavaAttacher); ok {
+		lifecycle.ConfigureAttachLifecycle(attachID, i.runIfCurrentAttach)
+		defer func() { resultErr = errors.Join(resultErr, lifecycle.Terminate()) }()
+	}
 	ctx, cancel := context.WithTimeout(parent, i.cfg.Java.Timeout)
 	defer cancel()
 
@@ -412,7 +447,6 @@ func (i *JavaInjector) newExecutableContext(
 	if loaded {
 		i.log.Info("OpenTelemetry eBPF Java Agent already loaded, reconfiguring")
 	}
-
 	if err := validateJavaTargetLifetime(ie.FileInfo); err != nil {
 		return err
 	}

@@ -52,6 +52,45 @@ type lifecycleTracer struct {
 	already      bool
 }
 
+type admissionLifecycleTracer struct {
+	stubTracer
+	result        bool
+	allowedOwners []*exec.FileInfo
+	blockedOwners []*exec.FileInfo
+}
+
+type lifecycleUprobeTargetTracer struct {
+	*lifecycleTracer
+	dev uint64
+	ino uint64
+}
+
+func (t *lifecycleUprobeTargetTracer) ResolveUprobeTarget(
+	_ *link.Executable,
+	_ uint64,
+) (uint64, uint64, error) {
+	return t.dev, t.ino, nil
+}
+
+func (t *admissionLifecycleTracer) AllowPID(
+	_ app.PID,
+	_ uint32,
+	_ *exec.FileInfo,
+	owner *exec.FileInfo,
+) bool {
+	t.allowedOwners = append(t.allowedOwners, owner)
+	return t.result
+}
+
+func (t *admissionLifecycleTracer) BlockPID(
+	_ app.PID,
+	_ uint32,
+	_ *exec.FileInfo,
+	owner *exec.FileInfo,
+) {
+	t.blockedOwners = append(t.blockedOwners, owner)
+}
+
 func (t *lifecycleTracer) LoadSpecs() ([]*ebpfcommon.SpecBundle, error) {
 	return t.bundles, t.loadErr
 }
@@ -101,6 +140,33 @@ func emptySpecBundle(objects io.Closer) *ebpfcommon.SpecBundle {
 		},
 		Objects: objects,
 	}
+}
+
+func TestProcessTracerAdmissionIsOwnedByFirstProgram(t *testing.T) {
+	owner := exec.New(exec.Init{Pid: 42})
+	core := &admissionLifecycleTracer{result: true}
+	rejectingOptional := &admissionLifecycleTracer{result: false}
+	acceptingOptional := &admissionLifecycleTracer{result: true}
+	tracer := &ProcessTracer{Programs: []Tracer{core, rejectingOptional, acceptingOptional}}
+
+	assert.True(t, tracer.AllowPID(owner.Pid(), owner.Ns(), owner, owner))
+	require.Equal(t, []*exec.FileInfo{owner}, core.allowedOwners)
+	require.Equal(t, []*exec.FileInfo{owner}, rejectingOptional.allowedOwners)
+	require.Equal(t, []*exec.FileInfo{owner}, acceptingOptional.allowedOwners)
+	assert.Empty(t, core.blockedOwners)
+	assert.Empty(t, rejectingOptional.blockedOwners)
+
+	rejectingCore := &admissionLifecycleTracer{result: false}
+	notInvoked := &admissionLifecycleTracer{result: true}
+	rejected := &ProcessTracer{Programs: []Tracer{rejectingCore, notInvoked}}
+	replacement := exec.New(exec.Init{Pid: owner.Pid()})
+
+	assert.False(t, rejected.AllowPID(replacement.Pid(), replacement.Ns(), replacement, replacement))
+	require.Equal(t, []*exec.FileInfo{replacement}, rejectingCore.allowedOwners)
+	assert.Empty(t, notInvoked.allowedOwners,
+		"supplementary programs must not run after core exact-owner rejection")
+	assert.Empty(t, rejectingCore.blockedOwners,
+		"the rejecting program owns its transaction rollback")
 }
 
 func testTracerConfig(t *testing.T) *obi.Config {
@@ -232,7 +298,7 @@ func TestNewExecutableRequiredFailureDoesNotPublishInstrumentable(t *testing.T) 
 	fileInfo := exec.New(exec.Init{Pid: app.PID(os.Getpid()), Ino: 99})
 	ie := &Instrumentable{
 		FileInfo: fileInfo,
-		Offsets:  &goexec.Offsets{Funcs: map[string]goexec.FuncOffsets{}},
+		Offsets:  &goexec.Offsets{Funcs: map[string][]goexec.FuncOffsets{}},
 	}
 	originalProcessMaps := processMaps
 	processMaps = func(app.PID) ([]*procfs.ProcMap, error) { return []*procfs.ProcMap{{}}, nil }
@@ -332,6 +398,195 @@ func TestNewExecutableInstanceRollsBackOnlyAdditionsFromCall(t *testing.T) {
 	assert.Equal(t, sharedModule.recorded, sharedModule.unlinked, "new module refs must roll back exactly")
 }
 
+func TestPreparedExecutableInstanceAdmissionRollbackRestoresProbeSnapshot(t *testing.T) {
+	sharedModule := &lifecycleTracer{
+		stubTracer: stubTracer{
+			uprobes: map[string]map[string][]*ebpfcommon.ProbeDesc{"": {}},
+		},
+		already: true,
+	}
+	tracer := NewProcessTracer(
+		Generic,
+		[]Tracer{sharedModule},
+		testTracerConfig(t),
+		imetrics.NoopReporter{},
+	)
+	existingCloser := &countingCloser{}
+	executableID := exec.FileID{Dev: 1, Ino: 111}
+	existingModule := exec.FileID{Dev: 2, Ino: 222}
+	inst := &instrumenter{
+		key:       executableID,
+		closables: []io.Closer{existingCloser},
+		modules:   map[exec.FileID]struct{}{existingModule: {}},
+	}
+	tracer.Instrumentables[executableID] = inst
+	fileInfo := exec.New(exec.Init{Pid: app.PID(os.Getpid()), Dev: executableID.Dev, Ino: executableID.Ino})
+
+	originalProcessMaps := processMaps
+	processMaps = func(app.PID) ([]*procfs.ProcMap, error) { return []*procfs.ProcMap{{}}, nil }
+	t.Cleanup(func() { processMaps = originalProcessMaps })
+
+	transaction, err := tracer.PrepareExecutableInstance(&Instrumentable{FileInfo: fileInfo})
+	require.NoError(t, err)
+	require.Len(t, sharedModule.recorded, 1)
+	require.NoError(t, transaction.Rollback())
+
+	assert.Equal(t, int32(0), existingCloser.closes.Load())
+	assert.Equal(t, map[exec.FileID]struct{}{existingModule: {}}, inst.modules)
+	assert.Equal(t, sharedModule.recorded, sharedModule.unlinked)
+}
+
+func TestPreparedSharedUprobeExecutableRollbackPreservesPredecessor(t *testing.T) {
+	const (
+		targetDev = uint64(9)
+		targetIno = uint64(99)
+	)
+	program := &lifecycleUprobeTargetTracer{
+		lifecycleTracer: &lifecycleTracer{
+			stubTracer: stubTracer{
+				uprobes: map[string]map[string][]*ebpfcommon.ProbeDesc{"": {}},
+			},
+			already: true,
+		},
+		dev: targetDev,
+		ino: targetIno,
+	}
+	tracer := NewProcessTracer(
+		Go,
+		[]Tracer{program},
+		testTracerConfig(t),
+		imetrics.NoopReporter{},
+	)
+	oldKey := exec.FileID{Dev: 1, Ino: 111}
+	newKey := exec.FileID{Dev: 2, Ino: 222}
+	existingModule := exec.FileID{Dev: 3, Ino: 333}
+	existingCloser := &countingCloser{}
+	inst := &instrumenter{
+		key:       oldKey,
+		uprobeKey: exec.FileID{Dev: targetDev, Ino: targetIno},
+		closables: []io.Closer{existingCloser},
+		modules:   map[exec.FileID]struct{}{existingModule: {}},
+	}
+	tracer.Instrumentables[oldKey] = inst
+	fileInfo := exec.New(exec.Init{Pid: app.PID(os.Getpid()), Dev: newKey.Dev, Ino: newKey.Ino})
+	ie := &Instrumentable{
+		FileInfo: fileInfo,
+		Offsets: &goexec.Offsets{Funcs: map[string][]goexec.FuncOffsets{
+			goUprobeTargetProbeSymbol: {{Start: 123}},
+		}},
+	}
+	originalProcessMaps := processMaps
+	processMaps = func(app.PID) ([]*procfs.ProcMap, error) { return []*procfs.ProcMap{{}}, nil }
+	t.Cleanup(func() { processMaps = originalProcessMaps })
+
+	transaction, err := tracer.PrepareExecutable(nil, ie)
+	require.NoError(t, err)
+	assert.NotContains(t, tracer.Instrumentables, newKey,
+		"a new executable key must remain private until exact admission commits")
+	require.Len(t, program.recorded, 1)
+	require.NoError(t, transaction.Rollback())
+
+	require.Same(t, inst, tracer.Instrumentables[oldKey])
+	assert.NotContains(t, tracer.Instrumentables, newKey)
+	assert.Equal(t, int32(0), existingCloser.closes.Load())
+	assert.Equal(t, map[exec.FileID]struct{}{existingModule: {}}, inst.modules)
+	assert.Equal(t, program.recorded, program.unlinked)
+}
+
+func TestPreparedSharedUprobeSameKeyRollbackPreservesPredecessorGeneration(t *testing.T) {
+	const (
+		targetDev          = uint64(9)
+		targetIno          = uint64(99)
+		previousGeneration = uint64(17)
+	)
+	program := &lifecycleUprobeTargetTracer{
+		lifecycleTracer: &lifecycleTracer{
+			stubTracer: stubTracer{
+				uprobes: map[string]map[string][]*ebpfcommon.ProbeDesc{"": {}},
+			},
+			already: true,
+		},
+		dev: targetDev,
+		ino: targetIno,
+	}
+	tracer := NewProcessTracer(
+		Go,
+		[]Tracer{program},
+		testTracerConfig(t),
+		imetrics.NoopReporter{},
+	)
+	key := exec.FileID{Dev: 1, Ino: 111}
+	existingModule := exec.FileID{Dev: 3, Ino: 333}
+	existingCloser := &countingCloser{}
+	inst := &instrumenter{
+		key:       key,
+		uprobeKey: exec.FileID{Dev: targetDev, Ino: targetIno},
+		closables: []io.Closer{existingCloser},
+		modules:   map[exec.FileID]struct{}{existingModule: {}},
+	}
+	tracer.Instrumentables[key] = inst
+	tracer.instrumentableGenerations[key] = previousGeneration
+	fileInfo := exec.New(exec.Init{Pid: app.PID(os.Getpid()), Dev: key.Dev, Ino: key.Ino})
+	ie := &Instrumentable{
+		FileInfo: fileInfo,
+		Offsets: &goexec.Offsets{Funcs: map[string][]goexec.FuncOffsets{
+			goUprobeTargetProbeSymbol: {{Start: 123}},
+		}},
+	}
+	originalProcessMaps := processMaps
+	processMaps = func(app.PID) ([]*procfs.ProcMap, error) { return []*procfs.ProcMap{{}}, nil }
+	t.Cleanup(func() { processMaps = originalProcessMaps })
+
+	transaction, err := tracer.PrepareExecutable(nil, ie)
+	require.NoError(t, err)
+	require.Same(t, inst, tracer.Instrumentables[key])
+	assert.Equal(t, previousGeneration, tracer.instrumentableGenerations[key])
+	assert.Zero(t, ie.ExecutableGeneration)
+	require.Len(t, program.recorded, 1)
+	require.NoError(t, transaction.Rollback())
+
+	require.Same(t, inst, tracer.Instrumentables[key])
+	assert.Equal(t, previousGeneration, tracer.instrumentableGenerations[key])
+	assert.Equal(t, int32(0), existingCloser.closes.Load())
+	assert.Equal(t, map[exec.FileID]struct{}{existingModule: {}}, inst.modules)
+	assert.Equal(t, program.recorded, program.unlinked)
+}
+
+func TestPreparedGenericSameKeyRollbackPreservesPredecessor(t *testing.T) {
+	const previousGeneration = uint64(23)
+	tracer := NewProcessTracer(Generic, nil, testTracerConfig(t), imetrics.NoopReporter{})
+	key := exec.FileID{Dev: 1, Ino: 111}
+	existingCloser := &countingCloser{}
+	predecessor := &instrumenter{
+		key:       key,
+		closables: []io.Closer{existingCloser},
+		modules:   map[exec.FileID]struct{}{},
+	}
+	tracer.Instrumentables[key] = predecessor
+	tracer.instrumentableGenerations[key] = previousGeneration
+	ie := &Instrumentable{FileInfo: exec.New(exec.Init{
+		Pid: app.PID(os.Getpid()),
+		Dev: key.Dev,
+		Ino: key.Ino,
+	})}
+	originalProcessMaps := processMaps
+	processMaps = func(app.PID) ([]*procfs.ProcMap, error) { return nil, nil }
+	t.Cleanup(func() { processMaps = originalProcessMaps })
+
+	transaction, err := tracer.PrepareExecutable(nil, ie)
+	require.NoError(t, err)
+	require.Same(t, predecessor, tracer.Instrumentables[key],
+		"same-key predecessor retirement must wait for exact admission")
+	assert.Equal(t, previousGeneration, tracer.instrumentableGenerations[key])
+	assert.Zero(t, ie.ExecutableGeneration)
+	assert.Equal(t, int32(0), existingCloser.closes.Load())
+	require.NoError(t, transaction.Rollback())
+
+	require.Same(t, predecessor, tracer.Instrumentables[key])
+	assert.Equal(t, previousGeneration, tracer.instrumentableGenerations[key])
+	assert.Equal(t, int32(0), existingCloser.closes.Load())
+}
+
 func TestNewExecutableInstanceRejectsMissingInstrumenter(t *testing.T) {
 	tracer := NewProcessTracer(Generic, nil, testTracerConfig(t), imetrics.NoopReporter{})
 	fileInfo := exec.New(exec.Init{Pid: app.PID(os.Getpid()), Ino: 404})
@@ -349,14 +604,16 @@ func TestProcessTracerSeparatesSameInodeOnDifferentDevices(t *testing.T) {
 	processMaps = func(app.PID) ([]*procfs.ProcMap, error) { return nil, nil }
 	t.Cleanup(func() { processMaps = originalProcessMaps })
 
-	require.NoError(t, tracer.NewExecutable(nil, &Instrumentable{FileInfo: first}))
-	require.NoError(t, tracer.NewExecutable(nil, &Instrumentable{FileInfo: second}))
+	firstInstrumentable := &Instrumentable{FileInfo: first}
+	secondInstrumentable := &Instrumentable{FileInfo: second}
+	require.NoError(t, tracer.NewExecutable(nil, firstInstrumentable))
+	require.NoError(t, tracer.NewExecutable(nil, secondInstrumentable))
 
 	require.Len(t, tracer.Instrumentables, 2)
 	assert.Contains(t, tracer.Instrumentables, first.ID())
 	assert.Contains(t, tracer.Instrumentables, second.ID())
 
-	tracer.UnlinkExecutable(first)
+	tracer.UnlinkExecutable(first, firstInstrumentable.ExecutableGeneration)
 	assert.NotContains(t, tracer.Instrumentables, first.ID())
 	assert.Contains(t, tracer.Instrumentables, second.ID())
 }

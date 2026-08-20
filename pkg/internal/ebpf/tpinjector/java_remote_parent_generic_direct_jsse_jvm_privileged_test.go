@@ -420,7 +420,7 @@ func javaRemoteParentGenericDirectJSSEIncomingCandidate(
 	candidate.Candidate.Tp.Ts = observed
 	candidate.Candidate.Tp.Flags = 1
 	candidate.Candidate.Valid = 1
-	candidate.Candidate.Provenance = 2 // k_tp_provenance_tcp_exact_flags
+	candidate.Candidate.State = 2 // k_tp_provenance_tcp_exact_flags
 	return candidate
 }
 

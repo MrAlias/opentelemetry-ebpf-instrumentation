@@ -4941,7 +4941,9 @@ func jsonObjectSchema(
 
 func TestPackagedJVMBenchmarkArtifactRoundTrip(t *testing.T) {
 	artifact := validPackagedJVMBenchmarkArtifact()
-	artifactPath := filepath.Join(t.TempDir(), "packaged-jvm-benchmark.json")
+	directory := t.TempDir()
+	require.NoError(t, os.Chmod(directory, 0o700))
+	artifactPath := filepath.Join(directory, "packaged-jvm-benchmark.json")
 	require.NoError(t, writePackagedJVMBenchmarkArtifact(artifactPath, artifact))
 
 	contents, err := os.ReadFile(artifactPath)
@@ -4967,7 +4969,9 @@ func TestPackagedJVMBenchmarkArtifactRetainsFailedGate(t *testing.T) {
 	require.False(t, artifact.Series[0].LatencyGate.Passed)
 	require.NoError(t, validatePackagedJVMBenchmarkArtifact(artifact))
 
-	artifactPath := filepath.Join(t.TempDir(), "failed-packaged-jvm-benchmark.json")
+	directory := t.TempDir()
+	require.NoError(t, os.Chmod(directory, 0o700))
+	artifactPath := filepath.Join(directory, "failed-packaged-jvm-benchmark.json")
 	require.NoError(t, writePackagedJVMBenchmarkArtifact(artifactPath, artifact))
 	contents, err := os.ReadFile(artifactPath)
 	require.NoError(t, err)

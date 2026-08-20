@@ -27,6 +27,7 @@ import (
 	"go.opentelemetry.io/obi/pkg/internal/goexec"
 	"go.opentelemetry.io/obi/pkg/internal/helpers/maps"
 	javaagent "go.opentelemetry.io/obi/pkg/internal/java"
+	"go.opentelemetry.io/obi/pkg/internal/nodejs"
 	"go.opentelemetry.io/obi/pkg/internal/testutil"
 	"go.opentelemetry.io/obi/pkg/obi"
 	"go.opentelemetry.io/obi/pkg/pipe/msg"
@@ -44,14 +45,44 @@ type recordingTracer struct {
 	blocked         []blockedPID
 	blockedServices []*execpkg.FileInfo
 	blockedFiles    []*execpkg.FileInfo
+	allow           func(app.PID, uint32, *execpkg.FileInfo, *execpkg.FileInfo) bool
 }
 
 type recordingNodeInjector struct {
-	calls int
+	calls      int
+	last       *ebpf.Instrumentable
+	prepared   *recordingNodePrepared
+	prepareErr error
 }
 
-func (i *recordingNodeInjector) NewExecutable(*ebpf.Instrumentable) {
+type recordingNodePrepared struct {
+	newCalls   int
+	closeCalls int
+	newErr     error
+}
+
+func (i *recordingNodeInjector) PrepareExecutable(
+	ie *ebpf.Instrumentable,
+) (nodejs.PreparedExecutable, error) {
 	i.calls++
+	i.last = ie
+	if i.prepareErr != nil {
+		return nil, i.prepareErr
+	}
+	if i.prepared == nil {
+		i.prepared = &recordingNodePrepared{}
+	}
+	return i.prepared, nil
+}
+
+func (p *recordingNodePrepared) NewExecutable() error {
+	p.newCalls++
+	return p.newErr
+}
+
+func (p *recordingNodePrepared) Close() error {
+	p.closeCalls++
+	return nil
 }
 
 type instrumentationErrorRecord struct {
@@ -61,7 +92,9 @@ type instrumentationErrorRecord struct {
 
 type instrumentationErrorRecorder struct {
 	imetrics.NoopReporter
-	records []instrumentationErrorRecord
+	records        []instrumentationErrorRecord
+	instrumented   []string
+	uninstrumented []string
 }
 
 type controlledJavaInjector struct {
@@ -105,14 +138,34 @@ func (r *instrumentationErrorRecorder) InstrumentationError(processName, errorTy
 	})
 }
 
+func (r *instrumentationErrorRecorder) InstrumentProcess(processName string) {
+	r.instrumented = append(r.instrumented, processName)
+}
+
+func (r *instrumentationErrorRecorder) UninstrumentProcess(processName string) {
+	r.uninstrumented = append(r.uninstrumented, processName)
+}
+
+func recordTestProcessInstance(
+	ta *traceAttacher,
+	executable execpkg.FileID,
+	owner *execpkg.FileInfo,
+) {
+	ta.recordProcessInstance(owner, executable)
+}
+
 func (r *recordingTracer) AllowPID(
 	pid app.PID,
 	ns uint32,
 	service, owner *execpkg.FileInfo,
-) {
+) bool {
 	r.allowed = append(r.allowed, blockedPID{pid: pid, ns: ns})
 	r.allowedServices = append(r.allowedServices, service)
 	r.allowedOwners = append(r.allowedOwners, owner)
+	if r.allow != nil {
+		return r.allow(pid, ns, service, owner)
+	}
+	return true
 }
 
 func (r *recordingTracer) BlockPID(
@@ -214,6 +267,168 @@ func TestMonitorPIDsKeepsServiceMetadataSeparateFromExactLifetimes(t *testing.T)
 	require.Same(t, secondChild, selector.lifetimeOwnerByPID[childTwo])
 }
 
+func TestWithCommonTracersKeepsCoreAdmissionProgramFirst(t *testing.T) {
+	cfg := obi.DefaultConfig
+	core := &recordingTracer{}
+	attacher := &traceAttacher{
+		Cfg:     &cfg,
+		Metrics: imetrics.NoopReporter{},
+		EbpfEventContext: &ebpfcommon.EBPFEventContext{
+			CommonPIDsFilter: &ebpfcommon.IdentityPidsFilter{},
+		},
+	}
+
+	programs := attacher.withCommonTracersGroup([]ebpf.Tracer{core})
+
+	require.NotEmpty(t, programs)
+	require.Same(t, core, programs[0],
+		"ProcessTracer admission semantics require the Generic/Go core program first")
+}
+
+func TestMonitorPIDsCommitsOnlyAcceptedCandidatesAfterExactOwner(t *testing.T) {
+	const (
+		parentPID   = app.PID(41)
+		eventPID    = app.PID(42)
+		acceptedPID = app.PID(43)
+	)
+	service := execpkg.New(execpkg.Init{Pid: parentPID, Ns: 17})
+	eventOwner := execpkg.New(execpkg.Init{Pid: eventPID, Ns: 18})
+	acceptedOwner := execpkg.New(execpkg.Init{Pid: acceptedPID, Ns: 19})
+	ie := &ebpf.Instrumentable{
+		FileInfo:  service,
+		PIDOwner:  eventOwner,
+		ChildPids: []app.PID{eventPID, acceptedPID},
+		PIDOwners: map[app.PID]*execpkg.FileInfo{
+			parentPID:   service,
+			eventPID:    eventOwner,
+			acceptedPID: acceptedOwner,
+		},
+	}
+	program := &recordingTracer{
+		allow: func(pid app.PID, _ uint32, _, _ *execpkg.FileInfo) bool {
+			return pid != parentPID
+		},
+	}
+	tracer := &ebpf.ProcessTracer{Programs: []ebpf.Tracer{program}}
+	selector := NewDynamicPIDSelector()
+	signals := msg.NewQueue[[]request.Span](msg.ChannelBufferLen(1))
+	signalEvents := signals.Subscribe()
+	attacher := &traceAttacher{
+		DynamicPIDSelector:  selector,
+		SpanSignalsShortcut: signals,
+	}
+
+	require.True(t, attacher.monitorPIDs(tracer, ie))
+
+	require.Equal(t, []blockedPID{
+		{pid: eventPID, ns: 18},
+		{pid: parentPID, ns: 17},
+		{pid: acceptedPID, ns: 19},
+	}, program.allowed, "the exact discovery-event owner must be attempted first")
+	assert.NotContains(t, selector.fileInfoByPID, parentPID)
+	require.Same(t, eventOwner, selector.lifetimeOwnerByPID[eventPID])
+	require.Same(t, acceptedOwner, selector.lifetimeOwnerByPID[acceptedPID])
+	spans := testutil.ReadChannel(t, signalEvents, testTimeout)
+	require.Len(t, spans, 2)
+	assert.Equal(t, []app.PID{eventPID, acceptedPID}, []app.PID{
+		spans[0].Service.ProcPID, spans[1].Service.ProcPID,
+	})
+}
+
+func TestMonitorPIDsRejectedSamePIDReplacementPreservesSelectorOwner(t *testing.T) {
+	const pid = app.PID(42)
+	predecessor := execpkg.New(execpkg.Init{Pid: pid, Dev: 7, Ino: 11, Ns: 17})
+	replacement := execpkg.New(execpkg.Init{Pid: pid, Dev: 7, Ino: 11, Ns: 17})
+	program := &recordingTracer{
+		allow: func(_ app.PID, _ uint32, _, owner *execpkg.FileInfo) bool {
+			return owner != replacement
+		},
+	}
+	tracer := &ebpf.ProcessTracer{Programs: []ebpf.Tracer{program}}
+	selector := NewDynamicPIDSelector()
+	attacher := &traceAttacher{DynamicPIDSelector: selector}
+
+	require.True(t, attacher.monitorPIDs(tracer, &ebpf.Instrumentable{
+		FileInfo: predecessor,
+		PIDOwner: predecessor,
+	}))
+	require.False(t, attacher.monitorPIDs(tracer, &ebpf.Instrumentable{
+		FileInfo: replacement,
+		PIDOwner: replacement,
+	}))
+
+	require.Same(t, predecessor, selector.fileInfoByPID[pid])
+	require.Same(t, predecessor, selector.lifetimeOwnerByPID[pid])
+	assert.Empty(t, program.blocked,
+		"a rejected replacement must not Block an independently admitted owner")
+}
+
+func TestCommitNewTracerAdmissionRejectsAndAbortsWithoutPublication(t *testing.T) {
+	owner := execpkg.New(execpkg.Init{Pid: 42, Dev: 7, Ino: 11, Ns: 17})
+	program := &recordingTracer{allow: func(app.PID, uint32, *execpkg.FileInfo, *execpkg.FileInfo) bool {
+		return false
+	}}
+	tracer := &ebpf.ProcessTracer{Type: ebpf.Generic, Programs: []ebpf.Tracer{program}}
+	reporter := &instrumentationErrorRecorder{}
+	aborted := 0
+	rolledBack := 0
+	attacher := &traceAttacher{
+		log:             slog.With("component", t.Name()),
+		Metrics:         reporter,
+		nodeInjector:    &recordingNodeInjector{},
+		existingTracers: map[execpkg.FileID]executableTracer{},
+		abortProcessTracerFn: func(*ebpf.ProcessTracer) error {
+			aborted++
+			return nil
+		},
+	}
+	ie := &ebpf.Instrumentable{FileInfo: owner, PIDOwner: owner, Tracer: tracer}
+
+	admitted := attacher.commitNewTracerAdmission(
+		tracer,
+		ie,
+		owner.ID(),
+		func(commit bool) error {
+			assert.False(t, commit)
+			rolledBack++
+			return nil
+		},
+	)
+
+	assert.False(t, admitted)
+	assert.Equal(t, 1, rolledBack)
+	assert.Equal(t, 1, aborted)
+	assert.Nil(t, ie.Tracer)
+	assert.Empty(t, attacher.existingTracers)
+	assert.Nil(t, attacher.reusableTracer)
+	assert.Empty(t, reporter.instrumented)
+	assert.Zero(t, attacher.nodeInjector.(*recordingNodeInjector).calls)
+}
+
+func TestNodeInjectionPreparedAfterAdmissionAlwaysCloses(t *testing.T) {
+	prepared := &recordingNodePrepared{newErr: errors.New("injection failed")}
+	injector := &recordingNodeInjector{prepared: prepared}
+	owner := execpkg.New(execpkg.Init{Pid: 42})
+	ie := &ebpf.Instrumentable{
+		Type:     svc.InstrumentableNodejs,
+		FileInfo: execpkg.New(execpkg.Init{Pid: 41}),
+		PIDOwner: owner,
+	}
+	attacher := &traceAttacher{
+		log:          slog.With("component", t.Name()),
+		nodeInjector: injector,
+	}
+
+	attacher.injectNodeAfterAdmission(ie)
+
+	assert.Equal(t, 1, injector.calls)
+	assert.Same(t, ie, injector.last)
+	assert.Same(t, owner, injector.last.PIDOwnerFileInfo())
+	assert.Equal(t, 1, prepared.newCalls)
+	assert.Equal(t, 1, prepared.closeCalls,
+		"failed injection must deterministically release every prepared handle")
+}
+
 func TestTraceAttacherJavaDisabledKeepsInjectorInterfaceNil(t *testing.T) {
 	originalRemoveMemlock := removeMemlock
 	removeMemlock = func() error { return nil }
@@ -259,7 +474,7 @@ func TestTraceAttacherJavaDisabledKeepsInjectorInterfaceNil(t *testing.T) {
 	}
 }
 
-func TestRejectedInstrumentableDoesNotIncrementProcessInstances(t *testing.T) {
+func TestRejectedExactAdmissionHasNoDiscoveryOrNodeSideEffects(t *testing.T) {
 	originalRemoveMemlock := removeMemlock
 	removeMemlock = func() error { return nil }
 	t.Cleanup(func() { removeMemlock = originalRemoveMemlock })
@@ -268,6 +483,7 @@ func TestRejectedInstrumentableDoesNotIncrementProcessInstances(t *testing.T) {
 	defer cancel()
 	instrumentables := msg.NewQueue[[]Event[ebpf.Instrumentable]](msg.ChannelBufferLen(1))
 	tracerEvents := msg.NewQueue[Event[*ebpf.Instrumentable]](msg.ChannelBufferLen(1))
+	events := tracerEvents.Subscribe()
 	attacher := &traceAttacher{
 		Cfg:                  &obi.Config{},
 		Metrics:              imetrics.NoopReporter{},
@@ -277,30 +493,47 @@ func TestRejectedInstrumentableDoesNotIncrementProcessInstances(t *testing.T) {
 	}
 	run, err := attacher.attacherLoop(ctx)
 	require.NoError(t, err)
+	const ino = uint64(9876)
+	owner := execpkg.New(execpkg.Init{
+		Pid:        42,
+		Ino:        ino,
+		CmdExePath: "/bin/rejected",
+	})
+	program := &recordingTracer{allow: func(app.PID, uint32, *execpkg.FileInfo, *execpkg.FileInfo) bool {
+		return false
+	}}
+	attacher.existingTracers[owner.ID()] = executableTracer{
+		tracer:     &ebpf.ProcessTracer{Type: ebpf.Go, Programs: []ebpf.Tracer{program}},
+		generation: 1,
+	}
+	nodeInjector := &recordingNodeInjector{}
+	attacher.nodeInjector = nodeInjector
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		run(ctx)
 	}()
 
-	const ino = uint64(9876)
 	instrumentables.Send([]Event[ebpf.Instrumentable]{
 		{
 			Type: EventCreated,
 			Obj: ebpf.Instrumentable{
-				Type: svc.InstrumentableUnknown,
-				FileInfo: execpkg.New(execpkg.Init{
-					Pid:        42,
-					Ino:        ino,
-					CmdExePath: "/bin/rejected",
-				}),
+				Type:     svc.InstrumentableUnknown,
+				FileInfo: owner,
+				PIDOwner: owner,
 			},
 		},
 	})
 	instrumentables.Close()
 	testutil.ReadChannel(t, done, testTimeout)
 
+	require.Len(t, program.allowed, 1)
+	assert.Zero(t, nodeInjector.calls)
 	require.NotContains(t, attacher.processInstances, execpkg.FileID{Ino: ino})
+	assert.Empty(t, attacher.admittedProcessInstances)
+	if event, ok := <-events; ok {
+		t.Fatalf("unexpected tracer event after rejected exact admission: %+v", event)
+	}
 }
 
 func TestJavaAttachmentDeletionCancelsWithoutBlockingDiscovery(t *testing.T) {
@@ -384,6 +617,23 @@ func TestJavaAttachmentReplacementSerializesOutsideDiscoveryLoop(t *testing.T) {
 	assert.Equal(t, uint32(1), secondControlled.closeCount.Load())
 }
 
+func TestExecutableKeySeparatesFilesystems(t *testing.T) {
+	first := execpkg.New(execpkg.Init{Dev: 1, Ino: 42})
+	second := execpkg.New(execpkg.Init{Dev: 2, Ino: 42})
+	firstKey := executableKey(first)
+	secondKey := executableKey(second)
+
+	assert.NotEqual(t, firstKey, secondKey)
+
+	tracers := map[ebpf.ExecutableKey]executableTracer{
+		firstKey:  {tracer: &ebpf.ProcessTracer{Type: ebpf.Go}},
+		secondKey: {tracer: &ebpf.ProcessTracer{Type: ebpf.Generic}},
+	}
+	require.Len(t, tracers, 2)
+	assert.Equal(t, ebpf.Go, tracers[firstKey].tracer.Type)
+	assert.Equal(t, ebpf.Generic, tracers[secondKey].tracer.Type)
+}
+
 func TestSyntheticDeletePath_TraceAttacherDeletesTracer(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -419,8 +669,9 @@ func TestSyntheticDeletePath_TraceAttacherDeletesTracer(t *testing.T) {
 
 	prog := &recordingTracer{}
 	tracer := &ebpf.ProcessTracer{Type: ebpf.Generic, Programs: []ebpf.Tracer{prog}}
-	ta.existingTracers[fileInfo.ID()] = tracer
-	ta.processInstances.Inc(fileInfo.ID())
+	key := executableKey(fileInfo)
+	ta.existingTracers[key] = executableTracer{tracer: tracer, generation: 1}
+	recordTestProcessInstance(ta, key, fileInfo)
 
 	go run(ctx)
 
@@ -436,10 +687,11 @@ func TestSyntheticDeletePath_TraceAttacherDeletesTracer(t *testing.T) {
 	require.NotNil(t, ev.Obj)
 	assert.Equal(t, app.PID(42), ev.Obj.FileInfo.Pid())
 	assert.Same(t, tracer, ev.Obj.Tracer)
+	assert.Equal(t, uint64(1), ev.Obj.ExecutableGeneration)
 	assert.Equal(t, []blockedPID{{pid: 42, ns: 17}}, prog.blocked)
 	require.Len(t, prog.blockedFiles, 1)
 	assert.Same(t, fileInfo, prog.blockedFiles[0])
-	_, exists := ta.existingTracers[fileInfo.ID()]
+	_, exists := ta.existingTracers[key]
 	assert.False(t, exists)
 }
 
@@ -457,20 +709,20 @@ func TestTraceAttacherSeparatesSameInodeOnDifferentDevices(t *testing.T) {
 	attacher := &traceAttacher{
 		log:     slog.With("component", t.Name()),
 		Metrics: imetrics.NoopReporter{},
-		existingTracers: map[execpkg.FileID]*ebpf.ProcessTracer{
-			firstInfo.ID():  firstTracer,
-			secondInfo.ID(): secondTracer,
+		existingTracers: map[execpkg.FileID]executableTracer{
+			firstInfo.ID():  {tracer: firstTracer, generation: 1},
+			secondInfo.ID(): {tracer: secondTracer, generation: 1},
 		},
 		processInstances:   maps.MultiCounter[execpkg.FileID]{},
 		OutputTracerEvents: msg.NewQueue[Event[*ebpf.Instrumentable]](msg.ChannelBufferLen(2)),
 	}
-	attacher.processInstances.Inc(firstInfo.ID())
-	attacher.processInstances.Inc(secondInfo.ID())
+	recordTestProcessInstance(attacher, firstInfo.ID(), firstInfo)
+	recordTestProcessInstance(attacher, secondInfo.ID(), secondInfo)
 
 	attacher.notifyProcessDeletion(&ebpf.Instrumentable{FileInfo: firstInfo})
 
 	assert.NotContains(t, attacher.existingTracers, firstInfo.ID())
-	assert.Same(t, secondTracer, attacher.existingTracers[secondInfo.ID()])
+	assert.Same(t, secondTracer, attacher.existingTracers[secondInfo.ID()].tracer)
 	assert.Equal(t, []blockedPID{{pid: firstInfo.Pid(), ns: firstInfo.Ns()}}, firstProgram.blocked)
 	assert.Empty(t, secondProgram.blocked)
 }
@@ -510,9 +762,17 @@ func TestSyntheticDeletePath_TraceAttacherDeletesInstance(t *testing.T) {
 
 	prog := &recordingTracer{}
 	tracer := &ebpf.ProcessTracer{Type: ebpf.Generic, Programs: []ebpf.Tracer{prog}}
-	ta.existingTracers[fileInfo.ID()] = tracer
-	ta.processInstances.Inc(fileInfo.ID())
-	ta.processInstances.Inc(fileInfo.ID())
+	key := executableKey(fileInfo)
+	ta.existingTracers[key] = executableTracer{tracer: tracer, generation: 1}
+	secondFileInfo := execpkg.New(execpkg.Init{
+		Service:    svc.Attrs{UID: svc.UID{Name: "dyn-svc", Namespace: "ns"}},
+		CmdExePath: "/bin/test",
+		Pid:        43,
+		Ino:        1234,
+		Ns:         17,
+	})
+	recordTestProcessInstance(ta, key, fileInfo)
+	recordTestProcessInstance(ta, key, secondFileInfo)
 
 	go run(ctx)
 
@@ -531,7 +791,7 @@ func TestSyntheticDeletePath_TraceAttacherDeletesInstance(t *testing.T) {
 	assert.Equal(t, []blockedPID{{pid: 42, ns: 17}}, prog.blocked)
 	require.Len(t, prog.blockedFiles, 1)
 	assert.Same(t, fileInfo, prog.blockedFiles[0])
-	assert.Same(t, tracer, ta.existingTracers[fileInfo.ID()])
+	assert.Same(t, tracer, ta.existingTracers[key].tracer)
 }
 
 func TestParentSubstitutedChildDeleteUsesAdmissionOwner(t *testing.T) {
@@ -590,8 +850,8 @@ func TestParentSubstitutedChildDeleteUsesAdmissionOwner(t *testing.T) {
 
 	prog := &recordingTracer{}
 	tracer := &ebpf.ProcessTracer{Type: ebpf.Generic, Programs: []ebpf.Tracer{prog}}
-	ta.existingTracers[parent.ID()] = tracer
-	ta.processInstances.Inc(parent.ID())
+	ta.existingTracers[parent.ID()] = executableTracer{tracer: tracer, generation: 1}
+	recordTestProcessInstance(ta, parent.ID(), child)
 	go run(ctx)
 
 	processMatches.Send([]Event[ProcessMatch]{

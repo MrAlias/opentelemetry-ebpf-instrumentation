@@ -406,8 +406,20 @@ type TestPidsFilter struct {
 	services map[app.PID]svc.Attrs
 }
 
-func (pf *TestPidsFilter) AllowPID(p app.PID, _ uint32, fi, _ *exec.FileInfo, _ PIDType) {
+func (pf *TestPidsFilter) AllowPID(
+	p app.PID,
+	_ uint32,
+	fi, _ *exec.FileInfo,
+	_ PIDType,
+	commit ...PIDAdmissionCommit,
+) bool {
+	for _, commitAdmission := range commit {
+		if commitAdmission != nil && !commitAdmission() {
+			return false
+		}
+	}
 	pf.services[p] = fi.ServiceAttrs()
+	return true
 }
 
 func (pf *TestPidsFilter) BlockPID(p app.PID, _ uint32, _, _ *exec.FileInfo) {

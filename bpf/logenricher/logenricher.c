@@ -29,44 +29,12 @@ char __license[] SEC("license") = "Dual MIT/GPL";
 
 SCRATCH_MEM_SIZED(log_event, k_log_event_max_size);
 
-// Linux exposes /proc/<pid>/stat starttime in USER_HZ ticks. USER_HZ is 100
-// on both supported BPF targets, and nsec_to_clock_t() therefore performs
-// this exact division for task_struct's nanosecond start timestamp.
-static const u64 k_nsec_per_process_start_tick = 10000000ULL;
-
 static __always_inline u64 log_enricher_encode_stat_device(u32 dev) {
     const u32 major = dev >> 20;
     const u32 minor = dev & ((1U << 20) - 1);
 
     // Match new_encode_dev(), which is the st_dev representation returned to userspace.
     return (u64)((minor & 0xffU) | (major << 8) | ((minor & ~0xffU) << 12));
-}
-
-// Kernels predating task_struct::start_boottime called the /proc starttime
-// source real_start_time. The CO-RE flavor suffix maps this declaration back
-// to task_struct without requiring the build kernel to contain the old field.
-struct task_struct___real_start_time {
-    u64 real_start_time;
-} __attribute__((preserve_access_index));
-
-static __always_inline bool process_start_ticks(const struct task_struct *leader, u64 *ticks) {
-    u64 start_ns = 0;
-
-    if (bpf_core_field_exists(((struct task_struct *)0)->start_boottime)) {
-        start_ns = BPF_CORE_READ(leader, start_boottime);
-    } else if (bpf_core_field_exists(
-                   ((struct task_struct___real_start_time *)0)->real_start_time)) {
-        start_ns =
-            BPF_CORE_READ((const struct task_struct___real_start_time *)leader, real_start_time);
-    } else {
-        // start_time is intentionally not a fallback: unlike start_boottime
-        // (and its old real_start_time name), it does not provably match the
-        // starttime value exported by /proc/<pid>/stat across suspend.
-        return false;
-    }
-
-    *ticks = start_ns / k_nsec_per_process_start_tick;
-    return *ticks != 0;
 }
 
 static __always_inline bool

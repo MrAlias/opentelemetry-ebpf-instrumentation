@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"runtime"
 	"runtime/debug"
+	"sync"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -22,33 +23,67 @@ import (
 	"go.opentelemetry.io/obi/pkg/internal/procs"
 )
 
+// extracted for testing
+var (
+	getEUID = syscall.Geteuid
+	getEGID = syscall.Getegid
+)
+
+var errTerminated = errors.New("attach terminated")
+
 type JAttacher struct {
-	logger       *slog.Logger
-	j9attacher   *j9Attacher
-	myUID        int
-	myGID        int
-	targetPID    int
-	targetStart  uint64
-	targetPIDFD  int
-	targetProcFD int
+	logger             *slog.Logger
+	j9attacher         *j9Attacher
+	myUID              int
+	myGID              int
+	mu                 sync.Mutex
+	initialized        bool
+	terminated         bool
+	attachID           int64
+	runIfCurrentAttach func(int64, func() error) error
+	targetPID          int
+	targetStart        uint64
+	targetPIDFD        int
+	targetProcFD       int
 }
 
 var (
-	openJVMTargetPIDFD   = unix.PidfdOpen
-	signalJVMTargetPIDFD = unix.PidfdSendSignal
+	openJVMTargetPIDFD         = unix.PidfdOpen
+	signalJVMTargetPIDFD       = unix.PidfdSendSignal
+	setAttachThreadCredentials = setThreadCredentials
 )
 
-func NewJAttacher(logger *slog.Logger) *JAttacher {
+func NewJAttacher(
+	logger *slog.Logger,
+	attachID int64,
+	runIfCurrentAttach func(int64, func() error) error,
+) *JAttacher {
 	if logger == nil {
 		logger = slog.Default()
 	}
 
 	return &JAttacher{
-		logger:       logger,
-		j9attacher:   nil,
-		targetPIDFD:  -1,
-		targetProcFD: -1,
+		logger:             logger,
+		j9attacher:         nil,
+		attachID:           attachID,
+		runIfCurrentAttach: runIfCurrentAttach,
+		targetPIDFD:        -1,
+		targetProcFD:       -1,
 	}
+}
+
+// ConfigureAttachLifecycle connects this exact target to the injector's
+// serialized attach generation. A canceled, superseded operation is then
+// prevented from changing credentials or performing delayed cleanup after a
+// newer operation has started.
+func (j *JAttacher) ConfigureAttachLifecycle(
+	attachID int64,
+	runIfCurrentAttach func(int64, func() error) error,
+) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.attachID = attachID
+	j.runIfCurrentAttach = runIfCurrentAttach
 }
 
 // BindTarget pins the exact process that subsequent attach commands may
@@ -215,15 +250,16 @@ func (j *JAttacher) signalTarget(pid int, signal syscall.Signal) error {
 }
 
 func (j *JAttacher) Init() {
-	j.myUID = syscall.Geteuid()
-	j.myGID = syscall.Getegid()
-}
+	j.mu.Lock()
+	defer j.mu.Unlock()
 
-func (j *JAttacher) Cleanup() error {
-	if j.j9attacher != nil {
-		return j.j9attacher.detach()
+	if j.initialized {
+		return
 	}
-	return nil
+
+	j.myUID = getEUID()
+	j.myGID = getEGID()
+	j.initialized = true
 }
 
 func setThreadEffectiveID(trap uintptr, id int) error {
@@ -250,6 +286,50 @@ func setThreadCredentials(uid, gid int) error {
 		return fmt.Errorf("setting attach-thread effective UID %d: %w", uid, err)
 	}
 	return nil
+}
+
+func (j *JAttacher) Terminate() error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+
+	j.terminated = true
+	return nil
+}
+
+func (j *JAttacher) Cleanup() error {
+	j.mu.Lock()
+	j9attacher := j.j9attacher
+	attachID := j.attachID
+	runIfCurrentAttach := j.runIfCurrentAttach
+	j.mu.Unlock()
+
+	if j9attacher == nil {
+		return nil
+	}
+	if runIfCurrentAttach == nil {
+		return j9attacher.detach()
+	}
+	return runIfCurrentAttach(attachID, j9attacher.detach)
+}
+
+func (j *JAttacher) changeThreadCredentials(uid, gid int) error {
+	j.mu.Lock()
+	attachID := j.attachID
+	runIfCurrentAttach := j.runIfCurrentAttach
+	j.mu.Unlock()
+
+	change := func() error {
+		j.mu.Lock()
+		defer j.mu.Unlock()
+		if j.terminated {
+			return errTerminated
+		}
+		return setAttachThreadCredentials(uid, gid)
+	}
+	if runIfCurrentAttach == nil {
+		return change()
+	}
+	return runIfCurrentAttach(attachID, change)
 }
 
 func (j *JAttacher) Attach(pid int, argv []string, ignoreOnJ9 bool) (io.ReadCloser, error) {
@@ -353,7 +433,7 @@ func (j *JAttacher) attachInNamespace(ctx context.Context, pid, nspid, targetUID
 	// only this locked sacrificial OS thread; process-wide Go wrappers would
 	// transiently deprivilege every tracer and discovery goroutine.
 	if j.myGID != targetGID || j.myUID != targetUID {
-		if err := setThreadCredentials(targetUID, targetGID); err != nil {
+		if err := j.changeThreadCredentials(targetUID, targetGID); err != nil {
 			return nil, fmt.Errorf("failed to change attach-thread credentials: %w", err)
 		}
 	}

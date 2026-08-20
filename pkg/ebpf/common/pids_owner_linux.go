@@ -13,6 +13,11 @@ import (
 	"go.opentelemetry.io/obi/pkg/internal/procs"
 )
 
+// PF_EXITING is set by exit_signals before sched_process_exit is emitted. An
+// owner with this flag can still have a readable /proc directory and executable
+// even though its last-thread lifecycle notification has already fired.
+const linuxTaskFlagExiting uint64 = 0x00000004
+
 func namespacedPIDsForOwner(pid app.PID, owner *exec.FileInfo) ([]app.PID, error) {
 	if owner == nil || owner.ProcessStartTime() == 0 {
 		return readNamespacePIDs(pid)
@@ -101,14 +106,15 @@ func validateProcessOwnerFD(pid app.PID, start, dev, ino uint64, fd int) error {
 }
 
 func validateProcessIdentityFD(pid app.PID, start uint64, fd int) error {
-	currentPID, _, currentStart, state, err := procs.ProcessStatFromProcFD(fd)
+	currentPID, _, currentStart, state, flags, err := procs.ProcessStatWithFlagsFromProcFD(fd)
 	if err != nil {
 		return fmt.Errorf("reading exact process identity for PID %d: %w", pid, err)
 	}
-	if currentPID != pid || currentStart != start || processStateDead(state) {
+	if currentPID != pid || currentStart != start || processStateDead(state) ||
+		flags&linuxTaskFlagExiting != 0 {
 		return fmt.Errorf(
-			"exact process identity for PID %d is PID %d start %d state %q, expected start %d",
-			pid, currentPID, currentStart, state, start,
+			"exact process identity for PID %d is PID %d start %d state %q flags %#x, expected start %d",
+			pid, currentPID, currentStart, state, flags, start,
 		)
 	}
 	return nil

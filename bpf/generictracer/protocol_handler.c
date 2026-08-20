@@ -7,8 +7,11 @@
 #include <bpfcore/bpf_helpers.h>
 #include <bpfcore/bpf_tracing.h>
 
+#include <common/preempt_guard.h>
+#include <common/protocol_http2_helpers.h>
 #include <common/tc_common.h>
 
+#include <generictracer/protocol_aerospike.h>
 #include <generictracer/protocol_http.h>
 #include <generictracer/protocol_http2.h>
 #include <generictracer/protocol_kafka.h>
@@ -21,7 +24,7 @@
 
 // k_tail_handle_buf_with_args
 SEC("kprobe")
-int obi_handle_buf_with_args(void *ctx) {
+int GUARDED_PROG(obi_handle_buf_with_args, void *, ctx) {
     call_protocol_args_t *args = protocol_args();
     if (!args) {
         return 0;
@@ -30,7 +33,7 @@ int obi_handle_buf_with_args(void *ctx) {
     bpf_dbg_printk("=== kprobe pid=%d, len=%d ===", args->pid_conn.pid, args->bytes_len);
 
     if (args->protocols.http && is_http(args->small_buf, MIN_HTTP_SIZE, &args->packet_type)) {
-        bpf_tail_call(ctx, &jump_table, k_tail_protocol_http);
+        preempt_guarded_tail_call(ctx, &jump_table, k_tail_protocol_http);
     }
     // Successful tail calls do not return. If HTTP was not selected or its
     // first dispatch missed, retire START's exclusive PUBLISHING cursor before
@@ -42,7 +45,9 @@ int obi_handle_buf_with_args(void *ctx) {
     }
 
     if ((args->protocol_type != k_protocol_type_http) &&
-        is_http2_or_grpc(args->small_buf, MIN_HTTP2_SIZE)) {
+        (is_http2_or_grpc(args->small_buf, MIN_HTTP2_SIZE) ||
+         (!already_tracked_http2(&args->pid_conn) &&
+          looks_like_http2_frames(args->u_buf, args->bytes_len)))) {
         // check after the main if condition to avoid sending the undesired http2 to the tcp parsers
         if (!args->protocols.http2) {
             return 0;
@@ -66,38 +71,44 @@ int obi_handle_buf_with_args(void *ctx) {
         if (!args->protocols.http2) {
             return 0;
         }
-        bpf_tail_call(ctx, &jump_table, k_tail_protocol_http2);
+        preempt_guarded_tail_call(ctx, &jump_table, k_tail_protocol_http2);
     } else if (args->protocols.tcp && is_mysql(&args->pid_conn.conn,
                                                (const unsigned char *)args->u_buf,
                                                args->bytes_len,
                                                &args->protocol_type)) {
         bpf_dbg_printk("Found mysql connection");
-        bpf_tail_call(ctx, &jump_table, k_tail_protocol_tcp);
+        preempt_guarded_tail_call(ctx, &jump_table, k_tail_protocol_tcp);
     } else if (args->protocols.tcp && is_postgres(&args->pid_conn.conn,
                                                   (const unsigned char *)args->u_buf,
                                                   args->bytes_len,
                                                   &args->protocol_type)) {
         bpf_dbg_printk("Found postgres connection");
-        bpf_tail_call(ctx, &jump_table, k_tail_protocol_tcp);
+        preempt_guarded_tail_call(ctx, &jump_table, k_tail_protocol_tcp);
     } else if (args->protocols.tcp && is_mssql(&args->pid_conn.conn,
                                                (const unsigned char *)args->u_buf,
                                                args->bytes_len,
                                                &args->protocol_type)) {
         bpf_dbg_printk("Found mssql connection");
-        bpf_tail_call(ctx, &jump_table, k_tail_protocol_tcp);
+        preempt_guarded_tail_call(ctx, &jump_table, k_tail_protocol_tcp);
     } else if (args->protocols.tcp && is_kafka(&args->pid_conn.conn,
                                                (const unsigned char *)args->u_buf,
                                                args->bytes_len,
                                                &args->protocol_type,
                                                args->direction)) {
         bpf_dbg_printk("Found kafka connection");
-        bpf_tail_call(ctx, &jump_table, k_tail_protocol_tcp);
+        preempt_guarded_tail_call(ctx, &jump_table, k_tail_protocol_tcp);
     } else if (args->protocols.tcp && is_sunrpc(&args->pid_conn.conn,
                                                 (const unsigned char *)args->u_buf,
                                                 args->bytes_len,
                                                 &args->protocol_type)) {
         bpf_dbg_printk("Found SunRPC connection");
-        bpf_tail_call(ctx, &jump_table, k_tail_protocol_tcp);
+        preempt_guarded_tail_call(ctx, &jump_table, k_tail_protocol_tcp);
+    } else if (args->protocols.tcp && is_aerospike(&args->pid_conn.conn,
+                                                   (const unsigned char *)args->u_buf,
+                                                   args->bytes_len,
+                                                   &args->protocol_type)) {
+        bpf_dbg_printk("Found Aerospike connection");
+        preempt_guarded_tail_call(ctx, &jump_table, k_tail_protocol_tcp);
     } else { // large request tracking and generic TCP
         http_info_t *info = bpf_map_lookup_elem(&ongoing_http, &args->pid_conn);
 
@@ -121,7 +132,7 @@ int obi_handle_buf_with_args(void *ctx) {
                 // Essentially, when a packet is extended by our sock_msg program and
                 // passed down another service, the receiving side may reassemble the
                 // packets into one buffer or not. If they are reassembled, then the
-                // call to bpf_tail_call(ctx, &jump_table, k_tail_protocol_http); will
+                // call to preempt_guarded_tail_call(ctx, &jump_table, k_tail_protocol_http); will
                 // scan for the incoming 'Traceparent' header. If they are not reassembled
                 // we'll see something like this:
                 // [before the injected header],[70 bytes for 'Traceparent...'],[the rest].
@@ -179,7 +190,7 @@ int obi_handle_buf_with_args(void *ctx) {
         } else if (args->protocols.tcp && !info) {
             // SSL requests will see both TCP traffic and text traffic, ignore the TCP if
             // we are processing SSL request. HTTP2 is already checked in handle_buf_with_connection.
-            bpf_tail_call(ctx, &jump_table, k_tail_protocol_tcp);
+            preempt_guarded_tail_call(ctx, &jump_table, k_tail_protocol_tcp);
         }
     }
 

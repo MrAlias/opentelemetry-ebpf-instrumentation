@@ -10,6 +10,7 @@
 #include <common/http_types.h>
 #include <common/java_remote_parent.h>
 #include <common/lw_thread.h>
+#include <common/preempt_guard.h>
 #include <common/protocol_http_helpers.h>
 #include <common/sock_port_ns.h>
 
@@ -100,7 +101,7 @@ static __always_inline void handle_buf_with_connection(void *ctx,
         return;
     }
 
-    bpf_tail_call(ctx, &jump_table, k_tail_handle_buf_with_args);
+    preempt_guarded_tail_call(ctx, &jump_table, k_tail_handle_buf_with_args);
 }
 
 static __always_inline void handle_ssl_prewrite_with_connection(void *ctx,
@@ -120,7 +121,7 @@ static __always_inline void handle_ssl_prewrite_with_connection(void *ctx,
     args->flags = k_call_protocol_flag_ssl_prewrite;
     args->ssl_ptr = ssl_ptr;
     args->ssl_handoff_id = handoff_id;
-    bpf_tail_call(ctx, &jump_table, k_tail_handle_buf_with_args);
+    preempt_guarded_tail_call(ctx, &jump_table, k_tail_handle_buf_with_args);
 }
 
 static __always_inline u8
@@ -170,7 +171,7 @@ static __always_inline void handle_light_weight_thread_buf(void *ctx,
         return;
     }
 
-    bpf_tail_call(ctx, &jump_table, k_tail_handle_buf_with_args);
+    preempt_guarded_tail_call(ctx, &jump_table, k_tail_handle_buf_with_args);
 }
 
 #define BUF_COPY_BLOCK_SIZE 16

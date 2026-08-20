@@ -270,6 +270,15 @@ func getDefinitions(
 		nil,
 	)
 
+	nodejsEventLoopTimeAttributes := NewAttrReportGroup(
+		false,
+		[]*AttrReportGroup{&appAttributes},
+		map[attr.Name]Default{
+			attr.NodejsEventLoopState: true,
+		},
+		nil,
+	)
+
 	httpRoutes := NewAttrReportGroup(
 		!groups.Has(GroupHTTPRoutes),
 		nil,
@@ -387,6 +396,15 @@ func getDefinitions(
 				attr.DBCollectionName: false,
 			},
 		},
+		DBServerDuration.Section: {
+			SubGroups: []*AttrReportGroup{&appAttributes, &serverInfo},
+			Attributes: map[attr.Name]Default{
+				attr.DBOperation:      true,
+				attr.DBSystemName:     true,
+				attr.ErrorType:        true,
+				attr.DBCollectionName: false,
+			},
+		},
 		MessagingPublishDuration.Section: {
 			SubGroups: []*AttrReportGroup{&messagingAttributes},
 		},
@@ -408,6 +426,7 @@ func getDefinitions(
 				attr.GenAITools:             false,
 				attr.GenAIToolCallArguments: false,
 				attr.GenAIToolCallResult:    false,
+				attr.GenAIResponseError:     false,
 				attr.DBResponseError:        false,
 			},
 		},
@@ -480,6 +499,22 @@ func getDefinitions(
 				attr.ServerAddr:         true,
 			},
 		},
+		GoRuntimeMemoryGCGoal.Section: {
+			SubGroups:  []*AttrReportGroup{&appAttributes},
+			Attributes: map[attr.Name]Default{},
+		},
+		GoRuntimeGoroutineCount.Section: {
+			SubGroups:  []*AttrReportGroup{&appAttributes},
+			Attributes: map[attr.Name]Default{},
+		},
+		GoRuntimeMemoryGCPauseDuration.Section: {
+			SubGroups:  []*AttrReportGroup{&appAttributes},
+			Attributes: map[attr.Name]Default{},
+		},
+		GoRuntimeScheduleDuration.Section: {
+			SubGroups:  []*AttrReportGroup{&appAttributes},
+			Attributes: map[attr.Name]Default{},
+		},
 		JVMMemoryUsed.Section: {
 			SubGroups:  []*AttrReportGroup{&jvmMemoryAttributes},
 			Attributes: map[attr.Name]Default{},
@@ -494,6 +529,10 @@ func getDefinitions(
 		},
 		JVMMemoryUsedAfterLastGC.Section: {
 			SubGroups:  []*AttrReportGroup{&jvmMemoryAttributes},
+			Attributes: map[attr.Name]Default{},
+		},
+		NodejsEventLoopTime.Section: {
+			SubGroups:  []*AttrReportGroup{&nodejsEventLoopTimeAttributes},
 			Attributes: map[attr.Name]Default{},
 		},
 		StatTCPRtt.Section: {

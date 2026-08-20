@@ -5,8 +5,6 @@ package prom
 
 import (
 	"context"
-	"errors"
-	"io"
 	"log/slog"
 	"sync/atomic"
 	"testing"
@@ -23,12 +21,11 @@ import (
 	"go.opentelemetry.io/obi/pkg/export/imetrics"
 	"go.opentelemetry.io/obi/pkg/export/otel/perapp"
 	"go.opentelemetry.io/obi/pkg/pipe/global"
-	"go.opentelemetry.io/obi/pkg/pipe/swarm"
 )
 
 func TestBPFCollectorEnabled(t *testing.T) {
 	cfg := &PrometheusConfig{}
-	mpCfg := &perapp.MetricsConfig{}
+	mpCfg := &perapp.GlobalMetricsConfig{}
 
 	t.Run("disabled without reporter", func(t *testing.T) {
 		assert.False(t, bpfCollectorEnabled(cfg, mpCfg, nil))
@@ -82,7 +79,7 @@ func TestCollectMapOccupancyIncludesNonEvictingAndLRUHashes(t *testing.T) {
 	assert.False(t, collectMapOccupancy(ebpf.PerCPUHash, "java_remote_par"))
 }
 
-func TestSupportedBPFProgramTypeIncludesCGroupSockopt(t *testing.T) {
+func TestSupportedProgramTypeIncludesCGroupSockopt(t *testing.T) {
 	for _, programType := range []ebpf.ProgramType{
 		ebpf.Kprobe,
 		ebpf.SocketFilter,
@@ -91,74 +88,9 @@ func TestSupportedBPFProgramTypeIncludesCGroupSockopt(t *testing.T) {
 		ebpf.SockOps,
 		ebpf.CGroupSockopt,
 	} {
-		assert.True(t, supportedBPFProgramType(programType), programType.String())
+		assert.True(t, supportedProgramType(programType), programType.String())
 	}
-	assert.False(t, supportedBPFProgramType(ebpf.TracePoint))
-}
-
-func TestRunBPFCollectorsRetainsOneStatsHandleUntilContextCancellation(t *testing.T) {
-	originalEnableBPFStatsRuntime := enableBPFStatsRuntimeFn
-	t.Cleanup(func() {
-		enableBPFStatsRuntimeFn = originalEnableBPFStatsRuntime
-	})
-
-	var enableCalls atomic.Int32
-	var closeCalls atomic.Int32
-	enableBPFStatsRuntimeFn = func() (io.Closer, error) {
-		enableCalls.Add(1)
-		return closeFunc(func() error {
-			closeCalls.Add(1)
-			return nil
-		}), nil
-	}
-
-	ctx, cancel := context.WithCancel(t.Context())
-	var runCalls atomic.Int32
-	runBPFCollectors(ctx, slog.Default(), []swarm.RunFunc{
-		func(context.Context) {
-			runCalls.Add(1)
-			assert.Equal(t, int32(1), enableCalls.Load())
-			assert.Zero(t, closeCalls.Load())
-		},
-		func(context.Context) {
-			runCalls.Add(1)
-			assert.Equal(t, int32(1), enableCalls.Load())
-			assert.Zero(t, closeCalls.Load())
-			cancel()
-		},
-	})
-
-	assert.Equal(t, int32(1), enableCalls.Load())
-	assert.Equal(t, int32(1), closeCalls.Load())
-	assert.Equal(t, int32(2), runCalls.Load())
-}
-
-func TestRunBPFCollectorsContinuesWhenRuntimeStatsAreUnavailable(t *testing.T) {
-	originalEnableBPFStatsRuntime := enableBPFStatsRuntimeFn
-	t.Cleanup(func() {
-		enableBPFStatsRuntimeFn = originalEnableBPFStatsRuntime
-	})
-
-	enableBPFStatsRuntimeFn = func() (io.Closer, error) {
-		return nil, errors.New("runtime stats unavailable")
-	}
-
-	ctx, cancel := context.WithCancel(t.Context())
-	var ran atomic.Bool
-	runBPFCollectors(ctx, slog.Default(), []swarm.RunFunc{
-		func(context.Context) {
-			ran.Store(true)
-			cancel()
-		},
-	})
-
-	assert.True(t, ran.Load())
-}
-
-type closeFunc func() error
-
-func (f closeFunc) Close() error {
-	return f()
+	assert.False(t, supportedProgramType(ebpf.TracePoint))
 }
 
 func TestBPFMetricsCollectsInternalMetricsForPrometheusReporter(t *testing.T) {
@@ -177,7 +109,7 @@ func TestBPFMetricsCollectsInternalMetricsForPrometheusReporter(t *testing.T) {
 		newInternalBPFCollectorFn = originalNewInternalBPFCollector
 	})
 
-	newInternalBPFCollectorFn = func(ctxInfo *global.ContextInfo, cfg *PrometheusConfig, mpCfg *perapp.MetricsConfig) *BPFCollector {
+	newInternalBPFCollectorFn = func(ctxInfo *global.ContextInfo, cfg *PrometheusConfig, mpCfg *perapp.GlobalMetricsConfig) *BPFCollector {
 		var collected bool
 		return &BPFCollector{
 			promCfg:         cfg,
@@ -196,6 +128,7 @@ func TestBPFMetricsCollectsInternalMetricsForPrometheusReporter(t *testing.T) {
 					probeID:   "7",
 					latency:   0.25,
 					count:     count,
+					program:   &BPFProgram{},
 				}}
 			},
 			mapMetrics: func() []BpfMapMetrics {
@@ -210,10 +143,12 @@ func TestBPFMetricsCollectsInternalMetricsForPrometheusReporter(t *testing.T) {
 		}
 	}
 
-	runFn, err := BPFMetrics(ctxInfo, &PrometheusConfig{}, &perapp.MetricsConfig{})(context.Background())
+	runFn, err := BPFMetrics(ctxInfo, &PrometheusConfig{}, &perapp.GlobalMetricsConfig{})(context.Background())
 	require.NoError(t, err)
 
-	startBPFMetricsRun(t, runFn)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	runFn(ctx)
 
 	require.Eventually(t, func() bool {
 		probeExecutionsMetric := gatheredMetric(t, registry, "obi_bpf_probe_executions_total", map[string]string{
@@ -226,12 +161,12 @@ func TestBPFMetricsCollectsInternalMetricsForPrometheusReporter(t *testing.T) {
 			"probe_type": "kprobe",
 			"probe_name": "tcp_connect",
 		})
-		mapEntriesMetric := gatheredMetric(t, registry, "obi_bpf_map_entries_total", map[string]string{
+		mapEntriesMetric := gatheredMetric(t, registry, "obi_bpf_map_entries", map[string]string{
 			"map_id":   "3",
 			"map_name": "connections",
 			"map_type": "hash",
 		})
-		mapMaxEntriesMetric := gatheredMetric(t, registry, "obi_bpf_map_max_entries_total", map[string]string{
+		mapMaxEntriesMetric := gatheredMetric(t, registry, "obi_bpf_map_max_entries", map[string]string{
 			"map_id":   "3",
 			"map_name": "connections",
 			"map_type": "hash",
@@ -257,7 +192,7 @@ func TestBPFMetricsCollectsInternalMetricsWhenPrometheusEndpointEnabled(t *testi
 	)
 	ctxInfo := &global.ContextInfo{Metrics: internalMetrics}
 	cfg := &PrometheusConfig{Port: 1}
-	mpCfg := &perapp.MetricsConfig{Features: export.FeatureEBPF}
+	mpCfg := &perapp.GlobalMetricsConfig{Features: export.FeatureEBPF}
 
 	originalNewBPFCollector := newBPFCollectorFn
 	originalNewInternalBPFCollector := newInternalBPFCollectorFn
@@ -267,7 +202,7 @@ func TestBPFMetricsCollectsInternalMetricsWhenPrometheusEndpointEnabled(t *testi
 	})
 
 	var promCollector *BPFCollector
-	newBPFCollectorFn = func(ctxInfo *global.ContextInfo, cfg *PrometheusConfig, mpCfg *perapp.MetricsConfig) *BPFCollector {
+	newBPFCollectorFn = func(ctxInfo *global.ContextInfo, cfg *PrometheusConfig, mpCfg *perapp.GlobalMetricsConfig) *BPFCollector {
 		var collected bool
 		promCollector = &BPFCollector{
 			promCfg:         cfg,
@@ -319,7 +254,7 @@ func TestBPFMetricsCollectsInternalMetricsWhenPrometheusEndpointEnabled(t *testi
 		return promCollector
 	}
 
-	newInternalBPFCollectorFn = func(ctxInfo *global.ContextInfo, cfg *PrometheusConfig, mpCfg *perapp.MetricsConfig) *BPFCollector {
+	newInternalBPFCollectorFn = func(ctxInfo *global.ContextInfo, cfg *PrometheusConfig, mpCfg *perapp.GlobalMetricsConfig) *BPFCollector {
 		var collected bool
 		return &BPFCollector{
 			promCfg:         cfg,
@@ -338,6 +273,7 @@ func TestBPFMetricsCollectsInternalMetricsWhenPrometheusEndpointEnabled(t *testi
 					probeID:   "7",
 					latency:   0.25,
 					count:     count,
+					program:   &BPFProgram{},
 				}}
 			},
 			mapMetrics: func() []BpfMapMetrics {
@@ -355,7 +291,9 @@ func TestBPFMetricsCollectsInternalMetricsWhenPrometheusEndpointEnabled(t *testi
 	runFn, err := BPFMetrics(ctxInfo, cfg, mpCfg)(context.Background())
 	require.NoError(t, err)
 
-	startBPFMetricsRun(t, runFn)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	runFn(ctx)
 
 	promMetricsCh := make(chan prometheus.Metric, 4)
 	promCollector.Collect(promMetricsCh)
@@ -384,12 +322,12 @@ func TestBPFMetricsCollectsInternalMetricsWhenPrometheusEndpointEnabled(t *testi
 			"probe_type": "kprobe",
 			"probe_name": "tcp_connect",
 		})
-		mapEntriesMetric := gatheredMetric(t, registry, "obi_bpf_map_entries_total", map[string]string{
+		mapEntriesMetric := gatheredMetric(t, registry, "obi_bpf_map_entries", map[string]string{
 			"map_id":   "3",
 			"map_name": "connections",
 			"map_type": "hash",
 		})
-		mapMaxEntriesMetric := gatheredMetric(t, registry, "obi_bpf_map_max_entries_total", map[string]string{
+		mapMaxEntriesMetric := gatheredMetric(t, registry, "obi_bpf_map_max_entries", map[string]string{
 			"map_id":   "3",
 			"map_name": "connections",
 			"map_type": "hash",
@@ -415,7 +353,7 @@ func TestBPFMetricsDoesNotCreateInternalCollectorForZeroIntervalReporter(t *test
 		),
 	}
 	cfg := &PrometheusConfig{Port: 1}
-	mpCfg := &perapp.MetricsConfig{Features: export.FeatureEBPF}
+	mpCfg := &perapp.GlobalMetricsConfig{Features: export.FeatureEBPF}
 
 	originalNewBPFCollector := newBPFCollectorFn
 	originalNewInternalBPFCollector := newInternalBPFCollectorFn
@@ -424,7 +362,7 @@ func TestBPFMetricsDoesNotCreateInternalCollectorForZeroIntervalReporter(t *test
 		newInternalBPFCollectorFn = originalNewInternalBPFCollector
 	})
 
-	newBPFCollectorFn = func(ctxInfo *global.ContextInfo, cfg *PrometheusConfig, mpCfg *perapp.MetricsConfig) *BPFCollector {
+	newBPFCollectorFn = func(ctxInfo *global.ContextInfo, cfg *PrometheusConfig, mpCfg *perapp.GlobalMetricsConfig) *BPFCollector {
 		return &BPFCollector{
 			promCfg:         cfg,
 			commonCfg:       mpCfg,
@@ -434,7 +372,7 @@ func TestBPFMetricsDoesNotCreateInternalCollectorForZeroIntervalReporter(t *test
 		}
 	}
 
-	newInternalBPFCollectorFn = func(_ *global.ContextInfo, _ *PrometheusConfig, _ *perapp.MetricsConfig) *BPFCollector {
+	newInternalBPFCollectorFn = func(_ *global.ContextInfo, _ *PrometheusConfig, _ *perapp.GlobalMetricsConfig) *BPFCollector {
 		t.Fatal("zero-interval reporter unexpectedly created an internal BPF collector")
 		return nil
 	}
@@ -442,7 +380,45 @@ func TestBPFMetricsDoesNotCreateInternalCollectorForZeroIntervalReporter(t *test
 	runFn, err := BPFMetrics(ctxInfo, cfg, mpCfg)(context.Background())
 	require.NoError(t, err)
 
-	startBPFMetricsRun(t, runFn)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	require.NotPanics(t, func() {
+		runFn(ctx)
+	})
+}
+
+func TestBPFCollectorDoesNotCollectAfterContextCleanup(t *testing.T) {
+	collector := newCollector(
+		&global.ContextInfo{},
+		&PrometheusConfig{},
+		&perapp.GlobalMetricsConfig{},
+		false,
+	)
+	collector.progs[ebpf.ProgramID(1)] = &BPFProgram{}
+
+	var collectionCalls atomic.Int32
+	collector.probeMetrics = func() []ProbeMetrics {
+		collectionCalls.Add(1)
+		return nil
+	}
+	collector.mapMetrics = func() []BpfMapMetrics {
+		collectionCalls.Add(1)
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	collector.cleanupOnContext(ctx)
+	cancel()
+
+	require.Eventually(t, func() bool {
+		collector.mu.Lock()
+		defer collector.mu.Unlock()
+		return len(collector.progs) == 0
+	}, time.Second, 10*time.Millisecond)
+
+	collector.collectMetrics()
+
+	require.Zero(t, collectionCalls.Load())
 }
 
 func gatheredMetric(t *testing.T, registry *prometheus.Registry, name string, labels map[string]string) *dto.Metric {
@@ -477,23 +453,4 @@ func metricLabelsMatch(metric *dto.Metric, labels map[string]string) bool {
 	}
 
 	return true
-}
-
-func startBPFMetricsRun(t *testing.T, runFn swarm.RunFunc) {
-	t.Helper()
-
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		runFn(ctx)
-	}()
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case <-done:
-		case <-time.After(time.Second):
-			t.Error("BPF metrics run function did not stop after context cancellation")
-		}
-	})
 }

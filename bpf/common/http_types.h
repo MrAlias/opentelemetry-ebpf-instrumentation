@@ -5,6 +5,7 @@
 
 #include <bpfcore/vmlinux.h>
 #include <bpfcore/bpf_helpers.h>
+#include <bpfcore/utils.h>
 
 #include <common/connection_info.h>
 #include <common/http_buf_size.h>
@@ -95,6 +96,12 @@ typedef struct call_protocol_args {
     lw_thread_t lw_thread;
 } call_protocol_args_t;
 
+static __always_inline void read_request_buf(http_info_t *info, const call_protocol_args_t *args) {
+    u32 info_buf_len = (u32)args->bytes_len;
+    bpf_clamp_umax(info_buf_len, FULL_BUF_SIZE);
+    bpf_probe_read(info->buf, info_buf_len, (void *)args->u_buf);
+}
+
 // Here we keep information on the packets passing through the socket filter
 typedef struct protocol_info {
     u32 hdr_len;
@@ -124,13 +131,17 @@ typedef struct http2_grpc_request {
     u8 flags; // Must be first
     u8 ssl;
     u8 type;
-    u8 _pad0[1];
+    enum parent_status parent_status;
     connection_info_t conn_info;
     u64 start_monotime_ns;
     u64 end_monotime_ns;
     unsigned char data[k_kprobes_http2_buf_size];
     unsigned char ret_data[k_kprobes_http2_ret_buf_size];
     int len;
+    // per-connection ordinal; a gap tells user space an event was lost.
+    // 0 = unnumbered, k_h2_seq_unreliable = numbering unavailable
+    u32 seq;
+    u32 _pad1;
     // we need this to filter traces from unsolicited processes that share the executable
     // with other instrumented processes
     pid_info pid;

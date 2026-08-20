@@ -2151,7 +2151,7 @@ prepare_exact_stage_incoming(const connection_info_t *connection) {
     tp_info_pid_t candidate = {
         .tp = {.ts = test_now_ns, .flags = 1},
         .valid = 1,
-        .provenance = k_tp_provenance_tcp_exact_flags,
+        .state = TP_INFO_PID_STATE_PROVENANCE(k_tp_provenance_tcp_exact_flags),
     };
     for (u32 i = 0; i < sizeof(candidate.tp.trace_id); i++) {
         candidate.tp.trace_id[i] = test_trace_seed + i;

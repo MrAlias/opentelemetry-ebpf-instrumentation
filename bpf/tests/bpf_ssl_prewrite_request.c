@@ -328,7 +328,7 @@ static void test_entry_path_keeps_collided_connection_blocked_after_handoff_ttl(
         .pid = test_connection.pid,
         .valid = 1,
         .req_type = EVENT_HTTP_CLIENT,
-        .provenance = k_tp_provenance_ssl_prewrite,
+        .state = TP_INFO_PID_STATE_PROVENANCE(k_tp_provenance_ssl_prewrite),
     };
     trace.tp.trace_id[0] = 1;
     trace.tp.span_id[0] = 2;

@@ -417,7 +417,7 @@ static ssl_args_t seed_finish_prewrite(enum ssl_prewrite_transport_phase phase, 
     test_prewrite.trace.pid = 42;
     test_prewrite.trace.valid = 1;
     test_prewrite.trace.req_type = EVENT_HTTP_CLIENT;
-    test_prewrite.trace.provenance = k_tp_provenance_ssl_prewrite;
+    tp_info_pid_set_provenance(&test_prewrite.trace, k_tp_provenance_ssl_prewrite);
     test_prewrite.trace.tp = test_http_info.tp;
     return args;
 }
@@ -1223,7 +1223,7 @@ static void test_successful_read_uses_transient_fake_connection(void) {
     assert_int_eq(128, test_last_parser_bytes_len, "positive read forwards the read length");
 }
 
-static void test_transient_fake_cleans_server_trace(void) {
+static void test_transient_fake_retains_delayed_server_trace(void) {
     reset();
     ssl_pid_connection_info_t fallback;
     initialize_fallback_ssl_connection(&fallback, 0x2a00000001ULL, test_ssl_ptr, 77);
@@ -1239,17 +1239,8 @@ static void test_transient_fake_cleans_server_trace(void) {
 
     handle_ssl_buf(NULL, 0x2a00000001ULL, &args, 128, TCP_RECV);
 
-    assert_int_eq(1, test_delete_server_trace_count, "fallback read deletes the server trace");
-    if (memcmp(&test_deleted_server_connection,
-               &test_last_connection,
-               sizeof(test_deleted_server_connection)) != 0) {
-        fprintf(stderr, "FAIL: fallback read deleted the server trace with a different key\n");
-        exit(1);
-    }
-    assert_int_eq(11, (int)test_deleted_server_key.extra_id, "trace key preserves extra ID");
-    assert_int_eq(12, (int)test_deleted_server_key.p_key.ns, "trace key preserves namespace");
-    assert_int_eq(13, (int)test_deleted_server_key.p_key.pid, "trace key preserves process ID");
-    assert_int_eq(14, (int)test_deleted_server_key.p_key.tid, "trace key preserves thread ID");
+    assert_int_eq(
+        0, test_delete_server_trace_count, "fallback read retains the delayed server trace");
 }
 
 static void seed_fallback_server_request(void) {
@@ -1435,7 +1426,7 @@ int main(void) {
     test_submitted_tls_request_is_not_resubmitted_on_shutdown();
     test_fallback_shutdown_uses_transient_connection();
     test_successful_read_uses_transient_fake_connection();
-    test_transient_fake_cleans_server_trace();
+    test_transient_fake_retains_delayed_server_trace();
     test_existing_real_connection_discards_fallback_request();
     test_promoted_real_connection_discards_fallback_request();
     test_real_shutdown_discards_fallback_before_finishing_real();

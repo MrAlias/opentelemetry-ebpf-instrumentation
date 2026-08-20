@@ -55,6 +55,7 @@ type FileInfo struct {
 	mu                sync.RWMutex
 	processHandleMu   sync.RWMutex
 	service           svc.Attrs
+	runtimeGen        map[app.PID]uint64
 	cmdExePath        string
 	proExeLinkPath    string
 	elfFile           *elf.File
@@ -81,6 +82,7 @@ type javaAuthorizationState struct {
 func New(init Init) *FileInfo {
 	return &FileInfo{
 		service:           init.Service,
+		runtimeGen:        map[app.PID]uint64{},
 		cmdExePath:        init.CmdExePath,
 		proExeLinkPath:    init.ProExeLinkPath,
 		elfFile:           init.ELF,
@@ -93,6 +95,23 @@ func New(init Init) *FileInfo {
 		processInstanceID: init.ProcessInstanceID,
 		processHandle:     init.ProcessHandle,
 	}
+}
+
+func (fi *FileInfo) RuntimeMetricGeneration(pid app.PID) uint64 {
+	fi.mu.RLock()
+	defer fi.mu.RUnlock()
+
+	return fi.runtimeGen[pid]
+}
+
+func (fi *FileInfo) SetRuntimeMetricGeneration(pid app.PID, generation uint64) {
+	fi.mu.Lock()
+	defer fi.mu.Unlock()
+
+	if fi.runtimeGen == nil {
+		fi.runtimeGen = map[app.PID]uint64{}
+	}
+	fi.runtimeGen[pid] = generation
 }
 
 // Identity getters. Fields are set at construction and never mutated, so

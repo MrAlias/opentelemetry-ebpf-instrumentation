@@ -34,12 +34,16 @@ import (
 func ptlog() *slog.Logger { return slog.With("component", "ebpf.ProcessTracer") }
 
 type instrumenter struct {
-	offsets     *goexec.Offsets
-	exe         *link.Executable
-	closables   []io.Closer
-	modules     map[exec.FileID]struct{}
-	metrics     imetrics.Reporter
-	processName string
+	key                         ExecutableKey
+	uprobeKey                   ExecutableKey
+	offsets                     *goexec.Offsets
+	exe                         *link.Executable
+	closables                   []io.Closer
+	optionalGoProbeGroupClosers []io.Closer
+	processScopedGoProbes       []processScopedGoProbeRegistration
+	modules                     map[exec.FileID]struct{}
+	metrics                     imetrics.Reporter
+	processName                 string
 }
 
 // tracerTransaction delays closer publication until an attach operation has
@@ -151,6 +155,12 @@ func closeClosers(closers []io.Closer) error {
 	return closeErr
 }
 
+type uprobeTargetResolver interface {
+	ResolveUprobeTarget(*link.Executable, uint64) (uint64, uint64, error)
+}
+
+const goUprobeTargetProbeSymbol = "runtime.newproc1"
+
 func loadSpec(eventContext *common.EBPFEventContext, bundle *common.SpecBundle, otelBPFFSPath string, idx int, cache *btf.Cache) error {
 	if err := ebpfconvenience.LoadSpec(
 		bundle.Spec,
@@ -184,13 +194,14 @@ func unloadInternalMaps(eventContext *common.EBPFEventContext) {
 
 func NewProcessTracer(tracerType ProcessTracerType, programs []Tracer, cfg *obi.Config, metrics imetrics.Reporter) *ProcessTracer {
 	pt := &ProcessTracer{
-		log:             ptlog().With("type", tracerType),
-		Programs:        programs,
-		Type:            tracerType,
-		Instrumentables: map[exec.FileID]*instrumenter{},
-		shutdownTimeout: cfg.ShutdownTimeout,
-		metrics:         metrics,
-		bpffsPath:       cfg.EBPF.BPFFSPath,
+		log:                       ptlog().With("type", tracerType),
+		Programs:                  programs,
+		Type:                      tracerType,
+		Instrumentables:           map[ExecutableKey]*instrumenter{},
+		instrumentableGenerations: map[ExecutableKey]uint64{},
+		shutdownTimeout:           cfg.ShutdownTimeout,
+		metrics:                   metrics,
+		bpffsPath:                 cfg.EBPF.BPFFSPath,
 	}
 	pt.abortFn = pt.abortBeforeRun
 	return pt
@@ -258,10 +269,24 @@ func (pt *ProcessTracer) Run(
 }
 
 func (pt *ProcessTracer) abortBeforeRun() error {
+	pt.instrumentablesMu.Lock()
+	defer pt.instrumentablesMu.Unlock()
+
 	var abortErr error
-	for ino, inst := range pt.Instrumentables {
+	closed := make(map[*instrumenter]struct{}, len(pt.Instrumentables))
+	for key, inst := range pt.Instrumentables {
+		for _, program := range pt.Programs {
+			if processScopedTracer, ok := program.(processScopedGoProbeTracer); ok {
+				processScopedTracer.UnregisterProcessScopedGoProbes(key.Dev, key.Ino)
+			}
+		}
+		delete(pt.Instrumentables, key)
+		delete(pt.instrumentableGenerations, key)
+		if _, alreadyClosed := closed[inst]; alreadyClosed {
+			continue
+		}
+		closed[inst] = struct{}{}
 		abortErr = errors.Join(abortErr, inst.close(pt.Programs))
-		delete(pt.Instrumentables, ino)
 	}
 
 	abortErr = errors.Join(abortErr, closeClosers(pt.loadedClosers))
@@ -471,39 +496,107 @@ func (pt *ProcessTracer) Init(eventContext *common.EBPFEventContext, cfg *obi.Co
 	return nil
 }
 
+type executableInstanceTransaction struct {
+	pt            *ProcessTracer
+	instrumenter  *instrumenter
+	ie            *Instrumentable
+	transactions  []*tracerTransaction
+	closersBefore int
+	modulesBefore map[exec.FileID]struct{}
+	done          bool
+}
+
+func (t *executableInstanceTransaction) Commit() {
+	if t == nil || t.done {
+		return
+	}
+	for idx, transaction := range t.transactions {
+		t.pt.Programs[idx].ProcessBinary(t.ie.FileInfo)
+		transaction.commit()
+	}
+	t.done = true
+	t.pt.instrumentablesMu.Unlock()
+	t.pt.lifecycleMu.Unlock()
+}
+
+func (t *executableInstanceTransaction) Rollback() error {
+	if t == nil || t.done {
+		return nil
+	}
+	var rollbackErr error
+	for idx := len(t.transactions) - 1; idx >= 0; idx-- {
+		rollbackErr = errors.Join(rollbackErr, t.transactions[idx].rollback())
+	}
+	t.instrumenter.closables = t.instrumenter.closables[:t.closersBefore]
+	t.instrumenter.modules = t.modulesBefore
+	t.done = true
+	t.pt.instrumentablesMu.Unlock()
+	t.pt.lifecycleMu.Unlock()
+	return rollbackErr
+}
+
 func (pt *ProcessTracer) NewExecutableInstance(ie *Instrumentable) error {
+	transaction, err := pt.PrepareExecutableInstance(ie)
+	if err != nil {
+		return err
+	}
+	transaction.Commit()
+	return nil
+}
+
+func (pt *ProcessTracer) PrepareExecutableInstance(
+	ie *Instrumentable,
+) (ExecutableInstanceTransaction, error) {
 	pt.lifecycleMu.Lock()
-	defer pt.lifecycleMu.Unlock()
 	if pt.aborted {
-		return errProcessTracerAborted
+		pt.lifecycleMu.Unlock()
+		return nil, errProcessTracerAborted
 	}
 	if ie == nil || ie.FileInfo == nil {
-		return errors.New("instrumentable process information is unavailable")
+		pt.lifecycleMu.Unlock()
+		return nil, errors.New("instrumentable process information is unavailable")
 	}
+	pt.instrumentablesMu.Lock()
 
-	if i, ok := pt.Instrumentables[ie.FileInfo.ID()]; ok {
+	key := ie.FileInfo.ID()
+	if i, ok := pt.Instrumentables[key]; ok {
 		pid := ie.FileInfo.Pid()
 		owner := ie.PIDOwnerFor(pid)
 		if err := common.ValidateProcessOwner(pid, owner); err != nil {
-			return fmt.Errorf("validating process owner before executable-instance attach: %w", err)
+			pt.instrumentablesMu.Unlock()
+			pt.lifecycleMu.Unlock()
+			return nil, fmt.Errorf("validating process owner before executable-instance attach: %w", err)
 		}
 
 		maps, err := processMaps(pid)
 		if err != nil {
-			return err
+			pt.instrumentablesMu.Unlock()
+			pt.lifecycleMu.Unlock()
+			return nil, err
 		}
 
 		closersBefore := len(i.closables)
 		modulesBefore := cloneModules(i.modules)
 		transactions := make([]*tracerTransaction, 0, len(pt.Programs))
-		rollback := func(attachErr error) error {
+		transaction := &executableInstanceTransaction{
+			pt:            pt,
+			instrumenter:  i,
+			ie:            ie,
+			transactions:  transactions,
+			closersBefore: closersBefore,
+			modulesBefore: modulesBefore,
+		}
+		rollback := func(attachErr error) (ExecutableInstanceTransaction, error) {
 			var rollbackErr error
 			for idx := len(transactions) - 1; idx >= 0; idx-- {
 				rollbackErr = errors.Join(rollbackErr, transactions[idx].rollback())
 			}
 			i.closables = i.closables[:closersBefore]
 			i.modules = modulesBefore
-			return errors.Join(attachErr, rollbackErr)
+			transaction.done = true
+			pt.instrumentablesMu.Unlock()
+			pt.lifecycleMu.Unlock()
+			return nil, errors.Join(attachErr, rollbackErr)
 		}
 
 		for _, p := range pt.Programs {
@@ -519,15 +612,15 @@ func (pt *ProcessTracer) NewExecutableInstance(ie *Instrumentable) error {
 				return rollback(err)
 			}
 		}
+		transaction.transactions = transactions
 		if err := common.ValidateProcessOwner(pid, owner); err != nil {
 			return rollback(fmt.Errorf("validating process owner after executable-instance attach: %w", err))
 		}
-		for idx, txn := range transactions {
-			pt.Programs[idx].ProcessBinary(ie.FileInfo)
-			txn.commit()
-		}
+		return transaction, nil
 	} else {
-		return fmt.Errorf(
+		pt.instrumentablesMu.Unlock()
+		pt.lifecycleMu.Unlock()
+		return nil, fmt.Errorf(
 			"updating executable instance %q (pid %d): instrumenter for device %d inode %d does not exist",
 			ie.FileInfo.CmdExePath(),
 			ie.FileInfo.Pid(),
@@ -535,46 +628,124 @@ func (pt *ProcessTracer) NewExecutableInstance(ie *Instrumentable) error {
 			ie.FileInfo.Ino(),
 		)
 	}
+}
 
-	return nil
+type executableTransaction struct {
+	pt            *ProcessTracer
+	ie            *Instrumentable
+	key           ExecutableKey
+	instrumenter  *instrumenter
+	transactions  []*tracerTransaction
+	shared        bool
+	closersBefore int
+	modulesBefore map[exec.FileID]struct{}
+	done          bool
+}
+
+func (t *executableTransaction) Commit() {
+	if t == nil || t.done {
+		return
+	}
+	for _, transaction := range t.transactions {
+		transaction.commit()
+	}
+	// Instrumenter lookup, executable generation rotation, predecessor
+	// retirement, and process-scoped probe registration all become visible at
+	// the exact-admission commit point. In particular, a same-FileID
+	// replacement must not close its predecessor while admission can still be
+	// rejected.
+	t.pt.commitInstrumenterForKey(t.key, t.instrumenter, t.ie)
+	t.done = true
+	t.pt.lifecycleMu.Unlock()
+}
+
+func (t *executableTransaction) Rollback() error {
+	if t == nil || t.done {
+		return nil
+	}
+	var rollbackErr error
+	for idx := len(t.transactions) - 1; idx >= 0; idx-- {
+		rollbackErr = errors.Join(rollbackErr, t.transactions[idx].rollback())
+	}
+	if t.shared {
+		t.pt.instrumentablesMu.Lock()
+		t.instrumenter.closables = t.instrumenter.closables[:t.closersBefore]
+		t.instrumenter.modules = t.modulesBefore
+		t.pt.instrumentablesMu.Unlock()
+	}
+	t.done = true
+	t.pt.lifecycleMu.Unlock()
+	return rollbackErr
 }
 
 func (pt *ProcessTracer) NewExecutable(exe *link.Executable, ie *Instrumentable) error {
+	transaction, err := pt.PrepareExecutable(exe, ie)
+	if err != nil {
+		return err
+	}
+	transaction.Commit()
+	return nil
+}
+
+func (pt *ProcessTracer) PrepareExecutable(
+	exe *link.Executable,
+	ie *Instrumentable,
+) (ExecutableTransaction, error) {
 	pt.lifecycleMu.Lock()
-	defer pt.lifecycleMu.Unlock()
 	if pt.aborted {
-		return errProcessTracerAborted
+		pt.lifecycleMu.Unlock()
+		return nil, errProcessTracerAborted
 	}
 	if ie == nil || ie.FileInfo == nil {
-		return errors.New("instrumentable process information is unavailable")
+		pt.lifecycleMu.Unlock()
+		return nil, errors.New("instrumentable process information is unavailable")
 	}
+	transaction, err := pt.prepareExecutableLocked(exe, ie)
+	if err != nil {
+		pt.lifecycleMu.Unlock()
+		return nil, err
+	}
+	return transaction, nil
+}
+
+func (pt *ProcessTracer) prepareExecutableLocked(
+	exe *link.Executable,
+	ie *Instrumentable,
+) (ExecutableTransaction, error) {
 
 	pid := ie.FileInfo.Pid()
 	owner := ie.PIDOwnerFor(pid)
 	if err := common.ValidateProcessOwner(pid, owner); err != nil {
-		return fmt.Errorf("validating process owner before executable attach: %w", err)
+		return nil, fmt.Errorf("validating process owner before executable attach: %w", err)
 	}
 
 	i := instrumenter{
+		key:         ExecutableKey{Dev: ie.FileInfo.Dev(), Ino: ie.FileInfo.Ino()},
 		exe:         exe,
 		offsets:     ie.Offsets, // this is needed for the function offsets, not fields
 		modules:     map[exec.FileID]struct{}{},
 		metrics:     pt.metrics,
 		processName: ie.FileInfo.ExecutableName(),
 	}
+	committed := false
+	defer func() {
+		if !committed {
+			i.rollbackOptionalGoProbeGroups()
+		}
+	}()
 
 	maps, err := processMaps(pid)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	transactions := make([]*tracerTransaction, 0, len(pt.Programs))
-	rollback := func(attachErr error) error {
+	rollback := func(attachErr error) (ExecutableTransaction, error) {
 		var rollbackErr error
 		for idx := len(transactions) - 1; idx >= 0; idx-- {
 			rollbackErr = errors.Join(rollbackErr, transactions[idx].rollback())
 		}
-		return errors.Join(attachErr, rollbackErr)
+		return nil, errors.Join(attachErr, rollbackErr)
 	}
 
 	for _, p := range pt.Programs {
@@ -583,7 +754,49 @@ func (pt *ProcessTracer) NewExecutable(exe *link.Executable, ie *Instrumentable)
 		if err := p.RegisterOffsets(ie.FileInfo, ie.Offsets); err != nil {
 			return rollback(fmt.Errorf("registering executable offsets: %w", err))
 		}
+	}
 
+	if uprobeKey, ok := pt.resolveUprobeTarget(exe, ie.Offsets); ok {
+		i.uprobeKey = uprobeKey
+		if existing := pt.instrumenterForUprobeTarget(uprobeKey); existing != nil {
+			closersBefore := len(existing.closables)
+			modulesBefore := cloneModules(existing.modules)
+			rollbackExisting := func(attachErr error) (ExecutableTransaction, error) {
+				existing.closables = existing.closables[:closersBefore]
+				existing.modules = modulesBefore
+				return rollback(attachErr)
+			}
+			for idx := range pt.Programs {
+				txn := transactions[idx]
+				if err := existing.uprobes(pid, txn, maps); err != nil {
+					printVerifierErrorInfo(err)
+					return rollbackExisting(err)
+				}
+
+				if err := existing.usdtProbes(pid, ie.FileInfo.Ns(), txn, maps); err != nil {
+					printVerifierErrorInfo(err)
+					return rollbackExisting(err)
+				}
+			}
+			if err := common.ValidateProcessOwner(pid, owner); err != nil {
+				return rollbackExisting(fmt.Errorf("validating process owner after executable attach: %w", err))
+			}
+			committed = true
+			return &executableTransaction{
+				pt:            pt,
+				ie:            ie,
+				key:           i.key,
+				instrumenter:  existing,
+				transactions:  transactions,
+				shared:        true,
+				closersBefore: closersBefore,
+				modulesBefore: modulesBefore,
+			}, nil
+		}
+	}
+
+	for idx := range pt.Programs {
+		txn := transactions[idx]
 		// Go style Uprobes
 		if err := i.goprobes(txn); err != nil {
 			printVerifierErrorInfo(err)
@@ -604,31 +817,144 @@ func (pt *ProcessTracer) NewExecutable(exe *link.Executable, ie *Instrumentable)
 	if err := common.ValidateProcessOwner(pid, owner); err != nil {
 		return rollback(fmt.Errorf("validating process owner after executable attach: %w", err))
 	}
-	for _, txn := range transactions {
-		txn.commit()
+	committed = true
+
+	return &executableTransaction{
+		pt:           pt,
+		ie:           ie,
+		key:          i.key,
+		instrumenter: &i,
+		transactions: transactions,
+	}, nil
+}
+
+func (pt *ProcessTracer) resolveUprobeTarget(exe *link.Executable, offsets *goexec.Offsets) (ExecutableKey, bool) {
+	if pt.Type != Go || offsets == nil {
+		return ExecutableKey{}, false
 	}
 
-	pt.Instrumentables[ie.FileInfo.ID()] = &i
+	probes, ok := offsets.Funcs[goUprobeTargetProbeSymbol]
+	if !ok || len(probes) == 0 {
+		return ExecutableKey{}, false
+	}
+
+	for _, p := range pt.Programs {
+		resolver, ok := p.(uprobeTargetResolver)
+		if !ok {
+			continue
+		}
+
+		dev, ino, err := resolver.ResolveUprobeTarget(exe, probes[0].Start)
+		if err != nil {
+			ptlog().Debug("resolving kernel uprobe target failed", "error", err)
+			return ExecutableKey{}, false
+		}
+
+		return ExecutableKey{Dev: dev, Ino: ino}, true
+	}
+
+	return ExecutableKey{}, false
+}
+
+func (pt *ProcessTracer) instrumenterForUprobeTarget(key ExecutableKey) *instrumenter {
+	pt.instrumentablesMu.Lock()
+	defer pt.instrumentablesMu.Unlock()
+
+	for _, i := range pt.Instrumentables {
+		if i.uprobeKey == key {
+			return i
+		}
+	}
 
 	return nil
 }
 
-func (pt *ProcessTracer) UnlinkExecutable(info *exec.FileInfo) {
+func (pt *ProcessTracer) commitInstrumenter(i *instrumenter, ie *Instrumentable) {
+	pt.commitInstrumenterForKey(i.key, i, ie)
+}
+
+func (pt *ProcessTracer) commitInstrumenterForKey(key ExecutableKey, i *instrumenter, ie *Instrumentable) {
+	pt.instrumentablesMu.Lock()
+	defer pt.instrumentablesMu.Unlock()
+
+	if previous := pt.Instrumentables[key]; previous != nil && previous != i {
+		pt.removeInstrumenter(key, previous)
+	}
+	if pt.Instrumentables == nil {
+		pt.Instrumentables = map[ExecutableKey]*instrumenter{}
+	}
+	pt.Instrumentables[key] = i
+	ie.ExecutableGeneration = pt.recordExecutableGeneration(key)
+	i.registerProcessScopedGoProbes(key)
+}
+
+func (pt *ProcessTracer) recordExecutableGeneration(key ExecutableKey) uint64 {
+	pt.nextExecutableGeneration++
+	if pt.nextExecutableGeneration == 0 {
+		pt.nextExecutableGeneration++
+	}
+	if pt.instrumentableGenerations == nil {
+		pt.instrumentableGenerations = map[ExecutableKey]uint64{}
+	}
+	pt.instrumentableGenerations[key] = pt.nextExecutableGeneration
+
+	return pt.nextExecutableGeneration
+}
+
+func (pt *ProcessTracer) UnlinkExecutable(info *exec.FileInfo, generation uint64) {
 	pt.lifecycleMu.Lock()
 	defer pt.lifecycleMu.Unlock()
 	if info == nil {
 		return
 	}
-	if i, ok := pt.Instrumentables[info.ID()]; ok {
-		if err := i.close(pt.Programs); err != nil {
-			pt.log.Debug("Unable to close on unlink", "error", err)
-		}
-		delete(pt.Instrumentables, info.ID())
-	} else {
+
+	pt.instrumentablesMu.Lock()
+	defer pt.instrumentablesMu.Unlock()
+	key := info.ID()
+
+	i, ok := pt.Instrumentables[key]
+	if !ok {
 		pt.log.Warn("Unable to find executable to unlink",
 			"path", info.CmdExePath(),
 			"pid", info.Pid(),
-			"device", info.Dev(), "inode", info.Ino())
+			"inode", info.Ino())
+		return
+	}
+	currentGeneration := pt.instrumentableGenerations[key]
+	if currentGeneration != generation {
+		pt.log.Debug("Ignoring stale executable unlink",
+			"path", info.CmdExePath(),
+			"pid", info.Pid(),
+			"inode", info.Ino(),
+			"generation", generation,
+			"current_generation", currentGeneration)
+		return
+	}
+
+	pt.removeInstrumenter(key, i)
+}
+
+func (pt *ProcessTracer) removeInstrumenter(key ExecutableKey, i *instrumenter) {
+	for _, p := range pt.Programs {
+		if processScopedTracer, ok := p.(processScopedGoProbeTracer); ok {
+			processScopedTracer.UnregisterProcessScopedGoProbes(key.Dev, key.Ino)
+		}
+	}
+	delete(pt.Instrumentables, key)
+	delete(pt.instrumentableGenerations, key)
+	for _, remaining := range pt.Instrumentables {
+		if remaining == i {
+			return
+		}
+	}
+	pt.unlinkInstrumenter(i)
+}
+
+func (pt *ProcessTracer) unlinkInstrumenter(i *instrumenter) {
+	if err := i.close(pt.Programs); err != nil {
+		if pt.log != nil {
+			pt.log.Debug("Unable to close on unlink", "error", err)
+		}
 	}
 }
 

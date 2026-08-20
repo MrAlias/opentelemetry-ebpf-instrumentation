@@ -32,6 +32,34 @@ func TestEnabledShouldReportGoRuntimeMetrics(t *testing.T) {
 	require.False(t, Enabled{Runtime: true}.ShouldReport(snapshot))
 }
 
+func TestEnabledShouldReportGoRuntimeHistograms(t *testing.T) {
+	snapshot := RuntimeMetricSnapshot{
+		Service:   svc.Attrs{SDKLanguage: svc.InstrumentableGolang},
+		Histogram: &GoRuntimeHistogramSnapshot{},
+	}
+
+	require.True(t, Enabled{Runtime: true}.ShouldReport(snapshot))
+	require.False(t, Enabled{Runtime: false}.ShouldReport(snapshot))
+
+	snapshot.Service.SDKLanguage = svc.InstrumentableJava
+	require.False(t, Enabled{Runtime: true}.ShouldReport(snapshot))
+}
+
+func TestEnabledShouldReportNodejsRuntimeMetrics(t *testing.T) {
+	snapshot := RuntimeMetricSnapshot{
+		Service: svc.Attrs{
+			Features: export.FeatureApplicationRuntime,
+		},
+		Nodejs: &NodejsRuntimeMetricSnapshot{},
+	}
+
+	require.True(t, Enabled{Runtime: true}.ShouldReport(snapshot))
+	require.False(t, Enabled{Runtime: false}.ShouldReport(snapshot))
+
+	snapshot.Service.Features = export.FeatureApplicationRED
+	require.False(t, Enabled{Runtime: true}.ShouldReport(snapshot))
+}
+
 func TestEnabledShouldReportJVMRuntimeMetrics(t *testing.T) {
 	snapshot := RuntimeMetricSnapshot{
 		Service: svc.Attrs{

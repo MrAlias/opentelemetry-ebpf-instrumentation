@@ -35,8 +35,13 @@ func NewProcessTracer(_ ProcessTracerType, _ []Tracer, _ *obi.Config, _ imetrics
 }
 
 func (pt *ProcessTracer) Init(_ *ebpfcommon.EBPFEventContext, _ *obi.Config) error {
-	pt.log.Debug("avoiding linter complaints for not using log, shutdownTimeout, and bpffsPath fields",
-		"v", pt.shutdownTimeout, "bpffsPath", pt.bpffsPath)
+	pt.instrumentablesMu.Lock()
+	defer pt.instrumentablesMu.Unlock()
+
+	pt.log.Debug("avoiding linter complaints for fields only used by the Linux tracer",
+		"v", pt.shutdownTimeout, "bpffsPath", pt.bpffsPath,
+		"executableGeneration", pt.nextExecutableGeneration,
+		"instrumentableGenerations", pt.instrumentableGenerations)
 	return nil
 }
 
@@ -44,11 +49,32 @@ func (pt *ProcessTracer) NewExecutable(_ *link.Executable, _ *Instrumentable) er
 	return nil
 }
 
+type noopExecutableTransaction struct{}
+
+func (noopExecutableTransaction) Commit()         {}
+func (noopExecutableTransaction) Rollback() error { return nil }
+
+func (pt *ProcessTracer) PrepareExecutable(
+	_ *link.Executable,
+	_ *Instrumentable,
+) (ExecutableTransaction, error) {
+	return noopExecutableTransaction{}, nil
+}
+
 func (pt *ProcessTracer) NewExecutableInstance(_ *Instrumentable) error {
 	return nil
 }
 
-func (pt *ProcessTracer) UnlinkExecutable(_ *exec.FileInfo) {}
+type noopExecutableInstanceTransaction struct{}
+
+func (noopExecutableInstanceTransaction) Commit()         {}
+func (noopExecutableInstanceTransaction) Rollback() error { return nil }
+
+func (pt *ProcessTracer) PrepareExecutableInstance(_ *Instrumentable) (ExecutableInstanceTransaction, error) {
+	return noopExecutableInstanceTransaction{}, nil
+}
+
+func (pt *ProcessTracer) UnlinkExecutable(_ *exec.FileInfo, _ uint64) {}
 
 func RunUtilityTracer(_ context.Context, _ *ebpfcommon.EBPFEventContext, _ UtilityTracer, _ *obi.Config) error {
 	return nil

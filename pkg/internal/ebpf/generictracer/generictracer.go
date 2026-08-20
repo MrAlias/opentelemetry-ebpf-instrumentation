@@ -327,12 +327,16 @@ func failJavaAuthorizationFile(fi *exec.FileInfo) {
 	fi.SetJavaAgentCapability(0)
 }
 
-// Updating these requires updating the constants below in pid.h
-// #define MAX_CONCURRENT_PIDS 3001 // estimate: 1000 concurrent processes (including children) * 3 namespaces per pid
-// #define PRIME_HASH 192053 // closest prime to 3001 * 64
+// Keep in sync with the BPF side, which asserts the relation between both
+// constants at compile time (bpf/pid/pid.h).
 const (
+	// mirrors k_max_concurrent_pids (bpf/pid/maps/map_sizing.h): estimate of
+	// 1000 concurrent processes (including children) * 3 namespaces per pid
 	maxConcurrentPids = 3001
-	primeHash         = 192053
+	// mirrors k_prime_hash (bpf/pid/pid.h): closest prime below
+	// maxConcurrentPids * 64; modulo by a prime distributes the hash evenly
+	// across the segment bit array
+	primeHash = 192053
 )
 
 func pidSegmentBit(k uint64) (uint32, uint32) {
@@ -363,19 +367,36 @@ func (p *Tracer) buildPidFilter() []uint64 {
 	return result
 }
 
-func (p *Tracer) rebuildValidPids() {
-	if p.bpfObjects.ValidPids != nil {
-		v := p.buildPidFilter()
+// validateValidPidsMap ensures the loaded map matches the index space written
+// by rebuildValidPids: a smaller map makes pid_matches() lookups miss and fail
+// open, while a larger one leaves segments unset, silently filtering out
+// matching PIDs.
+func (p *Tracer) validateValidPidsMap() error {
+	if got := p.bpfObjects.ValidPids.MaxEntries(); got != maxConcurrentPids {
+		return fmt.Errorf(
+			"valid_pids BPF map holds %d entries, expected %d: BPF and userspace PID filter constants have diverged",
+			got, maxConcurrentPids)
+	}
 
-		p.log.Debug("number of segments in pid filter cache", "len", len(v))
+	return nil
+}
 
-		for i, segment := range v {
-			err := p.bpfObjects.ValidPids.Put(uint32(i), segment)
-			if err != nil {
-				p.log.Error("Error setting up pid in BPF space, sizes of Go and BPF maps don't match", "error", err, "i", i)
-			}
+func (p *Tracer) rebuildValidPids() error {
+	if p.bpfObjects.ValidPids == nil {
+		return nil
+	}
+
+	v := p.buildPidFilter()
+
+	p.log.Debug("number of segments in pid filter cache", "len", len(v))
+
+	for i, segment := range v {
+		if err := p.bpfObjects.ValidPids.Put(uint32(i), segment); err != nil {
+			return fmt.Errorf("setting up pid segment %d in BPF space: %w", i, err)
 		}
 	}
+
+	return nil
 }
 
 func (p *Tracer) AllowPID(
@@ -383,7 +404,7 @@ func (p *Tracer) AllowPID(
 	ns uint32,
 	fi *exec.FileInfo,
 	owner *exec.FileInfo,
-) {
+) bool {
 	if owner == nil {
 		owner = fi
 	}
@@ -393,7 +414,13 @@ func (p *Tracer) AllowPID(
 		if fi != nil && pid == fi.Pid() {
 			failJavaAuthorizationFile(fi)
 		}
-		return
+		return false
+	}
+	if !p.pidsFilter.AllowPID(pid, ns, fi, owner, ebpfcommon.PIDTypeKProbes) {
+		if fi != nil && pid == fi.Pid() {
+			failJavaAuthorizationFile(fi)
+		}
+		return false
 	}
 	var event *javaAuthorizationEvent
 	created := false
@@ -407,8 +434,13 @@ func (p *Tracer) AllowPID(
 			created = false
 		}
 	}
-	p.pidsFilter.AllowPID(pid, ns, fi, owner, ebpfcommon.PIDTypeKProbes)
-	p.rebuildValidPids()
+	if err := p.rebuildValidPids(); err != nil {
+		p.log.Error("rebuilding the BPF PID filter", "error", err)
+		if created {
+			p.completeJavaAuthorizationEvent(fi, event, 0)
+		}
+		return true
+	}
 	// Invalidate either sign of a cached decision. Writing a positive entry here
 	// would bypass the rebuilt valid_pids set even when exact-owner admission
 	// failed during a PID-reuse race. The next BPF event recomputes and caches the
@@ -425,6 +457,7 @@ func (p *Tracer) AllowPID(
 			p.completeJavaAuthorizationEvent(fi, event, 0)
 		}
 	}
+	return true
 }
 
 func (p *Tracer) BlockPID(
@@ -445,7 +478,9 @@ func (p *Tracer) BlockPID(
 		return
 	}
 	p.pidsFilter.BlockPID(pid, ns, fi, owner)
-	p.rebuildValidPids()
+	if err := p.rebuildValidPids(); err != nil {
+		p.log.Error("rebuilding the BPF PID filter", "error", err)
+	}
 	p.deauthorizeJavaProcess(pid, ns, fi)
 	// Remove from cache so next access re-evaluates
 	if p.bpfObjects.PidCache != nil {
@@ -633,8 +668,8 @@ func (p *Tracer) completeJavaAuthorizationEvent(
 }
 
 // authorizeJavaProcess is retained as a narrow test helper. Production
-// AllowPID enqueues its exact lifetime before any filter mutation so a
-// concurrent BlockPID cannot pass the boundary before its tombstone exists.
+// AllowPID holds javaLifecycleMu across exact-owner filter admission and event
+// enqueue, so a concurrent BlockPID cannot pass between those boundaries.
 //
 //nolint:unparam // Keep the explicit PID to exercise the FileInfo identity guard in tests.
 func (p *Tracer) authorizeJavaProcess(pid app.PID, ns uint32, fi *exec.FileInfo) {
@@ -1489,16 +1524,19 @@ func (p *Tracer) tailCallPrograms() []*ebpf.Program {
 		p.bpfObjects.ObiProtocolHttp2GrpcHandleStartFrameServer,         // 11
 		p.bpfObjects.ObiProtocolHttp2GrpcHandleStartFrameServerFinalize, // 12
 		// Large buffer multi-batch emission
-		p.bpfObjects.ObiLargeBufEmitContinue, // 13  k_tail_large_buf_emit_continue
+		p.bpfObjects.ObiLargeBufEmitContinue,                            // 13  k_tail_large_buf_emit_continue
+		p.bpfObjects.ObiProtocolHttp2GrpcHandleStartFrameServerCommit,   // 14
+		p.bpfObjects.ObiProtocolHttp2GrpcHandleStartFrameServerHuffman,  // 15
+		p.bpfObjects.ObiProtocolHttp2GrpcHandleStartFrameServerHuffscan, // 16
 		// Traceparent validation
-		p.bpfObjects.ObiContinueProtocolHttpTpValidate, // 14
+		p.bpfObjects.ObiContinueProtocolHttpTpValidate, // 17
 		// Java remote-parent control carriers
-		p.bpfObjects.ObiJavaTaskCaptureTail,      // 15 k_tail_java_task_capture
-		p.bpfObjects.ObiJavaTaskRelayCaptureTail, // 16 k_tail_java_task_relay_capture
-		p.bpfObjects.ObiJavaTaskLinkTail,         // 17 k_tail_java_task_link
-		p.bpfObjects.ObiJavaControlCleanupTail,   // 18 k_tail_java_control_cleanup
-		p.bpfObjects.ObiJavaThreadsTail,          // 19 k_tail_java_threads
-		p.bpfObjects.ObiJavaLifecycleTail,        // 20 k_tail_java_lifecycle
+		p.bpfObjects.ObiJavaTaskCaptureTail,      // 18 k_tail_java_task_capture
+		p.bpfObjects.ObiJavaTaskRelayCaptureTail, // 19 k_tail_java_task_relay_capture
+		p.bpfObjects.ObiJavaTaskLinkTail,         // 20 k_tail_java_task_link
+		p.bpfObjects.ObiJavaControlCleanupTail,   // 21 k_tail_java_control_cleanup
+		p.bpfObjects.ObiJavaThreadsTail,          // 22 k_tail_java_threads
+		p.bpfObjects.ObiJavaLifecycleTail,        // 23 k_tail_java_lifecycle
 	}
 }
 
@@ -1506,7 +1544,7 @@ func (p *Tracer) SetupTailCalls() {
 	javaControlTailCallsReady := true
 	for i, prog := range p.tailCallPrograms() {
 		if prog == nil {
-			if i >= 15 {
+			if i >= 18 {
 				javaControlTailCallsReady = false
 			}
 			continue
@@ -1514,7 +1552,7 @@ func (p *Tracer) SetupTailCalls() {
 		p.log.Debug("loading program into tail call jump table", "index", i, "program", prog.String())
 		if err := p.bpfObjects.JumpTable.Update(uint32(i), uint32(prog.FD()), ebpf.UpdateAny); err != nil {
 			p.log.Error("error loading info tail call jump table", "error", err)
-			if i >= 15 {
+			if i >= 18 {
 				javaControlTailCallsReady = false
 			}
 		}
@@ -1604,6 +1642,9 @@ func (p *Tracer) constants() map[string]any {
 		m["disable_black_box_cp"] = uint32(0)
 	}
 
+	// gates the bpf_loop paths; unset it defaults to false and const-DCE drops them
+	m["g_bpf_loop_enabled"] = ebpfcommon.SupportsEBPFLoops(p.log, p.cfg.EBPF.OverrideBPFLoopEnabled)
+
 	m["http_max_captured_bytes"] = p.cfg.EBPF.BufferSizes.HTTP
 	m["tcp_max_captured_bytes"] = p.cfg.EBPF.BufferSizes.TCP
 	m["mysql_max_captured_bytes"] = p.cfg.EBPF.BufferSizes.MySQL
@@ -1618,8 +1659,12 @@ func (p *Tracer) constants() map[string]any {
 	m["java_remote_parent_enabled"] = p.javaRemoteParentEnabled
 	m["ssl_prewrite_max_age_ns"] = uint64(p.cfg.Java.RemoteParent.TTL.Nanoseconds())
 	m["jvm_sampling_interval_ns"] = uint64(0)
-	if p.jvmRuntimeMetricsEnabled() {
+	if p.cfg.AppRuntimeMetricsEnabled() {
 		m["jvm_sampling_interval_ns"] = uint64(p.cfg.JVMRuntimeMetrics.SamplingInterval.Nanoseconds())
+	}
+	m["nodejs_runtime_metrics_enabled"] = uint64(0)
+	if p.cfg.AppRuntimeMetricsEnabled() {
+		m["nodejs_runtime_metrics_enabled"] = uint64(1)
 	}
 
 	return m
@@ -1917,7 +1962,7 @@ func (p *Tracer) UProbes() map[string]map[string][]*ebpfcommon.ProbeDesc {
 }
 
 func (p *Tracer) USDTProbes() map[string][]*ebpfcommon.USDTProbeDesc {
-	if !p.jvmRuntimeMetricsEnabled() {
+	if !p.cfg.AppRuntimeMetricsEnabled() {
 		return nil
 	}
 	return map[string][]*ebpfcommon.USDTProbeDesc{
@@ -1988,6 +2033,10 @@ func (p *Tracer) runItersForPids() {
 				if err := netns.WithNetNS(int(pid), func() error {
 					return it.Run(p.log)
 				}); err != nil {
+					if errors.Is(err, os.ErrNotExist) {
+						p.log.Debug("process gone before iterating its netns", "pid", pid)
+						break
+					}
 					p.log.Error("error running iterator in netns", "pid", pid, "error", err)
 				}
 			}
@@ -2049,7 +2098,12 @@ func (p *Tracer) Run(
 	// At this point we now have loaded the bpf objects, which means we should insert any
 	// pids that are allowed into the bpf map
 	if p.bpfObjects.ValidPids != nil {
-		p.rebuildValidPids()
+		if err := p.validateValidPidsMap(); err != nil {
+			p.log.Error("BPF PID filter map sizing is invalid, discovery filtering may not be enforced", "error", err)
+		}
+		if err := p.rebuildValidPids(); err != nil {
+			p.log.Error("setting up the BPF PID filter, discovery filtering may not be enforced", "error", err)
+		}
 	} else {
 		p.log.Error("BPF Pids map is not created yet, this is a bug.")
 	}
@@ -2068,11 +2122,11 @@ func (p *Tracer) Run(
 	p.log.Info("Launching p.Tracer")
 
 	cfg := &p.cfg.EBPF
-	if p.jvmRuntimeMetricsEnabled() {
+	if p.cfg.AppRuntimeMetricsEnabled() {
 		if p.runtimeMetricsSender() == nil {
-			p.log.Warn("JVM runtime metrics enabled without runtime metrics queue")
+			p.log.Warn("runtime metrics enabled without runtime metrics queue")
 		} else {
-			p.log.Debug("reading JVM runtime metrics from shared ring buffer")
+			p.log.Debug("reading runtime metrics from shared ring buffer")
 		}
 	}
 
@@ -2089,16 +2143,16 @@ func (p *Tracer) Run(
 	)(ctx, []io.Closer{resourceCloser}, eventsChan)
 }
 
-func (p *Tracer) jvmRuntimeMetricsEnabled() bool {
-	return p.cfg != nil && p.cfg.JoinMetricsConfig().Features.AppRuntime()
-}
-
 func (p *Tracer) processSharedRingbufRecord(
 	ctx context.Context,
 	parseContext *ebpfcommon.EBPFParseContext,
 	cfg *config.EBPFTracer,
 	record *ringbuf.Record,
 ) (request.Span, bool, error) {
+	if handled, err := p.eventCtx.HandleInternalEvent(record); handled {
+		return request.Span{}, true, err
+	}
+
 	if handled, err := ebpfcommon.HandleRuntimeMetricsRecord(
 		ctx,
 		p.eventCtx,
@@ -2194,13 +2248,6 @@ func (p *Tracer) parseJVMMemoryPoolRecord(record *ringbuf.Record) ([]jvmruntime.
 	return events, false, nil
 }
 
-func kernelTime(ktime uint64) time.Time {
-	now := time.Now()
-	delta := timing.MonoTimeNow() - time.Duration(int64(ktime))
-
-	return now.Add(-delta)
-}
-
 //nolint:cyclop
 func (p *Tracer) lookForTimeouts(ctx context.Context, parseCtx *ebpfcommon.EBPFParseContext, ticker *time.Ticker, eventsChan *msg.Queue[[]request.Span]) {
 	for {
@@ -2217,7 +2264,7 @@ func (p *Tracer) lookForTimeouts(ctx context.Context, parseCtx *ebpfcommon.EBPFP
 					// but it hasn't been posted yet, likely missed by the logic that looks at finishing requests
 					// where we track the full response. If we haven't updated the EndMonotimeNs in more than some
 					// short interval, we are likely not going to finish this request from eBPF, so let's do it here.
-					if v.EndMonotimeNs != 0 && v.Submitted == 0 && t.After(kernelTime(v.EndMonotimeNs).Add(10*time.Second)) {
+					if v.EndMonotimeNs != 0 && v.Submitted == 0 && t.After(timing.KernelTime(v.EndMonotimeNs).Add(10*time.Second)) {
 						// Must use unsafe here, the two bpfHttpInfoTs are the same but generated from different
 						// ebpf2go outputs
 						s, ignore, err := ebpfcommon.HTTPInfoEventToSpan(parseCtx, (*ebpfcommon.BPFHTTPInfo)(unsafe.Pointer(&v)))
@@ -2227,7 +2274,7 @@ func (p *Tracer) lookForTimeouts(ctx context.Context, parseCtx *ebpfcommon.EBPFP
 						if err := p.bpfObjects.OngoingHttp.Delete(k); err != nil {
 							p.log.Debug("Error deleting ongoing request", "error", err)
 						}
-					} else if v.EndMonotimeNs == 0 && p.cfg.EBPF.HTTPRequestTimeout.Milliseconds() > 0 && t.After(kernelTime(v.StartMonotimeNs).Add(p.cfg.EBPF.HTTPRequestTimeout)) {
+					} else if v.EndMonotimeNs == 0 && p.cfg.EBPF.HTTPRequestTimeout.Milliseconds() > 0 && t.After(timing.KernelTime(v.StartMonotimeNs).Add(p.cfg.EBPF.HTTPRequestTimeout)) {
 						// If we don't have a request finish with endTime by the configured request timeout, terminate the
 						// waiting request with a timeout 408
 						s, ignore, err := ebpfcommon.HTTPInfoEventToSpan(parseCtx, (*ebpfcommon.BPFHTTPInfo)(unsafe.Pointer(&v)))

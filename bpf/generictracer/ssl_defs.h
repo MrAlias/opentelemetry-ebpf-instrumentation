@@ -21,54 +21,20 @@
 
 #include <logger/bpf_dbg.h>
 
-static __always_inline void cleanup_ssl_trace_info(http_info_t *info,
-                                                   pid_connection_info_t *pid_conn) {
-    if (info->type == EVENT_HTTP_REQUEST) {
-        trace_key_t t_key = {0};
-        t_key.extra_id = info->extra_id;
-        t_key.p_key.ns = info->pid.ns;
-        t_key.p_key.tid = info->task_tid;
-        t_key.p_key.pid = info->pid.user_pid;
-
-        delete_server_trace(pid_conn, &t_key);
-    }
-}
-
-static __always_inline void
-cleanup_ssl_server_trace(http_info_t *info, pid_connection_info_t *pid_conn, void *buf, u32 len) {
-    if (info && http_will_complete(info, (unsigned char *)buf, len)) {
-        cleanup_ssl_trace_info(info, pid_conn);
-    }
-}
-
-static __always_inline void cleanup_complete_ssl_server_trace(http_info_t *info,
-                                                              pid_connection_info_t *pid_conn) {
-    if (info && http_info_complete(info)) {
-        cleanup_ssl_trace_info(info, pid_conn);
-    }
-}
-
 static __always_inline void
 finish_possible_delayed_tls_http_request(pid_connection_info_t *pid_conn) {
     http_info_t *info = bpf_map_lookup_elem(&ongoing_http, pid_conn);
     if (info && info->submitted) {
-        // we need to check for server request, the same thread
-        // could be handling both client and server requests
-        if (info->type == EVENT_HTTP_REQUEST) {
-            cleanup_complete_ssl_server_trace(info, pid_conn);
-        }
-        finish_http(info, pid_conn);
+        finish_http(info, pid_conn, NULL);
     }
 }
 
 static __always_inline void finish_tls_http_request_on_shutdown(pid_connection_info_t *pid_conn) {
+#ifdef OBI_HTTP_TERMINATION_CURRENT_KEY
+    terminate_http_request_if_needed(pid_conn, NULL);
+#else
     terminate_http_request_if_needed(pid_conn);
-}
-
-static __always_inline void
-cleanup_trace_info_for_delayed_trace(pid_connection_info_t *pid_conn, void *buf, u32 len) {
-    http_info_t *info = bpf_map_lookup_elem(&ongoing_http, pid_conn);
-    cleanup_ssl_server_trace(info, pid_conn, buf, len);
+#endif
 }
 
 static __always_inline u8 initialize_fallback_ssl_connection(ssl_pid_connection_info_t *fallback,
@@ -470,7 +436,6 @@ handle_ssl_buf(void *ctx, u64 id, ssl_args_t *args, int bytes_len, u8 direction)
     bpf_dbg_printk("SSL conn");
     dbg_print_http_connection_info(&conn->p_conn.conn);
 
-    cleanup_trace_info_for_delayed_trace(&conn->p_conn, (void *)args->buf, bytes_len);
     // must be last, doesn't return
     handle_buf_with_connection(
         ctx, &conn->p_conn, (void *)args->buf, bytes_len, WITH_SSL, direction, conn->orig_dport);

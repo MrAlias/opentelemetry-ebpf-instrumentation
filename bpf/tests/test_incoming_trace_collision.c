@@ -345,7 +345,7 @@ static tp_info_pid_t candidate_with_flags(unsigned char trace_seed,
                 .flags = flags,
             },
         .valid = 1,
-        .provenance = k_tp_provenance_tcp_exact_flags,
+        .state = TP_INFO_PID_STATE_PROVENANCE(k_tp_provenance_tcp_exact_flags),
     };
     for (u32 index = 0; index < sizeof(value.tp.trace_id); index++) {
         value.tp.trace_id[index] = trace_seed + index;
@@ -358,6 +358,30 @@ static tp_info_pid_t candidate_with_flags(unsigned char trace_seed,
 
 static tp_info_pid_t candidate(unsigned char span_seed, u64 timestamp) {
     return candidate_with_flags(1, span_seed, k_flag_sampled, timestamp);
+}
+
+static void test_provenance_and_response_sent_share_state_without_aliasing(void) {
+    tp_info_pid_t value = {
+        .state = TP_INFO_PID_STATE_PROVENANCE(k_tp_provenance_tcp_exact_flags),
+    };
+
+    tp_info_pid_set_response_sent(&value, 1);
+    if (!tp_info_pid_response_sent(&value) ||
+        tp_info_pid_provenance(&value) != k_tp_provenance_tcp_exact_flags) {
+        fail("response-sent state corrupted TCP provenance");
+    }
+
+    tp_info_pid_set_provenance(&value, k_tp_provenance_ssl_prewrite);
+    if (!tp_info_pid_response_sent(&value) ||
+        tp_info_pid_provenance(&value) != k_tp_provenance_ssl_prewrite) {
+        fail("provenance update corrupted response-sent state");
+    }
+
+    tp_info_pid_set_response_sent(&value, 0);
+    if (tp_info_pid_response_sent(&value) ||
+        tp_info_pid_provenance(&value) != k_tp_provenance_ssl_prewrite) {
+        fail("response-sent clear corrupted provenance");
+    }
 }
 
 static void reset(void) {
@@ -772,7 +796,7 @@ static void test_legacy_tcp_parent_preserves_server_flags(void) {
     const tp_info_pid_t raw = candidate_with_flags(
         test_trace_seed, test_span_seed, test_future_sampled_flags, test_candidate_timestamp);
     tp_info_pid_t legacy = raw;
-    legacy.provenance = k_tp_provenance_tcp_legacy;
+    tp_info_pid_set_provenance(&legacy, k_tp_provenance_tcp_legacy);
     tp_info_t server = {.flags = test_generated_flags};
 
     if (!apply_incoming_trace_candidate(&server, &legacy, NULL, NULL) ||
@@ -876,6 +900,7 @@ static void test_disabled_path_retains_legacy_overwrite_and_delete(void) {
 }
 
 int main(void) {
+    test_provenance_and_response_sent_share_state_without_aliasing();
     test_duplicate_is_idempotent();
     test_conflict_becomes_ambiguous();
     test_identical_parent_on_newer_request_gets_new_generation();

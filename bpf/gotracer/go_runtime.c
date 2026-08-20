@@ -18,6 +18,7 @@
 #include <bpfcore/utils.h>
 
 #include <common/common.h>
+#include <common/preempt_guard.h>
 #include <common/ringbuf.h>
 #include <common/trace_helpers.h>
 
@@ -49,6 +50,7 @@ enum : u32 {
     k_go_runtime_heap_stats_slots = 3,
     k_go_runtime_heap_stats_fields_between_size_class_arrays = 2,
     k_go_runtime_max_size_classes = 68,
+    k_go_runtime_max_processors = 256,
 };
 
 static __always_inline bool go_runtime_read(void *dst, u32 size, u64 addr) {
@@ -65,6 +67,48 @@ static __always_inline bool go_runtime_read_offset(void *dst, u32 size, u64 base
     }
 
     return go_runtime_read(dst, size, base + offset);
+}
+
+static __always_inline void go_runtime_collect_histogram(u64 histogram_addr,
+                                                         u64 underflow_offset,
+                                                         u64 overflow_offset,
+                                                         go_runtime_histogram_kind_t kind,
+                                                         const pid_info *pid,
+                                                         u64 generation) {
+    if (!histogram_addr || underflow_offset % sizeof(u64)) {
+        return;
+    }
+
+    const u64 derived_bucket_count = underflow_offset / sizeof(u64);
+    if (derived_bucket_count != k_hist_max_buckets ||
+        overflow_offset != underflow_offset + sizeof(u64)) {
+        return;
+    }
+    const u32 bucket_count = (u32)derived_bucket_count;
+
+    go_runtime_histogram_event_t *event =
+        bpf_ringbuf_reserve(&events, sizeof(go_runtime_histogram_event_t), 0);
+    if (!event) {
+        return;
+    }
+
+    event->type = EVENT_GO_RUNTIME_HISTOGRAM;
+    event->kind = kind;
+    event->pid = *pid;
+    event->bucket_count = bucket_count;
+    event->generation = generation;
+
+    const u32 counts_size = bucket_count * sizeof(u64);
+    if (bpf_probe_read_user(event->counts, counts_size, (void *)histogram_addr) ||
+        !go_runtime_read_offset(
+            &event->underflow, sizeof(event->underflow), histogram_addr, underflow_offset) ||
+        !go_runtime_read_offset(
+            &event->overflow, sizeof(event->overflow), histogram_addr, overflow_offset)) {
+        bpf_ringbuf_discard(event, 0);
+        return;
+    }
+
+    bpf_ringbuf_submit(event, get_flags());
 }
 
 static __always_inline void go_runtime_collect_gc(const go_runtime_metric_target_t *target,
@@ -122,6 +166,39 @@ go_runtime_collect_scheduler_config(const go_runtime_metric_target_t *target,
             &snapshot->gomaxprocs, sizeof(snapshot->gomaxprocs), target->gomaxprocs_addr)) {
         snapshot->valid_mask |= go_runtime_metric_valid_processor_limit;
     }
+}
+
+static __always_inline void go_runtime_collect_gc_goal(go_runtime_metric_target_t *target,
+                                                       off_table_t *ot,
+                                                       go_runtime_metric_snapshot_t *snapshot) {
+    if (!(target->available_mask & go_runtime_metric_valid_memory_gc_goal)) {
+        return;
+    }
+
+    if (target->gc_goal_source == go_runtime_gc_goal_source_heap_goal_field) {
+        const u64 heap_goal_pos =
+            go_offset_of(ot, (go_offset){.v = _runtime_gc_controller_heap_goal_pos});
+        if (go_runtime_read_offset(&snapshot->memory_gc_goal,
+                                   sizeof(snapshot->memory_gc_goal),
+                                   target->gc_controller_addr,
+                                   heap_goal_pos)) {
+            snapshot->valid_mask |= go_runtime_metric_valid_memory_gc_goal;
+        }
+        return;
+    }
+
+    if (target->gc_goal_source != go_runtime_gc_goal_source_pace_scavenger_argument) {
+        return;
+    }
+
+    // Aligned u64 map-value loads JIT to single native accesses, which are tear-free on 64-bit hosts.
+    const u64 goal = *(volatile u64 *)&target->gc_goal;
+    if (!goal) {
+        return;
+    }
+
+    snapshot->memory_gc_goal = goal;
+    snapshot->valid_mask |= go_runtime_metric_valid_memory_gc_goal;
 }
 
 static __always_inline void go_runtime_collect_cpu_time(const go_runtime_metric_target_t *target,
@@ -445,6 +522,82 @@ static __always_inline void go_runtime_collect_heap_stats(const go_runtime_metri
     snapshot->valid_mask |= go_runtime_metric_valid_memory_used;
 }
 
+static __always_inline void
+go_runtime_collect_goroutine_count(const go_runtime_metric_target_t *target,
+                                   off_table_t *ot,
+                                   go_runtime_metric_snapshot_t *snapshot) {
+    if (!(target->available_mask & go_runtime_metric_valid_goroutine_count)) {
+        return;
+    }
+
+    const u64 sched_ngsys_pos = go_offset_of(ot, (go_offset){.v = _runtime_sched_ngsys_pos});
+    const u64 sched_gfree_stack_pos =
+        go_offset_of(ot, (go_offset){.v = _runtime_sched_gfree_stack_pos});
+    const u64 sched_gfree_no_stack_pos =
+        go_offset_of(ot, (go_offset){.v = _runtime_sched_gfree_no_stack_pos});
+    const u64 p_gfree_pos = go_offset_of(ot, (go_offset){.v = _runtime_p_gfree_pos});
+    const u64 glist_size_pos = go_offset_of(ot, (go_offset){.v = _runtime_glist_size_pos});
+
+    u64 allglen = 0;
+    s32 ngsys = 0;
+    s32 sched_gfree_stack = 0;
+    s32 sched_gfree_no_stack = 0;
+    u64 allp_data = 0;
+    u64 allp_len = 0;
+
+    if (!go_runtime_read(&allglen, sizeof(allglen), target->allglen_addr)) {
+        return;
+    }
+    if (!target->goroutine_count_includes_system &&
+        !go_runtime_read_offset(&ngsys, sizeof(ngsys), target->sched_addr, sched_ngsys_pos)) {
+        return;
+    }
+    if (!go_runtime_read_offset(&sched_gfree_stack,
+                                sizeof(sched_gfree_stack),
+                                target->sched_addr,
+                                sched_gfree_stack_pos + glist_size_pos)) {
+        return;
+    }
+    if (!go_runtime_read_offset(&sched_gfree_no_stack,
+                                sizeof(sched_gfree_no_stack),
+                                target->sched_addr,
+                                sched_gfree_no_stack_pos + glist_size_pos)) {
+        return;
+    }
+    if (!go_runtime_read(&allp_data, sizeof(allp_data), target->allp_addr) ||
+        !go_runtime_read(&allp_len, sizeof(allp_len), target->allp_addr + k_go_slice_len_offset) ||
+        !allp_data || !allp_len || allp_len > k_go_runtime_max_processors) {
+        return;
+    }
+
+    s64 goroutines = (s64)allglen - sched_gfree_stack - sched_gfree_no_stack;
+    if (!target->goroutine_count_includes_system) {
+        goroutines -= ngsys;
+    }
+
+    for (u32 i = 0; i < k_go_runtime_max_processors; i++) {
+        if (i >= allp_len) {
+            break;
+        }
+
+        u64 p_addr = 0;
+        s32 p_gfree = 0;
+        if (!go_runtime_read(&p_addr, sizeof(p_addr), allp_data + (i * sizeof(p_addr))) ||
+            !p_addr ||
+            !go_runtime_read_offset(
+                &p_gfree, sizeof(p_gfree), p_addr, p_gfree_pos + glist_size_pos)) {
+            return;
+        }
+        goroutines -= p_gfree;
+    }
+
+    if (goroutines < 1) {
+        return;
+    }
+    snapshot->goroutine_count = goroutines;
+    snapshot->valid_mask |= go_runtime_metric_valid_goroutine_count;
+}
+
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __type(key, go_addr_key_t); // key: pointer to the request goroutine
@@ -452,8 +605,19 @@ struct {
     __uint(max_entries, MAX_CONCURRENT_REQUESTS);
 } newproc1 SEC(".maps");
 
+static __always_inline bool
+go_runtime_target_matches_process(const go_runtime_metric_target_t *target, u32 host_pid) {
+    if (!target || !target->process_start_ticks ||
+        !go_process_lifecycle_epoch_matches(host_pid, target->process_lifecycle_epoch)) {
+        return false;
+    }
+
+    u64 start_ticks = 0;
+    return current_process_start_ticks(&start_ticks) && start_ticks == target->process_start_ticks;
+}
+
 SEC("uprobe/go_runtime_metrics")
-int obi_uprobe_go_runtime_metrics(struct pt_regs *ctx) {
+int GUARDED_PROG(obi_uprobe_go_runtime_metrics, struct pt_regs *, ctx) {
     (void)ctx;
 
     pid_info key = {};
@@ -461,9 +625,8 @@ int obi_uprobe_go_runtime_metrics(struct pt_regs *ctx) {
 
     bpf_dbg_printk("collecting Go runtime metrics pid=%d ns=%d", key.user_pid, key.ns);
 
-    const go_runtime_metric_target_t *target =
-        bpf_map_lookup_elem(&go_runtime_metric_targets, &key);
-    if (!target) {
+    go_runtime_metric_target_t *target = bpf_map_lookup_elem(&go_runtime_metric_targets, &key);
+    if (!go_runtime_target_matches_process(target, key.host_pid)) {
         return 0;
     }
 
@@ -475,6 +638,7 @@ int obi_uprobe_go_runtime_metrics(struct pt_regs *ctx) {
 
     event->type = EVENT_GO_RUNTIME_METRICS;
     event->pid = key;
+    event->generation = target->generation;
     // Collectors set valid_mask bits for metric groups populated in this snapshot.
     __builtin_memset(&event->snapshot, 0, sizeof(event->snapshot));
 
@@ -482,15 +646,63 @@ int obi_uprobe_go_runtime_metrics(struct pt_regs *ctx) {
     go_runtime_collect_gc(target, ot, &event->snapshot);
     go_runtime_collect_memory_config(target, ot, &event->snapshot);
     go_runtime_collect_scheduler_config(target, &event->snapshot);
+    go_runtime_collect_gc_goal(target, ot, &event->snapshot);
     go_runtime_collect_cpu_time(target, ot, &event->snapshot);
     go_runtime_collect_heap_stats(target, ot, &key, &event->snapshot);
+    go_runtime_collect_goroutine_count(target, ot, &event->snapshot);
 
     bpf_ringbuf_submit(event, get_flags());
+
+    const u64 underflow_pos =
+        go_offset_of(ot, (go_offset){.v = _runtime_time_histogram_underflow_pos});
+    const u64 overflow_pos =
+        go_offset_of(ot, (go_offset){.v = _runtime_time_histogram_overflow_pos});
+
+    if (target->sched_addr &&
+        (target->available_mask & go_runtime_metric_valid_gc_pause_histogram)) {
+        const u64 histogram_addr =
+            target->sched_addr +
+            go_offset_of(ot, (go_offset){.v = _runtime_sched_stw_total_time_gc_pos});
+        go_runtime_collect_histogram(histogram_addr,
+                                     underflow_pos,
+                                     overflow_pos,
+                                     go_runtime_histogram_kind_gc_pause,
+                                     &key,
+                                     target->generation);
+    }
+
+    if (target->sched_addr &&
+        (target->available_mask & go_runtime_metric_valid_schedule_duration_histogram)) {
+        const u64 histogram_addr =
+            target->sched_addr + go_offset_of(ot, (go_offset){.v = _runtime_sched_time_to_run_pos});
+        go_runtime_collect_histogram(histogram_addr,
+                                     underflow_pos,
+                                     overflow_pos,
+                                     go_runtime_histogram_kind_scheduler_latency,
+                                     &key,
+                                     target->generation);
+    }
+    return 0;
+}
+
+SEC("uprobe/go_runtime_gc_goal")
+int GUARDED_PROG(obi_uprobe_go_runtime_gc_goal, struct pt_regs *, ctx) {
+    pid_info key = {};
+    task_pid(&key);
+
+    go_runtime_metric_target_t *target = bpf_map_lookup_elem(&go_runtime_metric_targets, &key);
+    if (!go_runtime_target_matches_process(target, key.host_pid) ||
+        target->gc_goal_source != go_runtime_gc_goal_source_pace_scavenger_argument) {
+        return 0;
+    }
+
+    const u64 goal = (u64)GO_PARAM2(ctx);
+    *(volatile u64 *)&target->gc_goal = goal;
     return 0;
 }
 
 SEC("uprobe/runtime_newproc1")
-int obi_uprobe_runtime_newproc1(struct pt_regs *ctx) {
+int GUARDED_PROG(obi_uprobe_runtime_newproc1, struct pt_regs *, ctx) {
     bpf_dbg_printk("=== uprobe/runtime_newproc1 ===");
     void *creator_goroutine_addr = GOROUTINE_PTR(ctx);
     bpf_dbg_printk("creator_goroutine_addr=%lx", creator_goroutine_addr);
@@ -508,7 +720,7 @@ int obi_uprobe_runtime_newproc1(struct pt_regs *ctx) {
 }
 
 SEC("uprobe/runtime_newproc1_return")
-int obi_uprobe_runtime_newproc1_return(struct pt_regs *ctx) {
+int GUARDED_PROG(obi_uprobe_runtime_newproc1_return, struct pt_regs *, ctx) {
     bpf_dbg_printk("=== uprobe/runtime_newproc1_return ===");
     void *creator_goroutine_addr = GOROUTINE_PTR(ctx);
     const u64 pid_tid = bpf_get_current_pid_tgid();
@@ -516,6 +728,10 @@ int obi_uprobe_runtime_newproc1_return(struct pt_regs *ctx) {
     go_addr_key_t c_key = {.addr = (u64)creator_goroutine_addr, .pid = pid};
 
     bpf_dbg_printk("creator_goroutine_addr=%lx", creator_goroutine_addr);
+
+    // The result of newproc1 is the new goroutine
+    void *goroutine_addr = (void *)GO_PARAM1(ctx);
+    go_addr_key_t g_key = {.addr = (u64)goroutine_addr, .pid = pid};
 
     // Lookup the newproc1 invocation metadata
     new_func_invocation_t *invocation = bpf_map_lookup_elem(&newproc1, &c_key);
@@ -528,8 +744,6 @@ int obi_uprobe_runtime_newproc1_return(struct pt_regs *ctx) {
     void *parent_goroutine = (void *)invocation->parent;
     bpf_dbg_printk("parent_goroutine=%lx", parent_goroutine);
 
-    // The result of newproc1 is the new goroutine
-    void *goroutine_addr = (void *)GO_PARAM1(ctx);
     bpf_dbg_printk("goroutine_addr=%lx", goroutine_addr);
 
     go_addr_key_t p_key = {.addr = (u64)parent_goroutine, .pid = pid};
@@ -545,8 +759,6 @@ int obi_uprobe_runtime_newproc1_return(struct pt_regs *ctx) {
         }
     }
 
-    go_addr_key_t g_key = {.addr = (u64)goroutine_addr, .pid = pid};
-
     goroutine_metadata metadata = {
         .timestamp = bpf_ktime_get_ns(),
         .parent = p_key,
@@ -557,6 +769,8 @@ int obi_uprobe_runtime_newproc1_return(struct pt_regs *ctx) {
     }
 
 done:
+    // Delete any stale info on go_trace_map
+    bpf_map_delete_elem(&go_trace_map, &g_key);
     bpf_map_delete_elem(&newproc1, &c_key);
 
     return 0;
@@ -977,32 +1191,32 @@ done:
 }
 
 SEC("uprobe/runtime_chansend1")
-int obi_uprobe_runtime_chansend1(struct pt_regs *ctx) {
+int GUARDED_PROG(obi_uprobe_runtime_chansend1, struct pt_regs *, ctx) {
     return channel_send_start(ctx);
 }
 
 SEC("uprobe/runtime_chansend1_return")
-int obi_uprobe_runtime_chansend1_return(struct pt_regs *ctx) {
+int GUARDED_PROG(obi_uprobe_runtime_chansend1_return, struct pt_regs *, ctx) {
     return channel_send_return(ctx);
 }
 
 SEC("uprobe/runtime_chanrecv1")
-int obi_uprobe_runtime_chanrecv1(struct pt_regs *ctx) {
+int GUARDED_PROG(obi_uprobe_runtime_chanrecv1, struct pt_regs *, ctx) {
     return channel_recv_start(ctx);
 }
 
 SEC("uprobe/runtime_chanrecv1_return")
-int obi_uprobe_runtime_chanrecv1_return(struct pt_regs *ctx) {
+int GUARDED_PROG(obi_uprobe_runtime_chanrecv1_return, struct pt_regs *, ctx) {
     return channel_recv_return(ctx);
 }
 
 SEC("uprobe/runtime_chanrecv2")
-int obi_uprobe_runtime_chanrecv2(struct pt_regs *ctx) {
+int GUARDED_PROG(obi_uprobe_runtime_chanrecv2, struct pt_regs *, ctx) {
     return channel_recv_start(ctx);
 }
 
 SEC("uprobe/runtime_chanrecv2_return")
-int obi_uprobe_runtime_chanrecv2_return(struct pt_regs *ctx) {
+int GUARDED_PROG(obi_uprobe_runtime_chanrecv2_return, struct pt_regs *, ctx) {
     return channel_recv_return(ctx);
 }
 
@@ -1064,7 +1278,7 @@ enum offsets : u8 {
 };
 
 SEC("uprobe/runtime.mstart1")
-int obi_uprobe_runtime_mstart1(struct pt_regs *ctx) {
+int GUARDED_PROG(obi_uprobe_runtime_mstart1, struct pt_regs *, ctx) {
     const u64 pid_tgid = bpf_get_current_pid_tgid();
 
     void *g = (void *)GOROUTINE_PTR(ctx);
@@ -1080,7 +1294,7 @@ int obi_uprobe_runtime_mstart1(struct pt_regs *ctx) {
 }
 
 SEC("uprobe/runtime.mexit")
-int obi_uprobe_runtime_mexit(struct pt_regs *ctx) {
+int GUARDED_PROG(obi_uprobe_runtime_mexit, struct pt_regs *, ctx) {
     void *g = (void *)GOROUTINE_PTR(ctx);
     void *m = NULL;
 
@@ -1095,7 +1309,7 @@ int obi_uprobe_runtime_mexit(struct pt_regs *ctx) {
 
 // gp *g, oldval, newval uint32
 SEC("uprobe/runtime.casgstatus")
-int obi_uprobe_runtime_casgstatus(struct pt_regs *ctx) {
+int GUARDED_PROG(obi_uprobe_runtime_casgstatus, struct pt_regs *, ctx) {
     const u64 pid_tgid = bpf_get_current_pid_tgid();
 
     void *g = (void *)GO_PARAM1(ctx);

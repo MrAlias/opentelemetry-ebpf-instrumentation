@@ -49,6 +49,8 @@ readonly MAX_JAVA_DIAGNOSTIC_COUNTER=999999999
 readonly MAX_BPF_OPERATION_COUNTER=9223372036854775807
 readonly MAX_JAVA_DIAGNOSTICS_SNAPSHOT_BYTES=4096
 readonly MAX_PROC_CGROUP_BYTES=65536
+readonly MAX_BPF_FDINFO_FILES=4096
+readonly MAX_BPF_FDINFO_BYTES=16384
 readonly MAX_BENCHMARK_CA_CERTIFICATE_BYTES=16384
 readonly MAX_BENCHMARK_CA_METADATA_BYTES=16384
 readonly MAX_SUSTAINED_WORKLOAD_SUCCESSFUL_REQUESTS="$(((MAX_REPETITIONS + 1) * REQUEST_LIMIT))"
@@ -178,7 +180,9 @@ usage() {
     '                           complete adds bounded stale, timeout, and pressure evidence.' \
     '  -h, --help               Show this help text.' \
     '' \
-    'The total worker-seconds across all six cells must not exceed 120000.'
+    'The total worker-seconds across all six cells must not exceed 120000.' \
+    'Exact OBI-owned BPF map attribution must enumerate the root-owned OBI process fd and fdinfo directories.' \
+    'Run as root unless the host procfs/ptrace policy grants equivalent complete read access; Docker-group access alone is insufficient.'
 }
 
 log_info() {
@@ -1385,6 +1389,8 @@ write_manifest() {
       invocation: $invocation,
       docker_endpoint_evidence: "docker-daemon.json",
       container_process_binding_evidence: "cells/*/resources-{before,idle-recovery}/*-proc.txt",
+      obi_bpf_fd_ownership_evidence:
+        "cells/*/resources-{before,idle-recovery}/obi-bpf-fd-ownership.txt",
       application_source_identity: "application-source-identity.json",
       agent: $agent,
       tls_protocol: $tls,
@@ -1438,12 +1444,13 @@ write_manifest() {
           samples: ["before", "idle_recovery"],
           unavailable_samples_fail_closed: true,
           java_bridge_map_evaluation: {
-            status: "partial_not_evaluated",
-            metric_scope: "host_global_java_remote_par_superset",
-            ownership_attribution: false,
-            required_descriptive_samples: true,
+            status: "evaluated_when_exact_ownership_receipts_are_complete",
+            metric_scope: "exact_obi_process_open_bpf_map_ids",
+            ownership_attribution: true,
+            required_ownership_samples: true,
             bridge_disabled_project_map_configured_max_entries: 1,
-            completion_requirement: "project_ownership_attribution_or_clean_host_proof"
+            completion_requirement:
+              "stable_exact_obi_process_bpf_fd_rosters_bracketing_each_metrics_scrape"
           }
         }
       },
@@ -2823,6 +2830,228 @@ capture_proc_snapshot() {
   capture_proc_snapshot_from_root "$identity_file" "$output" /proc
 }
 
+capture_bpf_fd_roster_from_directories() {
+  local -r fd_directory="$1"
+  local -r fdinfo_directory="$2"
+  local -r output="$3"
+  local fd_listing=""
+  local listing=""
+  local fd_entry=""
+  local fd_name=""
+  local fd_type=""
+  local entry_name=""
+  local entry_type=""
+  local entry_path=""
+  local entry_size=""
+  local entry_index=0
+  local parsed=""
+  local entry_copy=""
+  local map_count=0
+  local -a fd_entries=()
+  local -a entries=()
+
+  [[ -d "$fd_directory" && ! -L "$fd_directory" &&
+    -d "$fdinfo_directory" && ! -L "$fdinfo_directory" &&
+    -f "$output" && ! -L "$output" ]] || return 1
+  fd_listing="$(find "$fd_directory" -mindepth 1 -maxdepth 1 \
+    -printf '%f\t%y\n' 2>/dev/null)" || return 1
+  listing="$(find "$fdinfo_directory" -mindepth 1 -maxdepth 1 \
+    -printf '%f\t%y\n' 2>/dev/null)" || return 1
+  if [[ -n "$fd_listing" ]]; then
+    mapfile -t fd_entries < <(printf '%s\n' "$fd_listing" | sort -t $'\t' -k1,1n)
+  fi
+  if [[ -n "$listing" ]]; then
+    mapfile -t entries < <(printf '%s\n' "$listing" | sort -t $'\t' -k1,1n)
+  fi
+  ((${#entries[@]} > 0 && ${#entries[@]} <= MAX_BPF_FDINFO_FILES &&
+    ${#fd_entries[@]} == ${#entries[@]})) || return 1
+  : >"$output" || return 1
+  entry_copy="$(mktemp "${output%/*}/.bpf-fdinfo.XXXXXX")" || return 1
+  for ((entry_index = 0; entry_index < ${#entries[@]}; entry_index++)); do
+    parsed="${entries[entry_index]}"
+    fd_entry="${fd_entries[entry_index]}"
+    IFS=$'\t' read -r fd_name fd_type <<<"$fd_entry" || {
+      rm -f -- "$entry_copy"
+      return 1
+    }
+    IFS=$'\t' read -r entry_name entry_type <<<"$parsed" || {
+      rm -f -- "$entry_copy"
+      return 1
+    }
+    [[ "$fd_name" =~ ^(0|[1-9][0-9]*)$ && "$fd_type" == l &&
+      "$entry_name" == "$fd_name" && "$entry_type" == f ]] || {
+      rm -f -- "$entry_copy"
+      return 1
+    }
+    entry_path="$fdinfo_directory/$entry_name"
+    [[ -f "$entry_path" && ! -L "$entry_path" ]] || {
+      rm -f -- "$entry_copy"
+      return 1
+    }
+    if ! head -c "$((MAX_BPF_FDINFO_BYTES + 1))" -- "$entry_path" >"$entry_copy"; then
+      rm -f -- "$entry_copy"
+      return 1
+    fi
+    entry_size="$(wc -c <"$entry_copy")" || {
+      rm -f -- "$entry_copy"
+      return 1
+    }
+    [[ "$entry_size" =~ ^(0|[1-9][0-9]*)$ &&
+      "$entry_size" -le "$MAX_BPF_FDINFO_BYTES" ]] || {
+      rm -f -- "$entry_copy"
+      return 1
+    }
+    if ! parsed="$(awk '
+      /^(map_id|prog_id):/ {
+        if ($0 !~ /^(map_id|prog_id):[[:space:]]+[1-9][0-9]*$/) {
+          invalid = 1
+          next
+        }
+        kind = $1
+        sub(/:$/, "", kind)
+        if (++seen[kind] != 1 || ++identities != 1) {
+          invalid = 1
+          next
+        }
+        print kind "=" $2
+      }
+      END { if (invalid) exit 1 }
+    ' "$entry_copy")"; then
+      rm -f -- "$entry_copy"
+      return 1
+    fi
+    if [[ -n "$parsed" ]]; then
+      printf 'fd=%s %s\n' "$entry_name" "$parsed" >>"$output" || {
+        rm -f -- "$entry_copy"
+        return 1
+      }
+    fi
+  done
+  rm -f -- "$entry_copy" || return 1
+  map_count="$(awk '$2 ~ /^map_id=/ {
+      split($2, identity, "="); ids[identity[2]] = 1
+    } END { print length(ids) }' \
+    "$output")" || return 1
+  [[ "$map_count" =~ ^[1-9][0-9]*$ ]]
+}
+
+capture_bpf_fd_ownership_from_root() {
+  local -r identity_file="$1"
+  local -r output="$2"
+  local -r proc_root="$3"
+  local container_id=""
+  local host_pid=""
+  local expected_start_time=""
+  local expected_cgroup_sha256=""
+  local expected_cgroup_container_binding=""
+  local before_identity=""
+  local after_identity=""
+  local fd_directory=""
+  local fdinfo_directory=""
+  local temporary=""
+  local first_roster=""
+  local second_roster=""
+
+  container_id="$(identity_field "$identity_file" container_id)" || {
+    printf 'status=unavailable\n' >"$output"
+    return 0
+  }
+  host_pid="$(identity_field "$identity_file" host_pid)" || {
+    printf 'status=unavailable\n' >"$output"
+    return 0
+  }
+  expected_start_time="$(identity_field "$identity_file" proc_start_time)" || {
+    printf 'status=unavailable\n' >"$output"
+    return 0
+  }
+  expected_cgroup_sha256="$(identity_field \
+    "$identity_file" proc_cgroup_sha256)" || {
+    printf 'status=unavailable\n' >"$output"
+    return 0
+  }
+  expected_cgroup_container_binding="$(identity_field \
+    "$identity_file" proc_cgroup_container_binding)" || {
+    printf 'status=unavailable\n' >"$output"
+    return 0
+  }
+  fd_directory="$proc_root/$host_pid/fd"
+  fdinfo_directory="$proc_root/$host_pid/fdinfo"
+  [[ "$container_id" =~ ^[0-9a-f]{64}$ && "$host_pid" =~ ^[1-9][0-9]*$ &&
+    "$expected_start_time" =~ ^[1-9][0-9]*$ &&
+    "$expected_cgroup_sha256" =~ ^[0-9a-f]{64}$ &&
+    "$expected_cgroup_container_binding" == "$PROC_CGROUP_CONTAINER_BINDING" &&
+    "$proc_root" == /* && -d "$proc_root" && ! -L "$proc_root" &&
+    -d "$fd_directory" && ! -L "$fd_directory" &&
+    -d "$fdinfo_directory" && ! -L "$fdinfo_directory" ]] || {
+    printf 'status=unavailable\n' >"$output"
+    return 0
+  }
+  before_identity="$(proc_identity_from_root \
+    "$proc_root" "$host_pid" "$container_id")" || {
+    printf 'status=unavailable\n' >"$output"
+    return 0
+  }
+  [[ "$before_identity" == \
+    "$expected_start_time $expected_cgroup_sha256 $expected_cgroup_container_binding" ]] || {
+    printf 'status=unavailable\n' >"$output"
+    return 0
+  }
+  temporary="$(mktemp "${output%/*}/.bpf-fd-ownership.XXXXXX")" || return 1
+  first_roster="$(mktemp "${output%/*}/.bpf-fd-roster-first.XXXXXX")" || {
+    rm -f -- "$temporary"
+    return 1
+  }
+  second_roster="$(mktemp "${output%/*}/.bpf-fd-roster-second.XXXXXX")" || {
+    rm -f -- "$temporary" "$first_roster"
+    return 1
+  }
+  if ! capture_bpf_fd_roster_from_directories \
+      "$fd_directory" "$fdinfo_directory" "$first_roster" ||
+    ! capture_bpf_fd_roster_from_directories \
+      "$fd_directory" "$fdinfo_directory" "$second_roster" ||
+    ! cmp -s -- "$first_roster" "$second_roster"; then
+    rm -f -- "$temporary" "$first_roster" "$second_roster"
+    printf 'status=unavailable\n' >"$output"
+    return 0
+  fi
+  {
+    printf 'status=available\n'
+    printf 'container_id=%s\n' "$container_id"
+    printf 'host_pid=%s\n' "$host_pid"
+    printf 'proc_start_time=%s\n' "$expected_start_time"
+    printf 'proc_cgroup_sha256=%s\n' "$expected_cgroup_sha256"
+    printf 'proc_cgroup_container_binding=%s\n' \
+      "$expected_cgroup_container_binding"
+    cat -- "$first_roster"
+  } >"$temporary" || {
+    rm -f -- "$temporary" "$first_roster" "$second_roster"
+    return 1
+  }
+  after_identity="$(proc_identity_from_root \
+    "$proc_root" "$host_pid" "$container_id")" || {
+    rm -f -- "$temporary" "$first_roster" "$second_roster"
+    printf 'status=unavailable\n' >"$output"
+    return 0
+  }
+  rm -f -- "$first_roster" "$second_roster" || {
+    rm -f -- "$temporary"
+    return 1
+  }
+  if [[ "$after_identity" != "$before_identity" ]]; then
+    rm -f -- "$temporary"
+    printf 'status=unavailable\n' >"$output"
+    return 0
+  fi
+  mv -T -- "$temporary" "$output"
+}
+
+capture_bpf_fd_ownership() {
+  local -r identity_file="$1"
+  local -r output="$2"
+
+  capture_bpf_fd_ownership_from_root "$identity_file" "$output" /proc
+}
+
 capture_obi_metrics() {
   local -r output="$1"
 
@@ -2837,6 +3066,30 @@ capture_obi_metrics() {
   fi
   printf 'status=unavailable\n' >"$output"
   return 0
+}
+
+capture_obi_metrics_with_ownership() {
+  local -r identity_file="$1"
+  local -r ownership_output="$2"
+  local -r metrics_output="$3"
+  local ownership_before="${ownership_output}.before"
+  local ownership_after="${ownership_output}.after"
+
+  [[ "$CELL_REQUIRES_OBI" == "true" ]] || return 1
+  [[ ! -e "$ownership_output" && ! -L "$ownership_output" &&
+    ! -e "$ownership_before" && ! -L "$ownership_before" &&
+    ! -e "$ownership_after" && ! -L "$ownership_after" ]] || return 1
+  capture_bpf_fd_ownership "$identity_file" "$ownership_before" || return 1
+  capture_obi_metrics "$metrics_output" || return 1
+  capture_bpf_fd_ownership "$identity_file" "$ownership_after" || return 1
+  if grep -Fxq 'status=available' "$ownership_before" &&
+    cmp -s -- "$ownership_before" "$ownership_after"; then
+    mv -T -- "$ownership_before" "$ownership_output" || return 1
+  else
+    rm -f -- "$ownership_before"
+    printf 'status=unavailable\n' >"$ownership_output"
+  fi
+  rm -f -- "$ownership_after"
 }
 
 capture_java_diagnostics() {
@@ -2924,7 +3177,15 @@ capture_resource_snapshot() {
   else
     printf 'status=unavailable\n' >"$snapshot_directory/container-stats.jsonl"
   fi
-  capture_obi_metrics "$snapshot_directory/obi-metrics.prom"
+  if [[ "$CELL_REQUIRES_OBI" == "true" ]]; then
+    capture_obi_metrics_with_ownership \
+      "$snapshot_directory/obi-identity.txt" \
+      "$snapshot_directory/obi-bpf-fd-ownership.txt" \
+      "$snapshot_directory/obi-metrics.prom"
+  else
+    capture_obi_metrics "$snapshot_directory/obi-metrics.prom"
+    printf 'status=not_applicable\n' >"$snapshot_directory/obi-bpf-fd-ownership.txt"
+  fi
   if [[ "$java_diagnostics_mode" == requested ]]; then
     capture_java_diagnostics "$snapshot_directory/java-diagnostics.txt"
   fi
@@ -3944,6 +4205,36 @@ proc_growth_snapshot_values() {
   ' "$snapshot"
 }
 
+proc_growth_identity_json() {
+  local -r snapshot="$1"
+  local values=""
+  local container_id=""
+  local host_pid=""
+  local proc_start_time=""
+  local proc_cgroup_sha256=""
+  local proc_cgroup_container_binding=""
+  local fd_count=""
+  local task_count=""
+
+  values="$(proc_growth_snapshot_values "$snapshot")" || return 1
+  read -r container_id host_pid proc_start_time proc_cgroup_sha256 \
+    proc_cgroup_container_binding fd_count task_count <<<"$values" || return 1
+  jq -cn \
+    --arg container_id "$container_id" \
+    --arg proc_cgroup_sha256 "$proc_cgroup_sha256" \
+    --arg proc_cgroup_container_binding "$proc_cgroup_container_binding" \
+    --argjson host_pid "$host_pid" \
+    --argjson proc_start_time "$proc_start_time" '
+      {
+        container_id: $container_id,
+        host_pid: $host_pid,
+        proc_start_time: $proc_start_time,
+        proc_cgroup_sha256: $proc_cgroup_sha256,
+        proc_cgroup_container_binding: $proc_cgroup_container_binding
+      }
+    '
+}
+
 process_growth_observation() {
   local -r cell="$1"
   local -r service="$2"
@@ -4131,21 +4422,78 @@ map_rows_json() {
   '
 }
 
+bpf_fd_ownership_json() {
+  local -r ownership_file="$1"
+
+  [[ -f "$ownership_file" && ! -L "$ownership_file" ]] || return 1
+  jq -Rsc '
+    (split("\n") |
+      if .[-1] == "" then .[0:-1] else error("missing final newline") end
+    ) as $lines |
+    if ($lines | length) < 7 or $lines[0] != "status=available"
+    then error("BPF FD ownership unavailable") else . end |
+    ($lines[1] |
+      capture("^container_id=(?<value>[0-9a-f]{64})$").value) as $container_id |
+    ($lines[2] |
+      capture("^host_pid=(?<value>[1-9][0-9]*)$").value | tonumber) as $host_pid |
+    ($lines[3] |
+      capture("^proc_start_time=(?<value>[1-9][0-9]*)$").value | tonumber) as $start |
+    ($lines[4] |
+      capture("^proc_cgroup_sha256=(?<value>[0-9a-f]{64})$").value) as $cgroup |
+    if $lines[5] !=
+      "proc_cgroup_container_binding=full_container_id_at_non_hex_boundaries"
+    then error("invalid proc cgroup binding") else . end |
+    ($lines[6:] |
+      map(capture("^fd=(?<fd>0|[1-9][0-9]*) (?<kind>map_id|prog_id)=(?<id>[1-9][0-9]*)$") |
+        .fd |= tonumber | .id |= tonumber)) as $descriptors |
+    ($descriptors | map(select(.kind == "map_id") | .id) | sort | unique) as $maps |
+    ($descriptors | map(select(.kind == "prog_id") | .id) | sort | unique) as $programs |
+    if ($maps | length) == 0 or
+      ($descriptors | length) == 0 or
+      ([ $descriptors[].fd ] != ([ $descriptors[].fd ] | sort | unique))
+    then error("invalid BPF FD ownership roster")
+    else {
+      container_id: $container_id,
+      host_pid: $host_pid,
+      proc_start_time: $start,
+      proc_cgroup_sha256: $cgroup,
+      proc_cgroup_container_binding:
+        "full_container_id_at_non_hex_boundaries",
+      descriptors: $descriptors,
+      map_ids: $maps,
+      program_ids: $programs
+    }
+    end
+  ' "$ownership_file"
+}
+
 java_bridge_map_growth_observation() {
   local -r cell="$1"
   local -r before_metrics="$2"
   local -r recovery_metrics="$3"
+  local -r before_ownership="$4"
+  local -r recovery_ownership="$5"
+  local -r before_process_snapshot="$6"
+  local -r recovery_process_snapshot="$7"
   local before_rows=""
   local recovery_rows=""
   local before_json="[]"
   local recovery_json="[]"
+  local before_owner="{}"
+  local recovery_owner="{}"
+  local before_process="{}"
+  local recovery_process="{}"
 
   if ! before_rows="$(java_bridge_map_metric_rows "$before_metrics")" ||
     ! recovery_rows="$(java_bridge_map_metric_rows "$recovery_metrics")"; then
     jq -cn \
       --arg cell "$cell" \
       --arg before "cells/$cell/resources-before/obi-metrics.prom" \
-      --arg recovery "cells/$cell/resources-idle-recovery/obi-metrics.prom" '
+      --arg recovery "cells/$cell/resources-idle-recovery/obi-metrics.prom" \
+      --arg before_ownership "cells/$cell/resources-before/obi-bpf-fd-ownership.txt" \
+      --arg recovery_ownership "cells/$cell/resources-idle-recovery/obi-bpf-fd-ownership.txt" \
+      --arg before_process "cells/$cell/resources-before/obi-proc.txt" \
+      --arg recovery_process "cells/$cell/resources-idle-recovery/obi-proc.txt" '
         {
           cell: $cell,
           status: "partial",
@@ -4155,7 +4503,79 @@ java_bridge_map_growth_observation() {
           scope: "host_global_java_remote_par_superset",
           ownership_attribution: false,
           reason: "required_before_or_idle_recovery_java_bridge_map_sample_unavailable_or_malformed",
-          sources: {before: $before, idle_recovery: $recovery}
+          sources: {before: $before, idle_recovery: $recovery},
+          ownership_sources: {
+            before: $before_ownership,
+            idle_recovery: $recovery_ownership
+          },
+          process_sources: {
+            before: $before_process,
+            idle_recovery: $recovery_process
+          }
+        }
+      '
+    return 0
+  fi
+  if ! before_owner="$(bpf_fd_ownership_json "$before_ownership")" ||
+    ! recovery_owner="$(bpf_fd_ownership_json "$recovery_ownership")"; then
+    jq -cn \
+      --arg cell "$cell" \
+      --arg before "cells/$cell/resources-before/obi-metrics.prom" \
+      --arg recovery "cells/$cell/resources-idle-recovery/obi-metrics.prom" \
+      --arg before_ownership "cells/$cell/resources-before/obi-bpf-fd-ownership.txt" \
+      --arg recovery_ownership "cells/$cell/resources-idle-recovery/obi-bpf-fd-ownership.txt" \
+      --arg before_process "cells/$cell/resources-before/obi-proc.txt" \
+      --arg recovery_process "cells/$cell/resources-idle-recovery/obi-proc.txt" '
+        {
+          cell: $cell,
+          status: "partial",
+          result: "not_evaluated",
+          data_status: "unavailable",
+          descriptive_result: "not_available",
+          scope: "host_global_java_remote_par_superset",
+          ownership_attribution: false,
+          reason: "required_stable_obi_bpf_fd_ownership_sample_unavailable_or_malformed",
+          sources: {before: $before, idle_recovery: $recovery},
+          ownership_sources: {
+            before: $before_ownership,
+            idle_recovery: $recovery_ownership
+          },
+          process_sources: {
+            before: $before_process,
+            idle_recovery: $recovery_process
+          }
+        }
+      '
+    return 0
+  fi
+  if ! before_process="$(proc_growth_identity_json "$before_process_snapshot")" ||
+    ! recovery_process="$(proc_growth_identity_json "$recovery_process_snapshot")"; then
+    jq -cn \
+      --arg cell "$cell" \
+      --arg before "cells/$cell/resources-before/obi-metrics.prom" \
+      --arg recovery "cells/$cell/resources-idle-recovery/obi-metrics.prom" \
+      --arg before_ownership "cells/$cell/resources-before/obi-bpf-fd-ownership.txt" \
+      --arg recovery_ownership "cells/$cell/resources-idle-recovery/obi-bpf-fd-ownership.txt" \
+      --arg before_process "cells/$cell/resources-before/obi-proc.txt" \
+      --arg recovery_process "cells/$cell/resources-idle-recovery/obi-proc.txt" '
+        {
+          cell: $cell,
+          status: "partial",
+          result: "not_evaluated",
+          data_status: "unavailable",
+          descriptive_result: "not_available",
+          scope: "host_global_java_remote_par_superset",
+          ownership_attribution: false,
+          reason: "required_bound_obi_process_sample_unavailable_or_malformed",
+          sources: {before: $before, idle_recovery: $recovery},
+          ownership_sources: {
+            before: $before_ownership,
+            idle_recovery: $recovery_ownership
+          },
+          process_sources: {
+            before: $before_process,
+            idle_recovery: $recovery_process
+          }
         }
       '
     return 0
@@ -4166,8 +4586,16 @@ java_bridge_map_growth_observation() {
     --arg cell "$cell" \
     --arg before_source "cells/$cell/resources-before/obi-metrics.prom" \
     --arg recovery_source "cells/$cell/resources-idle-recovery/obi-metrics.prom" \
+    --arg before_ownership_source "cells/$cell/resources-before/obi-bpf-fd-ownership.txt" \
+    --arg recovery_ownership_source "cells/$cell/resources-idle-recovery/obi-bpf-fd-ownership.txt" \
+    --arg before_process_source "cells/$cell/resources-before/obi-proc.txt" \
+    --arg recovery_process_source "cells/$cell/resources-idle-recovery/obi-proc.txt" \
     --argjson before "$before_json" \
-    --argjson recovery "$recovery_json" '
+    --argjson recovery "$recovery_json" \
+    --argjson before_owner "$before_owner" \
+    --argjson recovery_owner "$recovery_owner" \
+    --argjson before_process "$before_process" \
+    --argjson recovery_process "$recovery_process" '
       def rows_valid($rows):
         ($rows | length) > 0 and
         all($rows[];
@@ -4188,9 +4616,18 @@ java_bridge_map_growth_observation() {
           .[($row.map_id | tostring)].map_type = $row.map_type |
           .[($row.map_id | tostring)][$row.metric] = $row.value
         );
-      (indexed($before)) as $before_index |
-      (indexed($recovery)) as $recovery_index |
-      if (rows_valid($before) and rows_valid($recovery) and
+      ([$before[] |
+        .map_id as $id |
+        select($before_owner.map_ids | index($id))]) as $owned_before |
+      ([$recovery[] |
+        .map_id as $id |
+        select($recovery_owner.map_ids | index($id))]) as $owned_recovery |
+      (indexed($owned_before)) as $before_index |
+      (indexed($owned_recovery)) as $recovery_index |
+      if ($before_owner == $recovery_owner and
+          $before_process == $recovery_process and
+          ($before_owner | del(.descriptors, .map_ids, .program_ids)) == $before_process and
+          rows_valid($owned_before) and rows_valid($owned_recovery) and
           ($before_index | keys | sort) == ($recovery_index | keys | sort) and
           ([($before_index | keys[]) as $id |
             $before_index[$id].map_name == $recovery_index[$id].map_name and
@@ -4212,17 +4649,29 @@ java_bridge_map_growth_observation() {
         ] as $maps |
         {
           cell: $cell,
-          status: "partial",
-          result: "not_evaluated",
+          status: "complete",
+          result: (
+            if all($maps[]; .delta <= .maximum_delta)
+            then "passed" else "failed" end
+          ),
           data_status: "complete",
           descriptive_result: (
             if all($maps[]; .delta <= .maximum_delta)
             then "stable_or_decreased" else "growth_observed" end
           ),
-          scope: "host_global_java_remote_par_superset",
-          ownership_attribution: false,
+          scope: "exact_obi_process_open_bpf_map_ids",
+          ownership_attribution: true,
+          ownership: $before_owner,
           maps: $maps,
-          sources: {before: $before_source, idle_recovery: $recovery_source}
+          sources: {before: $before_source, idle_recovery: $recovery_source},
+          ownership_sources: {
+            before: $before_ownership_source,
+            idle_recovery: $recovery_ownership_source
+          },
+          process_sources: {
+            before: $before_process_source,
+            idle_recovery: $recovery_process_source
+          }
         }
       else
         {
@@ -4233,8 +4682,16 @@ java_bridge_map_growth_observation() {
           descriptive_result: "series_set_changed_or_was_duplicate",
           scope: "host_global_java_remote_par_superset",
           ownership_attribution: false,
-          reason: "java_bridge_map_series_changed_or_was_duplicate_or_incomplete",
-          sources: {before: $before_source, idle_recovery: $recovery_source}
+          reason: "owned_java_bridge_map_series_or_bpf_fd_roster_changed_or_was_duplicate_or_incomplete",
+          sources: {before: $before_source, idle_recovery: $recovery_source},
+          ownership_sources: {
+            before: $before_ownership_source,
+            idle_recovery: $recovery_ownership_source
+          },
+          process_sources: {
+            before: $before_process_source,
+            idle_recovery: $recovery_process_source
+          }
         }
       end
     '
@@ -4269,7 +4726,11 @@ resource_growth_gate() {
       observation="$(java_bridge_map_growth_observation \
         "$cell" \
         "$cell_dir/resources-before/obi-metrics.prom" \
-        "$cell_dir/resources-idle-recovery/obi-metrics.prom")" || return 1
+        "$cell_dir/resources-idle-recovery/obi-metrics.prom" \
+        "$cell_dir/resources-before/obi-bpf-fd-ownership.txt" \
+        "$cell_dir/resources-idle-recovery/obi-bpf-fd-ownership.txt" \
+        "$cell_dir/resources-before/obi-proc.txt" \
+        "$cell_dir/resources-idle-recovery/obi-proc.txt")" || return 1
       map_observations+=("$observation")
     fi
   done
@@ -4292,9 +4753,18 @@ resource_growth_gate() {
           )
         },
         map_dimension: {
-          status: "partial",
-          result: "not_evaluated",
-          reason: "host_global_metrics_do_not_attribute_visible_java_remote_par_series_to_this_demo_project",
+          status: (if all($maps[]; .status == "complete") then "complete" else "partial" end),
+          result: (
+            if any($maps[]; .status == "complete" and .result == "failed") then "failed"
+            elif any($maps[]; .status != "complete") then "not_evaluated"
+            else "passed"
+            end
+          ),
+          reason: (
+            if all($maps[]; .status == "complete") then null
+            else "stable_exact_obi_bpf_fd_ownership_is_required_for_every_map_sample"
+            end
+          ),
           descriptive_data_status: (
             if all($maps[]; .data_status == "complete") then "complete"
             elif any($maps[]; .data_status == "unavailable") then "unavailable"
@@ -4303,16 +4773,26 @@ resource_growth_gate() {
           )
         },
         map_sampling_scope: {
-          metric_scope: "host_global_java_remote_par_superset",
-          ownership_attribution: false,
-          descriptive_interpretation: "stable_or_decreased_applies_to_every_visible_java_remote_par_series",
-          evaluation_policy: "not_evaluated_without_project_ownership_attribution_or_clean_host_proof"
+          metric_scope: (
+            if all($maps[]; .status == "complete")
+            then "exact_obi_process_open_bpf_map_ids"
+            else "host_global_java_remote_par_superset"
+            end
+          ),
+          ownership_attribution: all($maps[]; .status == "complete" and .ownership_attribution == true),
+          descriptive_interpretation: (
+            if all($maps[]; .status == "complete")
+            then "stable_or_decreased_applies_only_to_exact_obi_owned_java_remote_parent_maps"
+            else "unattributed_or_ambiguous_samples_cannot_pass_the_map_dimension"
+            end
+          ),
+          evaluation_policy: "require_stable_exact_obi_process_bpf_fd_rosters_bracketing_each_metrics_scrape"
         },
         process_observations: $processes,
         java_bridge_map_observations: $maps
       } |
       .result = (
-        if .process_dimension.result == "failed" then "failed"
+        if .process_dimension.result == "failed" or .map_dimension.result == "failed" then "failed"
         else "not_evaluated"
         end
       )
@@ -4368,6 +4848,97 @@ validate_poc_gate_shape() {
           (.reason == "required_before_or_idle_recovery_proc_sample_unavailable_or_malformed" or
             .reason == "service_container_or_process_identity_changed_between_required_samples")
         end;
+      def map_sources_are_exact:
+        .sources == {
+          before: ("cells/" + .cell + "/resources-before/obi-metrics.prom"),
+          idle_recovery: ("cells/" + .cell + "/resources-idle-recovery/obi-metrics.prom")
+        } and
+        .ownership_sources == {
+          before: ("cells/" + .cell + "/resources-before/obi-bpf-fd-ownership.txt"),
+          idle_recovery: ("cells/" + .cell + "/resources-idle-recovery/obi-bpf-fd-ownership.txt")
+        } and
+        .process_sources == {
+          before: ("cells/" + .cell + "/resources-before/obi-proc.txt"),
+          idle_recovery: ("cells/" + .cell + "/resources-idle-recovery/obi-proc.txt")
+        };
+      def map_observation_is_exact:
+        (.cell | type == "string" and length > 0) and map_sources_are_exact and
+        if .status == "complete" then
+          ((keys | sort) == [
+            "cell", "data_status", "descriptive_result", "maps", "ownership",
+            "ownership_attribution", "ownership_sources", "process_sources", "result",
+            "scope", "sources", "status"
+          ]) and
+          (.result == "passed" or .result == "failed") and
+          .data_status == "complete" and
+          (.descriptive_result == "stable_or_decreased" or
+            .descriptive_result == "growth_observed") and
+          .scope == "exact_obi_process_open_bpf_map_ids" and
+          .ownership_attribution == true and
+          (.ownership |
+            (keys | sort) == [
+              "container_id", "descriptors", "host_pid", "map_ids",
+              "proc_cgroup_container_binding", "proc_cgroup_sha256", "proc_start_time",
+              "program_ids"
+            ] and
+            (.container_id | test("^[0-9a-f]{64}$")) and
+            (.host_pid | positive_integer) and
+            (.proc_start_time | positive_integer) and
+            (.proc_cgroup_sha256 | test("^[0-9a-f]{64}$")) and
+            .proc_cgroup_container_binding == "full_container_id_at_non_hex_boundaries" and
+            (.descriptors |
+              length > 0 and
+              ([.[].fd] == ([.[].fd] | sort | unique)) and
+              all(.[];
+                ((keys | sort) == ["fd", "id", "kind"]) and
+                (.fd | nonnegative_integer) and
+                (.id | positive_integer) and
+                (.kind == "map_id" or .kind == "prog_id"))) and
+            (.map_ids | length > 0 and all(.[]; positive_integer) and
+              . == (sort | unique)) and
+            (.program_ids | all(.[]; positive_integer) and . == (sort | unique)) and
+            .map_ids == ([.descriptors[] | select(.kind == "map_id") | .id] | sort | unique) and
+            .program_ids == ([.descriptors[] | select(.kind == "prog_id") | .id] | sort | unique)) and
+          (.ownership as $ownership |
+            .maps | length > 0 and
+            ([.[].map_id] == ([.[].map_id] | sort | unique)) and
+            all(.[];
+              ((keys | sort) == [
+                "before_entries", "delta", "idle_recovery_entries", "map_id",
+                "map_name", "map_type", "max_entries", "maximum_delta"
+              ]) and
+              (.map_id | positive_integer) and
+              (.map_name == "java_remote_par") and
+              (.map_type | type == "string" and length > 0) and
+              (.before_entries | nonnegative_integer) and
+              (.idle_recovery_entries | nonnegative_integer) and
+              (.max_entries | positive_integer) and
+              .before_entries <= .max_entries and
+              .idle_recovery_entries <= .max_entries and
+              (.delta | type == "number" and isfinite and floor == .) and
+              .delta == .idle_recovery_entries - .before_entries and
+              .maximum_delta == 0 and
+              (.map_id as $id | $ownership.map_ids | index($id)) != null)) and
+          .result == (
+            if all(.maps[]; .delta <= .maximum_delta) then "passed" else "failed" end
+          )
+        else
+          ((keys | sort) == [
+            "cell", "data_status", "descriptive_result", "ownership_attribution",
+            "ownership_sources", "process_sources", "reason", "result", "scope", "sources",
+            "status"
+          ]) and
+          .status == "partial" and .result == "not_evaluated" and
+          (.data_status == "unavailable" or .data_status == "ambiguous") and
+          (.descriptive_result == "not_available" or
+            .descriptive_result == "series_set_changed_or_was_duplicate") and
+          .scope == "host_global_java_remote_par_superset" and
+          .ownership_attribution == false and
+          (.reason == "required_before_or_idle_recovery_java_bridge_map_sample_unavailable_or_malformed" or
+            .reason == "required_stable_obi_bpf_fd_ownership_sample_unavailable_or_malformed" or
+            .reason == "required_bound_obi_process_sample_unavailable_or_malformed" or
+            .reason == "owned_java_bridge_map_series_or_bpf_fd_roster_changed_or_was_duplicate_or_incomplete")
+        end;
       length == 1 and
       (.[0] |
         .schema_version == 1 and
@@ -4410,23 +4981,39 @@ validate_poc_gate_shape() {
             else .status == "partial" and .result == "not_evaluated"
             end) and
           .result == (
-            if .process_dimension.result == "failed" then "failed"
+            if .process_dimension.result == "failed" or .map_dimension.result == "failed"
+            then "failed"
             else "not_evaluated"
             end
           ) and
           (.map_dimension |
             ((keys | sort) == ["descriptive_data_status", "reason", "result", "status"]) and
-            .status == "partial" and .result == "not_evaluated" and
-            .reason == "host_global_metrics_do_not_attribute_visible_java_remote_par_series_to_this_demo_project" and
-            (.descriptive_data_status == "complete" or
-              .descriptive_data_status == "ambiguous" or
-              .descriptive_data_status == "unavailable")) and
-          .map_sampling_scope == {
-            metric_scope: "host_global_java_remote_par_superset",
-            ownership_attribution: false,
-            descriptive_interpretation: "stable_or_decreased_applies_to_every_visible_java_remote_par_series",
-            evaluation_policy: "not_evaluated_without_project_ownership_attribution_or_clean_host_proof"
-          } and
+            if .status == "complete" then
+              (.result == "passed" or .result == "failed") and
+              .reason == null and .descriptive_data_status == "complete"
+            else
+              .status == "partial" and .result == "not_evaluated" and
+              .reason == "stable_exact_obi_bpf_fd_ownership_is_required_for_every_map_sample" and
+              (.descriptive_data_status == "complete" or
+                .descriptive_data_status == "ambiguous" or
+                .descriptive_data_status == "unavailable")
+            end) and
+          (.map_sampling_scope |
+            ((keys | sort) == [
+              "descriptive_interpretation", "evaluation_policy", "metric_scope",
+              "ownership_attribution"
+            ]) and
+            .evaluation_policy ==
+              "require_stable_exact_obi_process_bpf_fd_rosters_bracketing_each_metrics_scrape" and
+            if .ownership_attribution then
+              .metric_scope == "exact_obi_process_open_bpf_map_ids" and
+              .descriptive_interpretation ==
+                "stable_or_decreased_applies_only_to_exact_obi_owned_java_remote_parent_maps"
+            else
+              .metric_scope == "host_global_java_remote_par_superset" and
+              .descriptive_interpretation ==
+                "unattributed_or_ambiguous_samples_cannot_pass_the_map_dimension"
+            end) and
           (.process_observations | type == "array" and length == 23) and
           ([.process_observations[] | [.cell, .service]] == [
             ["uninstrumented", "trace-receiver"],
@@ -4459,16 +5046,24 @@ validate_poc_gate_shape() {
             "bridge-disabled", "getsockopt-hit", "unix-hit",
             "getsockopt-w3c", "getsockopt-helper-idle"
           ]) and
-          all(.java_bridge_map_observations[];
-            .status == "partial" and .result == "not_evaluated" and
-            (.data_status == "complete" or .data_status == "ambiguous" or
-              .data_status == "unavailable") and
-            (.descriptive_result == "stable_or_decreased" or
-              .descriptive_result == "growth_observed" or
-              .descriptive_result == "series_set_changed_or_was_duplicate" or
-              .descriptive_result == "not_available") and
-            .scope == "host_global_java_remote_par_superset" and
-            .ownership_attribution == false)) and
+          all(.java_bridge_map_observations[]; map_observation_is_exact) and
+          (. as $resources |
+            all(.java_bridge_map_observations[];
+              . as $map |
+              if $map.status != "complete" then true
+              else
+                ([$resources.process_observations[] |
+                  select(.cell == $map.cell and .service == "obi" and .status == "complete")]) as $owners |
+                ($owners | length) == 1 and
+                ($owners[0] | {
+                  container_id, host_pid, proc_start_time, proc_cgroup_sha256,
+                  proc_cgroup_container_binding
+                }) ==
+                ($map.ownership | {
+                  container_id, host_pid, proc_start_time, proc_cgroup_sha256,
+                  proc_cgroup_container_binding
+                })
+              end))) and
         .unmeasured_dimensions == {
           jfr_nmt_allocation_native_direct_memory: "not_collected",
           primary_cgroupsockopt_program_cpu: "not_collected",
@@ -4500,11 +5095,14 @@ validate_supported_poc_dimensions_pass() {
       .resources.process_dimension == {status: "complete", result: "passed"} and
       all(.resources.process_observations[];
         .status == "complete" and .result == "passed") and
-      .resources.map_dimension.status == "partial" and
-      .resources.map_dimension.result == "not_evaluated" and
+      .resources.map_dimension == {
+        status: "complete", result: "passed", reason: null,
+        descriptive_data_status: "complete"
+      } and
       .resources.map_dimension.descriptive_data_status == "complete" and
       all(.resources.java_bridge_map_observations[];
-        .status == "partial" and .result == "not_evaluated" and
+        .status == "complete" and .result == "passed" and
+        .ownership_attribution == true and
         .data_status == "complete"))
   ' "$artifact" >/dev/null
 }
@@ -7560,7 +8158,7 @@ write_summary() {
         "Midpoint resource snapshots are unsynchronized point samples and do not prove full in-load coverage.",
         "Unavailable dimensions in manifest.json are not measured as zero.",
         "The process-growth dimension requires complete before and idle-recovery FD and thread samples; unavailable samples cannot pass that dimension.",
-        "Java bridge map samples are a host-global, unattributed superset. Stable samples remain descriptive and cannot pass the map dimension or complete the PoC gate.",
+        "Java bridge map counters are evaluated only when both scrapes are bracketed by the same exact OBI process identity and open BPF FD roster; unrelated host-global map IDs are excluded.",
         "docker-daemon.json proves only that the selected endpoint was a stable existing non-symlink Unix socket; it does not prove where the daemon process runs.",
         "Each available process sample separately binds the exact inspected container ID to bounded local procfs cgroup, PID-start-time, and cgroup-digest evidence.",
         "A passed summary status means the harness completed successfully; poc-gates.json remains partial and is not issue-acceptance evidence.",

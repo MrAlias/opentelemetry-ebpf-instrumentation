@@ -1443,6 +1443,26 @@ run_benchmark_with_fake_bound_proc() {
         printf "stat=fixture-process-stat\n"
       } >"$output"
     }
+    capture_bpf_fd_ownership() {
+      local -r identity_file="$1"
+      local -r output="$2"
+      local container_id=""
+      local host_pid=""
+      container_id="$(identity_field "$identity_file" container_id)" || return 1
+      host_pid="$(identity_field "$identity_file" host_pid)" || return 1
+      {
+        printf "status=available\n"
+        printf "container_id=%s\n" "$container_id"
+        printf "host_pid=%s\n" "$host_pid"
+        printf "proc_start_time=123456\n"
+        printf "proc_cgroup_sha256=%064d\n" 0
+        printf "proc_cgroup_container_binding=%s\n" \
+          "$PROC_CGROUP_CONTAINER_BINDING"
+        printf "fd=4 map_id=41\n"
+        printf "fd=5 prog_id=71\n"
+        printf "fd=6 map_id=41\n"
+      } >"$output"
+    }
     trap '\''on_exit "$?"'\'' EXIT
     trap '\''exit 130'\'' INT TERM
     main "$@"
@@ -1997,6 +2017,117 @@ test_proc_snapshot_requires_container_starttime_and_cgroup_identity() (
   capture_proc_snapshot_from_root "$identity" "$snapshot" "$proc_root"
   grep -Fxq status=unavailable "$snapshot" || {
     printf 'process snapshot accepted cgroup identity drift\n' >&2
+    return 1
+  }
+)
+
+test_bpf_fd_ownership_requires_bound_stable_proc_identity() (
+  local -r fixture="$TEST_TMP_DIR/bpf-fd-ownership"
+  local -r proc_root="$fixture/proc"
+  local -r pid=4343
+  local -r container_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  local -r identity="$fixture/identity.txt"
+  local -r ownership="$fixture/ownership.txt"
+  local current=""
+  local start_time=""
+  local cgroup_sha256=""
+  local binding=""
+  local field=0
+
+  mkdir -p -- "$proc_root/$pid/fd" "$proc_root/$pid/fdinfo" "$proc_root/$pid/task"
+  touch -- "$proc_root/$pid/task/$pid"
+  for field in 3 4 5 6; do
+    ln -s -- /dev/null "$proc_root/$pid/fd/$field"
+  done
+  {
+    printf '%s (fixture process) S' "$pid"
+    for ((field = 1; field <= 18; field++)); do
+      printf ' 1'
+    done
+    printf ' 888\n'
+  } >"$proc_root/$pid/stat"
+  printf 'Name:\tfixture\nThreads:\t1\n' >"$proc_root/$pid/status"
+  printf '0::/system.slice/docker-%s.scope\n' "$container_id" \
+    >"$proc_root/$pid/cgroup"
+  printf 'pos:\t0\nflags:\t0100000\n' >"$proc_root/$pid/fdinfo/3"
+  printf 'pos:\t0\nflags:\t02000002\nmap_id:\t41\n' >"$proc_root/$pid/fdinfo/4"
+  printf 'pos:\t0\nflags:\t02000002\nprog_id:\t71\n' >"$proc_root/$pid/fdinfo/5"
+  printf 'pos:\t0\nflags:\t02000002\nmap_id:\t41\n' >"$proc_root/$pid/fdinfo/6"
+  reset_options
+  resolve_benchmark_identity_tools
+  current="$(proc_identity_from_root "$proc_root" "$pid" "$container_id")" || return 1
+  read -r start_time cgroup_sha256 binding <<<"$current" || return 1
+  {
+    printf 'service=obi\n'
+    printf 'container_id=%s\n' "$container_id"
+    printf 'host_pid=%s\n' "$pid"
+    printf 'proc_start_time=%s\n' "$start_time"
+    printf 'proc_cgroup_sha256=%s\n' "$cgroup_sha256"
+    printf 'proc_cgroup_container_binding=%s\n' "$binding"
+    printf 'project=fixture\n'
+    printf 'owner_sentinel=acceptance-demo-v1\n'
+  } >"$identity"
+  capture_bpf_fd_ownership_from_root "$identity" "$ownership" "$proc_root"
+  jq -e '
+    .container_id == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" and
+    .host_pid == 4343 and .proc_start_time == 888 and
+    .proc_cgroup_container_binding == "full_container_id_at_non_hex_boundaries" and
+    .descriptors == [
+      {fd: 4, kind: "map_id", id: 41},
+      {fd: 5, kind: "prog_id", id: 71},
+      {fd: 6, kind: "map_id", id: 41}
+    ] and .map_ids == [41] and .program_ids == [71]
+  ' < <(bpf_fd_ownership_json "$ownership") >/dev/null || {
+    printf 'exact bound BPF FD ownership did not normalize canonically\n' >&2
+    return 1
+  }
+
+  rm -f -- "$proc_root/$pid/fd/6"
+  capture_bpf_fd_ownership_from_root "$identity" "$ownership" "$proc_root"
+  grep -Fxq 'status=unavailable' "$ownership" || {
+    printf 'BPF FD ownership accepted an fdinfo entry without a matching FD\n' >&2
+    return 1
+  }
+  ln -s -- /dev/null "$proc_root/$pid/fd/6"
+  ln -s -- /dev/null "$proc_root/$pid/fd/7"
+  capture_bpf_fd_ownership_from_root "$identity" "$ownership" "$proc_root"
+  grep -Fxq 'status=unavailable' "$ownership" || {
+    printf 'BPF FD ownership accepted an FD without matching fdinfo\n' >&2
+    return 1
+  }
+  rm -f -- "$proc_root/$pid/fd/7"
+
+  local mutation_done=false
+  head() {
+    local -r path="${*: -1}"
+
+    command head "$@" || return 1
+    if [[ "$mutation_done" == false && "$path" == "$proc_root/$pid/fdinfo/4" ]]; then
+      printf 'pos:\t0\nflags:\t02000002\nmap_id:\t42\n' >"$proc_root/$pid/fdinfo/4"
+      printf 'pos:\t0\nflags:\t02000002\nprog_id:\t72\n' >"$proc_root/$pid/fdinfo/5"
+      mutation_done=true
+    fi
+  }
+  capture_bpf_fd_ownership_from_root "$identity" "$ownership" "$proc_root"
+  grep -Fxq 'status=unavailable' "$ownership" || {
+    printf 'BPF FD ownership accepted a hybrid intra-capture descriptor roster\n' >&2
+    return 1
+  }
+  unset -f head
+  printf 'pos:\t0\nflags:\t02000002\nmap_id:\t41\n' >"$proc_root/$pid/fdinfo/4"
+  printf 'pos:\t0\nflags:\t02000002\nprog_id:\t71\n' >"$proc_root/$pid/fdinfo/5"
+
+  printf 'pos:\t0\nmap_id:\t41\nmap_id:\t42\n' >"$proc_root/$pid/fdinfo/4"
+  capture_bpf_fd_ownership_from_root "$identity" "$ownership" "$proc_root"
+  grep -Fxq 'status=unavailable' "$ownership" || {
+    printf 'duplicate BPF FD identity was accepted\n' >&2
+    return 1
+  }
+  printf 'pos:\t0\nmap_id:\t41\n' >"$proc_root/$pid/fdinfo/4"
+  sed -i "s/^proc_start_time=.*/proc_start_time=$((start_time + 1))/" "$identity"
+  capture_bpf_fd_ownership_from_root "$identity" "$ownership" "$proc_root"
+  grep -Fxq 'status=unavailable' "$ownership" || {
+    printf 'BPF FD ownership accepted PID start-time drift\n' >&2
     return 1
   }
 )
@@ -3675,12 +3806,13 @@ test_complete_manifest_links_bounded_artifacts_and_scopes() {
     } and
     .predeclared_poc_gates.bounded_growth.unavailable_samples_fail_closed == true and
     .predeclared_poc_gates.bounded_growth.java_bridge_map_evaluation == {
-      status: "partial_not_evaluated",
-      metric_scope: "host_global_java_remote_par_superset",
-      ownership_attribution: false,
-      required_descriptive_samples: true,
+      status: "evaluated_when_exact_ownership_receipts_are_complete",
+      metric_scope: "exact_obi_process_open_bpf_map_ids",
+      ownership_attribution: true,
+      required_ownership_samples: true,
       bridge_disabled_project_map_configured_max_entries: 1,
-      completion_requirement: "project_ownership_attribution_or_clean_host_proof"
+      completion_requirement:
+        "stable_exact_obi_process_bpf_fd_rosters_bracketing_each_metrics_scrape"
     } and
     .predeclared_poc_gates.issue_acceptance_complete == false and
     .unavailable_dimensions.jfr_nmt_allocation_native_direct_memory == "not_collected" and
@@ -3815,12 +3947,35 @@ write_java_map_growth_fixture() {
   } >"$output"
 }
 
+write_bpf_fd_ownership_fixture() {
+  local -r output="$1"
+  local -r map_id="${2:-41}"
+  local -r program_id="${3:-71}"
+  local -r container_id="${4:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
+  local -r host_pid="${5:-101}"
+  local -r start_time="${6:-1010}"
+  local -r cgroup_sha256="${7:-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}"
+
+  {
+    printf 'status=available\n'
+    printf 'container_id=%s\n' "$container_id"
+    printf 'host_pid=%s\n' "$host_pid"
+    printf 'proc_start_time=%s\n' "$start_time"
+    printf 'proc_cgroup_sha256=%s\n' "$cgroup_sha256"
+    printf 'proc_cgroup_container_binding=%s\n' "$PROC_CGROUP_CONTAINER_BINDING"
+    printf 'fd=4 map_id=%s\n' "$map_id"
+    printf 'fd=5 prog_id=%s\n' "$program_id"
+    printf 'fd=6 map_id=%s\n' "$map_id"
+  } >"$output"
+}
+
 prepare_poc_gate_fixture() {
   local -r output="$1"
   local cell=""
   local service=""
   local cell_dir=""
   local pid=100
+  local obi_pid=""
   local -a services=()
 
   OUTPUT_DIR="$output"
@@ -3830,6 +3985,7 @@ prepare_poc_gate_fixture() {
   CONCURRENCY=1
   mkdir -p -- "$OUTPUT_DIR/cells"
   for cell in "${CORE_CELLS[@]}"; do
+    obi_pid=""
     write_variance_fixture_cell "$cell" 10 0 2000000000 100 50 90 100
     cell_spec "$cell" || return 1
     cell_dir="$OUTPUT_DIR/cells/$cell"
@@ -3843,9 +3999,21 @@ prepare_poc_gate_fixture() {
         "$cell_dir/resources-before/$service-proc.txt" "$pid" 20 8
       write_proc_growth_fixture \
         "$cell_dir/resources-idle-recovery/$service-proc.txt" "$pid" 20 8
+      if [[ "$service" == "obi" ]]; then
+        obi_pid="$pid"
+      fi
       ((pid += 1))
     done
     if [[ "$CELL_REQUIRES_OBI" == true ]]; then
+      [[ "$obi_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+      write_bpf_fd_ownership_fixture \
+        "$cell_dir/resources-before/obi-bpf-fd-ownership.txt" 41 71 \
+        aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+        "$obi_pid" "$((obi_pid * 10))"
+      write_bpf_fd_ownership_fixture \
+        "$cell_dir/resources-idle-recovery/obi-bpf-fd-ownership.txt" 41 71 \
+        aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+        "$obi_pid" "$((obi_pid * 10))"
       if [[ "$cell" == "bridge-disabled" ]]; then
         write_java_map_growth_fixture "$cell_dir/resources-before/obi-metrics.prom" 0 1
         write_java_map_growth_fixture "$cell_dir/resources-idle-recovery/obi-metrics.prom" 0 1
@@ -4350,23 +4518,74 @@ test_resource_growth_observations_fail_closed() (
 
   write_java_map_growth_fixture "$fixture/map-before.prom" 2 10000
   write_java_map_growth_fixture "$fixture/map-recovery.prom" 1 10000
+  write_proc_growth_fixture "$fixture/obi-proc-before.txt" 101 20 8
+  write_proc_growth_fixture "$fixture/obi-proc-recovery.txt" 101 19 7
+  write_bpf_fd_ownership_fixture "$fixture/map-before-owner.txt"
+  write_bpf_fd_ownership_fixture "$fixture/map-recovery-owner.txt"
   map_json="$(java_bridge_map_growth_observation \
-    test-cell "$fixture/map-before.prom" "$fixture/map-recovery.prom")"
+    test-cell "$fixture/map-before.prom" "$fixture/map-recovery.prom" \
+    "$fixture/map-before-owner.txt" "$fixture/map-recovery-owner.txt" \
+    "$fixture/obi-proc-before.txt" "$fixture/obi-proc-recovery.txt")"
   jq -e '
-    .status == "partial" and .result == "not_evaluated" and
+    .status == "complete" and .result == "passed" and
     .data_status == "complete" and
     .descriptive_result == "stable_or_decreased" and
-    .scope == "host_global_java_remote_par_superset" and
-    .ownership_attribution == false and
+    .scope == "exact_obi_process_open_bpf_map_ids" and
+    .ownership_attribution == true and
+    .ownership.descriptors == [
+      {fd: 4, kind: "map_id", id: 41},
+      {fd: 5, kind: "prog_id", id: 71},
+      {fd: 6, kind: "map_id", id: 41}
+    ] and
+    .ownership.map_ids == [41] and .ownership.program_ids == [71] and
     .maps == [{
       map_id: 41, map_name: "java_remote_par", map_type: "hash",
       before_entries: 2, idle_recovery_entries: 1, delta: -1,
       maximum_delta: 0, max_entries: 10000
     }]
   ' <<<"$map_json" >/dev/null || {
-    printf 'stable foreign-only Java map samples were treated as attributable gate evidence\n' >&2
+    printf 'stable exact-owner Java map samples did not pass the bounded growth gate\n' >&2
     return 1
   }
+
+  write_bpf_fd_ownership_fixture \
+    "$fixture/map-before-owner.txt" 42 71
+  map_json="$(java_bridge_map_growth_observation \
+    test-cell "$fixture/map-before.prom" "$fixture/map-recovery.prom" \
+    "$fixture/map-before-owner.txt" "$fixture/map-recovery-owner.txt" \
+    "$fixture/obi-proc-before.txt" "$fixture/obi-proc-recovery.txt")"
+  jq -e '
+    .status == "partial" and .result == "not_evaluated" and
+    .data_status == "ambiguous" and
+    .ownership_attribution == false
+  ' <<<"$map_json" >/dev/null || {
+    printf 'map samples outside the exact owned roster were allowed to pass\n' >&2
+    return 1
+  }
+  write_bpf_fd_ownership_fixture "$fixture/map-before-owner.txt"
+
+  write_bpf_fd_ownership_fixture \
+    "$fixture/map-before-owner.txt" 41 71 \
+    cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc 102 1020 \
+    dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+  write_bpf_fd_ownership_fixture \
+    "$fixture/map-recovery-owner.txt" 41 71 \
+    cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc 102 1020 \
+    dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+  map_json="$(java_bridge_map_growth_observation \
+    test-cell "$fixture/map-before.prom" "$fixture/map-recovery.prom" \
+    "$fixture/map-before-owner.txt" "$fixture/map-recovery-owner.txt" \
+    "$fixture/obi-proc-before.txt" "$fixture/obi-proc-recovery.txt")"
+  jq -e '
+    .status == "partial" and .result == "not_evaluated" and
+    .data_status == "ambiguous" and .ownership_attribution == false and
+    .reason == "owned_java_bridge_map_series_or_bpf_fd_roster_changed_or_was_duplicate_or_incomplete"
+  ' <<<"$map_json" >/dev/null || {
+    printf 'coordinated foreign BPF ownership was not rejected against the bound OBI process\n' >&2
+    return 1
+  }
+  write_bpf_fd_ownership_fixture "$fixture/map-before-owner.txt"
+  write_bpf_fd_ownership_fixture "$fixture/map-recovery-owner.txt"
 
   printf '%s\n' \
     'obi_bpf_map_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 1' \
@@ -4374,7 +4593,9 @@ test_resource_growth_observations_fail_closed() (
     'obi_bpf_map_max_entries_total{map_id="41",map_name="java_remote_par",map_type="hash"} 10000' \
     >"$fixture/map-recovery.prom"
   map_json="$(java_bridge_map_growth_observation \
-    test-cell "$fixture/map-before.prom" "$fixture/map-recovery.prom")"
+    test-cell "$fixture/map-before.prom" "$fixture/map-recovery.prom" \
+    "$fixture/map-before-owner.txt" "$fixture/map-recovery-owner.txt" \
+    "$fixture/obi-proc-before.txt" "$fixture/obi-proc-recovery.txt")"
   jq -e '.status == "partial" and .result == "not_evaluated"' \
     <<<"$map_json" >/dev/null || {
     printf 'duplicate Java map sample was misrepresented as complete\n' >&2
@@ -4389,15 +4610,18 @@ test_resource_growth_observations_fail_closed() (
       'obi_bpf_map_max_entries_total{map_id="42",map_name="java_remote_par",map_type="hash"} 1'
   } >"$fixture/map-recovery.prom"
   map_json="$(java_bridge_map_growth_observation \
-    test-cell "$fixture/map-before.prom" "$fixture/map-recovery.prom")"
+    test-cell "$fixture/map-before.prom" "$fixture/map-recovery.prom" \
+    "$fixture/map-before-owner.txt" "$fixture/map-recovery-owner.txt" \
+    "$fixture/obi-proc-before.txt" "$fixture/obi-proc-recovery.txt")"
   jq -e '
-    .status == "partial" and .result == "not_evaluated" and
-    .data_status == "ambiguous" and
-    .descriptive_result == "series_set_changed_or_was_duplicate" and
-    .scope == "host_global_java_remote_par_superset" and
-    .ownership_attribution == false
+    .status == "complete" and .result == "passed" and
+    .data_status == "complete" and
+    .descriptive_result == "stable_or_decreased" and
+    .scope == "exact_obi_process_open_bpf_map_ids" and
+    .ownership_attribution == true and
+    [.maps[].map_id] == [41]
   ' <<<"$map_json" >/dev/null || {
-    printf 'foreign or newly visible Java map series did not prevent a pass\n' >&2
+    printf 'an unrelated host-global Java map series contaminated the exact owned gate\n' >&2
     return 1
   }
 )
@@ -4450,6 +4674,13 @@ test_predeclared_poc_gate_stays_partial_and_evaluates_supported_dimensions() (
     printf 'PoC validator accepted a coordinated correctness-count forgery\n' >&2
     return 1
   fi
+  jq '
+    .resources.java_bridge_map_observations[0].ownership.host_pid += 1
+  ' "$stable_output/poc-gates.json" >"$mutated_gate"
+  if validate_poc_gate_schema "$mutated_gate"; then
+    printf 'PoC validator accepted map ownership not bound to the cell OBI process\n' >&2
+    return 1
+  fi
   jq -e '
     .status == "partial" and .result == "not_evaluated" and
     .correctness.observed_failures == 0 and
@@ -4465,20 +4696,22 @@ test_predeclared_poc_gate_stays_partial_and_evaluates_supported_dimensions() (
     .resources.status == "partial" and .resources.result == "not_evaluated" and
     .resources.process_dimension == {status: "complete", result: "passed"} and
     .resources.map_dimension == {
-      status: "partial",
-      result: "not_evaluated",
-      reason: "host_global_metrics_do_not_attribute_visible_java_remote_par_series_to_this_demo_project",
+      status: "complete",
+      result: "passed",
+      reason: null,
       descriptive_data_status: "complete"
     } and
     .resources.map_sampling_scope == {
-      metric_scope: "host_global_java_remote_par_superset",
-      ownership_attribution: false,
-      descriptive_interpretation: "stable_or_decreased_applies_to_every_visible_java_remote_par_series",
-      evaluation_policy: "not_evaluated_without_project_ownership_attribution_or_clean_host_proof"
+      metric_scope: "exact_obi_process_open_bpf_map_ids",
+      ownership_attribution: true,
+      descriptive_interpretation:
+        "stable_or_decreased_applies_only_to_exact_obi_owned_java_remote_parent_maps",
+      evaluation_policy:
+        "require_stable_exact_obi_process_bpf_fd_rosters_bracketing_each_metrics_scrape"
     } and
     .resources.java_bridge_map_observations[0].cell == "bridge-disabled" and
-    .resources.java_bridge_map_observations[0].status == "partial" and
-    .resources.java_bridge_map_observations[0].result == "not_evaluated" and
+    .resources.java_bridge_map_observations[0].status == "complete" and
+    .resources.java_bridge_map_observations[0].result == "passed" and
     .resources.java_bridge_map_observations[0].data_status == "complete" and
     .resources.java_bridge_map_observations[0].descriptive_result == "stable_or_decreased" and
     .resources.java_bridge_map_observations[0].maps == [{
@@ -4487,9 +4720,19 @@ test_predeclared_poc_gate_stays_partial_and_evaluates_supported_dimensions() (
       maximum_delta: 0, max_entries: 1
     }] and
     all(.resources.java_bridge_map_observations[];
-      .scope == "host_global_java_remote_par_superset" and
-      .ownership_attribution == false and
-      .status == "partial" and .result == "not_evaluated") and
+      .scope == "exact_obi_process_open_bpf_map_ids" and
+      .ownership_attribution == true and
+      .process_sources == {
+        before: ("cells/" + .cell + "/resources-before/obi-proc.txt"),
+        idle_recovery: ("cells/" + .cell + "/resources-idle-recovery/obi-proc.txt")
+      } and
+      .ownership.descriptors == [
+        {fd: 4, kind: "map_id", id: 41},
+        {fd: 5, kind: "prog_id", id: 71},
+        {fd: 6, kind: "map_id", id: 41}
+      ] and
+      .ownership.map_ids == [41] and .ownership.program_ids == [71] and
+      .status == "complete" and .result == "passed") and
     .issue_acceptance_complete == false and
     .unmeasured_dimensions == {
       jfr_nmt_allocation_native_direct_memory: "not_collected",
@@ -4541,7 +4784,7 @@ test_predeclared_poc_gate_stays_partial_and_evaluates_supported_dimensions() (
     .resources.map_dimension == {
       status: "partial",
       result: "not_evaluated",
-      reason: "host_global_metrics_do_not_attribute_visible_java_remote_par_series_to_this_demo_project",
+      reason: "stable_exact_obi_bpf_fd_ownership_is_required_for_every_map_sample",
       descriptive_data_status: "unavailable"
     } and
     (.resources.java_bridge_map_observations[] |
@@ -4725,9 +4968,9 @@ test_summary_resource_scope_is_independent_of_nonresource_failures() (
         result: "not_evaluated",
         process_fd_threads: {status: "complete", result: "passed"},
         java_bridge_map: {
-          status: "partial",
-          result: "not_evaluated",
-          reason: "host_global_metrics_do_not_attribute_visible_java_remote_par_series_to_this_demo_project",
+          status: "complete",
+          result: "passed",
+          reason: null,
           descriptive_data_status: "complete"
         }
       })
@@ -4743,9 +4986,9 @@ test_summary_resource_scope_is_independent_of_nonresource_failures() (
       result: "failed",
       process_fd_threads: {status: "complete", result: "failed"},
       java_bridge_map: {
-        status: "partial",
-        result: "not_evaluated",
-        reason: "host_global_metrics_do_not_attribute_visible_java_remote_par_series_to_this_demo_project",
+        status: "complete",
+        result: "passed",
+        reason: null,
         descriptive_data_status: "complete"
       }
     }
@@ -6201,9 +6444,9 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
       result: "not_evaluated",
       process_fd_threads: {status: "complete", result: "passed"},
       java_bridge_map: {
-        status: "partial",
-        result: "not_evaluated",
-        reason: "host_global_metrics_do_not_attribute_visible_java_remote_par_series_to_this_demo_project",
+        status: "complete",
+        result: "passed",
+        reason: null,
         descriptive_data_status: "complete"
       }
     } and
@@ -6235,9 +6478,9 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
   jq -e '
     .status == "partial" and .result == "not_evaluated" and
     .issue_acceptance_complete == false and
-    .resources.map_dimension.status == "partial" and
-    .resources.map_dimension.result == "not_evaluated" and
-    .resources.map_sampling_scope.ownership_attribution == false and
+    .resources.map_dimension.status == "complete" and
+    .resources.map_dimension.result == "passed" and
+    .resources.map_sampling_scope.ownership_attribution == true and
     (.resources.java_bridge_map_observations[] |
       select(.cell == "bridge-disabled") |
       .data_status == "complete" and
@@ -6248,9 +6491,11 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
         maximum_delta: 0, max_entries: 1
       }]) and
     all(.resources.java_bridge_map_observations[];
-      .status == "partial" and .result == "not_evaluated")
+      .status == "complete" and .result == "passed" and
+      .scope == "exact_obi_process_open_bpf_map_ids" and
+      .ownership_attribution == true)
   ' "$output/poc-gates.json" >/dev/null || {
-    printf 'hermetic run allowed host-global map samples to complete the PoC gate\n' >&2
+    printf 'hermetic run did not bind Java map samples to the exact OBI process\n' >&2
     return 1
   }
   jq -e '
@@ -6878,6 +7123,12 @@ main() {
     printf 'benchmark.sh council repair tests passed\n'
     return 0
   fi
+  if [[ "${BENCHMARK_TEST_ONLY:-}" == "resource-ownership" ]]; then
+    test_bpf_fd_ownership_requires_bound_stable_proc_identity
+    test_resource_growth_observations_fail_closed
+    printf 'benchmark.sh resource ownership tests passed\n'
+    return 0
+  fi
   test_parser_defaults_and_boundaries
   test_lifecycle_tool_paths_must_be_absolute_regular
   test_lifecycle_tool_resolution_rejects_relative_paths
@@ -6887,6 +7138,7 @@ main() {
   test_manifest_bootstrap_survives_second_locality_query_failure
   test_benchmark_documentation_binds_partial_status_to_mralias_issue
   test_proc_snapshot_requires_container_starttime_and_cgroup_identity
+  test_bpf_fd_ownership_requires_bound_stable_proc_identity
   test_make_compiler_resolution_honors_and_pins_inherited_cc
   test_native_make_environment_and_staging_are_hermetic
   test_native_source_state_rejects_dirty_and_mutating_inputs

@@ -2,7 +2,7 @@
 
 Status: **partial — the core application harness and bounded/native fixtures
 are implemented, but no retained full application run completes the
-native-memory and attributable map-growth acceptance evidence**
+native-memory, BPF CPU, and contention acceptance evidence**
 
 The retained benchmark evidence remains partial and does not close the open
 [MrAlias/opentelemetry-ebpf-instrumentation issue #37](https://github.com/MrAlias/opentelemetry-ebpf-instrumentation/issues/37).
@@ -33,16 +33,18 @@ and bounded process FD/thread growth from the before and idle-recovery samples.
 Unavailable required process samples fail that process dimension closed, and
 unavailable descriptive map samples prevent successful harness completion.
 
-The file does not claim a complete PoC result. The exported
-`java_remote_par` map series are host-global and carry no demo-project ownership
-label. The harness retains their before/recovery deltas descriptively with
-`ownership_attribution: false`, but the map dimension and overall gate remain
-`partial`/`not_evaluated` even when every visible series is stable. The
-overall status remains `partial` and its result becomes `failed` if a supported
-correctness, performance, or process-growth dimension fails; it can never be
-reported as a complete pass without attributable map evidence. The
-bridge-disabled cell still has the minimized bridge maps (maximum one entry),
-so its samples are required rather than treated as not applicable. JFR/NMT
+The file does not claim a complete PoC result. Although the exported
+`java_remote_par` series are host-global, each OBI sample now brackets the
+metrics scrape with the same exact Compose-owned container ID, host PID,
+PID start time, cgroup digest, and sorted `/proc/<pid>/fdinfo` BPF map/program
+roster. The map gate evaluates only `java_remote_par` series whose numeric map
+IDs are present in that stable OBI process roster; unrelated host-global series
+are excluded, and missing, changing, malformed, or unattributed rosters fail
+the map dimension closed. The bridge-disabled cell still has the minimized
+bridge maps (maximum one entry), so its samples are required rather than
+treated as not applicable. The overall status remains `partial` and its result
+becomes `failed` if a supported correctness, performance, process-growth, or
+owned-map-growth dimension fails. JFR/NMT
 allocation, native/direct-memory growth, primary cgroup-sockopt program CPU,
 and BPF lock contention are also uncollected. A `passed` `summary.json` status
 means only that the requested harness execution completed; it is neither a
@@ -452,7 +454,12 @@ comparison, not the required primary or Unix state-map miss/timeout benchmark
 cell.
 
 Create a private parent outside the repository for the retained artifact, then
-run the harness from the repository root:
+run the harness from the repository root. The exact owned-map gate enumerates
+both `/proc/<obi-host-pid>/fd` and `/proc/<obi-host-pid>/fdinfo` for the
+root-owned OBI container process. Run these commands from a root shell unless
+the host's procfs and ptrace policy grants equivalent complete read access;
+membership in the Docker group alone is normally insufficient. An unreadable
+or incomplete roster fails closed instead of becoming zero resource use:
 
 ```bash
 benchmark_parent="$(mktemp -d)"
@@ -501,7 +508,15 @@ token boundaries. The explicit cgroup/container binding is retained in every
 available identity, snapshot, and process observation. The before and
 idle-recovery process-growth gate requires that entire identity and binding to
 match, preventing an unrelated process or a reused numeric PID from completing
-the gate. This process evidence is separate from the Unix-socket evidence.
+the gate. For OBI, each metrics scrape is additionally bracketed by ownership
+receipts. Each receipt independently enumerates the exact `/fd` and `/fdinfo`
+filename rosters twice, requires both complete FD-to-`map_id`/`prog_id`
+readings to be byte-identical, and binds the resulting descriptor-numbered
+roster to the same container ID, host PID, PID start time, and cgroup digest as
+that cell's OBI process observation. The receipts before and after the scrape
+must also be identical. Only the owned map-ID intersection enters the
+map-growth gate. This process evidence is separate from the Unix-socket
+evidence.
 
 Every core cell, including uninstrumented, bridge-disabled, W3C, and
 helper-idle, must retain one clean application source identity. Complete mode
@@ -545,10 +560,11 @@ harness instead of being dropped or converted to zero.
 
 `variance.json` is the application performance benchmark and is descriptive by
 itself; it does not establish a production SLO. `poc-gates.json` applies the
-predeclared threshold to its fixed-five-repetition medians, but its overall
-result remains partial because the map-growth dimension is not attributable.
-`summary.json` links both artifacts without turning unavailable measurements
-into zeroes or treating successful harness completion as issue acceptance.
+predeclared threshold to its fixed-five-repetition medians and evaluates the
+exact OBI-owned Java bridge maps, but its overall result remains partial while
+the other declared resource dimensions are unavailable. `summary.json` links
+both artifacts without turning unavailable measurements into zeroes or treating
+successful harness completion as issue acceptance.
 
 The optional complete mode adds native transport/provider lookup percentiles
 and bounded pressure capacity/cleanup evidence as described above. It does not
@@ -566,7 +582,7 @@ the complete matrix for the open fork issue linked above. The retained
 supplies bounded eight-worker Java-to-native and bridge/provider percentiles
 plus per-thread allocation observations. End-to-end application state-map-miss
 performance, sustained application stale/timeout/pressure performance,
-attributable map growth, native-memory evidence, CPU isolation, and run-to-run
+native-memory evidence, CPU isolation, contention evidence, and run-to-run
 variance still require separate measurement before declaring the benchmark
 issue complete. The privileged Go transport artifact, native deterministic
 fixture, and packaged-JVM record are complementary evidence; none fills those

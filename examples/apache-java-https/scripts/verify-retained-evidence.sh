@@ -33,6 +33,12 @@ readonly RAW_V3_ARCHIVE_MAX_FILES=32768
 readonly CLAIM_V1_ARCHIVE_MAX_BYTES=188416
 readonly CLAIM_V1_ARCHIVE_MAX_FILES=7
 readonly CLAIM_VERIFY_SH_SHA256='376907ef806b4fdbdc971dde6d4a6f968476c64b237900d80a80dcd8d83e6f8b'
+readonly FAULT_SECURITY_MATRIX_V1_ARCHIVE_MAX_BYTES=262144
+readonly FAULT_SECURITY_MATRIX_V1_ARCHIVE_MAX_FILES=6
+# Updated with the exact portable verifier bytes emitted by the matrix
+# projector. Keeping this pin here prevents a bundle-controlled verifier from
+# selecting a weaker public validation contract.
+readonly FAULT_SECURITY_MATRIX_VERIFY_SH_SHA256='6f8dabcca0235c585c40c85ffeb978c139eef1a51ba56c40506f61ded58bc027'
 readonly RAW_V3_JSON_MAX_BYTES=1048576
 readonly RAW_V3_PRESSURE_CONTAINER_INSPECTIONS_MAX_BYTES=32768
 readonly RAW_V3_SCENARIO_MAX_BYTES=8388608
@@ -77,8 +83,14 @@ usage() {
   printf '%s\n' \
     "Usage: $SCRIPT_NAME [--current-code] BUNDLE_DIRECTORY" \
     "       $SCRIPT_NAME --raw-v3 acceptance ABSOLUTE_RESULT_DIRECTORY" \
+    "       $SCRIPT_NAME --raw-v3 acceptance-getsockopt ABSOLUTE_RESULT_DIRECTORY" \
+    "       $SCRIPT_NAME --raw-v3 acceptance-unix ABSOLUTE_RESULT_DIRECTORY" \
+    "       $SCRIPT_NAME --raw-v3 acceptance-auto ABSOLUTE_RESULT_DIRECTORY" \
+    "       $SCRIPT_NAME --raw-v3 pid-reuse-getsockopt ABSOLUTE_RESULT_DIRECTORY" \
+    "       $SCRIPT_NAME --raw-v3 pid-reuse-unix ABSOLUTE_RESULT_DIRECTORY" \
     "       $SCRIPT_NAME --raw-v3 assertion-failure ABSOLUTE_RESULT_DIRECTORY" \
     "       $SCRIPT_NAME --claims-v1 ABSOLUTE_BUNDLE_DIRECTORY" \
+    "       $SCRIPT_NAME --fault-security-matrix-v1 ABSOLUTE_BUNDLE_DIRECTORY" \
     "" \
     "Verify one sanitized retained acceptance-evidence bundle in this Git checkout." \
     "The verifier checks the checksum manifest, canonical evidence identity, clean" \
@@ -87,7 +99,8 @@ usage() {
     "--current-code also rejects changes after that revision except retained evidence" \
     "publication and Markdown documentation in the repository's documentation locations." \
     "The raw-v3 modes validate private producer output without publishing it." \
-    "The claims-v1 mode validates one closed bounded-claim summary."
+    "The claims-v1 mode validates one closed bounded-claim summary." \
+    "The fault-security-matrix-v1 mode validates its separate six-file summary."
 }
 
 die() {
@@ -442,6 +455,70 @@ is_sha1() {
 
 is_sha256() {
   [[ "$1" =~ ^[0-9a-f]{64}$ ]]
+}
+
+raw_v3_kind_transport() {
+  local -r kind="$1"
+
+  case "$kind" in
+    acceptance|acceptance-getsockopt|assertion-failure|pid-reuse-getsockopt)
+      printf 'getsockopt\n'
+      ;;
+    acceptance-unix|pid-reuse-unix)
+      printf 'unix\n'
+      ;;
+    acceptance-auto)
+      printf 'auto\n'
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+raw_v3_kind_scenario() {
+  local -r kind="$1"
+
+  case "$kind" in
+    acceptance|acceptance-getsockopt|acceptance-unix|acceptance-auto)
+      printf 'all\n'
+      ;;
+    pid-reuse-getsockopt|pid-reuse-unix)
+      printf 'pid-reuse\n'
+      ;;
+    assertion-failure)
+      printf 'assertion-failure\n'
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+raw_v3_kind_selected_transport() {
+  local -r kind="$1"
+
+  case "$kind" in
+    acceptance-unix|pid-reuse-unix) printf 'unix\n' ;;
+    acceptance|acceptance-getsockopt|acceptance-auto|assertion-failure|\
+    pid-reuse-getsockopt)
+      # A successful current-source auto/all run necessarily selects the
+      # primary transport: its Unix security branch is deliberately restricted
+      # to a forced-Unix invocation.
+      printf 'getsockopt\n'
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+raw_v3_kind_is_full_acceptance() {
+  case "$1" in
+    acceptance|acceptance-getsockopt|acceptance-unix|acceptance-auto) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+raw_v3_kind_is_pid_reuse() {
+  case "$1" in
+    pid-reuse-getsockopt|pid-reuse-unix) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 is_safe_relative_path() {
@@ -2922,6 +2999,14 @@ validate_run_status_v3() {
 validate_raw_v3_run_status() {
   local -r kind="$1"
   local -r environment="$BUNDLE_DIR/environment.txt"
+  local expected_transport=""
+  local expected_selected_transport=""
+  local expected_scenario=""
+
+  expected_transport="$(raw_v3_kind_transport "$kind")" || return 1
+  expected_selected_transport="$(raw_v3_kind_selected_transport "$kind")" ||
+    return 1
+  expected_scenario="$(raw_v3_kind_scenario "$kind")" || return 1
 
   require_regular_file terminal-java-diagnostics.json
   require_regular_file terminal-obi-metrics.json
@@ -2938,11 +3023,18 @@ validate_raw_v3_run_status() {
       "$SCRIPT_NAME" >&2
     return 1
   }
-  jq -e '
-    .selection.requested_transport == "getsockopt" and
-    .selection.selected_transport == "getsockopt" and
+  jq -e --arg requested "$expected_transport" \
+    --arg selected "$expected_selected_transport" \
+    --arg scenario "$expected_scenario" \
+    --argjson allow_artifact "$(raw_v3_kind_is_pid_reuse "$kind" &&
+      printf 'true\n' || printf 'false\n')" '
+    .selection.scenario == $scenario and
+    .selection.requested_transport == $requested and
+    .selection.selected_transport == $selected and
     .selection.repeat_count == 1 and
-    all(.boundaries[].captures[]; .kind != "artifact")
+    (if $allow_artifact then
+      ([.boundaries[].captures[] | select(.kind == "artifact")] | length) == 1
+    else all(.boundaries[].captures[]; .kind != "artifact") end)
   ' <<<"$OBI_METRIC_BOUNDARY_INDEX_PAYLOAD" >/dev/null || {
     printf '%s: raw run-status predicate failed: fixed-boundary-selection\n' \
       "$SCRIPT_NAME" >&2
@@ -2959,7 +3051,7 @@ validate_raw_v3_run_status() {
     return 1
   }
   case "$kind" in
-    acceptance)
+    acceptance|acceptance-getsockopt|acceptance-unix|acceptance-auto)
       jq -e -s \
         --arg index_digest "$OBI_METRIC_BOUNDARY_INDEX_SHA256" '
           length == 3 and
@@ -2994,6 +3086,45 @@ validate_raw_v3_run_status() {
           "$BUNDLE_DIR/terminal-java-diagnostics.json" \
           "$BUNDLE_DIR/terminal-obi-metrics.json" >/dev/null || {
         printf '%s: raw run-status predicate failed: acceptance-envelope\n' \
+          "$SCRIPT_NAME" >&2
+        return 1
+      }
+      ;;
+    pid-reuse-getsockopt|pid-reuse-unix)
+      jq -e -s \
+        --arg index_digest "$OBI_METRIC_BOUNDARY_INDEX_SHA256" '
+          length == 3 and
+          (.[0] |
+            type == "object" and
+            keys == [
+              "acceptance_evidence", "acceptance_evidence_reason",
+              "evidence_directory", "exit_status",
+              "failure_line", "failure_stage", "java_bridge_diagnostics",
+              "java_bridge_diagnostics_reference",
+              "obi_metric_boundary_index_reference",
+              "obi_metric_boundary_index_sha256", "obi_metric_evidence",
+              "obi_metric_evidence_reference", "schema", "status"
+            ] and
+            .schema == "obi-apache-java-https-run-status-v3" and
+            .status == "passed" and .exit_status == 0 and
+            .acceptance_evidence == false and
+            .acceptance_evidence_reason == "targeted-scenario" and
+            .failure_stage == "none" and .failure_line == 0 and
+            (.evidence_directory | type == "string" and startswith("/") and
+              length >= 2 and length <= 4096 and
+              (contains("\n") or contains("\r") | not)) and
+            .java_bridge_diagnostics_reference ==
+              "terminal-java-diagnostics.json" and
+            .obi_metric_evidence_reference == "terminal-obi-metrics.json" and
+            .obi_metric_boundary_index_reference ==
+              "obi-metric-boundary-index.json" and
+            .obi_metric_boundary_index_sha256 == $index_digest) and
+          .[0].java_bridge_diagnostics == .[1] and
+          .[0].obi_metric_evidence == .[2]
+        ' "$BUNDLE_DIR/run-status.json" \
+          "$BUNDLE_DIR/terminal-java-diagnostics.json" \
+          "$BUNDLE_DIR/terminal-obi-metrics.json" >/dev/null || {
+        printf '%s: raw run-status predicate failed: pid-reuse-envelope\n' \
           "$SCRIPT_NAME" >&2
         return 1
       }
@@ -3043,6 +3174,165 @@ validate_raw_v3_run_status() {
   esac
 }
 
+validate_raw_v3_profile_boundaries() {
+  local -r kind="$1"
+  local requested_transport=""
+  local selected_transport=""
+
+  requested_transport="$(raw_v3_kind_transport "$kind")" || return 1
+  selected_transport="$(raw_v3_kind_selected_transport "$kind")" || return 1
+  if [[ "$kind" == acceptance || "$kind" == assertion-failure ]]; then
+    # The legacy getsockopt/claims-v1 profile retains its established raw
+    # predicate. Stronger per-profile applicability checks are selected only
+    # by the new explicit matrix kinds.
+    return 0
+  fi
+  if raw_v3_kind_is_pid_reuse "$kind"; then
+    jq -e --arg requested "$requested_transport" \
+      --arg selected "$selected_transport" '
+      .selection == {
+        repeat_count: 1,
+        requested_transport: $requested,
+        scenario: "pid-reuse",
+        selected_transport: $selected
+      } and
+      (.boundaries | length) == 1 and
+      (.boundaries[0] as $boundary |
+        $boundary.id == "pid-reuse" and
+        $boundary.ordinal == 1 and $boundary.state == "complete" and
+        $boundary.not_applicable_reason == null and
+        ([$boundary.captures[] |
+          select(.kind == "artifact" and .state == "captured")] |
+          length) == 1 and
+        ([$boundary.captures[] |
+          select(.kind == "artifact" and
+            .id == "pid-reuse-controller" and
+            .reference == "pid-reuse-controller.json")] | length) == 1 and
+        ([$boundary.captures[] |
+          select(.kind == "pair" and .state == "captured") |
+          [.id, .pair_reference]] | sort) == ([
+            ["basic-pid-reuse-recovery",
+              "obi-metric-pairs/basic-pid-reuse-recovery.json"],
+            ["pid-reuse-controller-window",
+              "obi-metric-pairs/pid-reuse-controller-window.json"]
+          ] | sort) and
+        $boundary.status_references == [{
+          reference: "scenario-basic-pid-reuse-recovery-status.json",
+          sha256: $boundary.status_references[0].sha256
+        }])
+    ' <<<"$OBI_METRIC_BOUNDARY_INDEX_PAYLOAD" >/dev/null
+    return
+  fi
+
+  raw_v3_kind_is_full_acceptance "$kind" || return 1
+  jq -e --arg requested "$requested_transport" \
+    --arg selected "$selected_transport" '
+    def one($id): [.boundaries[] | select(.id == $id)] |
+      if length == 1 then .[0] else error("missing boundary") end;
+    def complete($id): (one($id) | .state == "complete" and
+      .not_applicable_reason == null);
+    def na($id; $reason): (one($id) |
+      .state == "not_applicable" and .captures == [] and
+      .not_applicable_reason == $reason and
+      .status_references == [{
+        reference: ("scenario-" + $id + "-status.json"),
+        sha256: .status_references[0].sha256
+      }]);
+    .selection == {
+      repeat_count: 1,
+      requested_transport: $requested,
+      scenario: "all",
+      selected_transport: $selected
+    } and complete("security") and complete("permanent-absence") and
+    complete("restart-during-traffic") and
+    complete("helper-attach-failure") and
+    all(.boundaries[];
+      .id as $id |
+      (["primary-w3c-stale", "primary-generation-mismatch",
+        "primary-w3c-fault", "unix-w3c-stale",
+        "unix-generation-mismatch", "w3c-fault", "auto-unavailable"] |
+        index($id)) != null or
+      (.state == "complete" and .not_applicable_reason == null)) and
+    (if $requested == "getsockopt" then
+      complete("primary-w3c-stale") and
+      complete("primary-generation-mismatch") and
+      complete("primary-w3c-fault") and
+      na("unix-w3c-stale"; "requires forced Unix transport") and
+      na("unix-generation-mismatch"; "requires forced Unix transport") and
+      na("w3c-fault"; "requires forced Unix transport") and
+      na("auto-unavailable"; "requires auto transport selection")
+    elif $requested == "unix" then
+      na("primary-w3c-stale"; "requires forced getsockopt transport") and
+      na("primary-generation-mismatch";
+        "requires forced getsockopt transport") and
+      na("primary-w3c-fault"; "requires forced getsockopt transport") and
+      complete("unix-w3c-stale") and
+      complete("unix-generation-mismatch") and complete("w3c-fault") and
+      na("auto-unavailable"; "requires auto transport selection")
+    else
+      na("primary-w3c-stale"; "requires forced getsockopt transport") and
+      na("primary-generation-mismatch";
+        "requires forced getsockopt transport") and
+      na("primary-w3c-fault"; "requires forced getsockopt transport") and
+      na("unix-w3c-stale"; "requires forced Unix transport") and
+      na("unix-generation-mismatch"; "requires forced Unix transport") and
+      na("w3c-fault"; "requires forced Unix transport") and
+      complete("auto-unavailable")
+    end)
+  ' <<<"$OBI_METRIC_BOUNDARY_INDEX_PAYLOAD" >/dev/null || return 1
+
+  jq -e --arg mode "$selected_transport" '
+    .status == "passed" and .scenario == "security" and
+    .mode == (if $mode == "getsockopt" then "primary" else "unix" end) and
+    .obi_metric_boundary_ids == ["security"]
+  ' "$BUNDLE_DIR/scenario-security-status.json" >/dev/null
+}
+
+validate_raw_pid_reuse_evidence() {
+  local -r kind="$1"
+  local expected_transport=""
+  local controller='pid-reuse-controller.json'
+  local controller_stderr='pid-reuse-controller.stderr.log'
+
+  expected_transport="$(raw_v3_kind_transport "$kind")" || return 1
+  raw_v3_kind_is_pid_reuse "$kind" || return 1
+  validate_single_json_object "$controller" 16384 || return 1
+  validate_bounded_regular_file "$controller_stderr" 16384 64 || return 1
+  [[ ! -s "$BUNDLE_DIR/$controller_stderr" ]] || return 1
+  jq -e --arg transport "$expected_transport" '
+    type == "object" and
+    ((keys | sort) == ([
+      "a_reaped_before_b", "authorization_maps_agree", "different_lifetime",
+      "injected_residue_preserved", "injected_residue_rejected",
+      "jvm_a_privileges_dropped", "jvm_b_privileges_dropped",
+      "negative_status", "normal_cleanup", "obi_capabilities_distinct",
+      "obi_capabilities_nonzero", "private_artifacts_removed",
+      "private_pid_namespace", "recovery_parent_exact", "recovery_status",
+      "residue", "same_namespace_inode", "same_numeric_pid",
+      "same_numeric_tid", "same_primary_socket", "schema", "status",
+      "transport", "w3c_fail_open"
+    ] | sort)) and
+    .schema == "obi-pid-reuse-public-v1" and .status == "passed" and
+    .transport == $transport and .private_pid_namespace == true and
+    .same_namespace_inode == true and .same_numeric_pid == true and
+    .same_numeric_tid == true and .a_reaped_before_b == true and
+    .different_lifetime == true and .obi_capabilities_nonzero == true and
+    .obi_capabilities_distinct == true and
+    .authorization_maps_agree == true and
+    .jvm_a_privileges_dropped == true and
+    .jvm_b_privileges_dropped == true and
+    .normal_cleanup == "completed" and
+    .residue == "injected_after_a_reap" and .same_primary_socket == true and
+    .negative_status == (if $transport == "getsockopt" then
+      "unsupported" else "ambiguous" end) and
+    .injected_residue_rejected == true and
+    .injected_residue_preserved == true and .w3c_fail_open == true and
+    .recovery_status == "valid" and .recovery_parent_exact == true and
+    .private_artifacts_removed == true
+  ' "$BUNDLE_DIR/$controller" >/dev/null || return 1
+  validate_raw_scenario_graph basic basic-pid-reuse-recovery
+}
+
 # Select the raw pressure contract only from the authenticated producer blob.
 # Bundles made before the marker retain the legacy monitor contract; one exact
 # marker selects the ready/fill/release/post-traffic-verification contract.
@@ -3086,18 +3376,41 @@ validate_raw_source_provenance() {
   local bridge_tree_sha256=""
   local manifest_tree_sha256=""
   local expected_manifest="$TMP_DIR/raw-source-tree.manifest"
-  local expected_scenario="all"
+  local expected_scenario=""
+  local expected_transport=""
   local expected_acceptance="true"
   local expected_reason="none"
-  local expected_invocation='./examples/apache-java-https/run.sh --transport getsockopt --agent otel --tls TLSv1.3'
+  local expected_invocation=""
+  local expected_command_timeout=1200
+  local expected_readiness_timeout=90
   local invocation=""
   local pressure_contract_version=""
 
+  expected_scenario="$(raw_v3_kind_scenario "$kind")" || return 1
+  expected_transport="$(raw_v3_kind_transport "$kind")" || return 1
+  case "$kind" in
+    acceptance)
+      # Preserve the original claims-v1 producer profile byte-for-byte.
+      expected_command_timeout=180
+      expected_readiness_timeout=120
+      ;;
+    assertion-failure)
+      expected_acceptance=false
+      expected_reason='deliberate-assertion-failure,targeted-scenario'
+      expected_command_timeout=180
+      expected_readiness_timeout=120
+      ;;
+    pid-reuse-getsockopt|pid-reuse-unix)
+      expected_acceptance=false
+      expected_reason=targeted-scenario
+      ;;
+  esac
   if [[ "$kind" == assertion-failure ]]; then
-    expected_scenario="assertion-failure"
-    expected_acceptance="false"
-    expected_reason="deliberate-assertion-failure,targeted-scenario"
     expected_invocation='./examples/apache-java-https/run.sh --transport getsockopt --scenario assertion-failure'
+  elif raw_v3_kind_is_pid_reuse "$kind"; then
+    expected_invocation="./examples/apache-java-https/run.sh --transport $expected_transport --agent otel --tls TLSv1.3 --scenario pid-reuse"
+  else
+    expected_invocation="./examples/apache-java-https/run.sh --transport $expected_transport --agent otel --tls TLSv1.3"
   fi
   validate_canonical_key_value_order "$environment" \
     invocation revision dirty source_tree_sha256 source_tree_manifest_schema \
@@ -3195,7 +3508,7 @@ validate_raw_source_provenance() {
     "$(key_value "$environment" patch_identity_sha256)" =~ ^[0-9a-f]{64}$ &&
     "$(key_value "$environment" patch_identity_sha256)" == \
       "$(key_value "$source_state" patch_identity_sha256)" &&
-    "$(key_value "$environment" transport)" == getsockopt &&
+    "$(key_value "$environment" transport)" == "$expected_transport" &&
     "$(key_value "$environment" agent_distribution)" == otel &&
     "$(key_value "$environment" tls_protocol)" == TLSv1.3 &&
     "$(key_value "$environment" obi_log_level)" == info &&
@@ -3207,8 +3520,8 @@ validate_raw_source_provenance() {
     "$(key_value "$environment" architecture)" =~ ^(x86_64|aarch64)$ &&
     "$(key_value "$environment" acceptance_evidence)" == "$expected_acceptance" &&
     "$(key_value "$environment" acceptance_evidence_reason)" == "$expected_reason" &&
-    "$(key_value "$environment" command_timeout_seconds)" == 180 &&
-    "$(key_value "$environment" readiness_timeout_seconds)" == 120 &&
+    "$(key_value "$environment" command_timeout_seconds)" == "$expected_command_timeout" &&
+    "$(key_value "$environment" readiness_timeout_seconds)" == "$expected_readiness_timeout" &&
     "$(key_value "$environment" compose_project)" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ &&
     -n "$(key_value "$environment" kernel)" &&
     -n "$(key_value "$environment" openssl)" &&
@@ -3247,10 +3560,17 @@ validate_raw_source_provenance() {
 
 validate_raw_scenario_graph() {
   local -r scenario="$1"
-  local -r result="scenario-$scenario.json"
-  local -r status="scenario-$scenario-status.json"
+  local -r label="${2:-$scenario}"
+  local -r result="scenario-$label.json"
+  local -r status="scenario-$label-status.json"
   local expected_count=""
   local expected_endpoint='/api/echo'
+  local expected_selected_transport=""
+
+  expected_selected_transport="$(jq -er '.selection.selected_transport' \
+    <<<"$OBI_METRIC_BOUNDARY_INDEX_PAYLOAD")" || return 1
+  [[ "$expected_selected_transport" == getsockopt ||
+    "$expected_selected_transport" == unix ]] || return 1
 
   case "$scenario" in
     basic|timeout-retry) expected_count=1 ;;
@@ -3357,13 +3677,13 @@ validate_raw_scenario_graph() {
       "$SCRIPT_NAME" "$scenario" >&2
     return 1
   }
-  jq -e --arg scenario "$scenario" '
+  jq -e --arg scenario "$scenario" --arg label "$label" '
     keys == ["after_phase", "before_phase", "exit_status", "java_diagnostics",
       "metric_status", "obi_metric_boundary_ids", "obi_metric_evidence",
       "pressure_correlation", "receive_coordination_maps", "result",
       "scenario", "scenario_reconciliation", "status", "stderr"] and
     .status == "passed" and .scenario == $scenario and .exit_status == 0 and
-    .metric_status == 0 and .result == ("scenario-" + $scenario + ".json")
+    .metric_status == 0 and .result == ("scenario-" + $label + ".json")
   ' "$BUNDLE_DIR/$status" >/dev/null || {
     printf '%s: raw scenario predicate failed: %s-status-envelope\n' \
       "$SCRIPT_NAME" "$scenario" >&2
@@ -4147,7 +4467,8 @@ validate_raw_scenario_graph() {
         .pressure_correlation.unresolved_count == 0
       ' "$BUNDLE_DIR/$result" >/dev/null || return 1
       jq -e -s --argjson contract_version \
-        "${RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION:-0}" '
+        "${RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION:-0}" \
+        --arg expected_transport "$expected_selected_transport" '
         def count:
           type == "number" and floor == . and . >= 0 and . <= 128;
         def admission_count:
@@ -4156,7 +4477,7 @@ validate_raw_scenario_graph() {
         .[1].pressure_correlation as $status |
         $trace == $status.trace and
         ($status.bridge as $bridge |
-          $bridge.transport == "getsockopt" and
+          $bridge.transport == $expected_transport and
           ($bridge.phase_outcome_counts |
             keys == ["candidate", "inject", "retrieval", "stage"] and
             all(.[]; count) and .inject == 128 and
@@ -4727,6 +5048,12 @@ raw_pressure_delta_summary() {
   local -r expected_requests="$4"
   local maximum_admission=""
   local parsed_delta=""
+  local expected_transport=""
+
+  expected_transport="$(jq -er '.selection.selected_transport' \
+    <<<"$OBI_METRIC_BOUNDARY_INDEX_PAYLOAD")" || return 1
+  [[ "$expected_transport" == getsockopt || "$expected_transport" == unix ]] ||
+    return 1
 
   maximum_admission="$(
     raw_pressure_admission_max_events "$expected_requests"
@@ -4738,6 +5065,7 @@ raw_pressure_delta_summary() {
     -v wanted_valid="$expected_valid" \
     -v wanted_roots="$expected_roots" \
     -v wanted_requests="$expected_requests" \
+    -v expected_transport="$expected_transport" \
     -v max_admission="$maximum_admission" '
     function upstream_status(status) {
       return status == "missing" || status == "stale" ||
@@ -4802,7 +5130,7 @@ raw_pressure_delta_summary() {
         next
       }
       if (operation == "take") {
-        if (transport != "getsockopt") {
+        if (transport != expected_transport) {
           if (delta != 0) failed = 1
         } else {
           retrieval_total += delta
@@ -4835,7 +5163,7 @@ raw_pressure_delta_summary() {
         next
       }
       allowed = operation == "negotiate" && status == "missing" &&
-        transport == "getsockopt"
+        transport == expected_transport
       allowed = allowed || (operation == "cleanup" && status == "valid" &&
         transport == "tcp")
       allowed = allowed || (operation == "report" && status == "valid" &&
@@ -5036,6 +5364,7 @@ validate_raw_pressure_barrier() {
   local handoff_total=""
   local admission_overload=""
   local admission_maximum=""
+  local expected_transport=""
   local extra=""
   local -a lines=()
 
@@ -5085,6 +5414,10 @@ validate_raw_pressure_barrier() {
   roots="$(jq -er '.pressure_correlation.explicit_root_count' \
     "$BUNDLE_DIR/$result")" || return 1
   request_count="$(jq -er '.request_count' "$BUNDLE_DIR/$result")" || return 1
+  expected_transport="$(jq -er '.selection.selected_transport' \
+    <<<"$OBI_METRIC_BOUNDARY_INDEX_PAYLOAD")" || return 1
+  [[ "$expected_transport" == getsockopt || "$expected_transport" == unix ]] ||
+    return 1
   [[ "$exact_hits" =~ ^(0|[1-9][0-9]*)$ &&
     "$roots" =~ ^[1-9][0-9]*$ &&
     "$request_count" =~ ^[1-9][0-9]{0,3}$ ]] || return 1
@@ -5200,7 +5533,8 @@ validate_raw_pressure_barrier() {
     --argjson handoff "$handoff_total" \
     --argjson roots "$roots" \
     --argjson admission_overload "$admission_overload" \
-    --argjson admission_maximum "$admission_maximum" '
+    --argjson admission_maximum "$admission_maximum" \
+    --arg expected_transport "$expected_transport" '
       .pressure_correlation.barrier_reference == $barrier and
       .pressure_correlation.container_inspections == {
         reference: $inspections, sha256: $inspections_sha256,
@@ -5209,7 +5543,7 @@ validate_raw_pressure_barrier() {
       .pressure_correlation.trace.explicit_root_count == $roots and
       .pressure_correlation.trace.wrong_parent_count == 0 and
       .pressure_correlation.trace.unresolved_count == 0 and
-      .pressure_correlation.bridge.transport == "getsockopt" and
+      .pressure_correlation.bridge.transport == $expected_transport and
       .pressure_correlation.bridge.phase_outcome_counts == {
         inject: $inject, candidate: $candidate, stage: $stage,
         retrieval: $retrieval
@@ -6287,6 +6621,9 @@ raw_v3_producer_boundary_owner() {
     w3c-only-extension-disabled)
       printf 'extension-controls\n'
       ;;
+    pid-reuse-controller-window|basic-pid-reuse-recovery)
+      printf 'pid-reuse\n'
+      ;;
     *) return 1 ;;
   esac
 }
@@ -6300,7 +6637,10 @@ validate_raw_v3_terminal_private_state() {
   local diagnostics=""
 
   case "$kind" in
-    acceptance) expected_phase=extension-controls-obi-stopped ;;
+    acceptance|acceptance-getsockopt|acceptance-unix|acceptance-auto)
+      expected_phase=extension-controls-obi-stopped
+      ;;
+    pid-reuse-getsockopt|pid-reuse-unix) expected_phase=final ;;
     assertion-failure) expected_phase=basic-after ;;
     *) return 1 ;;
   esac
@@ -6428,6 +6768,165 @@ raw_v3_manifest_add_pressure_cleanup_attempts() {
       *) return 1 ;;
     esac
   done
+}
+
+# Matrix-only profiles are private inputs that are destroyed before workflow
+# publication. Their boundary journal remains the exact authority for every
+# pair, status, phase identity, Java snapshot, unavailable attestation, and
+# artifact capture. This additional closure restricts all producer support
+# files to the current run.sh naming grammar without baking transport-specific
+# dynamic retry counts into the public matrix contract.
+validate_raw_v3_matrix_closure() {
+  local -r kind="$1"
+  local relative=""
+  local leaf=""
+  local label=""
+  local expected_scenario=""
+  local actual_scenario=""
+  local -a required=(
+    source-state.txt source-tree.manifest git-status.txt bridge-build.log
+    environment.txt official-javaagent.json bridge-artifacts.json
+    bridge-artifacts.sha256 bridge-metadata.sha256 bridge-source-revision.txt
+    bridge-source-tree.sha256 certificates.json compose-resolved.yaml
+    compose-up.log apache-instrumentation-startup.prom
+    apache-instrumentation-startup.txt
+    java-selected-transport-configuration.txt host-topology.txt
+    bpftool-feature-probe.txt bpftool-maps.txt bpftool-programs.txt
+    compose-images.json container-identities.txt image-identities.txt
+    java-version.txt apache-version.txt apache-openssl-version.txt
+    obi-startup.log java-startup.log apache-startup.log
+    obi-metric-boundary-index.json .obi-metric-boundary-index.freeze
+    terminal-java-diagnostics.json terminal-obi-metrics.json run-status.json
+    .terminal-java-diagnostics.lock
+    .terminal-java-diagnostics-transition.lock
+    .terminal-java-diagnostics.freeze .last-valid-java-diagnostics.json
+    compose-ps.txt compose.log final-receiver-snapshot.json
+  )
+
+  expected_scenario="$(raw_v3_kind_scenario "$kind")" || return 1
+  for relative in "${required[@]}"; do
+    [[ -f "$BUNDLE_DIR/$relative" && ! -L "$BUNDLE_DIR/$relative" ]] ||
+      return 1
+  done
+  [[ -z "$(find -- "$BUNDLE_DIR" -mindepth 1 \
+    ! -type f ! -type d -print -quit)" ]] || return 1
+  while IFS= read -r relative; do
+    is_safe_relative_path "$relative" || return 1
+    case "$relative" in
+      phases|obi-metric-pairs|restart-control) ;;
+      phases/[a-z0-9]* )
+        [[ "$relative" =~ ^phases/[a-z0-9][a-z0-9-]{0,63}$ ]] || return 1
+        ;;
+      *) return 1 ;;
+    esac
+  done < <(find -- "$BUNDLE_DIR" -mindepth 1 -type d -printf '%P\n' |
+    LC_ALL=C sort)
+
+  while IFS= read -r relative; do
+    is_safe_relative_path "$relative" || return 1
+    case "$relative" in
+      phases/*/*)
+        [[ "$relative" =~ ^phases/[a-z0-9][a-z0-9-]{0,63}/(obi-metrics\.prom|obi-metrics\.delta|obi-identity\.json|java-diagnostics\.txt|java-diagnostics\.stderr|java-diagnostics\.delta|container-stats\.jsonl|(obi|apache-proxy|java-backend|coalesced-source|trace-receiver)-(resources|processes)\.txt)$ ]] ||
+          return 1
+        ;;
+      obi-metric-pairs/*)
+        [[ "$relative" =~ ^obi-metric-pairs/[a-z0-9][a-z0-9-]{0,63}\.json$ ]] ||
+          return 1
+        ;;
+      restart-control/*)
+        [[ "$expected_scenario" == all &&
+          "$relative" =~ ^restart-control/(events\.log|pre-stop-ready|obi-stopped|stopped-traffic-complete|obi-ready|post-restart-traffic-complete)$ ]] ||
+          return 1
+        ;;
+      */*) return 1 ;;
+      *)
+        case "$relative" in
+          source-state.txt|source-tree.manifest|git-status.txt|bridge-build.log|\
+          environment.txt|official-javaagent.json|bridge-artifacts.json|\
+          bridge-artifacts.sha256|bridge-metadata.sha256|\
+          bridge-source-revision.txt|bridge-source-tree.sha256|\
+          certificates.json|compose-resolved.yaml|compose-up.log|\
+          apache-instrumentation-*.prom|apache-instrumentation-*.txt|\
+          java-selected-transport-configuration.txt|\
+          java-auto-unavailable-transport-configuration.txt|\
+          java-transport-configuration.txt|host-topology.txt|\
+          bpftool-feature-probe.txt|bpftool-maps.txt|bpftool-programs.txt|\
+          compose-images.json|container-identities.txt|image-identities.txt|\
+          java-version.txt|apache-version.txt|apache-openssl-version.txt|\
+          obi-startup.log|java-startup.log|apache-startup.log|\
+          obi-metric-boundary-index.json|.obi-metric-boundary-index.freeze|\
+          terminal-java-diagnostics.json|terminal-obi-metrics.json|\
+          run-status.json|.terminal-java-diagnostics.lock|\
+          .terminal-java-diagnostics-transition.lock|\
+          .terminal-java-diagnostics.freeze|\
+          .last-valid-java-diagnostics.json|compose-ps.txt|compose.log|\
+          final-receiver-snapshot.json|runtime-assertions-*.txt|\
+          duplicate-suppression-*.prom|metrics-*.prom|metrics-*.delta|\
+          receive-cursor-map-*.json|receive-cursor-map-*.stderr.log|\
+          receive-cursor-map-*.log|map-pressure-*.json|\
+          map-pressure-*.stderr.log|map-pressure-*.prom|\
+          map-pressure-*.log|map-pressure-*.txt|map-pressure-*.status|\
+          delayed-otlp-*.txt|delayed-otlp-*.json|compose-*.yaml|compose-*.json|\
+          security-*.log|security-*.json|security-*.txt|security-*.cgroup|\
+          security-*.status|primary-*.txt|primary-*.log|primary-*.json|\
+          primary-*.status|primary-*.prom|primary-*.delta|\
+          w3c-match-*.txt|w3c-match-*.log|w3c-match-*.json|\
+          w3c-match-*.status|w3c-match-*.prom|w3c-match-*.delta|\
+          generation-mismatch-*.json|\
+          generation-mismatch-*.stderr.log|permanent-absence-*.txt|\
+          permanent-absence-*.log|*-response.json|*-response.normalized.json|\
+          *-response.status|restart-fault-*.txt|helper-attach-*.log|\
+          helper-attach-*.txt|helper-attach-*.prom|helper-attach-*.delta|\
+          auto-unavailable-*.txt|auto-unavailable-*.json|\
+          auto-unavailable-*.log|auto-unavailable-*.status|\
+          auto-unavailable-*.prom|auto-unavailable-*.delta|\
+          unix-generation-mismatch-*.txt|\
+          unix-generation-mismatch-*.json|\
+          unix-generation-mismatch-*.log|\
+          unix-generation-mismatch-*.status|\
+          unix-generation-mismatch-*.prom|\
+          unix-generation-mismatch-*.delta|w3c-fault-*.log|\
+          w3c-fault-*.txt|w3c-fault-*.json|w3c-fault-*.status|\
+          w3c-fault-*.prom|w3c-fault-*.delta|\
+          pid-reuse-controller.json|pid-reuse-controller.stderr.log|\
+          pid-reuse-keystore-runtime.json|scenario-*.json|\
+          scenario-*.stderr.log)
+            ;;
+          *) return 1 ;;
+        esac
+        ;;
+    esac
+  done < <(find -- "$BUNDLE_DIR" -mindepth 1 -type f -printf '%P\n' |
+    LC_ALL=C sort)
+
+  # A scenario result and stderr stream must be owned by one retained status;
+  # arbitrary lookalike scenario files cannot ride through the prefix grammar.
+  while IFS= read -r relative; do
+    leaf="${relative##*/}"
+    case "$leaf" in
+      scenario-*-status.json) continue ;;
+      scenario-*.json)
+        label="${leaf#scenario-}"
+        label="${label%.json}"
+        ;;
+      scenario-*.stderr.log)
+        label="${leaf#scenario-}"
+        label="${label%.stderr.log}"
+        ;;
+      *) continue ;;
+    esac
+    if [[ "$label" == security-primary-live-fd-victim ]]; then
+      [[ -f "$BUNDLE_DIR/scenario-primary-live-fd-security-status.json" ]] ||
+        return 1
+      continue
+    fi
+    [[ -f "$BUNDLE_DIR/scenario-$label-status.json" ]] || return 1
+    actual_scenario="$(jq -er '.scenario' \
+      "$BUNDLE_DIR/scenario-$label-status.json")" || return 1
+    [[ "$actual_scenario" =~ ^[a-z0-9][a-z0-9-]{0,95}$ ]] || return 1
+  done < <(find -- "$BUNDLE_DIR" -mindepth 1 -maxdepth 1 -type f \
+    \( -name 'scenario-*.json' -o -name 'scenario-*.stderr.log' \) \
+    -printf '%P\n' | LC_ALL=C sort)
 }
 
 validate_raw_v3_exact_closure() {
@@ -7093,7 +7592,10 @@ validate_raw_v3_bundle() {
   validate_raw_v3_terminal_private_state "$kind" || {
     die "raw terminal Java private publication state is inconsistent"
   }
-  if [[ "$kind" == acceptance ]]; then
+  validate_raw_v3_profile_boundaries "$kind" || {
+    die "raw v3 transport/scenario boundary profile is inconsistent"
+  }
+  if raw_v3_kind_is_full_acceptance "$kind"; then
     for scenario in "${stress_scenarios[@]}"; do
       validate_raw_scenario_graph "$scenario" || {
         die "raw v3 stress evidence is invalid: $scenario"
@@ -7109,6 +7611,10 @@ validate_raw_v3_bundle() {
     validate_raw_resource_recovery || {
       die "raw v3 container-leader resource recovery evidence is invalid"
     }
+  elif raw_v3_kind_is_pid_reuse "$kind"; then
+    validate_raw_pid_reuse_evidence "$kind" || {
+      die "raw v3 PID-reuse evidence is invalid or unsupported"
+    }
   else
     validate_raw_scenario_graph basic || {
       die "raw deliberate-failure control did not first pass basic"
@@ -7117,12 +7623,18 @@ validate_raw_v3_bundle() {
       die "raw deliberate-failure authority is invalid"
     }
   fi
-  validate_raw_v3_exact_closure "$kind" || {
+  if [[ "$kind" == acceptance || "$kind" == assertion-failure ]]; then
+    validate_raw_v3_exact_closure "$kind"
+  else
+    validate_raw_v3_matrix_closure "$kind"
+  fi || {
     die "raw v3 file and directory closure is invalid"
   }
-  validate_raw_handoff_admission_contract || {
-    die "raw v3 handoff-admission metric contract is invalid"
-  }
+  if ! raw_v3_kind_is_pid_reuse "$kind"; then
+    validate_raw_handoff_admission_contract || {
+      die "raw v3 handoff-admission metric contract is invalid"
+    }
+  fi
 }
 
 # The bounded public contract is implemented by one pinned portable verifier.
@@ -7135,6 +7647,19 @@ validate_claim_summary_bundle() {
   verifier_sha256="$(sha256sum <"$BUNDLE_DIR/verify.sh")" || return 1
   verifier_sha256="${verifier_sha256%% *}"
   [[ "$verifier_sha256" == "$CLAIM_VERIFY_SH_SHA256" ]] || return 1
+  find -- "$BUNDLE_DIR" -type f -exec chmod 0444 -- {} + || return 1
+  find -- "$BUNDLE_DIR" -depth -type d -exec chmod 0555 -- {} + || return 1
+  (CDPATH='' cd / && bash "$BUNDLE_DIR/verify.sh" >/dev/null)
+}
+
+validate_fault_security_matrix_bundle() {
+  local verifier_sha256=""
+
+  [[ -f "$BUNDLE_DIR/verify.sh" && ! -L "$BUNDLE_DIR/verify.sh" ]] || return 1
+  verifier_sha256="$(sha256sum <"$BUNDLE_DIR/verify.sh")" || return 1
+  verifier_sha256="${verifier_sha256%% *}"
+  [[ "$verifier_sha256" == "$FAULT_SECURITY_MATRIX_VERIFY_SH_SHA256" ]] ||
+    return 1
   find -- "$BUNDLE_DIR" -type f -exec chmod 0444 -- {} + || return 1
   find -- "$BUNDLE_DIR" -depth -type d -exec chmod 0555 -- {} + || return 1
   (CDPATH='' cd / && bash "$BUNDLE_DIR/verify.sh" >/dev/null)
@@ -7380,7 +7905,10 @@ main() {
   case "${1:-}" in
     --raw-v3)
       [[ "$REQUIRE_CURRENT_CODE" == false && $# == 3 &&
-        ( "$2" == acceptance || "$2" == assertion-failure ) ]] || {
+        ( "$2" == acceptance || "$2" == acceptance-getsockopt ||
+          "$2" == acceptance-unix || "$2" == acceptance-auto ||
+          "$2" == pid-reuse-getsockopt || "$2" == pid-reuse-unix ||
+          "$2" == assertion-failure ) ]] || {
         usage >&2
         return 2
       }
@@ -7396,6 +7924,14 @@ main() {
       VERIFICATION_MODE=claims-v1
       shift
       ;;
+    --fault-security-matrix-v1)
+      [[ "$REQUIRE_CURRENT_CODE" == false && $# == 2 ]] || {
+        usage >&2
+        return 2
+      }
+      VERIFICATION_MODE=fault-security-matrix-v1
+      shift
+      ;;
     *)
       [[ $# == 1 ]] || {
         usage >&2
@@ -7405,7 +7941,7 @@ main() {
   esac
   [[ -d "$1" && ! -L "$1" ]] || die "bundle directory is missing or a symbolic link"
   if [[ "$VERIFICATION_MODE" != tracked && "$1" != /* ]]; then
-    die "raw-v3 and claims-v1 directories must be absolute"
+    die "raw-v3 and public summary directories must be absolute"
   fi
   EXTERNAL_SOURCE_DIRECTORY="$(cd -- "$1" && pwd -P)" || {
     die "could not resolve bundle directory"
@@ -7451,6 +7987,16 @@ main() {
         "$CLAIM_V1_ARCHIVE_MAX_BYTES" 444 555
       validate_claim_summary_bundle || die "claims-v1 bundle is invalid"
       printf 'bounded claims verified: %s (checkout commit %s)\n' \
+        "$BUNDLE_NAME" "$TRUSTED_HEAD"
+      return 0
+      ;;
+    fault-security-matrix-v1)
+      snapshot_external_bundle \
+        "$BUNDLE_DIR" "$FAULT_SECURITY_MATRIX_V1_ARCHIVE_MAX_FILES" \
+        "$FAULT_SECURITY_MATRIX_V1_ARCHIVE_MAX_BYTES" 444 555
+      validate_fault_security_matrix_bundle ||
+        die "fault-security-matrix-v1 bundle is invalid"
+      printf 'bounded fault/security matrix verified: %s (checkout commit %s)\n' \
         "$BUNDLE_NAME" "$TRUSTED_HEAD"
       return 0
       ;;

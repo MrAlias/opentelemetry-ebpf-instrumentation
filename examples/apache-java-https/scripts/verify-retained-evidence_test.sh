@@ -4201,6 +4201,50 @@ create_raw_v3_acceptance_fixture() {
   write_raw_v3_run_status_fixture "$bundle" acceptance
 }
 
+upgrade_raw_v3_acceptance_to_explicit_getsockopt_fixture() {
+  local -r bundle="$1"
+
+  replace_resource_record_line "$bundle/environment.txt" \
+    'command_timeout_seconds=' 'command_timeout_seconds=1200' || return 1
+  replace_resource_record_line "$bundle/environment.txt" \
+    'readiness_timeout_seconds=' 'readiness_timeout_seconds=90' || return 1
+  replace_json_file "$bundle/scenario-security-status.json" \
+    '.mode = "primary"' || return 1
+  refresh_v3_status_digest "$bundle" scenario-security-status.json
+}
+
+test_explicit_getsockopt_raw_v3_profile() {
+  local -r repository="$1"
+  local -r verifier="$2"
+  local -r revision="$3"
+  local -r pressure_contract_version="${4:-1}"
+  local -r acceptance="$TEST_TMP_DIR/raw-v3-explicit-getsockopt"
+
+  create_raw_v3_acceptance_fixture \
+    "$repository" "$revision" "$acceptance" "$pressure_contract_version"
+  upgrade_raw_v3_acceptance_to_explicit_getsockopt_fixture "$acceptance"
+  "$verifier" --raw-v3 acceptance-getsockopt "$acceptance" >/dev/null ||
+    die 'explicit current-default getsockopt/all raw-v3 profile was rejected'
+
+  replace_json_file "$acceptance/scenario-security-status.json" \
+    '.mode = "unix"'
+  refresh_v3_status_digest "$acceptance" scenario-security-status.json
+  expect_external_v3_rejection \
+    'explicit getsockopt/all evidence with a Unix security profile' \
+    "$verifier" --raw-v3 acceptance-getsockopt "$acceptance"
+  replace_json_file "$acceptance/scenario-security-status.json" \
+    '.mode = "primary"'
+  refresh_v3_status_digest "$acceptance" scenario-security-status.json
+  replace_json_file "$acceptance/obi-metric-boundary-index.json" '
+    .boundaries |= map(if .id == "unix-w3c-stale" then
+      .not_applicable_reason = "wrong scoped reason" else . end)
+  '
+  sync_v3_index_envelopes "$acceptance"
+  expect_external_v3_rejection \
+    'explicit getsockopt/all evidence with a forged Unix applicability reason' \
+    "$verifier" --raw-v3 acceptance-getsockopt "$acceptance"
+}
+
 create_raw_v3_assertion_fixture() {
   local -r repository="$1"
   local -r revision="$2"
@@ -5629,6 +5673,8 @@ test_raw_v3_mode() {
   local digest=""
   local path=""
 
+  test_explicit_getsockopt_raw_v3_profile \
+    "$repository" "$verifier" "$revision" "$pressure_contract_version"
   create_raw_v3_acceptance_fixture \
     "$repository" "$revision" "$acceptance" "$pressure_contract_version"
   "$verifier" --raw-v3 acceptance "$acceptance" >/dev/null
@@ -6243,6 +6289,7 @@ test_pressure_contract_version_is_source_anchored() {
 }
 
 main() {
+  local -r requested_suite="${1:-all}"
   local -r evidence_id='synthetic-current-code'
   local repository=""
   local fixture_verifier=""
@@ -6252,13 +6299,21 @@ main() {
   local source_revision=""
   local rejection_output=""
 
+  [[ $# -le 1 &&
+    ( "$requested_suite" == all ||
+      "$requested_suite" == fault-security-profiles ) ]] || {
+    printf 'Usage: %s [fault-security-profiles]\n' "${BASH_SOURCE[0]##*/}" >&2
+    return 2
+  }
   check_dependencies
   assert_no_invalid_jq_generator_binders
   assert_jq_generator_context_semantics
   umask 022
   [[ -x "$VERIFIER" ]] || die "verifier is not executable: $VERIFIER"
   TEST_TMP_DIR="$(mktemp -d)"
-  test_pressure_contract_version_is_source_anchored "$VERIFIER"
+  if [[ "$requested_suite" == all ]]; then
+    test_pressure_contract_version_is_source_anchored "$VERIFIER"
+  fi
   repository="$TEST_TMP_DIR/repository"
   fixture_verifier="$repository/examples/apache-java-https/scripts/verify-retained-evidence.sh"
   bundle="$repository/examples/apache-java-https/evidence/$evidence_id"
@@ -6278,6 +6333,13 @@ main() {
   printf 'tested source\n' >"$repository/source.txt"
   commit_fixture "$repository" 'Create tested source revision'
   source_revision="$(git -C "$repository" rev-parse HEAD)"
+
+  if [[ "$requested_suite" == fault-security-profiles ]]; then
+    test_explicit_getsockopt_raw_v3_profile \
+      "$repository" "$fixture_verifier" "$source_revision" 1
+    printf 'verify-retained-evidence explicit matrix-profile tests passed\n'
+    return 0
+  fi
 
   create_bundle "$repository" "$evidence_id" "$source_revision"
   commit_fixture "$repository" 'Publish retained evidence'

@@ -315,6 +315,8 @@ func TestJavaRemoteParentStatLabelsIdentifyTransport(t *testing.T) {
 		{transport: "tcp", operation: "inject", status: "malformed"},
 		{transport: "tcp", operation: "inject", status: "overload"},
 		{transport: "tcp", operation: "inject", status: "segmented"},
+		{transport: "tcp", operation: "handoff_admission", status: "overload"},
+		{transport: "tcp", operation: "handoff_admission", status: "ambiguous"},
 	}, javaRemoteParentStatLabels)
 	assert.Equal(t, javaRemoteParentStatLabel{
 		transport: "tcp", operation: "stage", status: "valid",
@@ -325,6 +327,12 @@ func TestJavaRemoteParentStatLabelsIdentifyTransport(t *testing.T) {
 	assert.Equal(t, javaRemoteParentStatLabel{
 		transport: "tcp", operation: "inject", status: "ambiguous",
 	}, javaRemoteParentStatLabels[javaRemoteParentStatInjectAmbiguous])
+	assert.Equal(t, javaRemoteParentStatLabel{
+		transport: "tcp", operation: "handoff_admission", status: "overload",
+	}, javaRemoteParentStatLabels[javaRemoteParentStatHandoffAdmissionOverload])
+	assert.Equal(t, javaRemoteParentStatLabel{
+		transport: "tcp", operation: "handoff_admission", status: "ambiguous",
+	}, javaRemoteParentStatLabels[javaRemoteParentStatHandoffAdmissionAmbiguous])
 }
 
 func TestJavaRemoteParentReportMetricCompletesStatPublication(t *testing.T) {
@@ -334,6 +342,8 @@ func TestJavaRemoteParentReportMetricCompletesStatPublication(t *testing.T) {
 	var current [javaRemoteParentStatCount]uint64
 	current[javaRemoteParentStatStageValid] = 1
 	current[javaRemoteParentStatInjectAmbiguous] = 2
+	current[javaRemoteParentStatHandoffAdmissionOverload] = 3
+	current[javaRemoteParentStatHandoffAdmissionAmbiguous] = 4
 
 	tracer.reportJavaRemoteParentStatDeltas(previous, current)
 	tracer.reportJavaRemoteParentStatDeltas(current, current)
@@ -341,6 +351,8 @@ func TestJavaRemoteParentReportMetricCompletesStatPublication(t *testing.T) {
 	assert.Equal(t, []javaRemoteParentObservation{
 		{transport: "tcp", operation: "stage", status: "valid", count: 1},
 		{transport: "tcp", operation: "inject", status: "ambiguous", count: 2},
+		{transport: "tcp", operation: "handoff_admission", status: "overload", count: 3},
+		{transport: "tcp", operation: "handoff_admission", status: "ambiguous", count: 4},
 		{transport: "tcp", operation: "report", status: "valid", count: 1},
 		{transport: "tcp", operation: "report", status: "valid", count: 1},
 	}, reporter.observations)
@@ -363,17 +375,18 @@ func TestJavaRemoteParentMetricCardinalityContract(t *testing.T) {
 		"disabled":   {},
 	}
 	operations := map[string]struct{}{
-		"stage":        {},
-		"candidate":    {},
-		"handoff":      {},
-		"take":         {},
-		"discard":      {},
-		"negotiate":    {},
-		"availability": {},
-		"cleanup":      {},
-		"evict":        {},
-		"inject":       {},
-		"report":       {},
+		"stage":             {},
+		"candidate":         {},
+		"handoff":           {},
+		"handoff_admission": {},
+		"take":              {},
+		"discard":           {},
+		"negotiate":         {},
+		"availability":      {},
+		"cleanup":           {},
+		"evict":             {},
+		"inject":            {},
+		"report":            {},
 	}
 	statuses := map[string]struct{}{}
 	for status := javabridge.StatusUnknown; status <= javabridge.StatusDisabled; status++ {
@@ -393,10 +406,10 @@ func TestJavaRemoteParentMetricCardinalityContract(t *testing.T) {
 	}
 
 	require.Len(t, transports, 4)
-	require.Len(t, operations, 11)
+	require.Len(t, operations, 12)
 	require.Len(t, statuses, 18)
 	require.Len(t, stages, 6)
-	assert.Equal(t, 792, len(transports)*len(operations)*len(statuses))
+	assert.Equal(t, 864, len(transports)*len(operations)*len(statuses))
 
 	seen := map[javaRemoteParentStatLabel]struct{}{}
 	for _, label := range javaRemoteParentStatLabels {

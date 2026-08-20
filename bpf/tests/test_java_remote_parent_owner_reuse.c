@@ -1,6 +1,7 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -60,6 +61,9 @@ static u8 test_java_vt_delete_identity_if_matches(const pid_key_t *synthetic_own
 #define java_vt_delete_identity_if_matches test_java_vt_delete_identity_if_matches
 
 #include <maps/java_remote_parent.h>
+
+_Static_assert(k_java_remote_parent_bpf_errno_e2big == E2BIG,
+               "BPF E2BIG constant diverged from the host UAPI");
 
 static u32 test_thread_mapping_tid_from_pid_tgid(u64 id);
 static u8 test_thread_mapping_register_process_incarnation(u64 incarnation);
@@ -293,6 +297,7 @@ static int replace_terminal_after_update;
 static u64 stats[k_java_remote_parent_stat_max];
 static int handoff_claim_update_attempts;
 static int handoff_claim_update_successes;
+static long handoff_claim_forced_update_status;
 static int inject_handoff_claim_on_publish;
 static int inject_handoff_claim_on_collision;
 static int injected_handoff_claims;
@@ -920,8 +925,11 @@ static long update_handoff_claim(const java_remote_parent_handoff_key_t *key,
                                  const java_remote_parent_handoff_claim_t *value,
                                  unsigned long long flags) {
     handoff_claim_update_attempts++;
+    if (handoff_claim_forced_update_status != 0) {
+        return handoff_claim_forced_update_status;
+    }
     if (find_handoff_claim(key) || flags != BPF_NOEXIST) {
-        return -1;
+        return -EEXIST;
     }
     for (size_t i = 0; i < sizeof(handoff_claims) / sizeof(handoff_claims[0]); i++) {
         if (!handoff_claims[i].present) {
@@ -932,7 +940,7 @@ static long update_handoff_claim(const java_remote_parent_handoff_key_t *key,
             return 0;
         }
     }
-    return -1;
+    return -E2BIG;
 }
 
 static long update_ambiguity(const java_remote_parent_key_t *key,
@@ -1980,6 +1988,7 @@ static void seed_generation(const connection_info_t *connection) {
     task_update_attempts = 0;
     handoff_claim_update_attempts = 0;
     handoff_claim_update_successes = 0;
+    handoff_claim_forced_update_status = 0;
     inject_handoff_claim_on_publish = 0;
     inject_handoff_claim_on_collision = 0;
     injected_handoff_claims = 0;
@@ -2854,7 +2863,10 @@ static void test_capture_claim_race_converges_published_alias_for_claimant(void)
         injected_handoff_claims != 1 || inject_handoff_claim_on_publish ||
         aliases_at_handoff_publish != 1 || aliases_at_handoff_delete != 1 ||
         handoff_claim_update_attempts != 1 || handoff_claim_update_successes != 1 ||
-        find_ambiguity(&stored_state_key) || unexpected_update || unexpected_delete) {
+        stats[k_java_remote_parent_stat_handoff_admission_overload] != 0 ||
+        stats[k_java_remote_parent_stat_handoff_admission_ambiguous] != 0 ||
+        thread_mapping_claim.present || find_ambiguity(&stored_state_key) || unexpected_update ||
+        unexpected_delete) {
         fail("capture publisher did not converge a concurrent handoff claim");
     }
 }
@@ -2882,8 +2894,10 @@ static void test_capture_workspaces_are_guarded_and_zeroized(void) {
 
     java_remote_parent_capture_handoff(test_capture_race_token);
     if (!find_handoff(&handoff_key) || stored_state.aliases != 1 || !exact_test_alias_replay() ||
-        !alias_replay_retain_workspace_zero() || !handoff_capture_workspace_zero() ||
-        unexpected_update || unexpected_delete) {
+        stats[k_java_remote_parent_stat_handoff_admission_overload] != 0 ||
+        stats[k_java_remote_parent_stat_handoff_admission_ambiguous] != 0 ||
+        thread_mapping_claim.present || !alias_replay_retain_workspace_zero() ||
+        !handoff_capture_workspace_zero() || unexpected_update || unexpected_delete) {
         fail("handoff capture did not zeroize and release its workspaces");
     }
 }
@@ -2918,9 +2932,184 @@ static void test_full_handoff_ticket_map_rejects_capture_before_alias_publicatio
         find_handoff_claim(&target) || find_handoff(&target) || find_handoff_mutation(&target) ||
         stored_state.aliases || exact_test_alias_replay() || handoff_claim_update_attempts != 1 ||
         handoff_claim_update_successes || find_ambiguity(&stored_state_key) ||
-        !alias_replay_retain_workspace_zero() || !handoff_capture_workspace_zero() ||
-        unexpected_update || unexpected_delete) {
+        stats[k_java_remote_parent_stat_handoff_admission_overload] != 1 ||
+        stats[k_java_remote_parent_stat_handoff_admission_ambiguous] != 0 ||
+        thread_mapping_claim.present || !alias_replay_retain_workspace_zero() ||
+        !handoff_capture_workspace_zero() || unexpected_update || unexpected_delete) {
         fail("full C admission retained an alias or published H");
+    }
+}
+
+static void test_existing_handoff_ticket_is_not_reported_as_capacity_pressure(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    const java_remote_parent_handoff_key_t target =
+        java_remote_parent_handoff_key(&test_owner, test_capture_race_token);
+    handoff_claims[0] = (handoff_claim_entry_t){
+        .key = target,
+        .value =
+            {
+                .observed_monotime_ns = test_now_ns | k_java_remote_parent_handoff_open_tag,
+                .process_incarnation = test_process_incarnation,
+            },
+        .present = 1,
+    };
+    const handoff_claim_entry_t before = handoff_claims[0];
+
+    java_remote_parent_capture_handoff(test_capture_race_token);
+
+    if (memcmp(&handoff_claims[0], &before, sizeof(before)) != 0 || find_handoff(&target) ||
+        find_handoff_mutation(&target) || stored_state.aliases || exact_test_alias_replay() ||
+        handoff_claim_update_attempts != 1 || handoff_claim_update_successes ||
+        stats[k_java_remote_parent_stat_handoff_admission_overload] != 0 ||
+        stats[k_java_remote_parent_stat_handoff_admission_ambiguous] != 1 ||
+        thread_mapping_claim.present || !alias_replay_retain_workspace_zero() ||
+        !handoff_capture_workspace_zero() || unexpected_update || unexpected_delete) {
+        fail("existing C ticket was misclassified as capacity pressure");
+    }
+}
+
+static void test_noncapacity_handoff_ticket_error_is_ambiguous(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    const java_remote_parent_handoff_key_t target =
+        java_remote_parent_handoff_key(&test_owner, test_capture_race_token);
+    handoff_claim_forced_update_status = -ENOMEM;
+
+    java_remote_parent_capture_handoff(test_capture_race_token);
+
+    if (find_handoff_claim(&target) || find_handoff(&target) || find_handoff_mutation(&target) ||
+        stored_state.aliases || exact_test_alias_replay() || handoff_claim_update_attempts != 1 ||
+        handoff_claim_update_successes ||
+        stats[k_java_remote_parent_stat_handoff_admission_overload] != 0 ||
+        stats[k_java_remote_parent_stat_handoff_admission_ambiguous] != 1 ||
+        thread_mapping_claim.present || !alias_replay_retain_workspace_zero() ||
+        !handoff_capture_workspace_zero() || unexpected_update || unexpected_delete) {
+        fail("noncapacity C admission failure was misclassified as pressure");
+    }
+}
+
+static void test_enospc_handoff_ticket_error_is_ambiguous(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    const java_remote_parent_handoff_key_t target =
+        java_remote_parent_handoff_key(&test_owner, test_capture_race_token);
+    handoff_claim_forced_update_status = -ENOSPC;
+
+    java_remote_parent_capture_handoff(test_capture_race_token);
+
+    if (find_handoff_claim(&target) || find_handoff(&target) || find_handoff_mutation(&target) ||
+        stored_state.aliases || exact_test_alias_replay() || handoff_claim_update_attempts != 1 ||
+        handoff_claim_update_successes ||
+        stats[k_java_remote_parent_stat_handoff_admission_overload] != 0 ||
+        stats[k_java_remote_parent_stat_handoff_admission_ambiguous] != 1 ||
+        thread_mapping_claim.present || !alias_replay_retain_workspace_zero() ||
+        !handoff_capture_workspace_zero() || unexpected_update || unexpected_delete) {
+        fail("ENOSPC C admission was misclassified as capacity pressure");
+    }
+}
+
+static void test_handoff_ticket_readback_mismatch_is_ambiguous(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    const java_remote_parent_handoff_key_t target =
+        java_remote_parent_handoff_key(&test_owner, test_capture_race_token);
+    handoff_claim_reclaim_lookup_count = 1;
+    replace_handoff_claim_on_second_reclaim_check = 1;
+
+    java_remote_parent_capture_handoff(test_capture_race_token);
+
+    const handoff_claim_entry_t *foreign = find_handoff_claim(&target);
+    if (!foreign ||
+        foreign->value.observed_monotime_ns !=
+            ((test_now_ns | k_java_remote_parent_handoff_open_tag) + 1) ||
+        foreign->value.process_incarnation != test_process_incarnation ||
+        replace_handoff_claim_on_second_reclaim_check || find_handoff(&target) ||
+        find_handoff_mutation(&target) || stored_state.aliases || exact_test_alias_replay() ||
+        handoff_claim_update_attempts != 1 || handoff_claim_update_successes != 1 ||
+        stats[k_java_remote_parent_stat_handoff_admission_overload] != 0 ||
+        stats[k_java_remote_parent_stat_handoff_admission_ambiguous] != 1 ||
+        thread_mapping_claim.present || !alias_replay_retain_workspace_zero() ||
+        !handoff_capture_workspace_zero() || unexpected_update || unexpected_delete) {
+        fail("C readback mismatch did not preserve the foreign ticket as ambiguous");
+    }
+}
+
+static void test_relay_admission_failure_releases_claims_without_alias_mutation(
+    long update_status, u64 expected_overload, u64 expected_ambiguous) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    stored_state.aliases = 1;
+    alias_replay_entry_t *replay = seed_alias_replay(
+        &stored_state_key, test_observed_monotime_ns, test_process_incarnation, 1);
+    stored_task = (java_remote_parent_task_t){
+        .owner = test_owner,
+        .generation = test_generation,
+        .observed_monotime_ns = test_observed_monotime_ns,
+        .process_incarnation = test_process_incarnation,
+    };
+    task_present = 1;
+    const java_remote_parent_state_t state_before = stored_state;
+    const java_remote_parent_task_t task_before = stored_task;
+    const java_remote_parent_alias_replay_t replay_before = replay->value;
+    const java_remote_parent_handoff_key_t target =
+        java_remote_parent_handoff_key(&test_child, test_relay_race_token);
+    const java_remote_parent_handoff_key_t second_target =
+        java_remote_parent_handoff_key(&test_child, test_capture_race_token);
+    handoff_claim_forced_update_status = update_status;
+
+    java_remote_parent_capture_relay_for_capability(
+        &test_child, test_relay_race_token, test_process_incarnation);
+    java_remote_parent_capture_relay_for_capability(
+        &test_child, test_capture_race_token, test_process_incarnation);
+
+    if (!task_present || memcmp(&stored_task, &task_before, sizeof(task_before)) != 0 ||
+        memcmp(&stored_state, &state_before, sizeof(state_before)) != 0 ||
+        replay != exact_test_alias_replay() ||
+        memcmp(&replay->value, &replay_before, sizeof(replay_before)) != 0 ||
+        find_task_claim(&test_child) || thread_mapping_claim.present ||
+        find_handoff_claim(&target) || find_handoff(&target) || find_handoff_mutation(&target) ||
+        find_handoff_claim(&second_target) || find_handoff(&second_target) ||
+        find_handoff_mutation(&second_target) || handoff_claim_update_attempts != 2 ||
+        handoff_claim_update_successes ||
+        stats[k_java_remote_parent_stat_handoff_admission_overload] != expected_overload ||
+        stats[k_java_remote_parent_stat_handoff_admission_ambiguous] != expected_ambiguous ||
+        find_ambiguity(&stored_state_key) || !alias_replay_retain_workspace_zero() ||
+        !handoff_capture_workspace_zero() || unexpected_update || unexpected_delete) {
+        fail("relay C admission failure leaked a claim or mutated its source alias");
+    }
+}
+
+static void test_full_handoff_map_is_not_admission_pressure(void) {
+    const connection_info_t connection = {.s_port = 1234, .d_port = 443};
+    seed_generation(&connection);
+    handoffs[0] = (handoff_entry_t){
+        .key = java_remote_parent_handoff_key(&test_owner, test_cancelled_token),
+        .value = {.owner = test_owner,
+                  .generation = test_generation,
+                  .observed_monotime_ns = test_observed_monotime_ns,
+                  .process_incarnation = test_process_incarnation},
+        .present = 1,
+    };
+    handoffs[1] = handoffs[0];
+    handoffs[1].key = java_remote_parent_handoff_key(&test_owner, test_missing_token);
+    const handoff_entry_t first_before = handoffs[0];
+    const handoff_entry_t second_before = handoffs[1];
+    const java_remote_parent_handoff_key_t target =
+        java_remote_parent_handoff_key(&test_owner, test_capture_race_token);
+
+    java_remote_parent_capture_handoff(test_capture_race_token);
+
+    if (memcmp(&handoffs[0], &first_before, sizeof(first_before)) != 0 ||
+        memcmp(&handoffs[1], &second_before, sizeof(second_before)) != 0 || find_handoff(&target) ||
+        find_handoff_claim(&target) || find_handoff_mutation(&target) || stored_state.aliases ||
+        handoff_claim_update_attempts != 1 || handoff_claim_update_successes != 1 ||
+        stats[k_java_remote_parent_stat_handoff_admission_overload] != 0 ||
+        stats[k_java_remote_parent_stat_handoff_admission_ambiguous] != 0 ||
+        stats[k_java_remote_parent_stat_stage_overload] != 1 || thread_mapping_claim.present ||
+        !find_ambiguity(&stored_state_key) || !alias_replay_retain_workspace_zero() ||
+        !handoff_capture_workspace_zero() || unexpected_update || unexpected_delete) {
+        fail("full H map was misclassified as C admission pressure");
     }
 }
 
@@ -2946,7 +3135,10 @@ static void test_relay_claim_race_converges_to_existing_task_alias(void) {
         find_handoff_claim(&handoff_key) || injected_handoff_claims != 1 ||
         inject_handoff_claim_on_publish || aliases_at_handoff_publish != 2 ||
         aliases_at_handoff_delete != 2 || handoff_claim_update_attempts != 1 ||
-        handoff_claim_update_successes != 1 || find_ambiguity(&stored_state_key) ||
+        handoff_claim_update_successes != 1 ||
+        stats[k_java_remote_parent_stat_handoff_admission_overload] != 0 ||
+        stats[k_java_remote_parent_stat_handoff_admission_ambiguous] != 0 ||
+        thread_mapping_claim.present || find_ambiguity(&stored_state_key) ||
         !alias_replay_retain_workspace_zero() || !handoff_capture_workspace_zero() ||
         unexpected_update || unexpected_delete) {
         fail("relay publisher did not converge a concurrent handoff claim");
@@ -10805,6 +10997,13 @@ int main(void) {
     test_claim_status_packed_classifier_matches_reference();
     test_capture_workspaces_are_guarded_and_zeroized();
     test_full_handoff_ticket_map_rejects_capture_before_alias_publication();
+    test_existing_handoff_ticket_is_not_reported_as_capacity_pressure();
+    test_noncapacity_handoff_ticket_error_is_ambiguous();
+    test_enospc_handoff_ticket_error_is_ambiguous();
+    test_handoff_ticket_readback_mismatch_is_ambiguous();
+    test_relay_admission_failure_releases_claims_without_alias_mutation(-E2BIG, 2, 0);
+    test_relay_admission_failure_releases_claims_without_alias_mutation(-ENOSPC, 0, 2);
+    test_full_handoff_map_is_not_admission_pressure();
     test_capture_claim_race_converges_published_alias_for_claimant();
     test_relay_claim_race_converges_to_existing_task_alias();
     test_collision_claim_tombstone_drains_handoff_under_mutation();

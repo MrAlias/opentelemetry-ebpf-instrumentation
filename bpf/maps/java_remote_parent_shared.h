@@ -620,7 +620,10 @@ enum java_remote_parent_stat : u32 {
     k_java_remote_parent_stat_inject_malformed = 32,
     k_java_remote_parent_stat_inject_overload = 33,
     k_java_remote_parent_stat_inject_segmented = 34,
-    k_java_remote_parent_stat_max = 35,
+    // Append-only: userspace consumes this array by stable numeric index.
+    k_java_remote_parent_stat_handoff_admission_overload = 35,
+    k_java_remote_parent_stat_handoff_admission_ambiguous = 36,
+    k_java_remote_parent_stat_max = 37,
 };
 
 struct {

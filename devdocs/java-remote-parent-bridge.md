@@ -895,17 +895,21 @@ must restart with the current helper generation. If the facade is present but
 the bootstrap bridge lacks its snapshot method, it reports version mismatch.
 
 The OBI operation counter has four possible `transport` values (`tcp`,
-`getsockopt`, `unix`, and `disabled`), eleven possible `operation` values
-(`stage`, `candidate`, `handoff`, `inject`, `take`, `discard`, `negotiate`,
-`availability`, `cleanup`, `evict`, and `report`), and eighteen fixed status
-values. Its absolute Cartesian cardinality bound is therefore 792, while the
+`getsockopt`, `unix`, and `disabled`), twelve possible `operation` values
+(`stage`, `candidate`, `handoff`, `handoff_admission`, `inject`, `take`,
+`discard`, `negotiate`, `availability`, `cleanup`, `evict`, and `report`), and
+eighteen fixed status values. Its absolute Cartesian cardinality bound is
+therefore 864, while the
 implementation emits only the meaningful combinations. `auto` is never a
 metric label; availability records use the concrete transport. Failures before
 a fallback request can be decoded are
 reported as `negotiate`, so malformed or unauthenticated input cannot introduce
 another operation label. Local startup and transport-transition failures use
-`availability`; valid, disabled, and failure statuses describe OBI transport
-lifecycle outcomes, not the Java helper's selection or proof of request use. They
+`availability`; `handoff_admission` reports the auxiliary capacity decision,
+classifies `overload` only when the map update returns `E2BIG`, and is not part
+of upstream/retrieval conservation. Valid, disabled, and failure statuses
+describe OBI transport lifecycle outcomes, not the Java helper's selection or
+proof of request use. They
 cannot be confused with an unauthorized caller. Cleanup and fallback-map
 eviction are emitted as counted `tcp` lifecycle operations and never contain
 map keys. A `tcp/report/valid` marker is emitted after each successful BPF
@@ -916,10 +920,17 @@ trace-flag, decrypted-read, framework-miss, and transport-availability counters
 plus one take and one discard counter for each of the 14 fixed statuses. None
 of these surfaces derives a label or key from request data.
 
+The 37-entry statistics array is `PinInternal`: it is shared by the generic,
+tracepoint, Go, bridge, and primary loaders inside one OBI process, but is not a
+bpffs-persisted map carried across agent restarts. Every loader therefore ships
+the same key/value/type/size contract; a clean process restart creates the
+37-entry map, and later loaders in that process reuse that exact map rather than
+silently accepting the prior 35-entry ABI.
+
 Retained acceptance bundles from revisions before the availability rename can
 contain `operation="select"`. That historical label means OBI-side transport
 readiness or preference, never Java helper selection, and does not alter the
-current eleven-operation, 792-series bound. The [evidence
+current twelve-operation, 864-series bound. The [evidence
 index](../examples/apache-java-https/evidence/README.md) identifies those
 historical schemas; the V2 Java snapshot remains the selection source of truth.
 

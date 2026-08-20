@@ -24,16 +24,18 @@ import (
 )
 
 const (
-	javaRemoteParentStatCount               = 35
-	javaRemoteParentStatStageValid          = 0
-	javaRemoteParentStatTakeValid           = 4
-	javaRemoteParentStatTakeUnauthorized    = 8
-	javaRemoteParentStatDiscardValid        = 12
-	javaRemoteParentStatDiscardUnauthorized = 16
-	javaRemoteParentStatHandoffValid        = 25
-	javaRemoteParentStatInjectAmbiguous     = 31
-	javaRemoteParentPollInterval            = 10 * time.Second
-	javaRemoteParentReadinessPollInterval   = 100 * time.Millisecond
+	javaRemoteParentStatCount                     = 37
+	javaRemoteParentStatStageValid                = 0
+	javaRemoteParentStatTakeValid                 = 4
+	javaRemoteParentStatTakeUnauthorized          = 8
+	javaRemoteParentStatDiscardValid              = 12
+	javaRemoteParentStatDiscardUnauthorized       = 16
+	javaRemoteParentStatHandoffValid              = 25
+	javaRemoteParentStatInjectAmbiguous           = 31
+	javaRemoteParentStatHandoffAdmissionOverload  = 35
+	javaRemoteParentStatHandoffAdmissionAmbiguous = 36
+	javaRemoteParentPollInterval                  = 10 * time.Second
+	javaRemoteParentReadinessPollInterval         = 100 * time.Millisecond
 )
 
 type javaRemoteParentAvailabilityStage string
@@ -187,6 +189,8 @@ var javaRemoteParentStatLabels = [javaRemoteParentStatCount]javaRemoteParentStat
 	{transport: "tcp", operation: "inject", status: "malformed"},
 	{transport: "tcp", operation: "inject", status: "overload"},
 	{transport: "tcp", operation: "inject", status: "segmented"},
+	{transport: "tcp", operation: "handoff_admission", status: "overload"},
+	{transport: "tcp", operation: "handoff_admission", status: "ambiguous"},
 }
 
 func (p *Tracer) loadJavaRemoteParentSpecs() {

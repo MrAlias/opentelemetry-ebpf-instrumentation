@@ -90,6 +90,16 @@ func TestJavaRemoteParentSharedMapSpecsAreCompatible(t *testing.T) {
 				require.NotContains(t, specs[loader].Maps, "jrp_recv_guard")
 			}
 			for loader, spec := range specs {
+				stats := spec.Maps["java_remote_parent_stats"]
+				require.NotNil(t, stats, loader+" java_remote_parent_stats")
+				require.Equal(t, ebpf.PerCPUArray, stats.Type, loader)
+				require.Equal(t, uint32(4), stats.KeySize, loader)
+				require.Equal(t, uint32(8), stats.ValueSize, loader)
+				require.Equal(t, uint32(37), stats.MaxEntries, loader)
+				require.Zero(t, stats.Flags, loader)
+				require.Equal(t, ebpfconvenience.PinInternal, stats.Pinning, loader)
+			}
+			for loader, spec := range specs {
 				for _, mapName := range []string{
 					"java_remote_parent_connections",
 					"java_remote_parent_cookie_connections",

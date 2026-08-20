@@ -23,7 +23,11 @@
 #include <pid/pid_helpers.h>
 #include <pid/types/pid_key.h>
 
-enum { k_java_remote_parent_max_ancestry = 3 };
+enum {
+    k_java_remote_parent_max_ancestry = 3,
+    // Stable Linux UAPI errno for a BPF hash map at max_entries.
+    k_java_remote_parent_bpf_errno_e2big = 7,
+};
 
 static __always_inline u8 java_remote_parent_process_claim_equal(
     const java_thread_mapping_claim_t *left, const java_thread_mapping_claim_t *right) {
@@ -522,14 +526,22 @@ java_remote_parent_reserve_handoff_ticket(const java_remote_parent_handoff_key_t
         .observed_monotime_ns = observed | k_java_remote_parent_handoff_open_tag,
         .process_incarnation = process_capability,
     };
-    if (bpf_map_update_elem(&java_remote_parent_handoff_claims, key, local_ticket, BPF_NOEXIST) !=
-        0) {
+    const long update_status =
+        bpf_map_update_elem(&java_remote_parent_handoff_claims, key, local_ticket, BPF_NOEXIST);
+    if (update_status != 0) {
+        // Linux BPF hash updates report max_entries as E2BIG. Key contention
+        // and every other helper error stay fail-closed and visible as
+        // ambiguous rather than being relabelled as pressure.
+        java_remote_parent_stat_add(update_status == -k_java_remote_parent_bpf_errno_e2big
+                                        ? k_java_remote_parent_stat_handoff_admission_overload
+                                        : k_java_remote_parent_stat_handoff_admission_ambiguous);
         __builtin_memset(local_ticket, 0, sizeof(*local_ticket));
         return 0;
     }
     const java_remote_parent_handoff_claim_t *published =
         bpf_map_lookup_elem(&java_remote_parent_handoff_claims, key);
     if (!java_remote_parent_task_claim_equal(published, local_ticket)) {
+        java_remote_parent_stat_add(k_java_remote_parent_stat_handoff_admission_ambiguous);
         __builtin_memset(local_ticket, 0, sizeof(*local_ticket));
         return 0;
     }

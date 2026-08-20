@@ -1,5 +1,5 @@
-name: Java remote-parent RHEL packaged-JVM transport preflight
-run-name: Java remote-parent RHEL 9.6 packaged-JVM transport @ ${{ inputs.ref || github.sha }}
+name: Java remote-parent kernel compatibility preflight
+run-name: Java remote-parent kernel matrix @ ${{ inputs.ref || github.sha }}
 
 on:
   push:
@@ -12,7 +12,7 @@ on:
         type: string
 
 concurrency:
-  group: java-remote-parent-rhel-${{ github.run_id }}
+  group: java-remote-parent-kernel-${{ github.run_id }}
   cancel-in-progress: false
 
 permissions:
@@ -20,9 +20,24 @@ permissions:
 
 jobs:
   validate:
-    name: RHEL 9.6 packaged-JVM transport preflight
+    name: ${{ matrix.kernel_id }} packaged-JVM transport preflight
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # RHEL 8 remains explicitly unknown: it is not promoted into this
+        # support-claiming campaign without a passing runtime feature probe.
+        kernel_id:
+          - 5.10-lts
+          - 5.15-lts
+          - 6.1-lts
+          - 6.6-lts
+          - 6.12-lts
+          - rhel9.6
+    env:
+      CAMPAIGN_OUTPUT: testoutput/java-remote-parent-${{ matrix.kernel_id }}-kernel-sockopt
+      OBI_VM_KERNEL_ID: ${{ matrix.kernel_id }}
     steps:
       - name: Checkout selected ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -37,21 +52,20 @@ jobs:
       - name: Generate BPF artifacts
         uses: ./.github/actions/generate-bpf
         with:
-          artifact-name: java-remote-parent-bpf-${{ github.run_id }}
-          cache-key-prefix: go-build-java-remote-parent-rhel
+          artifact-name: java-remote-parent-bpf-${{ matrix.kernel_id }}-${{ github.run_id }}
+          cache-key-prefix: go-build-java-remote-parent-kernel-${{ matrix.kernel_id }}
 
       - name: Run Java bridge ABI tests
         run: |
           set -Eeuo pipefail
-          output_dir=testoutput/java-remote-parent-rhel9.6-kernel-sockopt
           test_pattern='^(TestRecord|TestRequest|TestSampled|TestVersion|TestValidRemoteParent)'
-          mkdir -p "$output_dir"
+          mkdir -p -- "$CAMPAIGN_OUTPUT"
           git rev-parse HEAD \
-            | tee "$output_dir/source-commit.txt"
+            | tee "$CAMPAIGN_OUTPUT/source-commit.txt"
           go test -list "$test_pattern" ./pkg/internal/javabridge \
             | awk '/^Test/ { print }' \
-            | tee "$output_dir/abi-selected-tests.txt"
-          mapfile -t selected_tests < "$output_dir/abi-selected-tests.txt"
+            | tee "$CAMPAIGN_OUTPUT/abi-selected-tests.txt"
+          mapfile -t selected_tests < "$CAMPAIGN_OUTPUT/abi-selected-tests.txt"
           if (( ${#selected_tests[@]} == 0 )); then
             printf '%s\n' 'ABI test pattern selected no tests' >&2
             exit 1
@@ -61,13 +75,13 @@ jobs:
             -v \
             -run "$test_pattern" \
             ./pkg/internal/javabridge 2>&1 \
-            | tee "$output_dir/abi-tests.log"
-          if grep -Eq -- '^[[:space:]]*--- SKIP:' "$output_dir/abi-tests.log"; then
+            | tee "$CAMPAIGN_OUTPUT/abi-tests.log"
+          if grep -Eq -- '^[[:space:]]*--- SKIP:' "$CAMPAIGN_OUTPUT/abi-tests.log"; then
             printf '%s\n' 'A selected ABI test skipped' >&2
             exit 1
           fi
           for test_name in "${selected_tests[@]}"; do
-            if ! grep -Fq -- "--- PASS: ${test_name} " "$output_dir/abi-tests.log"; then
+            if ! grep -Fq -- "--- PASS: ${test_name} " "$CAMPAIGN_OUTPUT/abi-tests.log"; then
               printf 'Selected ABI test did not report PASS: %s\n' "$test_name" >&2
               exit 1
             fi
@@ -85,9 +99,8 @@ jobs:
       - name: Build Java bridge probe artifact
         run: |
           set -Eeuo pipefail
-          output_dir=testoutput/java-remote-parent-rhel9.6-kernel-sockopt
-          artifact_dir="${output_dir}/java-artifacts"
-          mkdir -p "$artifact_dir"
+          artifact_dir="${CAMPAIGN_OUTPUT}/java-artifacts"
+          mkdir -p -- "$artifact_dir"
           docker build \
             --output "type=local,dest=${artifact_dir}" \
             --target export \
@@ -95,44 +108,61 @@ jobs:
             .
           test -s "${artifact_dir}/obi-java-agent.jar"
           sha256sum "${artifact_dir}/obi-java-agent.jar" \
-            | tee "${output_dir}/java-agent.sha256"
+            | tee "${CAMPAIGN_OUTPUT}/java-agent.sha256"
 
       - name: Install QEMU
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends qemu-utils qemu-system-x86
 
-      - name: Read pinned RHEL 9.6 kernel metadata
+      - name: Read digest-pinned kernel metadata
         id: kernel-metadata
         run: |
           set -Eeuo pipefail
-          lvh_tag="$(yq '.kernels[] | select(.id == "rhel9.6") | .lvh_tag' internal/test/vm/kernels.yaml)"
-          digest="$(yq '.kernels[] | select(.id == "rhel9.6") | .digest' internal/test/vm/kernels.yaml)"
-          if [[ -z "$lvh_tag" || "$lvh_tag" == "null" ]]; then
-            printf '%s\n' 'Missing rhel9.6 LVH tag' >&2
+          if [[ ! "$OBI_VM_KERNEL_ID" =~ ^[a-z0-9][a-z0-9._-]{0,31}$ ]]; then
+            printf 'Invalid kernel ID: %s\n' "$OBI_VM_KERNEL_ID" >&2
+            exit 1
+          fi
+          lvh_tag="$(OBI_KERNEL_ID="$OBI_VM_KERNEL_ID" yq \
+            '.kernels[] | select(.id == strenv(OBI_KERNEL_ID)) | .lvh_tag' \
+            internal/test/vm/kernels.yaml)"
+          digest="$(OBI_KERNEL_ID="$OBI_VM_KERNEL_ID" yq \
+            '.kernels[] | select(.id == strenv(OBI_KERNEL_ID)) | .digest' \
+            internal/test/vm/kernels.yaml)"
+          if [[ ! "$lvh_tag" =~ ^[a-z0-9][a-z0-9._-]{0,127}$ ]]; then
+            printf 'Missing or invalid LVH tag for %s: %s\n' \
+              "$OBI_VM_KERNEL_ID" "$lvh_tag" >&2
             exit 1
           fi
           if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            printf 'Invalid rhel9.6 LVH digest: %s\n' "$digest" >&2
+            printf 'Invalid LVH digest for %s: %s\n' \
+              "$OBI_VM_KERNEL_ID" "$digest" >&2
             exit 1
           fi
           printf 'lvh_tag=%s\n' "$lvh_tag" >> "$GITHUB_OUTPUT"
           printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
-          printf 'RHEL 9.6 LVH tag: %s\ndigest: %s\n' "$lvh_tag" "$digest"
+          {
+            printf 'kernel_id=%s\n' "$OBI_VM_KERNEL_ID"
+            printf 'lvh_tag=%s\n' "$lvh_tag"
+            printf 'digest=%s\n' "$digest"
+            printf '%s\n' \
+              'selection=digest_pinned_matrix' \
+              'support_decision=runtime_feature_probes_not_kernel_version'
+          } | tee "$CAMPAIGN_OUTPUT/kernel-source.properties"
 
-      - name: Resolve digest-pinned RHEL 9.6 kernel
+      - name: Resolve digest-pinned kernel
         id: kernel
         uses: ./.github/actions/setup-lvh-kernel
         with:
-          kernel-id: rhel9.6
+          kernel-id: ${{ matrix.kernel_id }}
           lvh-tag: ${{ steps.kernel-metadata.outputs.lvh_tag }}
 
-      - name: Verify resolved RHEL kernel digest
+      - name: Verify resolved kernel digest
         env:
           EXPECTED_LVH_DIGEST: ${{ steps.kernel-metadata.outputs.digest }}
         run: |
           set -Eeuo pipefail
-          buildinfo=internal/test/vm/lvh/out/vmlinuz-rhel9.6-amd64.buildinfo
+          buildinfo="internal/test/vm/lvh/out/vmlinuz-${OBI_VM_KERNEL_ID}-amd64.buildinfo"
           resolved_digest="$(yq '.lvh_digest' "$buildinfo")"
           if [[ "$resolved_digest" != "$EXPECTED_LVH_DIGEST" ]]; then
             printf 'Resolved LVH digest %s, expected %s\n' \
@@ -141,16 +171,17 @@ jobs:
           fi
 
       - name: Run packaged-JVM transport preflight in VM
+        id: vm-preflight
         env:
           KERNEL: ${{ steps.kernel.outputs.kernel }}
           MODULES_DIR: ${{ steps.kernel.outputs.modules-dir }}
         run: |
           set -Eeuo pipefail
-          output_dir=testoutput/java-remote-parent-rhel9.6-kernel-sockopt
           runner_uid="$(id -u)"
           runner_gid="$(id -g)"
-          install -d -m 0700 "$output_dir"
-          vm_workdir="$(mktemp -d -- "$RUNNER_TEMP/java-remote-parent-rhel-vm.XXXXXX")"
+          install -d -m 0700 "$CAMPAIGN_OUTPUT"
+          rm -f -- testoutput/success
+          vm_workdir="$(mktemp -d -- "$RUNNER_TEMP/java-remote-parent-kernel-vm.XXXXXX")"
           chmod 0700 "$vm_workdir"
           launch_status=0
           set +e
@@ -159,8 +190,9 @@ jobs:
             KERNEL="$KERNEL" \
             MODULES_DIR="$MODULES_DIR" \
             ARCH=amd64 \
+            JAVA_REMOTE_PARENT_KERNEL_ID="$OBI_VM_KERNEL_ID" \
             TARGET_TEST=run-java-remote-parent-rhel-kernel-sockopt-vm \
-            2>&1 | tee "$output_dir/vm-console.log"
+            2>&1 | tee "$CAMPAIGN_OUTPUT/vm-console.log"
           launch_status="${PIPESTATUS[0]}"
           set -e
           ownership_status=0
@@ -168,12 +200,46 @@ jobs:
           sudo chown -R -- "$runner_uid:$runner_gid" "$vm_workdir" || ownership_status=$?
           cleanup_status=0
           rm -rf -- "$vm_workdir" || cleanup_status=$?
+
+          cell_status=fail
+          if (( launch_status == 0 && ownership_status == 0 && cleanup_status == 0 )) &&
+            [[ -f testoutput/success ]]; then
+            cell_status=pass
+          elif [[ -f "$CAMPAIGN_OUTPUT/kernel-feature.properties" ]] &&
+            grep -Fxq 'status=untested' \
+              "$CAMPAIGN_OUTPUT/kernel-feature.properties"; then
+            cell_status=untested
+          elif [[ -f "$CAMPAIGN_OUTPUT/kernel-feature.properties" ]] &&
+            grep -Fxq 'status=unsupported' \
+              "$CAMPAIGN_OUTPUT/kernel-feature.properties"; then
+            cell_status=unsupported
+          elif [[ -f "$CAMPAIGN_OUTPUT/privileged-tests.log" ]] &&
+            grep -Eq -- '^[[:space:]]*--- SKIP:' \
+              "$CAMPAIGN_OUTPUT/privileged-tests.log"; then
+            cell_status=unsupported
+          fi
+          {
+            printf 'format_version=1\n'
+            printf 'matrix_revision=java-remote-parent-kernel-v1\n'
+            printf 'kernel_id=%s\n' "$OBI_VM_KERNEL_ID"
+            printf 'architecture=amd64\n'
+            printf 'repository=%s\n' "${GITHUB_REPOSITORY:-unavailable}"
+            printf 'workflow_ref=%s\n' "${GITHUB_WORKFLOW_REF:-unavailable}"
+            printf 'run_id=%s\n' "${GITHUB_RUN_ID:-unavailable}"
+            printf 'run_attempt=%s\n' "${GITHUB_RUN_ATTEMPT:-unavailable}"
+            printf 'status_scope=packaged_jvm_transport_preflight\n'
+            printf 'status=%s\n' "$cell_status"
+            printf '%s\n' \
+              'support_decision=runtime_feature_probes_and_required_non_skipping_tests' \
+              'version_inference=disabled'
+          } > "$CAMPAIGN_OUTPUT/matrix-cell.properties"
+
           if (( launch_status != 0 )); then
             exit "$launch_status"
           fi
           (( ownership_status == 0 )) || exit "$ownership_status"
           (( cleanup_status == 0 )) || exit "$cleanup_status"
-          test -f testoutput/success
+          [[ -f testoutput/success ]]
 
       - name: Verify CI source remained clean
         if: always()
@@ -181,19 +247,19 @@ jobs:
           set -Eeuo pipefail
           status="$(git status --porcelain=v1 --untracked-files=all -- . ':!testoutput')"
           if [[ -n "$status" ]]; then
-            printf '%s\n' 'CI source changed during RHEL validation:' >&2
+            printf '%s\n' 'CI source changed during kernel validation:' >&2
             printf '%s\n' "$status" >&2
             exit 1
           fi
 
-      - name: Upload RHEL packaged-JVM transport evidence
+      - name: Upload kernel packaged-JVM transport evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: java-remote-parent-rhel9.6-kernel-sockopt-${{ github.run_id }}
+          name: java-remote-parent-${{ matrix.kernel_id }}-kernel-sockopt-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            internal/test/vm/lvh/out/vmlinuz-rhel9.6-amd64.buildinfo
-            internal/test/vm/lvh/out/vmlinuz-rhel9.6-amd64.config
-            testoutput/java-remote-parent-rhel9.6-kernel-sockopt
+            internal/test/vm/lvh/out/vmlinuz-${{ matrix.kernel_id }}-amd64.buildinfo
+            internal/test/vm/lvh/out/vmlinuz-${{ matrix.kernel_id }}-amd64.config
+            testoutput/java-remote-parent-${{ matrix.kernel_id }}-kernel-sockopt
           if-no-files-found: error
           retention-days: 14

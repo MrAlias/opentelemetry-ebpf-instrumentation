@@ -316,7 +316,7 @@ require_rhel_workflow_vm_contract() {
     local cleanup_line=""
     local rethrow_line=""
 
-    grep -Fq -- "vm_workdir=\"\$(mktemp -d -- \"\$RUNNER_TEMP/java-remote-parent-rhel-vm.XXXXXX\")\"" \
+    grep -Fq -- "vm_workdir=\"\$(mktemp -d -- \"\$RUNNER_TEMP/java-remote-parent-kernel-vm.XXXXXX\")\"" \
         "$workflow" || return 1
     grep -Fq -- "WORKDIR=\"\$vm_workdir\"" "$workflow" || return 1
     ! grep -Fq -- "WORKDIR=\"\$(pwd)\"" "$workflow" || return 1
@@ -329,6 +329,18 @@ require_rhel_workflow_vm_contract() {
     grep -Fq -- 'TestPackagedJVMBenchmarkArtifactV2StrictContract' "$workflow" || return 1
     grep -Fq -- 'TestPackagedJVMBenchmarkArtifactV2RejectsSemanticMutations' "$workflow" || return 1
     grep -Fq -- 'TestDecodePackagedJVMBenchmarkArtifactV2RejectsStructuralMutations' "$workflow" || return 1
+    grep -Fq -- "JAVA_REMOTE_PARENT_KERNEL_ID=\"\$OBI_VM_KERNEL_ID\"" \
+        "$workflow" || return 1
+    grep -Fq -- 'support_decision=runtime_feature_probes_and_required_non_skipping_tests' \
+        "$workflow" || return 1
+    grep -Fq -- 'version_inference=disabled' "$workflow" || return 1
+    grep -Fq -- 'cell_status=unsupported' "$workflow" || return 1
+    grep -Fq -- 'workflow_ref=%s' "$workflow" || return 1
+    grep -Fq -- 'run_attempt=%s' "$workflow" || return 1
+    for kernel_id in 5.10-lts 5.15-lts 6.1-lts 6.6-lts 6.12-lts rhel9.6; do
+        [[ "$(grep -Fxc -- "          - ${kernel_id}" "$workflow")" == 1 ]] || return 1
+    done
+    ! grep -Eq -- '^[[:space:]]+- rhel8[.]' "$workflow" || return 1
     mktemp_line="$(grep -Fn -- "vm_workdir=\"\$(mktemp -d --" "$workflow" | cut -d: -f1)"
     launch_line="$(grep -Fn -- 'sudo make -C internal/test/vm' "$workflow" | cut -d: -f1)"
     chown_line="$(grep -Fn -- "sudo chown -R -- \"\$runner_uid:\$runner_gid\" testoutput" "$workflow" | cut -d: -f1)"
@@ -355,7 +367,22 @@ require_rhel_vm_image_contract() {
     grep -Fq -- "if [ \"\$target\" = \"run-java-remote-parent-rhel-kernel-sockopt-vm\" ]; then" \
         "$dockerfile" || return 1
     grep -Fq -- 'bash internal/test/vm/run-java-remote-parent-rhel.sh' "$dockerfile" || return 1
+    grep -Fq -- "kernel_id) kernel_id=\"\$v\" ;;" "$dockerfile" || return 1
+    grep -Fq -- "OBI_VM_KERNEL_ID=\"\$kernel_id\"" "$dockerfile" || return 1
+    grep -Fq -- "''|*[!a-z0-9._-]*)" "$dockerfile" || return 1
     ! grep -Fq -- "cd /build && make \$target" "$dockerfile" || return 1
+}
+
+require_kernel_makefile_contract() {
+    local -r makefile="$1"
+
+    grep -Fq -- 'export JAVA_REMOTE_PARENT_KERNEL_ID' "$makefile" || return 1
+    grep -Fq -- "case \"\$\${JAVA_REMOTE_PARENT_KERNEL_ID}\" in" \
+        "$makefile" || return 1
+    grep -Fq -- "\"\$\${JAVA_REMOTE_PARENT_KERNEL_ID}\" \\" \
+        "$makefile" || return 1
+    ! grep -Fq -- "case \"\$(JAVA_REMOTE_PARENT_KERNEL_ID)\" in" \
+        "$makefile" || return 1
 }
 
 test_rhel_ci_is_private_and_preserves_launch_status() {
@@ -381,6 +408,128 @@ test_rhel_ci_is_private_and_preserves_launch_status() {
     for mutation in "$repo_workdir" "$missing_chown" "$masked_status" "$missing_cleanup"; do
         if require_rhel_workflow_vm_contract "$mutation" >/dev/null 2>&1; then
             test_fail "RHEL workflow validator accepted mutation: ${mutation}"
+        fi
+    done
+}
+
+test_kernel_campaign_identity_is_bounded() {
+    local collect_function=""
+    local feature_function=""
+    local main_function=""
+    local output=""
+    local mkdir_line=""
+    local validate_line=""
+
+    output="$(
+        OBI_VM_KERNEL_ID=6.12-lts bash -c '
+            source "$1"
+            validate_campaign_identity
+            printf "%s\n" "$OUTPUT_DIR"
+        ' bash "${SCRIPT_DIR}/run-java-remote-parent-rhel.sh"
+    )" || test_fail 'valid upstream kernel campaign identity was rejected'
+    [[ "$output" == 'testoutput/java-remote-parent-6.12-lts-kernel-sockopt' ]] || \
+        test_fail 'kernel campaign output was not derived from its validated identity'
+
+    for invalid in '' '../escape' 'RHEL9.6' 'rhel9/6' 'rhel9 6' \
+        'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; do
+        if OBI_VM_KERNEL_ID="$invalid" bash -c '
+            source "$1"
+            validate_campaign_identity
+        ' bash "${SCRIPT_DIR}/run-java-remote-parent-rhel.sh" >/dev/null 2>&1; then
+            test_fail "kernel campaign accepted invalid identity: ${invalid:-empty}"
+        fi
+    done
+    if OBI_VM_EXPECTED_ARCHITECTURE=aarch64 bash -c '
+        source "$1"
+        validate_campaign_identity
+    ' bash "${SCRIPT_DIR}/run-java-remote-parent-rhel.sh" >/dev/null 2>&1; then
+        test_fail 'x86-only nested VM campaign accepted an arm64 architecture'
+    fi
+
+    collect_function="$(declare -f collect_kernel_evidence)"
+    feature_function="$(declare -f write_kernel_feature_status)"
+    main_function="$(declare -f main)"
+    validate_line="$(awk '/validate_campaign_identity/ { print NR; exit }' \
+        <<<"$main_function")"
+    mkdir_line="$(awk '/mkdir -p --/ { print NR; exit }' <<<"$main_function")"
+    [[ "$collect_function" == *'bpftool feature probe kernel full'* && \
+        "$collect_function" == *'write_kernel_feature_status unsupported'* && \
+        "$collect_function" == *'write_kernel_feature_status untested'* && \
+        "$collect_function" == *'write_kernel_feature_status probe_complete compatible'* && \
+        "$collect_function" != *'5.14.'* && \
+        "$feature_function" == *'version_inference=disabled'* && \
+        "$feature_function" == *'final_support_decision=selected_go_runtime_feature_probes_and_non_skipping_tests'* && \
+        "$validate_line" =~ ^[1-9][0-9]*$ && \
+        "$mkdir_line" =~ ^[1-9][0-9]*$ && \
+        validate_line -lt mkdir_line ]] || \
+        test_fail 'kernel campaign lost bounded identity or runtime feature-probe ordering'
+}
+
+require_java_provider_workflow_contract() {
+    local -r workflow="$1"
+    local provider_job=""
+    local required=""
+
+    provider_job="$(awk '
+        /^  production-provider-runtime:/ { selected = 1 }
+        selected { print }
+    ' "$workflow")" || return 1
+    [[ -n "$provider_job" ]] || return 1
+    grep -Fq -- 'runner: ubuntu-latest' <<<"$provider_job" || return 1
+    grep -Fq -- 'runner: ubuntu-24.04-arm' <<<"$provider_job" || return 1
+    grep -Fq -- 'test-java: [8, 11, 17, 21]' <<<"$provider_job" || return 1
+    grep -Fq -- 'jni-entry: native/linux-amd64/libobijni.so' \
+        <<<"$provider_job" || return 1
+    grep -Fq -- 'jni-entry: native/linux-aarch64/libobijni.so' \
+        <<<"$provider_job" || return 1
+    grep -Fq -- 'sudo bpftool feature probe kernel full' \
+        <<<"$provider_job" || return 1
+    grep -Fq -- 'version_inference=disabled' <<<"$provider_job" || return 1
+    grep -Fq -- 'final_support_decision=selected_go_runtime_feature_probes_and_non_skipping_tests' \
+        <<<"$provider_job" || return 1
+    grep -Fq -- '-test.count=3' <<<"$provider_job" || return 1
+    grep -Fq -- 'resource-growth.properties' <<<"$provider_job" || return 1
+    grep -Fq -- "residual-\${kind}.json" <<<"$provider_job" || return 1
+    grep -Fq -- 'if (( new_after > 0 ))' <<<"$provider_job" || return 1
+    for required in \
+        TestJavaRemoteParentPrimaryJVMFaults \
+        TestJavaRemoteParentPrimaryJVMDirectSSLSocket \
+        TestJavaRemoteParentGenericJVMDirectSSLSocket \
+        TestJavaRemoteParentNestedCgroupLifecycle \
+        TestJavaRemoteParentCgroupLinkProcessDeathCleanup \
+        TestJavaRemoteParentCgroupPartialAttachRollback; do
+        grep -Fq -- "$required" <<<"$provider_job" || return 1
+    done
+    for required in pass fail unsupported untested; do
+        grep -Eq -- "(cell_status|runtime_classification)=${required}([[:space:]]|$)" \
+            <<<"$provider_job" || return 1
+    done
+    grep -Fq -- 'status_scope=production_bpf_jni_provider_runtime' \
+        <<<"$provider_job" || return 1
+    grep -Fq -- 'workflow_ref=%s' <<<"$provider_job" || return 1
+    grep -Fq -- 'run_attempt=%s' <<<"$provider_job" || return 1
+}
+
+test_java_provider_workflow_matrix_contract() {
+    local -r workflow="${SCRIPT_DIR}/../../../.github/workflows/java-agent.yml"
+    local -r valid="${TEST_TMP_DIR}/java-agent-workflow-valid.yml"
+    local -r missing_arm="${TEST_TMP_DIR}/java-agent-workflow-missing-arm.yml"
+    local -r missing_resource_gate="${TEST_TMP_DIR}/java-agent-workflow-missing-resource.yml"
+    local -r version_inferred="${TEST_TMP_DIR}/java-agent-workflow-version-inferred.yml"
+
+    track_fixture "$valid"
+    cp -- "$workflow" "$valid"
+    require_java_provider_workflow_contract "$valid" || \
+        test_fail 'Java provider workflow lost its native production matrix contract'
+    write_mutated_fixture "$missing_arm" "$valid" \
+        '/jni-entry: native\/linux-aarch64\/libobijni[.]so/d'
+    write_mutated_fixture "$missing_resource_gate" "$valid" \
+        '/if (( new_after > 0 ))/d'
+    write_mutated_fixture "$version_inferred" "$valid" \
+        's/version_inference=disabled/version_inference=kernel_release/'
+    for mutation in "$missing_arm" "$missing_resource_gate" "$version_inferred"; do
+        if require_java_provider_workflow_contract "$mutation" >/dev/null 2>&1; then
+            test_fail "Java provider workflow validator accepted mutation: ${mutation}"
         fi
     done
 }
@@ -424,6 +573,27 @@ echo "--- mount state ---"|'
         "$root_make_source_git"; do
         if require_rhel_vm_image_contract "$mutation" >/dev/null 2>&1; then
             test_fail "RHEL VM image validator accepted mutation: ${mutation}"
+        fi
+    done
+}
+
+test_kernel_makefile_handoff_is_bounded() {
+    local -r makefile="${SCRIPT_DIR}/Makefile"
+    local -r valid="${TEST_TMP_DIR}/Makefile.valid"
+    local -r missing_export="${TEST_TMP_DIR}/Makefile.missing-export"
+    local -r direct_expansion="${TEST_TMP_DIR}/Makefile.direct-expansion"
+
+    track_fixture "$valid"
+    cp -- "$makefile" "$valid"
+    require_kernel_makefile_contract "$valid" || \
+        test_fail 'VM Makefile lost its bounded kernel-ID environment handoff'
+    write_mutated_fixture "$missing_export" "$valid" \
+        '/^export JAVA_REMOTE_PARENT_KERNEL_ID$/d'
+    write_mutated_fixture "$direct_expansion" "$valid" \
+        "s/\$\${JAVA_REMOTE_PARENT_KERNEL_ID}/\$(JAVA_REMOTE_PARENT_KERNEL_ID)/g"
+    for mutation in "$missing_export" "$direct_expansion"; do
+        if require_kernel_makefile_contract "$mutation" >/dev/null 2>&1; then
+            test_fail "VM Makefile validator accepted mutation: ${mutation}"
         fi
     done
 }
@@ -646,7 +816,8 @@ test_packaged_jvm_runner_contract() {
         "$benchmark_function" == *"env -i \"\${benchmark_environment[@]}\""* && \
         "$benchmark_function" == *'packaged-jvm-benchmark-root-environment.txt'* && \
         "$benchmark_function" == *'userspace=Alpine Linux'* && \
-        "$benchmark_function" == *'kernel_input=RHEL 9.6 LVH pinned artifact'* && \
+        "$benchmark_function" == *'kernel_input=LVH digest-pinned %s artifact'* && \
+        "$benchmark_function" == *"\"\$KERNEL_ID\""* && \
         "$validation_function" == *'VALIDATE_CI_CROSSLINKS=1'* && \
         "$source_git_function" == *'--no-new-privs'* && \
         "$source_git_function" == *'--inh-caps=-all'* && \
@@ -774,11 +945,14 @@ run_tests() {
     test_artifact_path_preserves_symlinks
     test_relative_agent_path_resolution
     test_rhel_ci_is_private_and_preserves_launch_status
+    test_kernel_campaign_identity_is_bounded
+    test_java_provider_workflow_matrix_contract
     test_rhel_vm_installs_setpriv_without_dirtying_source
+    test_kernel_makefile_handoff_is_bounded
     test_packaged_jvm_source_git_contract
     test_packaged_jvm_setpriv_identity_contract
     test_packaged_jvm_runner_contract
-    printf '%s\n' 'RHEL verifier and transport benchmark validator tests passed'
+    printf '%s\n' 'Kernel compatibility verifier and transport benchmark validator tests passed'
 }
 
 if (($# != 0)); then

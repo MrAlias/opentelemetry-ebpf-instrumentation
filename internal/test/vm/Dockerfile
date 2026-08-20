@@ -248,12 +248,14 @@ echo "=================================="
 target=""
 test_pattern=""
 run_number=""
+kernel_id=""
 if [ -r /build/testoutput/test-env ]; then
     while IFS='=' read -r k v; do
         case "$k" in
             target) target="$v" ;;
             test_pattern) test_pattern="$v" ;;
             run_number) run_number="$v" ;;
+            kernel_id) kernel_id="$v" ;;
         esac
     done < /build/testoutput/test-env
 fi
@@ -283,7 +285,15 @@ if [ -n "$target" ]; then
     if [ "$target" = "run-java-remote-parent-rhel-kernel-sockopt-vm" ]; then
         # This target's source identity must not run through Make's root-level
         # Git expansions. Its Bash runner drops only the bounded Git commands.
-        bash internal/test/vm/run-java-remote-parent-rhel.sh
+        case "$kernel_id" in
+            ''|*[!a-z0-9._-]*)
+                echo "ERROR: invalid Java remote-parent kernel ID" >&2
+                poweroff
+                exit 1
+                ;;
+        esac
+        OBI_VM_KERNEL_ID="$kernel_id" \
+            bash internal/test/vm/run-java-remote-parent-rhel.sh
     else
         make "$target" TEST_PATTERN="$test_pattern" RUN_NUMBER="$run_number"
     fi && touch /build/testoutput/success

@@ -4,7 +4,9 @@
 
 set -Eeuo pipefail
 
-readonly OUTPUT_DIR="${TEST_OUTPUT:-testoutput}/java-remote-parent-rhel9.6-kernel-sockopt"
+readonly KERNEL_ID="${OBI_VM_KERNEL_ID-rhel9.6}"
+readonly EXPECTED_ARCHITECTURE="${OBI_VM_EXPECTED_ARCHITECTURE-x86_64}"
+readonly OUTPUT_DIR="${TEST_OUTPUT:-testoutput}/java-remote-parent-${KERNEL_ID}-kernel-sockopt"
 readonly JAVA_AGENT_PATH="${OUTPUT_DIR}/java-artifacts/obi-java-agent.jar"
 readonly JAVA_AGENT_CHECKSUM="${OUTPUT_DIR}/java-agent.sha256"
 readonly VERIFIER_TEST_PATTERN='^TestBPFVerifierProductionProfiles$'
@@ -43,6 +45,27 @@ readonly -a PACKAGED_JVM_SETPRIV_OPTIONS=(
 fail() {
     printf 'ERROR: %s\n' "$*" >&2
     exit 1
+}
+
+validate_campaign_identity() {
+    [[ "$KERNEL_ID" =~ ^[a-z0-9][a-z0-9._-]{0,31}$ ]] || \
+        fail "invalid kernel campaign identifier: ${KERNEL_ID}"
+    [[ "$EXPECTED_ARCHITECTURE" == x86_64 ]] || \
+        fail "unsupported VM campaign architecture: ${EXPECTED_ARCHITECTURE}"
+}
+
+write_kernel_feature_status() {
+    local -r status="$1"
+    local -r reason="$2"
+
+    {
+        printf 'probe=bpftool_feature_probe_kernel_full\n'
+        printf 'status=%s\n' "$status"
+        printf 'reason=%s\n' "$reason"
+        printf '%s\n' \
+            'final_support_decision=selected_go_runtime_feature_probes_and_non_skipping_tests' \
+            'version_inference=disabled'
+    } > "$OUTPUT_DIR/kernel-feature.properties"
 }
 
 resolve_existing_path() {
@@ -503,18 +526,29 @@ collect_kernel_evidence() {
 
     (( EUID == 0 )) || fail 'VM validation must run as root'
     kernel_release="$(uname -r)"
-    [[ "$kernel_release" == 5.14.* ]] || \
-        fail "expected the RHEL 9 5.14 kernel family, got ${kernel_release}"
-    [[ "$(uname -m)" == x86_64 ]] || fail 'expected x86_64 architecture'
-    [[ -r /sys/fs/cgroup/cgroup.controllers ]] || \
+    [[ "$(uname -m)" == "$EXPECTED_ARCHITECTURE" ]] || \
+        fail "expected ${EXPECTED_ARCHITECTURE} architecture, got $(uname -m)"
+    if [[ ! -r /sys/fs/cgroup/cgroup.controllers ]]; then
+        write_kernel_feature_status unsupported cgroup_v2_unavailable
         fail 'unified cgroup v2 is unavailable'
-    [[ -s "$btf_file" ]] || fail "kernel BTF is unavailable at ${btf_file}"
-    command -v bpftool >/dev/null 2>&1 || fail 'bpftool is unavailable'
+    fi
+    if [[ ! -s "$btf_file" ]]; then
+        write_kernel_feature_status unsupported kernel_btf_unavailable
+        fail "kernel BTF is unavailable at ${btf_file}"
+    fi
+    if ! command -v bpftool >/dev/null 2>&1; then
+        write_kernel_feature_status untested bpftool_unavailable
+        fail 'bpftool is unavailable'
+    fi
 
     {
         printf '%s\n' '=== uname ==='
         uname -a
-        printf 'release=%s\narchitecture=%s\n' "$kernel_release" "$(uname -m)"
+        printf 'kernel_id=%s\nrelease=%s\narchitecture=%s\n' \
+            "$KERNEL_ID" "$kernel_release" "$(uname -m)"
+        printf '%s\n' \
+            'support_decision=runtime_feature_probes_and_required_non_skipping_tests' \
+            'version_inference=disabled'
         id
     } 2>&1 | tee "$OUTPUT_DIR/uname.txt"
 
@@ -534,10 +568,15 @@ collect_kernel_evidence() {
         sha256sum "$btf_file"
     } 2>&1 | tee "$OUTPUT_DIR/btf.txt"
 
-    {
+    if {
         bpftool version
         bpftool feature probe kernel full
-    } 2>&1 | tee "$OUTPUT_DIR/bpftool-feature.txt"
+    } 2>&1 | tee "$OUTPUT_DIR/bpftool-feature.txt"; then
+        write_kernel_feature_status probe_complete compatible
+    else
+        write_kernel_feature_status unsupported bpftool_runtime_probe_failed
+        fail 'bpftool kernel feature probe failed'
+    fi
 }
 
 run_production_verifier_profiles() {
@@ -735,7 +774,8 @@ run_packaged_jvm_benchmark() {
 
     {
         printf 'userspace=Alpine Linux\n'
-        printf 'kernel_input=RHEL 9.6 LVH pinned artifact\n'
+        printf 'kernel_id=%s\n' "$KERNEL_ID"
+        printf 'kernel_input=LVH digest-pinned %s artifact\n' "$KERNEL_ID"
         printf 'kernel_release=%s\nsource_revision=%s\n' \
             "$kernel_release" "$source_revision"
         printf 'java=%s\nsetpriv=%s\nagent=%s\nsockopt_bpf=%s\nsockops_bpf=%s\n' \
@@ -803,6 +843,7 @@ run_packaged_jvm_benchmark() {
 }
 
 main() {
+    validate_campaign_identity
     mkdir -p -- "$OUTPUT_DIR"
     collect_kernel_evidence
     require_java_agent

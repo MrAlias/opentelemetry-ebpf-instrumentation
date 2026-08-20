@@ -24,6 +24,8 @@ REPO_ROOT ?= ../../..
 TARGET_TEST ?= run-integration-test-vm
 TEST_PATTERN ?= TestMultiProcess
 RUN_NUMBER ?= 1
+JAVA_REMOTE_PARENT_KERNEL_ID ?= rhel9.6
+export JAVA_REMOTE_PARENT_KERNEL_ID
 TEST_OUTPUT = $(REPO_ROOT)/testoutput
 MNT ?= mnt
 IMG_SIZE ?= 20G
@@ -71,8 +73,13 @@ $(ROOT_IMG): Dockerfile
 	qemu-img convert $(ROOT_IMAGE_RAW) -O qcow2 $(ROOT_IMG) && rm $(ROOT_IMAGE_RAW)
 
 write-test-env: $(TEST_OUTPUT)
-	@printf 'target=%s\ntest_pattern=%s\nrun_number=%s\n' \
+	@case "$${JAVA_REMOTE_PARENT_KERNEL_ID}" in \
+		''|*[!a-z0-9._-]*) \
+			echo "ERROR: invalid JAVA_REMOTE_PARENT_KERNEL_ID" >&2; exit 1 ;; \
+	 esac; \
+	 printf 'target=%s\ntest_pattern=%s\nrun_number=%s\nkernel_id=%s\n' \
 		"$(TARGET_TEST)" "$(TEST_PATTERN)" "$(RUN_NUMBER)" \
+		"$${JAVA_REMOTE_PARENT_KERNEL_ID}" \
 		> $(TEST_OUTPUT)/test-env
 
 launchvm: check_qemu $(ROOT_IMG) $(TEST_OUTPUT) write-test-env

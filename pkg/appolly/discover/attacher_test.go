@@ -23,12 +23,15 @@ import (
 	"go.opentelemetry.io/obi/pkg/appolly/services"
 	"go.opentelemetry.io/obi/pkg/ebpf"
 	ebpfcommon "go.opentelemetry.io/obi/pkg/ebpf/common"
+	attr "go.opentelemetry.io/obi/pkg/export/attributes/names"
 	"go.opentelemetry.io/obi/pkg/export/imetrics"
 	"go.opentelemetry.io/obi/pkg/internal/goexec"
 	"go.opentelemetry.io/obi/pkg/internal/helpers/maps"
 	javaagent "go.opentelemetry.io/obi/pkg/internal/java"
+	"go.opentelemetry.io/obi/pkg/internal/jvmtools"
 	"go.opentelemetry.io/obi/pkg/internal/nodejs"
 	"go.opentelemetry.io/obi/pkg/internal/testutil"
+	"go.opentelemetry.io/obi/pkg/internal/transform/route"
 	"go.opentelemetry.io/obi/pkg/obi"
 	"go.opentelemetry.io/obi/pkg/pipe/msg"
 )
@@ -225,6 +228,259 @@ func TestTraceAttacherReportsJavaAttachFailure(t *testing.T) {
 		processName: "java",
 		errorType:   imetrics.InstrumentationErrorAttachingJavaAgent,
 	}}, reporter.records)
+}
+
+func TestJavaServiceMetadataUsesExactEventOwnerAndCommitsAfterAdmission(t *testing.T) {
+	const (
+		parentPID = app.PID(41)
+		eventPID  = app.PID(42)
+	)
+	parent := execpkg.New(execpkg.Init{
+		Pid: parentPID,
+		Service: svc.Attrs{
+			UID:      svc.UID{Namespace: "production", Instance: "parent-instance"},
+			EnvVars:  map[string]string{"SOURCE": "parent"},
+			Metadata: map[attr.Name]string{"existing": "preserved"},
+		},
+	})
+	eventOwner := execpkg.New(execpkg.Init{
+		Pid: eventPID,
+		Service: svc.Attrs{
+			EnvVars: map[string]string{"SOURCE": "event-owner"},
+		},
+	})
+	ie := &ebpf.Instrumentable{
+		Type:     svc.InstrumentableJava,
+		FileInfo: parent,
+		PIDOwner: eventOwner,
+	}
+	var validated []*execpkg.FileInfo
+	attacher := &traceAttacher{
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		validateMetadataOwnerFn: func(pid app.PID, owner *execpkg.FileInfo) error {
+			assert.Equal(t, eventPID, pid)
+			validated = append(validated, owner)
+			return nil
+		},
+		readJavaServiceMetadataFn: func(pid app.PID, service svc.Attrs) (jvmtools.ServiceMetadata, error) {
+			assert.Equal(t, eventPID, pid,
+				"parent substitution must not redirect metadata reads to the parent PID")
+			assert.Equal(t, "event-owner", service.EnvVars["SOURCE"])
+			assert.Empty(t, service.UID.Name)
+			assert.Equal(t, "preserved", service.Metadata["existing"])
+			return jvmtools.ServiceMetadata{Name: "orders", Version: "1.2.3"}, nil
+		},
+	}
+
+	update := attacher.resolveServiceMetadata(ie)
+
+	require.NotNil(t, update)
+	require.Len(t, validated, 3)
+	for _, owner := range validated {
+		assert.Same(t, eventOwner, owner)
+	}
+	provisional := parent.ServiceAttrs()
+	assert.Equal(t, "orders", provisional.UID.Name)
+	assert.Equal(t, "1.2.3", provisional.Metadata[jvmtools.ServiceVersionAttribute])
+	assert.False(t, parent.AutoName(), "auto-name is an admission commit side effect")
+
+	parent.SetSDKLanguage(svc.InstrumentableJava)
+	update.Commit()
+
+	committed := parent.ServiceAttrs()
+	assert.Equal(t, "production", committed.UID.Namespace)
+	assert.Equal(t, "parent-instance", committed.UID.Instance)
+	assert.Equal(t, "preserved", committed.Metadata["existing"])
+	assert.Equal(t, svc.InstrumentableJava, committed.SDKLanguage)
+	assert.True(t, parent.AutoName())
+}
+
+func TestJavaServiceMetadataPIDReuseAfterPublicationRollsBackExactly(t *testing.T) {
+	baselineMetadata := map[attr.Name]string{"existing": "preserved"}
+	target := execpkg.New(execpkg.Init{
+		Pid: 41,
+		Service: svc.Attrs{
+			UID:      svc.UID{Namespace: "production", Instance: "stable-instance"},
+			Metadata: baselineMetadata,
+		},
+	})
+	eventOwner := execpkg.New(execpkg.Init{Pid: 42})
+	before := target.ServiceAttrs()
+	validation := 0
+	attacher := &traceAttacher{
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		validateMetadataOwnerFn: func(pid app.PID, owner *execpkg.FileInfo) error {
+			assert.Equal(t, app.PID(42), pid)
+			assert.Same(t, eventOwner, owner)
+			validation++
+			if validation == 3 {
+				return errors.New("exact owner exited and PID was reused")
+			}
+			return nil
+		},
+		readJavaServiceMetadataFn: func(pid app.PID, service svc.Attrs) (jvmtools.ServiceMetadata, error) {
+			return jvmtools.ServiceMetadata{Name: "replacement", Version: "9.9.9"}, nil
+		},
+	}
+
+	update := attacher.resolveServiceMetadata(&ebpf.Instrumentable{
+		Type:     svc.InstrumentableJava,
+		FileInfo: target,
+		PIDOwner: eventOwner,
+	})
+
+	assert.Nil(t, update)
+	assert.Equal(t, 3, validation)
+	assert.Equal(t, before, target.ServiceAttrs(),
+		"a lifetime change after provisional publication must restore UID and metadata")
+	assert.False(t, target.AutoName())
+}
+
+func TestJavaServiceMetadataAtomicBeginPreservesResolverTimePublication(t *testing.T) {
+	target := execpkg.New(execpkg.Init{Pid: 42})
+	attacher := &traceAttacher{
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		validateMetadataOwnerFn: func(app.PID, *execpkg.FileInfo) error {
+			return nil
+		},
+		readJavaServiceMetadataFn: func(app.PID, svc.Attrs) (jvmtools.ServiceMetadata, error) {
+			// Model a shared-parent updater publishing after the resolver took its
+			// missing-field snapshot but before provisional apply.
+			target.SetUID(svc.UID{Name: "runtime", Namespace: "runtime-ns"})
+			target.SetMetadata(map[attr.Name]string{
+				jvmtools.ServiceVersionAttribute: "runtime-version",
+			})
+			return jvmtools.ServiceMetadata{Name: "stale-derived", Version: "stale-version"}, nil
+		},
+	}
+
+	receipt := attacher.resolveServiceMetadata(&ebpf.Instrumentable{
+		Type: svc.InstrumentableJava, FileInfo: target, PIDOwner: target,
+	})
+
+	assert.Nil(t, receipt)
+	got := target.ServiceAttrs()
+	assert.Equal(t, "runtime", got.UID.Name)
+	assert.Equal(t, "runtime-ns", got.UID.Namespace)
+	assert.Equal(t, "runtime-version", got.Metadata[jvmtools.ServiceVersionAttribute])
+}
+
+func TestJavaServiceMetadataReceiptPreservesIntendedDynamicPIDFields(t *testing.T) {
+	target := execpkg.New(execpkg.Init{Pid: 42})
+	attacher := &traceAttacher{
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		validateMetadataOwnerFn: func(app.PID, *execpkg.FileInfo) error {
+			return nil
+		},
+		readJavaServiceMetadataFn: func(app.PID, svc.Attrs) (jvmtools.ServiceMetadata, error) {
+			return jvmtools.ServiceMetadata{Name: "derived", Version: "1.2.3"}, nil
+		},
+	}
+	receipt := attacher.resolveServiceMetadata(&ebpf.Instrumentable{
+		Type: svc.InstrumentableJava, FileInfo: target, PIDOwner: target,
+	})
+	require.NotNil(t, receipt)
+
+	require.True(t, applyDynamicPIDAttributes(target, dynamicPIDAttributes{
+		serviceName:      "runtime-orders",
+		serviceNamespace: "runtime-ns",
+		resourceAttributes: map[string]string{
+			"deployment.environment": "production",
+		},
+	}))
+	receipt.Rollback()
+
+	got := target.ServiceAttrs()
+	assert.Equal(t, "runtime-orders", got.UID.Name)
+	assert.Equal(t, "runtime-ns", got.UID.Namespace)
+	assert.Equal(t, "production", got.Metadata["deployment.environment"])
+	assert.NotContains(t, got.Metadata, jvmtools.ServiceVersionAttribute,
+		"an unrelated dynamic metadata key must not adopt the provisional version")
+	assert.False(t, target.AutoName())
+}
+
+func TestJavaServiceMetadataReceiptPreservesProcessContextAndUnrelatedUpdates(t *testing.T) {
+	target := execpkg.New(execpkg.Init{Pid: 42})
+	attacher := &traceAttacher{
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		validateMetadataOwnerFn: func(app.PID, *execpkg.FileInfo) error {
+			return nil
+		},
+		readJavaServiceMetadataFn: func(app.PID, svc.Attrs) (jvmtools.ServiceMetadata, error) {
+			return jvmtools.ServiceMetadata{Name: "derived", Version: "1.2.3"}, nil
+		},
+	}
+	receipt := attacher.resolveServiceMetadata(&ebpf.Instrumentable{
+		Type: svc.InstrumentableJava, FileInfo: target, PIDOwner: target,
+	})
+	require.NotNil(t, receipt)
+
+	(&processContextDecorator{}).addAttribute(target, attr.ServiceNamespace, "context-ns")
+	matcher := route.NewMatcher([]string{"/orders/:id"})
+	target.SetSDKLanguage(svc.InstrumentableJava)
+	target.SetHarvestedRoutes(matcher)
+	target.SetHostNameInstance("host-a", "instance-a")
+	receipt.Rollback()
+
+	got := target.ServiceAttrs()
+	assert.Empty(t, got.UID.Name,
+		"a namespace update must not adopt the provisional name")
+	assert.Equal(t, "context-ns", got.UID.Namespace)
+	assert.Equal(t, "context-ns", got.Metadata[attr.ServiceNamespace])
+	assert.NotContains(t, got.Metadata, jvmtools.ServiceVersionAttribute,
+		"a namespace metadata key must not adopt the provisional version")
+	assert.Equal(t, svc.InstrumentableJava, got.SDKLanguage)
+	assert.Equal(t, "host-a", got.HostName)
+	assert.Equal(t, "instance-a", got.UID.Instance)
+	assert.Same(t, matcher, got.HarvestedRouteMatcher)
+}
+
+func TestRejectedJavaServiceMetadataAdmissionPreservesUnrelatedDefaults(t *testing.T) {
+	target := execpkg.New(execpkg.Init{
+		Pid:        42,
+		CmdExePath: "/usr/bin/java",
+		Service: svc.Attrs{
+			UID:      svc.UID{Namespace: "production", Instance: "stable-instance"},
+			Metadata: nil,
+		},
+	})
+	before := target.ServiceAttrs()
+	attacher := &traceAttacher{
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		validateMetadataOwnerFn: func(app.PID, *execpkg.FileInfo) error {
+			return nil
+		},
+		readJavaServiceMetadataFn: func(app.PID, svc.Attrs) (jvmtools.ServiceMetadata, error) {
+			return jvmtools.ServiceMetadata{Version: "1.2.3"}, nil
+		},
+	}
+	ie := &ebpf.Instrumentable{
+		Type:     svc.InstrumentableJava,
+		FileInfo: target,
+		PIDOwner: target,
+	}
+
+	update := attacher.resolveServiceMetadata(ie)
+	require.NotNil(t, update)
+	require.NotEqual(t, before, target.ServiceAttrs())
+	target.ApplyServiceDefaults(svc.InstrumentableJava)
+	require.Equal(t, "java", target.ServiceAttrs().UID.Name)
+	require.True(t, target.AutoName())
+
+	// This is the same rollback edge used when getTracer rejects exact PID
+	// admission after metadata and ordinary service defaults were visible to
+	// tracer construction.
+	update.Rollback()
+
+	got := target.ServiceAttrs()
+	assert.Equal(t, before.UID.Namespace, got.UID.Namespace)
+	assert.Equal(t, before.UID.Instance, got.UID.Instance)
+	assert.Equal(t, "java", got.UID.Name,
+		"rollback must preserve the independent default-name publication")
+	assert.Equal(t, svc.InstrumentableJava, got.SDKLanguage)
+	assert.Nil(t, got.Metadata,
+		"rollback must preserve nil-vs-empty metadata state")
+	assert.True(t, target.AutoName())
 }
 
 func TestMonitorPIDsKeepsServiceMetadataSeparateFromExactLifetimes(t *testing.T) {
@@ -474,7 +730,7 @@ func TestTraceAttacherJavaDisabledKeepsInjectorInterfaceNil(t *testing.T) {
 	}
 }
 
-func TestRejectedExactAdmissionHasNoDiscoveryOrNodeSideEffects(t *testing.T) {
+func TestRejectedExactAdmissionRollsBackJavaMetadataAndHasNoSideEffects(t *testing.T) {
 	originalRemoveMemlock := removeMemlock
 	removeMemlock = func() error { return nil }
 	t.Cleanup(func() { removeMemlock = originalRemoveMemlock })
@@ -490,15 +746,26 @@ func TestRejectedExactAdmissionHasNoDiscoveryOrNodeSideEffects(t *testing.T) {
 		InputInstrumentables: instrumentables,
 		OutputTracerEvents:   tracerEvents,
 		EbpfEventContext:     &ebpfcommon.EBPFEventContext{},
+		validateMetadataOwnerFn: func(app.PID, *execpkg.FileInfo) error {
+			return nil
+		},
+		readJavaServiceMetadataFn: func(app.PID, svc.Attrs) (jvmtools.ServiceMetadata, error) {
+			return jvmtools.ServiceMetadata{Name: "provisional-orders", Version: "9.9.9"}, nil
+		},
 	}
 	run, err := attacher.attacherLoop(ctx)
 	require.NoError(t, err)
 	const ino = uint64(9876)
 	owner := execpkg.New(execpkg.Init{
-		Pid:        42,
-		Ino:        ino,
+		Pid: 42,
+		Ino: ino,
+		Service: svc.Attrs{
+			UID:      svc.UID{Namespace: "production", Instance: "stable"},
+			Metadata: map[attr.Name]string{"existing": "preserved"},
+		},
 		CmdExePath: "/bin/rejected",
 	})
+	beforeService := owner.ServiceAttrs()
 	program := &recordingTracer{allow: func(app.PID, uint32, *execpkg.FileInfo, *execpkg.FileInfo) bool {
 		return false
 	}}
@@ -518,7 +785,7 @@ func TestRejectedExactAdmissionHasNoDiscoveryOrNodeSideEffects(t *testing.T) {
 		{
 			Type: EventCreated,
 			Obj: ebpf.Instrumentable{
-				Type:     svc.InstrumentableUnknown,
+				Type:     svc.InstrumentableJava,
 				FileInfo: owner,
 				PIDOwner: owner,
 			},
@@ -531,6 +798,17 @@ func TestRejectedExactAdmissionHasNoDiscoveryOrNodeSideEffects(t *testing.T) {
 	assert.Zero(t, nodeInjector.calls)
 	require.NotContains(t, attacher.processInstances, execpkg.FileID{Ino: ino})
 	assert.Empty(t, attacher.admittedProcessInstances)
+	rolledBack := owner.ServiceAttrs()
+	assert.Equal(t, beforeService.UID, rolledBack.UID)
+	assert.Equal(t, beforeService.Metadata, rolledBack.Metadata)
+	assert.Equal(t, svc.InstrumentableJava, rolledBack.SDKLanguage,
+		"field-scoped rollback must preserve getTracer's unrelated SDK update")
+	assert.False(t, owner.AutoName())
+	retryReceipt := owner.BeginServiceMetadataAdmission(
+		"retry", jvmtools.ServiceVersionAttribute, "2.0",
+	)
+	require.NotNil(t, retryReceipt, "rejected admission leaked provisional field ownership")
+	retryReceipt.Rollback()
 	if event, ok := <-events; ok {
 		t.Fatalf("unexpected tracer event after rejected exact admission: %+v", event)
 	}

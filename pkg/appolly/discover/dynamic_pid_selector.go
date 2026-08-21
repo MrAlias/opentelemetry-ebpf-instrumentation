@@ -670,33 +670,17 @@ func (d *DynamicPIDSelector) SetPID(entry selection.DynamicPIDEntry) bool {
 }
 
 func applyDynamicPIDAttributes(fi *exec.FileInfo, attrs dynamicPIDAttributes) bool {
-	updated := false
-	if attrs.serviceName != "" || attrs.serviceNamespace != "" {
-		uid := fi.ServiceAttrs().UID
-		if attrs.serviceName != "" {
-			uid.Name = attrs.serviceName
-		}
-		if attrs.serviceNamespace != "" {
-			uid.Namespace = attrs.serviceNamespace
-		}
-		fi.SetUID(uid)
-		updated = true
+	if attrs.serviceName == "" && attrs.serviceNamespace == "" &&
+		len(attrs.resourceAttributes) == 0 {
+		return false
 	}
-	if len(attrs.resourceAttributes) > 0 {
-		snap := fi.ServiceAttrs()
-		metadata := snap.Metadata
-		if metadata == nil {
-			metadata = map[attr.Name]string{}
-		} else {
-			metadata = maps.Clone(metadata)
-		}
-		for k, v := range attrs.resourceAttributes {
-			metadata[attr.Name(k)] = v
-		}
-		fi.SetMetadata(metadata)
-		updated = true
+
+	metadata := make(map[attr.Name]string, len(attrs.resourceAttributes))
+	for key, value := range attrs.resourceAttributes {
+		metadata[attr.Name(key)] = value
 	}
-	return updated
+	fi.ApplyDynamicServiceAttrs(attrs.serviceName, attrs.serviceNamespace, metadata)
+	return true
 }
 
 func (v *dynamicPIDSignalView) contains(mask dynamicPIDSignal) bool {

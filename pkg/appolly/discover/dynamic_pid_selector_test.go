@@ -495,6 +495,66 @@ func TestDynamicPIDSelector_SetPID_UpdatesFileInfo(t *testing.T) {
 	assert.Equal(t, "payments", snap.Metadata["team"])
 }
 
+func TestApplyDynamicPIDAttributesDoesNotResurrectRolledBackAdmission(t *testing.T) {
+	const versionKey = attr.Name("service.version")
+	fi := exec.New(exec.Init{})
+	receipt := fi.BeginServiceMetadataAdmission("derived", versionKey, "1.2.3")
+	require.NotNil(t, receipt)
+
+	// Capture the exact stale snapshot that the former read-modify-write path
+	// could publish after rollback. The updater now captures only field intent.
+	stale := fi.ServiceAttrs()
+	require.Equal(t, "derived", stale.UID.Name)
+	require.Equal(t, "1.2.3", stale.Metadata[versionKey])
+	update := dynamicPIDAttributes{
+		serviceNamespace: "runtime-ns",
+		resourceAttributes: map[string]string{
+			"deployment.environment": "production",
+		},
+	}
+	ready := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan bool, 1)
+	go func() {
+		close(ready)
+		<-release
+		done <- applyDynamicPIDAttributes(fi, update)
+	}()
+	<-ready
+
+	receipt.Rollback()
+	close(release)
+	require.True(t, <-done)
+
+	got := fi.ServiceAttrs()
+	assert.Empty(t, got.UID.Name)
+	assert.Equal(t, "runtime-ns", got.UID.Namespace)
+	assert.NotContains(t, got.Metadata, versionKey)
+	assert.Equal(t, "production", got.Metadata["deployment.environment"])
+}
+
+func TestApplyDynamicPIDAttributesExplicitFieldsSupersedeAdmission(t *testing.T) {
+	const versionKey = attr.Name("service.version")
+	fi := exec.New(exec.Init{})
+	receipt := fi.BeginServiceMetadataAdmission("derived", versionKey, "1.2.3")
+	require.NotNil(t, receipt)
+
+	require.True(t, applyDynamicPIDAttributes(fi, dynamicPIDAttributes{
+		serviceName: "derived",
+		resourceAttributes: map[string]string{
+			string(versionKey): "1.2.3",
+		},
+	}))
+	receipt.Rollback()
+
+	got := fi.ServiceAttrs()
+	assert.Equal(t, "derived", got.UID.Name,
+		"an explicit same-value name must supersede the provisional receipt")
+	assert.Equal(t, "1.2.3", got.Metadata[versionKey],
+		"an explicit same-value version must supersede the provisional receipt")
+	assert.False(t, fi.AutoName())
+}
+
 func TestDynamicPIDSelector_RegisterReconcilesSetPIDCommittedAfterDiscoverySnapshot(t *testing.T) {
 	const (
 		ownerPID = app.PID(42)

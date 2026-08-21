@@ -402,7 +402,7 @@ func (md *procEventMetadataDecorator) handleProcessEvent(pe exec.ProcessEvent) {
 		AppendKubeMetadata(md.store, pe.File, podMeta, md.clusterName, containerName)
 	} else {
 		// do not leave the service attributes map as nil
-		pe.File.SetMetadata(map[attr.Name]string{})
+		pe.File.EnsureServiceMetadataMap()
 
 		md.log.Debug("no metadata for event", "event", pe)
 
@@ -468,16 +468,31 @@ func (md *procEventMetadataDecorator) cleanupPodData(pod *informer.ObjectMeta) {
 // This method should be invoked by any entity willing to follow a common policy for
 // setting metadata attributes. For example this metadataDecorator or the survey informer
 func AppendKubeMetadata(store *kube.Store, fi *exec.FileInfo, meta *ikube.CachedObjMeta, clusterName, containerName string) {
-	snap := fi.ServiceAttrs()
-	if !applyKubeMetadata(store, &snap, meta, clusterName, containerName) {
-		return
-	}
-	fi.SetUID(snap.UID)
-	fi.SetMetadata(snap.Metadata)
-	fi.SetHostName(snap.HostName)
+	fi.UpdateServiceAttrs(func(service *svc.Attrs, provisionalAutoName bool) exec.ServiceAttrsUpdate {
+		result := exec.ServiceAttrsUpdate{}
+		result.Publish = applyKubeMetadataUpdate(
+			store, service, meta, clusterName, containerName,
+			service.AutoName() || provisionalAutoName, &result,
+		)
+		return result
+	})
 }
 
 func applyKubeMetadata(store *kube.Store, s *svc.Attrs, meta *ikube.CachedObjMeta, clusterName, containerName string) bool {
+	return applyKubeMetadataUpdate(
+		store, s, meta, clusterName, containerName, s.AutoName(), nil,
+	)
+}
+
+func applyKubeMetadataUpdate(
+	store *kube.Store,
+	s *svc.Attrs,
+	meta *ikube.CachedObjMeta,
+	clusterName string,
+	containerName string,
+	logicalAutoName bool,
+	update *exec.ServiceAttrsUpdate,
+) bool {
 	if meta.Meta.Pod == nil {
 		// if this message happen, there is a bug
 		klog().Debug("pod metadata for is nil. Ignoring decoration", "meta", meta)
@@ -485,8 +500,12 @@ func applyKubeMetadata(store *kube.Store, s *svc.Attrs, meta *ikube.CachedObjMet
 	}
 	topOwner := ikube.TopOwner(meta.Meta.Pod)
 	name, namespace := store.ServiceNameNamespaceForMetadata(meta.Meta, containerName)
-	if s.AutoName() {
+	if logicalAutoName {
 		s.UID.Name = name
+		s.SetAutoName()
+		if update != nil {
+			update.ServiceName = true
+		}
 	}
 	if s.UID.Namespace == "" {
 		s.UID.Namespace = namespace
@@ -514,28 +533,44 @@ func applyKubeMetadata(store *kube.Store, s *svc.Attrs, meta *ikube.CachedObjMet
 		maps.Copy(m, s.Metadata)
 	}
 	maps.Copy(m, k8sMeta)
+	for key := range k8sMeta {
+		recordServiceMetadataUpdate(update, key)
+	}
 
 	// ownerKind could be also "Pod", but we won't insert it as "owner" label to avoid
 	// growing cardinality
 	if topOwner != nil {
 		m[attr.K8sOwnerName] = topOwner.Name
 		m[attr.K8sKind] = topOwner.Kind
+		recordServiceMetadataUpdate(update, attr.K8sOwnerName)
+		recordServiceMetadataUpdate(update, attr.K8sKind)
 	}
 
 	for _, owner := range meta.Meta.Pod.Owners {
 		if _, ok := m[attr.K8sKind]; !ok {
 			m[attr.K8sKind] = owner.Kind
+			recordServiceMetadataUpdate(update, attr.K8sKind)
 		}
 		if kindLabel := OwnerLabelName(owner.Kind); kindLabel != "" {
 			m[kindLabel] = owner.Name
+			recordServiceMetadataUpdate(update, kindLabel)
 		}
 	}
 
 	maps.Copy(m, meta.OTELResourceMeta)
+	for key := range meta.OTELResourceMeta {
+		recordServiceMetadataUpdate(update, key)
+	}
 
 	s.Metadata = m
 	s.HostName = meta.Meta.Name
 	return true
+}
+
+func recordServiceMetadataUpdate(update *exec.ServiceAttrsUpdate, key attr.Name) {
+	if update != nil {
+		update.MetadataKeys = append(update.MetadataKeys, key)
+	}
 }
 
 func OwnerLabelName(kind string) attr.Name {

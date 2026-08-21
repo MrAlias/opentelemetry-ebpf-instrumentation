@@ -21,6 +21,7 @@ import (
 	attr "go.opentelemetry.io/obi/pkg/export/attributes/names"
 	"go.opentelemetry.io/obi/pkg/export/imetrics"
 	"go.opentelemetry.io/obi/pkg/internal/helpers/container"
+	ikube "go.opentelemetry.io/obi/pkg/internal/kube"
 	"go.opentelemetry.io/obi/pkg/internal/testutil"
 	"go.opentelemetry.io/obi/pkg/kube"
 	"go.opentelemetry.io/obi/pkg/kube/kubecache/informer"
@@ -29,6 +30,104 @@ import (
 )
 
 const timeout = 5 * time.Second
+
+func TestAppendKubeMetadataDoesNotResurrectRolledBackAdmission(t *testing.T) {
+	const versionKey = attr.Name("service.version")
+	informerSource := &fakeInformer{}
+	store := kube.NewStore(informerSource, nil, nil, imetrics.NoopReporter{})
+	metadata := &ikube.CachedObjMeta{Meta: &informer.ObjectMeta{
+		Name:      "pod-a",
+		Namespace: "production",
+		Pod: &informer.PodInfo{
+			NodeName: "node-a",
+			Uid:      "pod-uid",
+		},
+	}}
+	fi := exec.New(exec.Init{})
+	receipt := fi.BeginServiceMetadataAdmission("derived", versionKey, "1.2.3")
+	require.NotNil(t, receipt)
+
+	// Capture the stale provisional snapshot used by the former RMW path, then
+	// force its decorator write to run only after the admission has rolled back.
+	stale := fi.ServiceAttrs()
+	require.Equal(t, "derived", stale.UID.Name)
+	require.Equal(t, "1.2.3", stale.Metadata[versionKey])
+	ready := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		close(ready)
+		<-release
+		AppendKubeMetadata(store, fi, metadata, "cluster-a", "app")
+		close(done)
+	}()
+	<-ready
+
+	receipt.Rollback()
+	close(release)
+	<-done
+
+	got := fi.ServiceAttrs()
+	assert.Empty(t, got.UID.Name)
+	assert.Equal(t, "production", got.UID.Namespace)
+	assert.Equal(t, "production.pod-a.app", got.UID.Instance)
+	assert.NotContains(t, got.Metadata, versionKey)
+	assert.Equal(t, "pod-a", got.Metadata[attr.K8sPodName])
+	assert.Equal(t, "cluster-a", got.Metadata[attr.K8sClusterName])
+	assert.Equal(t, "pod-a", got.HostName)
+}
+
+func TestAppendKubeMetadataSameVersionSupersedesAdmission(t *testing.T) {
+	const versionKey = attr.Name("service.version")
+	informerSource := &fakeInformer{}
+	store := kube.NewStore(informerSource, nil, nil, imetrics.NoopReporter{})
+	metadata := &ikube.CachedObjMeta{
+		Meta: &informer.ObjectMeta{
+			Name:      "pod-a",
+			Namespace: "production",
+			Pod:       &informer.PodInfo{Uid: "pod-uid"},
+		},
+		OTELResourceMeta: map[attr.Name]string{
+			versionKey: "1.2.3",
+		},
+	}
+	fi := exec.New(exec.Init{})
+	receipt := fi.BeginServiceMetadataAdmission("derived", versionKey, "1.2.3")
+	require.NotNil(t, receipt)
+
+	AppendKubeMetadata(store, fi, metadata, "cluster-a", "app")
+	receipt.Rollback()
+
+	got := fi.ServiceAttrs()
+	assert.Equal(t, "pod-a", got.UID.Name,
+		"Kubernetes naming must supersede the lower-precedence provisional name")
+	assert.Equal(t, "1.2.3", got.Metadata[versionKey],
+		"an explicit same-value Kubernetes version must supersede its receipt")
+	assert.True(t, fi.AutoName())
+}
+
+func TestAppendKubeMetadataProvisionalNamePrecedenceOnCommit(t *testing.T) {
+	const versionKey = attr.Name("service.version")
+	informerSource := &fakeInformer{}
+	store := kube.NewStore(informerSource, nil, nil, imetrics.NoopReporter{})
+	metadata := &ikube.CachedObjMeta{Meta: &informer.ObjectMeta{
+		Name:      "pod-a",
+		Namespace: "production",
+		Pod:       &informer.PodInfo{Uid: "pod-uid"},
+	}}
+	fi := exec.New(exec.Init{})
+	receipt := fi.BeginServiceMetadataAdmission("derived", versionKey, "1.2.3")
+	require.NotNil(t, receipt)
+
+	AppendKubeMetadata(store, fi, metadata, "cluster-a", "app")
+	receipt.Commit()
+
+	got := fi.ServiceAttrs()
+	assert.Equal(t, "pod-a", got.UID.Name,
+		"commit must not restore the lower-precedence provisional name")
+	assert.Equal(t, "1.2.3", got.Metadata[versionKey])
+	assert.True(t, fi.AutoName())
+}
 
 func TestDecoration(t *testing.T) {
 	originalInfoForPID := kube.InfoForPID

@@ -52,24 +52,27 @@ type Init struct {
 }
 
 type FileInfo struct {
-	mu                sync.RWMutex
-	processHandleMu   sync.RWMutex
-	service           svc.Attrs
-	runtimeGen        map[app.PID]uint64
-	cmdExePath        string
-	proExeLinkPath    string
-	elfFile           *elf.File
-	pid               app.PID
-	ppid              app.PID
-	dev               uint64
-	ino               uint64
-	ns                uint32
-	processStart      uint64
-	processInstanceID uint64
-	processHandle     *os.File
-	javaCapability    uint64
-	javaAuthSeq       uint64
-	javaAuth          *javaAuthorizationState
+	mu                     sync.RWMutex
+	processHandleMu        sync.RWMutex
+	service                svc.Attrs
+	runtimeGen             map[app.PID]uint64
+	cmdExePath             string
+	proExeLinkPath         string
+	elfFile                *elf.File
+	pid                    app.PID
+	ppid                   app.PID
+	dev                    uint64
+	ino                    uint64
+	ns                     uint32
+	processStart           uint64
+	processInstanceID      uint64
+	processHandle          *os.File
+	javaCapability         uint64
+	javaAuthSeq            uint64
+	javaAuth               *javaAuthorizationState
+	serviceAdmissionSeq    uint64
+	provisionalServiceName *provisionalServiceNameState
+	provisionalServiceMeta *provisionalServiceMetadataState
 }
 
 type javaAuthorizationState struct {
@@ -77,6 +80,40 @@ type javaAuthorizationState struct {
 	done       chan struct{}
 	capability uint64
 	completed  bool
+}
+
+type provisionalServiceNameState struct {
+	token    uint64
+	previous string
+	value    string
+}
+
+type provisionalServiceMetadataState struct {
+	token          uint64
+	key            attr.Name
+	previous       string
+	previousExists bool
+	mapWasNil      bool
+	value          string
+}
+
+// ServiceMetadataAdmission is an opaque receipt for provisional service name
+// and resource metadata fields. Commit and Rollback affect a field only while
+// this receipt remains its exact owner.
+type ServiceMetadataAdmission struct {
+	fileInfo *FileInfo
+	token    uint64
+	name     bool
+	metadata bool
+}
+
+// ServiceAttrsUpdate describes which receipt-relevant fields a decorator
+// explicitly publishes. Declaring a field preserves same-value setter intent;
+// actual name/version changes are detected even when omitted here.
+type ServiceAttrsUpdate struct {
+	Publish      bool
+	ServiceName  bool
+	MetadataKeys []attr.Name
 }
 
 func New(init Init) *FileInfo {
@@ -166,12 +203,283 @@ func (fi *FileInfo) ServiceAttrs() svc.Attrs {
 	fi.mu.RLock()
 	defer fi.mu.RUnlock()
 
-	out := fi.service
-	out.Metadata = maps.Clone(fi.service.Metadata)
-	out.EnvVars = maps.Clone(fi.service.EnvVars)
+	return cloneServiceAttrs(fi.service)
+}
 
-	// no need to clone the other fields as they are immutable
+func cloneServiceAttrs(service svc.Attrs) svc.Attrs {
+	out := service
+	out.Metadata = maps.Clone(service.Metadata)
+	out.EnvVars = maps.Clone(service.EnvVars)
+
+	// No need to clone the other fields as they are immutable.
 	return out
+}
+
+// UpdateServiceAttrs atomically decorates a private clone of the current
+// service attributes. update must only mutate the supplied clone and describes
+// whether it should be published and any explicit name/metadata-key writes. A
+// true second argument identifies a provisional derived name that decorators
+// should treat as logically automatic. A decorator supersedes provisional
+// service metadata only when it declares or actually changes the owned field;
+// unrelated updates preserve the receipt.
+func (fi *FileInfo) UpdateServiceAttrs(
+	update func(*svc.Attrs, bool) ServiceAttrsUpdate,
+) bool {
+	if update == nil {
+		return false
+	}
+
+	fi.mu.Lock()
+	defer fi.mu.Unlock()
+
+	updated := cloneServiceAttrs(fi.service)
+	provisionalAutoName := fi.provisionalServiceName != nil &&
+		fi.service.UID.Name == fi.provisionalServiceName.value
+	result := update(&updated, provisionalAutoName)
+	if !result.Publish {
+		return false
+	}
+
+	if fi.provisionalServiceName != nil &&
+		(result.ServiceName || updated.UID.Name != fi.service.UID.Name ||
+			updated.AutoName() != fi.service.AutoName()) {
+		fi.provisionalServiceName = nil
+	}
+	if state := fi.provisionalServiceMeta; state != nil {
+		before, beforeExists := fi.service.Metadata[state.key]
+		after, afterExists := updated.Metadata[state.key]
+		if containsMetadataKey(result.MetadataKeys, state.key) ||
+			beforeExists != afterExists || before != after {
+			fi.provisionalServiceMeta = nil
+		}
+	}
+	fi.service = updated
+	return true
+}
+
+func containsMetadataKey(keys []attr.Name, wanted attr.Name) bool {
+	for _, key := range keys {
+		if key == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+// EnsureServiceMetadataMap records the independent requirement that Metadata
+// remain non-nil without adopting an owned provisional metadata key. If the
+// admission later rolls that key back, it restores an empty map rather than
+// the receipt's original nil map.
+func (fi *FileInfo) EnsureServiceMetadataMap() {
+	fi.mu.Lock()
+	defer fi.mu.Unlock()
+
+	if fi.service.Metadata == nil {
+		fi.service.Metadata = map[attr.Name]string{}
+	}
+	if state := fi.provisionalServiceMeta; state != nil {
+		state.mapWasNil = false
+	}
+}
+
+// ApplyDynamicServiceAttrs atomically applies only the fields present in a
+// dynamic PID update. An explicit name or metadata key supersedes a matching
+// provisional admission field; namespace and unrelated metadata updates leave
+// provisional ownership intact.
+func (fi *FileInfo) ApplyDynamicServiceAttrs(
+	name string,
+	namespace string,
+	metadata map[attr.Name]string,
+) {
+	fi.mu.Lock()
+	defer fi.mu.Unlock()
+
+	if name != "" {
+		fi.provisionalServiceName = nil
+		fi.service.UID.Name = name
+	}
+	if namespace != "" {
+		fi.service.UID.Namespace = namespace
+	}
+	fi.applyServiceMetadataLocked(metadata)
+}
+
+// ApplyProcessContextAttribute atomically merges one process-context metadata
+// key and, for service identity keys, fills only a logically missing UID field.
+// A provisional name is logically missing, so an explicit service.name value
+// supersedes it. Namespace and unrelated metadata never adopt provisional
+// name or metadata fields.
+func (fi *FileInfo) ApplyProcessContextAttribute(key attr.Name, value string) {
+	fi.mu.Lock()
+	defer fi.mu.Unlock()
+
+	fi.applyServiceMetadataLocked(map[attr.Name]string{key: value})
+	switch key {
+	case attr.ServiceName:
+		if fi.provisionalServiceName != nil || fi.service.UID.Name == "" {
+			fi.provisionalServiceName = nil
+			fi.service.UID.Name = value
+		}
+	case attr.ServiceNamespace:
+		if fi.service.UID.Namespace == "" {
+			fi.service.UID.Namespace = value
+		}
+	}
+}
+
+func (fi *FileInfo) applyServiceMetadataLocked(metadata map[attr.Name]string) {
+	if len(metadata) == 0 {
+		return
+	}
+
+	updated := maps.Clone(fi.service.Metadata)
+	if updated == nil {
+		updated = make(map[attr.Name]string, len(metadata))
+	}
+	for key, value := range metadata {
+		if state := fi.provisionalServiceMeta; state != nil && state.key == key {
+			// The explicit key owns even a same-value write.
+			fi.provisionalServiceMeta = nil
+		}
+		updated[key] = value
+	}
+	fi.service.Metadata = updated
+}
+
+// BeginServiceMetadataAdmission atomically applies missing derived service
+// fields and returns their ownership receipt. Starting a new transaction first
+// supersedes and rolls back any still-provisional fields from an older one.
+func (fi *FileInfo) BeginServiceMetadataAdmission(
+	name string,
+	metadataKey attr.Name,
+	metadataValue string,
+) *ServiceMetadataAdmission {
+	fi.mu.Lock()
+	defer fi.mu.Unlock()
+
+	fi.rollbackProvisionalServiceNameLocked(fi.provisionalServiceName)
+	fi.rollbackProvisionalServiceMetadataLocked(fi.provisionalServiceMeta)
+	fi.serviceAdmissionSeq++
+	if fi.serviceAdmissionSeq == 0 {
+		fi.serviceAdmissionSeq++
+	}
+	token := fi.serviceAdmissionSeq
+	receipt := &ServiceMetadataAdmission{fileInfo: fi, token: token}
+
+	if name != "" && fi.service.UID.Name == "" {
+		fi.provisionalServiceName = &provisionalServiceNameState{
+			token:    token,
+			previous: fi.service.UID.Name,
+			value:    name,
+		}
+		fi.service.UID.Name = name
+		receipt.name = true
+	}
+	if metadataValue != "" && fi.service.Metadata[metadataKey] == "" {
+		previous, previousExists := fi.service.Metadata[metadataKey]
+		state := &provisionalServiceMetadataState{
+			token:          token,
+			key:            metadataKey,
+			previous:       previous,
+			previousExists: previousExists,
+			mapWasNil:      fi.service.Metadata == nil,
+			value:          metadataValue,
+		}
+		metadata := maps.Clone(fi.service.Metadata)
+		if metadata == nil {
+			metadata = map[attr.Name]string{}
+		}
+		metadata[metadataKey] = metadataValue
+		fi.service.Metadata = metadata
+		fi.provisionalServiceMeta = state
+		receipt.metadata = true
+	}
+	if !receipt.name && !receipt.metadata {
+		return nil
+	}
+	return receipt
+}
+
+// Commit makes receipt-owned fields permanent. The derived name's auto-name
+// flag is set in the same critical section that verifies exact ownership and
+// value, eliminating a read-then-set race with independent identity updates.
+func (a *ServiceMetadataAdmission) Commit() {
+	if a == nil || a.fileInfo == nil {
+		return
+	}
+	fi := a.fileInfo
+	fi.mu.Lock()
+	defer fi.mu.Unlock()
+
+	if state := fi.provisionalServiceName; a.name &&
+		state != nil && state.token == a.token {
+		if fi.service.UID.Name == state.value {
+			fi.service.SetAutoName()
+		}
+		fi.provisionalServiceName = nil
+	}
+	if state := fi.provisionalServiceMeta; a.metadata &&
+		state != nil && state.token == a.token {
+		fi.provisionalServiceMeta = nil
+	}
+}
+
+// Rollback restores only fields still owned by this receipt. Independent
+// setters invalidate ownership, including same-value writes, so their intent
+// and every unrelated service field remain untouched.
+func (a *ServiceMetadataAdmission) Rollback() {
+	if a == nil || a.fileInfo == nil {
+		return
+	}
+	fi := a.fileInfo
+	fi.mu.Lock()
+	defer fi.mu.Unlock()
+
+	if state := fi.provisionalServiceName; a.name &&
+		state != nil && state.token == a.token {
+		fi.rollbackProvisionalServiceNameLocked(state)
+	}
+	if state := fi.provisionalServiceMeta; a.metadata &&
+		state != nil && state.token == a.token {
+		fi.rollbackProvisionalServiceMetadataLocked(state)
+	}
+}
+
+func (fi *FileInfo) rollbackProvisionalServiceNameLocked(
+	state *provisionalServiceNameState,
+) {
+	if state == nil {
+		return
+	}
+	if fi.service.UID.Name == state.value {
+		fi.service.UID.Name = state.previous
+	}
+	if fi.provisionalServiceName == state {
+		fi.provisionalServiceName = nil
+	}
+}
+
+func (fi *FileInfo) rollbackProvisionalServiceMetadataLocked(
+	state *provisionalServiceMetadataState,
+) {
+	if state == nil {
+		return
+	}
+	if current, exists := fi.service.Metadata[state.key]; exists && current == state.value {
+		metadata := maps.Clone(fi.service.Metadata)
+		if state.previousExists {
+			metadata[state.key] = state.previous
+		} else {
+			delete(metadata, state.key)
+		}
+		if state.mapWasNil && len(metadata) == 0 {
+			metadata = nil
+		}
+		fi.service.Metadata = metadata
+	}
+	if fi.provisionalServiceMeta == state {
+		fi.provisionalServiceMeta = nil
+	}
 }
 
 func (fi *FileInfo) SDKLanguage() svc.InstrumentableType {
@@ -359,6 +667,9 @@ func (fi *FileInfo) SetHarvestedRoutes(m route.Matcher) {
 func (fi *FileInfo) SetMetadata(m map[attr.Name]string) {
 	fi.mu.Lock()
 	defer fi.mu.Unlock()
+	// A setter call is an ownership event even when m contains the same value:
+	// callers may have intentionally adopted the provisional version.
+	fi.provisionalServiceMeta = nil
 	fi.service.Metadata = m
 }
 
@@ -375,9 +686,20 @@ func (fi *FileInfo) SetHostName(h string) {
 	fi.service.HostName = h
 }
 
+func (fi *FileInfo) SetAutoServiceName(name string) {
+	fi.mu.Lock()
+	defer fi.mu.Unlock()
+	// Preserve same-value setter intent by retiring any provisional receipt.
+	fi.provisionalServiceName = nil
+	fi.service.UID.Name = name
+	fi.service.SetAutoName()
+}
+
 func (fi *FileInfo) SetUID(uid svc.UID) {
 	fi.mu.Lock()
 	defer fi.mu.Unlock()
+	// SetUID owns the complete identity, including a same-value service name.
+	fi.provisionalServiceName = nil
 	fi.service.UID = uid
 }
 
@@ -394,6 +716,7 @@ func (fi *FileInfo) ApplyServiceDefaults(t svc.InstrumentableType) {
 	fi.mu.Lock()
 	defer fi.mu.Unlock()
 	if fi.service.UID.Name == "" {
+		fi.provisionalServiceName = nil
 		fi.service.UID.Name = fi.ExecutableName()
 		fi.service.SetAutoName()
 	}
@@ -406,6 +729,10 @@ func (fi *FileInfo) ApplyServiceDefaults(t svc.InstrumentableType) {
 func (fi *FileInfo) ApplyEnvVariables(envVars map[string]string) {
 	fi.mu.Lock()
 	defer fi.mu.Unlock()
+	// Environment application is a whole identity/metadata publication. Clear
+	// both receipts even when the parsed values equal their provisional values.
+	fi.provisionalServiceName = nil
+	fi.provisionalServiceMeta = nil
 
 	fi.service.EnvVars = envVars
 	m := maps.Clone(fi.service.Metadata)

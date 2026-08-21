@@ -9,8 +9,10 @@ import (
 
 	"go.opentelemetry.io/obi/pkg/appolly/app"
 	"go.opentelemetry.io/obi/pkg/appolly/app/request"
+	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
 	"go.opentelemetry.io/obi/pkg/appolly/discover/exec"
 	"go.opentelemetry.io/obi/pkg/docker"
+	attr "go.opentelemetry.io/obi/pkg/export/attributes/names"
 	"go.opentelemetry.io/obi/pkg/pipe/global"
 	"go.opentelemetry.io/obi/pkg/pipe/msg"
 	"go.opentelemetry.io/obi/pkg/pipe/swarm"
@@ -107,10 +109,7 @@ func DockerProcessEventDecoratorProvider(
 						}
 					}
 					if ok {
-						snap := ev.File.ServiceAttrs()
-						ci.DecorateService(&snap)
-						ev.File.SetUID(snap.UID)
-						ev.File.SetMetadata(snap.Metadata)
+						appendDockerMetadata(ev.File, ci)
 					}
 				case exec.ProcessEventTerminated:
 					delete(containerByPID, ev.File.Pid())
@@ -120,4 +119,19 @@ func DockerProcessEventDecoratorProvider(
 			})
 		}, nil
 	}
+}
+
+func appendDockerMetadata(file *exec.FileInfo, container docker.ContainerMeta) {
+	file.UpdateServiceAttrs(func(service *svc.Attrs, provisionalAutoName bool) exec.ServiceAttrsUpdate {
+		nameTouched := service.AutoName() || provisionalAutoName
+		if nameTouched {
+			service.SetAutoName()
+		}
+		container.DecorateService(service)
+		return exec.ServiceAttrsUpdate{
+			Publish:      true,
+			ServiceName:  nameTouched,
+			MetadataKeys: []attr.Name{attr.ContainerName, attr.ContainerID},
+		}
+	})
 }

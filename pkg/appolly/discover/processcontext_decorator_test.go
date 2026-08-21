@@ -325,3 +325,59 @@ func TestProcessContextDecorator_AddAttribute_PreservesExplicitUID(t *testing.T)
 	assert.Equal(t, "explicit-name", attrs.UID.Name)
 	assert.Equal(t, "explicit-ns", attrs.UID.Namespace)
 }
+
+func TestProcessContextDecorator_AddAttribute_DoesNotResurrectRolledBackAdmission(t *testing.T) {
+	const versionKey = attr.Name("service.version")
+	pcd := newTestPCD()
+	fi := execpkg.New(execpkg.Init{})
+	receipt := fi.BeginServiceMetadataAdmission("derived", versionKey, "1.2.3")
+	require.NotNil(t, receipt)
+
+	// Capture the exact stale snapshot that the former read-modify-write path
+	// could publish after rollback. The updater now captures only key/value intent.
+	stale := fi.ServiceAttrs()
+	require.Equal(t, "derived", stale.UID.Name)
+	require.Equal(t, "1.2.3", stale.Metadata[versionKey])
+	ready := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		close(ready)
+		<-release
+		pcd.addAttribute(fi, attr.ServiceNamespace, "context-ns")
+		pcd.addAttribute(fi, attr.Name("context.key"), "context-value")
+		close(done)
+	}()
+	<-ready
+
+	receipt.Rollback()
+	close(release)
+	<-done
+
+	got := fi.ServiceAttrs()
+	assert.Empty(t, got.UID.Name)
+	assert.Equal(t, "context-ns", got.UID.Namespace)
+	assert.Equal(t, "context-ns", got.Metadata[attr.ServiceNamespace])
+	assert.NotContains(t, got.Metadata, versionKey)
+	assert.Equal(t, "context-value", got.Metadata["context.key"])
+}
+
+func TestProcessContextDecorator_AddAttribute_ExplicitFieldsSupersedeAdmission(t *testing.T) {
+	const versionKey = attr.Name("service.version")
+	pcd := newTestPCD()
+	fi := execpkg.New(execpkg.Init{})
+	receipt := fi.BeginServiceMetadataAdmission("derived", versionKey, "1.2.3")
+	require.NotNil(t, receipt)
+
+	pcd.addAttribute(fi, attr.ServiceName, "derived")
+	pcd.addAttribute(fi, versionKey, "1.2.3")
+	receipt.Rollback()
+
+	got := fi.ServiceAttrs()
+	assert.Equal(t, "derived", got.UID.Name,
+		"an explicit same-value name must supersede the provisional receipt")
+	assert.Equal(t, "derived", got.Metadata[attr.ServiceName])
+	assert.Equal(t, "1.2.3", got.Metadata[versionKey],
+		"an explicit same-value version must supersede the provisional receipt")
+	assert.False(t, fi.AutoName())
+}

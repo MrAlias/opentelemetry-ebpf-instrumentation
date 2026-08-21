@@ -200,25 +200,5 @@ func (pcd *processContextDecorator) applyContext(fi *execpkg.FileInfo, info proc
 }
 
 func (pcd *processContextDecorator) addAttribute(fi *execpkg.FileInfo, key attr.Name, value string) {
-	svcAttrs := fi.ServiceAttrs()
-
-	m := svcAttrs.Metadata
-	if m == nil {
-		m = make(map[attr.Name]string)
-	}
-	m[key] = value
-	fi.SetMetadata(m)
-
-	// Populate service UID from process context attributes, but only if not
-	// already explicitly set. This allows process-level metadata to establish
-	// the service identity while preserving any explicit configuration.
-	if key == attr.ServiceName && svcAttrs.UID.Name == "" {
-		uid := svcAttrs.UID
-		uid.Name = value
-		fi.SetUID(uid)
-	} else if key == attr.ServiceNamespace && svcAttrs.UID.Namespace == "" {
-		uid := svcAttrs.UID
-		uid.Namespace = value
-		fi.SetUID(uid)
-	}
+	fi.ApplyProcessContextAttribute(key, value)
 }

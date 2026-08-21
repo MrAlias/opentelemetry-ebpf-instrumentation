@@ -23,6 +23,7 @@ import (
 	"go.opentelemetry.io/obi/pkg/export/imetrics"
 	"go.opentelemetry.io/obi/pkg/internal/helpers/maps"
 	javaagent "go.opentelemetry.io/obi/pkg/internal/java"
+	"go.opentelemetry.io/obi/pkg/internal/jvmtools"
 	"go.opentelemetry.io/obi/pkg/internal/nodejs"
 	"go.opentelemetry.io/obi/pkg/internal/transform/route/harvest"
 	"go.opentelemetry.io/obi/pkg/obi"
@@ -99,6 +100,11 @@ type traceAttacher struct {
 	newExecutableFn         func(*ebpf.ProcessTracer, *link.Executable, *ebpf.Instrumentable) error
 	newExecutableInstanceFn func(*ebpf.ProcessTracer, *ebpf.Instrumentable) error
 	abortProcessTracerFn    func(*ebpf.ProcessTracer) error
+
+	// Java service metadata seams let tests model PID reuse between each
+	// exact-owner bracket without changing process-global jvmtools hooks.
+	readJavaServiceMetadataFn func(app.PID, svc.Attrs) (jvmtools.ServiceMetadata, error)
+	validateMetadataOwnerFn   func(app.PID, *discexec.FileInfo) error
 }
 
 type javaAttachOperation struct {
@@ -171,9 +177,13 @@ func (ta *traceAttacher) attacherLoop(_ context.Context) (swarm.RunFunc, error) 
 						}
 						continue
 					}
+					metadataUpdate := ta.resolveServiceMetadata(&instr.Obj)
 					javaPrepared := ta.prepareProcessSpecificInjection(&instr.Obj)
 
 					if ok := ta.getTracer(&instr.Obj); ok {
+						if metadataUpdate != nil {
+							metadataUpdate.Commit()
+						}
 						ta.injectNodeAfterAdmission(&instr.Obj)
 						ta.recordProcessInstance(
 							instr.Obj.PIDOwnerFileInfo(), instr.Obj.FileInfo.ID(),
@@ -182,9 +192,14 @@ func (ta *traceAttacher) attacherLoop(_ context.Context) (swarm.RunFunc, error) 
 							ta.startJavaAttachment(ctx, &instr.Obj, javaPrepared)
 						}
 						ta.OutputTracerEvents.Send(Event[*ebpf.Instrumentable]{Type: EventCreated, Obj: &instr.Obj})
-					} else if javaPrepared != nil {
-						if err := javaPrepared.Close(); err != nil {
-							ta.log.Warn("unable to close rejected prepared Java target", "pid", instr.Obj.FileInfo.Pid(), "error", err)
+					} else {
+						if metadataUpdate != nil {
+							metadataUpdate.Rollback()
+						}
+						if javaPrepared != nil {
+							if err := javaPrepared.Close(); err != nil {
+								ta.log.Warn("unable to close rejected prepared Java target", "pid", instr.Obj.FileInfo.Pid(), "error", err)
+							}
 						}
 					}
 
@@ -362,6 +377,79 @@ func (ta *traceAttacher) handleJavaAttachResult(ie *ebpf.Instrumentable, err err
 		"pid", ie.FileInfo.Pid(),
 		"error", err,
 	)
+}
+
+// resolveServiceMetadata reads Java launch metadata from the exact discovery
+// event owner. FileInfo can be a substituted parent used as a shared
+// tracer/service bucket; reading that parent's numeric /proc path here would
+// inspect an unadmitted or reused process. Derived fields are instead applied
+// provisionally to FileInfo and committed only after exact PID admission.
+func (ta *traceAttacher) resolveServiceMetadata(
+	ie *ebpf.Instrumentable,
+) *discexec.ServiceMetadataAdmission {
+	if ie == nil || ie.Type != svc.InstrumentableJava || ie.FileInfo == nil {
+		return nil
+	}
+	eventOwner := ie.PIDOwnerFileInfo()
+	if eventOwner == nil {
+		return nil
+	}
+	pid := eventOwner.Pid()
+	validate := ebpfcommon.ValidateProcessOwner
+	if ta.validateMetadataOwnerFn != nil {
+		validate = ta.validateMetadataOwnerFn
+	}
+	if err := validate(pid, eventOwner); err != nil {
+		if ta.log != nil {
+			ta.log.Debug("process lifetime changed before Java service metadata resolution",
+				"pid", pid, "error", err)
+		}
+		return nil
+	}
+
+	// Missing-field policy belongs to the tracer/service owner, while launch
+	// arguments and placeholder environment belong to the exact event owner.
+	service := ie.FileInfo.ServiceAttrs()
+	service.EnvVars = eventOwner.ServiceAttrs().EnvVars
+	read := jvmtools.ReadServiceMetadata
+	if ta.readJavaServiceMetadataFn != nil {
+		read = ta.readJavaServiceMetadataFn
+	}
+	metadata, err := read(pid, service)
+	if err != nil {
+		if ta.log != nil {
+			ta.log.Debug("unable to resolve Java service metadata", "pid", pid, "error", err)
+		}
+		return nil
+	}
+	if err := validate(pid, eventOwner); err != nil {
+		if ta.log != nil {
+			ta.log.Debug("process lifetime changed during Java service metadata resolution",
+				"pid", pid, "error", err)
+		}
+		return nil
+	}
+
+	update := ie.FileInfo.BeginServiceMetadataAdmission(
+		metadata.Name,
+		jvmtools.ServiceVersionAttribute,
+		metadata.Version,
+	)
+	if update == nil {
+		return nil
+	}
+	// Bracket publication as well as the numeric reads. If the process exits
+	// between resolution and provisional publication, roll back each field this
+	// receipt still owns. Independent setters intentionally supersede ownership.
+	if err := validate(pid, eventOwner); err != nil {
+		update.Rollback()
+		if ta.log != nil {
+			ta.log.Debug("process lifetime changed before Java service metadata publication",
+				"pid", pid, "error", err)
+		}
+		return nil
+	}
+	return update
 }
 
 //nolint:cyclop

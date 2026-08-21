@@ -69,11 +69,13 @@ Both the runner and collector recompute the canonical clean source-tree,
 tracked-patch, and patch-identity tuple before publication. Any tracked or
 untracked checkout change after authority capture rejects the operation.
 
-Raw command arguments, logs, container identities, and raw application
+Raw outer command arguments, logs, container identities, and raw application
 evidence stay under each cell's mode-0700 `private/` directory. Public cell
 records contain requested dimensions, source/config/runtime identities,
-assertions, and cryptographic digests, but no absolute/private path or command
-argument. A canonical `evidence_index` binds every digest-valued runtime,
+assertions, and cryptographic digests, but no absolute host/private path. A
+lifecycle cell also retains the exact fixed inner argv: its only absolute token
+is the stable descriptor alias `/proc/self/fd/9`, and every other path is a
+canonical private basename. A canonical `evidence_index` binds every digest-valued runtime,
 artifact, and assertion leaf to one unique safe relative file under that
 cell's raw-evidence root. The sealer requires exact raw-manifest membership and
 re-hashes the named regular file; an unbound digest, duplicate binding, path
@@ -98,18 +100,21 @@ silently turn into an unused environment parameter.
 | `runsh-java21-container-v1` | production `run.sh --transport VALUE --agent VALUE --tls VALUE --scenario all --repeat 1 --seed 1`; only container-process Java 21 forced-transport cells |
 | `preprovisioned-host-application-v1` | registry-approved driver from `OBI_COMPATIBILITY_HOST_APPLICATION_DRIVER` and `OBI_COMPATIBILITY_HOST_APPLICATION_DRIVER_SHA256` |
 | `preprovisioned-jvm-application-v1` | registry-approved driver from `OBI_COMPATIBILITY_JVM_APPLICATION_DRIVER` and `OBI_COMPATIBILITY_JVM_APPLICATION_DRIVER_SHA256` |
-| `preprovisioned-lifecycle-application-v1` | registry-approved driver from `OBI_COMPATIBILITY_LIFECYCLE_APPLICATION_DRIVER` and `OBI_COMPATIBILITY_LIFECYCLE_APPLICATION_DRIVER_SHA256` |
+| `preprovisioned-lifecycle-application-v1` | source-controlled `providers/lifecycle-application-driver-v1.sh`; any override must resolve to that exact registry path and digest |
 
-An external driver must also have an exact `{id, sha256}` entry for its
+An external driver must also have an exact `{id, path, sha256}` entry for its
 provider in the source-controlled `provider-registry-v1.json`. The production
-registry currently has no approved external drivers, so external-platform
-cells honestly remain `untested` until reviewed implementations and digests
-are added. A supplied but unapproved self-matching path/checksum is not
-executed. An approved driver must be an absolute, executable, non-symlink
-single-link file owned by root or the invoking user and not writable by group
-or world. The wrapper copies it to a mode-0500 private snapshot, verifies the
-original and snapshot identities before and after execution, and executes the
-snapshot with this exact interface:
+registry approves one lifecycle outer driver and still has no approved host or
+JVM application driver. The separate source-controlled
+`lifecycle-executor-registry-v1.json` has no production approvals. Outer-driver
+approval is not an execution or pass claim: until a real inner executor is
+reviewed with an exact canonical path, digest, and allowed-cell roster, all
+seven helper cells remain infrastructure `untested`. A supplied but unapproved self-matching
+path/checksum is not executed. An approved path must resolve to the exact
+regular executable under this source tree; a same-byte copy at a foreign path
+is not approved. The wrapper copies it to a mode-0500 private snapshot,
+verifies the original and snapshot identities before and after execution, and
+executes the snapshot with this exact interface:
 
 ```text
 DRIVER \
@@ -158,6 +163,133 @@ runtime:
   requires byte-identical normal/unavailable results, a passing normal-agent
   extraction proof, and no more than 64 diagnostics or 65,536 diagnostic
   bytes.
+
+### Reviewed helper-lifecycle driver
+
+The source-controlled lifecycle driver is selected automatically when both
+legacy driver override variables are absent. If either override is supplied,
+both must still name the exact outer registry path and digest; they are not an
+escape from source approval. The checked-in inner registry is empty, so the
+following descriptor remains a future interface rather than current execution
+authority. Actual platform execution requires both a reviewed inner-registry
+entry and an explicit, mode-safe environment descriptor:
+
+```bash
+export OBI_COMPATIBILITY_LIFECYCLE_ENVIRONMENT=/absolute/path/environment.json
+export OBI_COMPATIBILITY_LIFECYCLE_ENVIRONMENT_SHA256="$({
+  sha256sum -- "$OBI_COMPATIBILITY_LIFECYCLE_ENVIRONMENT"
+} | awk '{print $1}')"
+```
+
+The descriptor has this exact shape. Its `cell` is exactly JSON-equal to the
+selected object in `helper-lifecycle-v1.json`; a real descriptor
+does not abbreviate the object shown here.
+
+```json
+{
+  "schema": "compatibility-helper-lifecycle-environment-v1",
+  "id": "upstream612-jdk21-amd64-lifecycle-v1",
+  "cell": {
+    "id": "h-jdk21-amd64-otel-getsockopt",
+    "kernel": "upstream-6.12",
+    "deployment": "container-process",
+    "cgroup_topology": "unified-v2",
+    "architecture": "amd64",
+    "jvm_feature": 21,
+    "agent_distribution": "otel",
+    "agent_version": "2.28.1",
+    "tls": "TLSv1.3",
+    "transport": "getsockopt",
+    "provider": "preprovisioned-lifecycle-application-v1"
+  },
+  "executor": {
+    "id": "reviewed-helper-lifecycle-executor-v1",
+    "path": "providers/lifecycle-executors/run-helper-lifecycle-cell",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  }
+}
+```
+
+The descriptor is a regular, single-link, root- or caller-owned file with no
+group/world write bit. Its executor object must exactly match one source-bound
+inner-registry entry, including the canonical compatibility-relative path,
+digest, and permission for the selected cell ID. The approved executor has the
+same ownership/link/mode constraints. The driver snapshots all authority
+inputs, opens the executor snapshot once, checks path and open-descriptor
+inode/digest equality before and after execution, and invokes that inherited
+descriptor with this exact path-free argument vector from its private working
+directory:
+
+```text
+/proc/self/fd/9 \
+  --contract compatibility-helper-lifecycle-environment-v1 \
+  --campaign-revision apache-java-https-helper-lifecycle-v1 \
+  --plan-sha256 SHA256 \
+  --cell requested-cell.snapshot.json \
+  --source-authority source-authority.snapshot.json \
+  --source-authority-sha256 SHA256 \
+  --environment lifecycle-environment.snapshot.json \
+  --environment-sha256 SHA256 \
+  --output environment-output
+```
+
+The executor writes `result.json` following
+`schemas/lifecycle-environment-result.schema.json`, plus `raw/` and
+`raw.sha256` for any attempted product status. The observation echoes its
+exact argv, executor digest, environment identity, requested cell, and exit
+status. The execution runs under a Linux child-subreaper supervisor; a timeout
+or any descendant still live when the executor exits is terminated and reaped,
+then fails the provider contract without publishing an executor result. The
+supervisor authenticates its leader and every observed descendant by exact
+PID, start time, session, and process-group identity and signals only through
+`pidfd`; a platform without those primitives fails closed. Detached `setsid`
+descendants remain children of the subreaper and are included. PID reuse or an
+identity mismatch is a containment failure and is never resolved by signalling
+a saved numeric process group. The driver independently checks the seven-cell
+roster, all exact
+framework/lifecycle/resource keys, resource arithmetic and trends, the full
+digest-to-file index, byte-identical normal/unavailable results, normal-agent
+extraction, and diagnostic count/byte caps. It then constructs the provider
+envelope itself. A sanitized receipt binds the inner-registry digest, complete
+approval object, environment ID/digest, exact safe argv, executable digest,
+exit status, and successful containment result. Its digest is a required raw
+evidence-index entry. The provider result and public cell retain that typed
+inner authority. The outer adapter overwrites outer command/driver identity
+with its observed snapshot values, `seal-cell.sh` reapproves the inner identity
+and cell permission, and `collect.sh` rejects unapproved or mixed inner
+identities before aggregation.
+
+Missing or invalid environment identity, an empty inner registry, or an
+unapproved executor is infrastructure `untested`;
+the reviewed driver was attempted and remains identified. Once the executor
+runs, a missing, malformed, argv-lying, cross-cell, contradictory, unsafe, or
+unbounded observation produces a provider-contract `fail`, never `untested`,
+`unsupported`, or `pass`. A valid executor-reported `untested` remains
+infrastructure-only. No checked-in record materializes any of these statuses.
+
+Each run-cell or collector transaction retains one provider/inner-executor
+registry snapshot pair and passes that exact pair, its source identities, and
+its snapshot identities through plan validation, selection, sealing, and
+collector reapproval; nested consumers do not take an independent snapshot.
+The registries are copied through stable regular-file descriptors before
+parsing. Their approved-entry rosters are materialized into bounded private
+files through already-open descriptors, checked for exact count and byte caps,
+and consumed from those same identities. A producer's nonzero status is
+propagated unchanged; partial output, source/snapshot/roster substitution, or
+an A-to-B-to-A traversal fails validation. Private scratch roots remain open as
+directory descriptors, so source/cell/provider/raw descendants are consumed
+through the retained root even if an ancestor pathname is replaced and later
+restored. Final files use retained-candidate, no-replace publication. Final
+directories retain every bounded child directory and regular-file descriptor,
+recompute the exact recursive path/type/identity/content manifest immediately
+before and after no-replace rename, and reject any roster or byte change.
+Temporary roots are
+never recursively removed. Cleanup atomically moves the whole entry into a
+randomized, mode-0700 retained quarantine and checks the exact
+device/inode/owner/type boundary without traversing any leaf. A foreign or late
+replacement—including a symlink, special file, reused directory, or post-check
+leaf—is preserved and causes failure; no cleanup path applies `rm -rf`,
+`unlink`, or `rmdir` to potentially foreign bytes.
 
 The external driver's raw evidence uses safe relative `directory` and
 `manifest` names under the cell's private directory. The manifest must list
@@ -245,11 +377,28 @@ control is an explicit remaining source dependency.
 
 ## Source validation
 
-The focused test creates only temporary synthetic fixtures and never publishes
-a pass:
+The focused test creates only temporary synthetic fixtures. The production
+inner registry stays empty; setup modifies only a clean test-owned repository
+copy to approve its synthetic executor for the seven exact cells. Pass-shaped
+fixtures exercise sealing but remain only inside a mode-0700 retained test
+quarantine and are never published or presented as application execution:
 
 ```bash
 ./examples/apache-java-https/compatibility/tests/campaign_test.sh
+```
+
+For the reviewed lifecycle-driver boundary alone:
+
+```bash
+OBI_COMPATIBILITY_TEST_SCOPE=lifecycle-driver \
+  ./examples/apache-java-https/compatibility/tests/campaign_test.sh
+```
+
+For the registry, quarantine, and process-identity boundaries alone:
+
+```bash
+OBI_COMPATIBILITY_TEST_SCOPE=authority-boundaries \
+  ./examples/apache-java-https/compatibility/tests/campaign_test.sh
 ```
 
 It covers exact counts, aggregate closure, missing/foreign/duplicate/stale IDs,
@@ -261,7 +410,19 @@ helper fallback-result/diagnostic/extraction mutations, and claimed passes
 containing an untested resource gate. It also mutates tracked and untracked
 source after authority capture, provider/command exit codes, integer request/
 resource counters, bounded slopes, non-finite numeric encodings, process-group
-cleanup, and private-manifest entry types and limits. Focused adapter fixtures
+cleanup, PID/start/session/process-group reuse, delayed session change plus
+double-fork containment, registry producer failures/partial rosters/selection
+and reapproval ABA, in-place byte/mode ABA, retained quarantine replacement
+types, and private-manifest entry types and limits. The lifecycle-driver
+scope executes synthetic contracts for all seven exact cells, mutates every
+lifecycle and repeated-resource gate, and covers missing or mismatched
+environment identity, cell/transport/JDK/architecture mismatch,
+path/digest/open-snapshot/argv boundaries, nonblocking FIFO/symlink/regular
+pre-open rejection, inner-registry cell permission and
+collector reapproval, unavailable-result equivalence, diagnostic caps, leak
+deltas and trends, malformed output, setsid and delayed double-fork descendant
+containment, and the
+prohibition on inferred passes. Focused adapter fixtures
 also mutate exact-parent case rosters, `bpftool` semantics, container/project
 identity, image resolution, Java runtime/project identity, host `/proc` cgroup
 bytes, topology cross-binding, Apache/OpenSSL ownership, and duplicate command

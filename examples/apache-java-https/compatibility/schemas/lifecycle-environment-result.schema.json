@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:obi:apache-java-https:compatibility-helper-lifecycle-environment-result-v1",
+  "title": "Preprovisioned helper lifecycle environment result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "campaign_revision",
+    "plan_sha256",
+    "requested",
+    "environment",
+    "command",
+    "status",
+    "reason",
+    "runtime",
+    "artifacts",
+    "assertions",
+    "evidence_index",
+    "raw_evidence"
+  ],
+  "properties": {
+    "schema": {
+      "const": "compatibility-helper-lifecycle-environment-result-v1"
+    },
+    "campaign_revision": {
+      "const": "apache-java-https-helper-lifecycle-v1"
+    },
+    "plan_sha256": {"$ref": "#/$defs/sha256"},
+    "requested": {"type": "object"},
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "sha256"],
+      "properties": {
+        "id": {"$ref": "#/$defs/token"},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["argv", "executable_sha256", "exit_status"],
+      "properties": {
+        "argv": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": {"type": "string", "minLength": 1, "maxLength": 4096}
+        },
+        "executable_sha256": {"$ref": "#/$defs/sha256"},
+        "exit_status": {"type": "integer", "minimum": 0, "maximum": 255}
+      }
+    },
+    "status": {"enum": ["pass", "fail", "unsupported", "untested"]},
+    "reason": {"$ref": "#/$defs/token"},
+    "runtime": {"type": ["object", "null"]},
+    "artifacts": {"type": ["object", "null"]},
+    "assertions": {"type": ["object", "null"]},
+    "evidence_index": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 512,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["field", "path", "sha256"],
+            "properties": {
+              "field": {
+                "type": "string",
+                "pattern": "^(runtime|artifacts|assertions)([.][A-Za-z0-9_-]+)+$"
+              },
+              "path": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}(/[A-Za-z0-9][A-Za-z0-9._-]{0,127})*$"
+              },
+              "sha256": {"$ref": "#/$defs/sha256"}
+            }
+          }
+        }
+      ]
+    },
+    "raw_evidence": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["directory", "manifest", "manifest_sha256"],
+          "properties": {
+            "directory": {"const": "raw"},
+            "manifest": {"const": "raw.sha256"},
+            "manifest_sha256": {"$ref": "#/$defs/sha256"}
+          }
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "untested"}}},
+      "then": {
+        "properties": {
+          "runtime": {"type": "null"},
+          "artifacts": {"type": "null"},
+          "assertions": {"type": "null"},
+          "evidence_index": {"type": "null"},
+          "raw_evidence": {"type": "null"}
+        }
+      },
+      "else": {
+        "properties": {
+          "runtime": {"type": "object"},
+          "artifacts": {"type": "object"},
+          "assertions": {"type": "object"},
+          "evidence_index": {"type": "array"},
+          "raw_evidence": {"type": "object"}
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "token": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,95}$"
+    }
+  }
+}

@@ -13,8 +13,13 @@ source "$SCRIPT_DIRECTORY/lib.sh"
 SEAL_TEMP_DIRECTORY=""
 SEAL_TEMP_IDENTITY=""
 SEAL_TEMP_PARENT=""
+SEAL_TEMP_DESCRIPTOR=""
 
 cleanup_seal_temp() {
+  if [[ "$SEAL_TEMP_DESCRIPTOR" =~ ^[1-9][0-9]*$ ]]; then
+    exec {SEAL_TEMP_DESCRIPTOR}<&- || true
+    SEAL_TEMP_DESCRIPTOR=""
+  fi
   [[ -n "$SEAL_TEMP_DIRECTORY" ]] || return 0
   compatibility_remove_owned_temp_directory \
     "$SEAL_TEMP_DIRECTORY" "$SEAL_TEMP_IDENTITY" "$SEAL_TEMP_PARENT" \
@@ -26,6 +31,11 @@ usage() {
   cat >&2 <<'USAGE'
 Usage: seal-cell.sh --campaign NAME --cell FILE --provider-result FILE \
   --provider-launcher FILE --private-directory DIR --private-manifest FILE \
+  [--provider-registry-snapshot FILE --provider-registry-snapshot-identity ID \
+   --provider-registry-source-identity ID \
+   --lifecycle-executor-registry-snapshot FILE \
+   --lifecycle-executor-registry-snapshot-identity ID \
+   --lifecycle-executor-registry-source-identity ID] \
   --output FILE
 USAGE
 }
@@ -47,16 +57,23 @@ validate_provider_result() {
   local -r revision="$4"
   local -r plan_sha256="$5"
   local -r registry_sha256="$6"
+  local -r executor_registry_sha256="$7"
+  local -r source_authority_sha256="$8"
+  local -r provider_registry="$9"
+  local -r executor_registry="${10}"
 
   jq -e \
     --arg campaign "$campaign" \
     --arg revision "$revision" \
     --arg plan_sha256 "$plan_sha256" \
     --arg registry_sha256 "$registry_sha256" \
+    --arg executor_registry_sha256 "$executor_registry_sha256" \
+    --arg source_authority_sha256 "$source_authority_sha256" \
     --argjson max_assertion_count "$COMPATIBILITY_MAX_ASSERTION_COUNT" \
     --argjson max_resource_magnitude "$COMPATIBILITY_MAX_RESOURCE_MAGNITUDE" \
     --slurpfile requested "$cell" \
-    --slurpfile registry "$COMPATIBILITY_PROVIDER_REGISTRY" '
+    --slurpfile registry "$provider_registry" \
+    --slurpfile executor_registry "$executor_registry" '
       def sha256: type == "string" and test("^[0-9a-f]{64}$");
       def revision: type == "string" and test("^[0-9a-f]{40}$");
       def contains_secret_word:
@@ -206,14 +223,64 @@ validate_provider_result() {
         (.artifacts.helper_sha256 | sha256) and
         (.artifacts.extension_sha256 | sha256) and
         (.artifacts.runtime_config_sha256 | sha256);
+      def lifecycle_executor_authority:
+        .lifecycle_executor as $inner |
+        (.lifecycle_executor | type == "object") and
+        (.lifecycle_executor | keys == [
+          "approval", "command", "environment", "receipt_sha256",
+          "registry_sha256", "schema"
+        ]) and
+        .lifecycle_executor.schema ==
+          "compatibility-lifecycle-executor-authority-v1" and
+        .lifecycle_executor.registry_sha256 == $executor_registry_sha256 and
+        (.lifecycle_executor.approval | keys == [
+          "allowed_cell_ids", "id", "path", "sha256"
+        ]) and
+        (.lifecycle_executor.approval.id | reason) and
+        (.lifecycle_executor.approval.path | type == "string" and
+          test("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}(/[A-Za-z0-9][A-Za-z0-9._-]{0,127})*$")) and
+        (.lifecycle_executor.approval.sha256 | sha256) and
+        (.lifecycle_executor.approval.allowed_cell_ids | type == "array" and
+          length > 0 and . == (sort | unique) and
+          index($requested[0].id) != null) and
+        ([$executor_registry[0].approved_executors[] |
+          select(. == $inner.approval)] | length == 1) and
+        (.lifecycle_executor.environment | keys == ["id", "sha256"]) and
+        (.lifecycle_executor.environment.id | reason) and
+        (.lifecycle_executor.environment.sha256 | sha256) and
+        (.lifecycle_executor.command | keys == [
+          "argv", "executable_sha256", "exit_status"
+        ]) and
+        .lifecycle_executor.command.executable_sha256 ==
+          .lifecycle_executor.approval.sha256 and
+        (.lifecycle_executor.command.exit_status | exit_code) and
+        .lifecycle_executor.command.argv == [
+          "/proc/self/fd/9",
+          "--contract", "compatibility-helper-lifecycle-environment-v1",
+          "--campaign-revision", $revision,
+          "--plan-sha256", $plan_sha256,
+          "--cell", "requested-cell.snapshot.json",
+          "--source-authority", "source-authority.snapshot.json",
+          "--source-authority-sha256", $source_authority_sha256,
+          "--environment", "lifecycle-environment.snapshot.json",
+          "--environment-sha256", .lifecycle_executor.environment.sha256,
+          "--output", "environment-output"
+        ] and
+        (.lifecycle_executor.receipt_sha256 | sha256);
       . as $root |
-      (keys == [
+      ((keys == [
         "artifacts", "assertions", "attempted", "campaign", "campaign_revision",
         "cell_id", "command", "evidence_index", "external_driver",
         "infrastructure_failure", "plan_sha256", "provider",
         "provider_exit_status", "provider_registry_sha256", "raw_evidence", "reason",
         "requested", "runtime", "schema", "source", "status"
-      ]) and
+      ]) or (keys == [
+        "artifacts", "assertions", "attempted", "campaign", "campaign_revision",
+        "cell_id", "command", "evidence_index", "external_driver",
+        "infrastructure_failure", "lifecycle_executor", "plan_sha256", "provider",
+        "provider_exit_status", "provider_registry_sha256", "raw_evidence", "reason",
+        "requested", "runtime", "schema", "source", "status"
+      ])) and
       .schema == "compatibility-provider-result-v1" and
       .campaign == $campaign and .campaign_revision == $revision and
       .plan_sha256 == $plan_sha256 and .requested == $requested[0] and
@@ -255,8 +322,14 @@ validate_provider_result() {
             .sha256 == $root.external_driver.sha256) ] | length == 1)
        end) and
       ([.reason, ((.runtime // {}) | del(.agent.url)),
-        .artifacts // {}, .assertions // {}, .evidence_index // []] |
-        all(.. | strings; safe_public_string)) and
+        .artifacts // {}, .assertions // {}, .evidence_index // [],
+        .lifecycle_executor // {}] |
+        all(.. | strings; . == "/proc/self/fd/9" or safe_public_string)) and
+      (if $requested[0].provider ==
+        "preprovisioned-lifecycle-application-v1" then
+        (.lifecycle_executor? == null or lifecycle_executor_authority)
+       else .lifecycle_executor? == null
+       end) and
       (if .status == "pass" then
         .attempted == true and .infrastructure_failure == false and
         .command.executed == true and
@@ -264,6 +337,11 @@ validate_provider_result() {
         strong_source and runtime_identity and pass_transport and
         .runtime.provider.feature_probe.supported == true and
         artifact_identity and raw_evidence and
+        (if $requested[0].provider ==
+          "preprovisioned-lifecycle-application-v1" then
+          lifecycle_executor_authority and
+          .lifecycle_executor.command.exit_status == 0
+         else true end) and
         (.assertions.exact_parent | keys == ["matched", "requests", "status", "wrong"]) and
         .assertions.application_result == "pass" and
         .assertions.cleanup == "pass" and
@@ -299,6 +377,11 @@ validate_provider_result() {
           ]) and
         .command.exit_status != 0 and strong_source and runtime_identity and
           artifact_identity and pass_transport and
+          (if $requested[0].provider ==
+            "preprovisioned-lifecycle-application-v1" then
+            lifecycle_executor_authority and
+            .lifecycle_executor.command.exit_status == .command.exit_status
+           else true end) and
           .runtime.provider.feature_probe.supported == true and
           .assertions.product_failure == true
          end)
@@ -307,6 +390,11 @@ validate_provider_result() {
         .command.executed == true and
         (.command.exit_status | exit_code) and .command.exit_status == 78 and
         strong_source and runtime_identity and artifact_identity and raw_evidence and
+        (if $requested[0].provider ==
+          "preprovisioned-lifecycle-application-v1" then
+          lifecycle_executor_authority and
+          .lifecycle_executor.command.exit_status == 78
+         else true end) and
         .runtime.provider.feature_probe.supported == false and
         (if $requested[0].transport == "auto" then
           .runtime.provider.attempted_transports == ["getsockopt", "unix"]
@@ -344,7 +432,18 @@ validate_provider_result() {
         (.source.git_tree | type == "string" and
           (. == "" or test("^[0-9a-f]{40}$"))) and
         .runtime == null and .artifacts == null and .assertions == null and
-        .raw_evidence == null and .evidence_index == null and
+        (if .lifecycle_executor? == null then
+          .raw_evidence == null and .evidence_index == null
+         else
+          lifecycle_executor_authority and
+          .lifecycle_executor.command.exit_status == 69 and
+          raw_evidence and
+          .evidence_index == [{
+            field:"lifecycle_executor.receipt_sha256",
+            path:"lifecycle-execution-receipt.json",
+            sha256:.lifecycle_executor.receipt_sha256
+          }]
+         end) and
         (if .attempted then
           .command.executed == true and (.command.exit_status | exit_code)
          else
@@ -635,6 +734,51 @@ validate_helper_unavailable_bridge_evidence() {
     compatibility_die "unavailable-bridge diagnostics are missing, changed, or unbounded"
 }
 
+validate_lifecycle_executor_receipt() {
+  local -r result="$1"
+  local -r raw_directory="$2"
+  local receipt_path=""
+  local receipt=""
+
+  [[ "$(jq -er '.lifecycle_executor? != null' "$result")" == true ]] || return 0
+  receipt_path="$(jq -er '
+    [.evidence_index[] |
+      select(.field == "lifecycle_executor.receipt_sha256") | .path] |
+    if length == 1 then .[0] else empty end
+  ' "$result")" || return
+  [[ "$receipt_path" == lifecycle-execution-receipt.json ]] ||
+    compatibility_die "lifecycle executor receipt uses a noncanonical path" || return
+  receipt="$raw_directory/$receipt_path"
+  compatibility_require_regular_file "$receipt" || return
+  compatibility_validate_json_file "$receipt" || return
+  jq -e --slurpfile result "$result" '
+    $result[0] as $root |
+    keys == [
+      "approval", "command", "environment", "registry_sha256",
+      "requested_cell_id", "schema", "supervision"
+    ] and
+    .schema == "compatibility-lifecycle-execution-receipt-v1" and
+    .registry_sha256 == $root.lifecycle_executor.registry_sha256 and
+    .approval == $root.lifecycle_executor.approval and
+    .environment == $root.lifecycle_executor.environment and
+    .requested_cell_id == $root.requested.id and
+    .command == $root.lifecycle_executor.command and
+    (.supervision | keys == [
+      "cleanup_complete", "containment_violation", "executor_exit_status",
+      "observed_descendants", "schema", "timed_out"
+    ]) and
+    .supervision == {
+      cleanup_complete:true,
+      containment_violation:false,
+      executor_exit_status:$root.lifecycle_executor.command.exit_status,
+      observed_descendants:0,
+      schema:"compatibility-lifecycle-executor-supervision-v1",
+      timed_out:false
+    }
+  ' "$receipt" >/dev/null ||
+    compatibility_die "lifecycle executor receipt is malformed or contradictory"
+}
+
 main() {
   local campaign=""
   local cell=""
@@ -647,17 +791,46 @@ main() {
   local revision=""
   local plan_sha256=""
   local registry_sha256=""
+  local executor_registry_sha256=""
+  local registry_snapshot=""
+  local executor_registry_snapshot=""
+  local registry_source_identity=""
+  local executor_registry_source_identity=""
+  local registry_snapshot_identity=""
+  local executor_registry_snapshot_identity=""
+  local source_authority_sha256=""
   local launcher_sha256=""
+  local launcher_source=""
+  local launcher_source_identity=""
+  local launcher_snapshot_identity=""
   local provider_result_sha256=""
   local private_manifest_sha256=""
   local raw_manifest_sha256=""
   local argv_sha256=""
   local scratch=""
+  local scratch_authority=""
+  local plan_source=""
+  local plan_source_identity=""
+  local plan_snapshot_identity=""
+  local private_source=""
+  local private_source_ledger=""
+  local private_source_ledger_identity=""
+  local private_snapshot=""
+  local private_snapshot_ledger=""
+  local private_snapshot_ledger_identity=""
+  local private_manifest_source=""
+  local private_manifest_source_identity=""
+  local private_manifest_snapshot_identity=""
+  local cell_source=""
+  local provider_result_source=""
   local regenerated=""
   local raw_directory=""
   local raw_manifest=""
   local raw_regenerated=""
   local output_parent=""
+  local scratch_parent=""
+  local sealed_candidate=""
+  local sealed_candidate_identity=""
 
   while (( $# > 0 )); do
     case "$1" in
@@ -691,6 +864,36 @@ main() {
         private_manifest="$2"
         shift 2
         ;;
+      --provider-registry-snapshot)
+        (( $# >= 2 )) || { usage; return 2; }
+        registry_snapshot="$2"
+        shift 2
+        ;;
+      --provider-registry-snapshot-identity)
+        (( $# >= 2 )) || { usage; return 2; }
+        registry_snapshot_identity="$2"
+        shift 2
+        ;;
+      --provider-registry-source-identity)
+        (( $# >= 2 )) || { usage; return 2; }
+        registry_source_identity="$2"
+        shift 2
+        ;;
+      --lifecycle-executor-registry-snapshot)
+        (( $# >= 2 )) || { usage; return 2; }
+        executor_registry_snapshot="$2"
+        shift 2
+        ;;
+      --lifecycle-executor-registry-snapshot-identity)
+        (( $# >= 2 )) || { usage; return 2; }
+        executor_registry_snapshot_identity="$2"
+        shift 2
+        ;;
+      --lifecycle-executor-registry-source-identity)
+        (( $# >= 2 )) || { usage; return 2; }
+        executor_registry_source_identity="$2"
+        shift 2
+        ;;
       --output)
         (( $# >= 2 )) || { usage; return 2; }
         output="$2"
@@ -711,42 +914,163 @@ main() {
     -n "$provider_launcher" && -n "$private_directory" &&
     -n "$private_manifest" && -n "$output" ]] || { usage; return 2; }
 
-  compatibility_require_commands cmp jq mktemp sha256sum || return
-  compatibility_validate_plan "$campaign" || return
-  plan="$(compatibility_plan_path "$campaign")" || return
-  revision="$(compatibility_campaign_revision "$campaign")" || return
-  plan_sha256="$(compatibility_sha256 "$plan")" || return
-  registry_sha256="$(compatibility_provider_registry_sha256)" || return
+  compatibility_require_commands cmp jq mktemp python3 sha256sum stat || return
   compatibility_require_regular_file "$cell" || return
   compatibility_require_regular_file "$provider_result" || return
-  compatibility_validate_json_file "$cell" || return
-  compatibility_validate_json_file "$provider_result" || return
   compatibility_require_regular_file "$provider_launcher" || return
   compatibility_require_directory "$private_directory" || return
   compatibility_require_regular_file "$private_manifest" || return
+  private_source="${private_directory%/}"
+  cell_source="$cell"
+  provider_result_source="$provider_result"
+  private_manifest_source="$private_manifest"
+  launcher_source="$(readlink -f -- "$provider_launcher")" || return
+  [[ "$cell_source" == "$private_source/requested.json" &&
+    "$provider_result_source" == "$private_source/provider-result.json" ]] ||
+    compatibility_die "sealer inputs are not the canonical private evidence files" ||
+    return
   [[ ! -e "$output" && ! -L "$output" ]] ||
     compatibility_die "sealed cell output already exists: $output" || return
+  output_parent="$(dirname -- "$output")" || return
+  compatibility_require_directory "$output_parent" || return
+  output_parent="$(cd -- "$output_parent" && pwd -P)" || return
+  output="$output_parent/$(basename -- "$output")"
+  scratch_parent="$(cd -- "${TMPDIR:-/tmp}" && pwd -P)" || return
+  compatibility_require_outside_repository "$scratch_parent" || return
+  scratch="$(mktemp -d "$scratch_parent/.compatibility-seal.XXXXXX")" || return
+  SEAL_TEMP_DIRECTORY="$scratch"
+  SEAL_TEMP_PARENT="$scratch_parent"
+  SEAL_TEMP_IDENTITY="$(compatibility_directory_identity "$scratch")" || return
+  trap cleanup_seal_temp EXIT
+  chmod 0700 -- "$scratch"
+  exec {SEAL_TEMP_DESCRIPTOR}<"$scratch" || return
+  [[ "$(stat -Lc '%d:%i:%u' -- "/proc/self/fd/$SEAL_TEMP_DESCRIPTOR")" == \
+      "$SEAL_TEMP_IDENTITY" &&
+    "$(stat -Lc '%a:%u' -- "/proc/self/fd/$SEAL_TEMP_DESCRIPTOR")" == \
+      "700:$EUID" ]] || compatibility_die "seal scratch authority changed" || return
+  scratch_authority="/proc/self/fd/$SEAL_TEMP_DESCRIPTOR/."
+
+  if [[ -z "$registry_snapshot" && -z "$registry_snapshot_identity" &&
+    -z "$registry_source_identity" && -z "$executor_registry_snapshot" &&
+    -z "$executor_registry_snapshot_identity" &&
+    -z "$executor_registry_source_identity" ]]; then
+    registry_snapshot="$scratch_authority/provider-registry.snapshot.json"
+    executor_registry_snapshot=\
+"$scratch_authority/lifecycle-executor-registry.snapshot.json"
+    registry_source_identity="$(
+      compatibility_prepare_provider_registry_snapshot "$registry_snapshot"
+    )" || return
+    executor_registry_source_identity="$(
+      compatibility_prepare_lifecycle_executor_registry_snapshot \
+        "$executor_registry_snapshot"
+    )" || return
+    registry_snapshot_identity="$(compatibility_stable_file_identity \
+      "$registry_snapshot" 67108864)" || return
+    executor_registry_snapshot_identity="$(compatibility_stable_file_identity \
+      "$executor_registry_snapshot" 67108864)" || return
+  else
+    [[ -n "$registry_snapshot" && -n "$registry_snapshot_identity" &&
+      -n "$registry_source_identity" && -n "$executor_registry_snapshot" &&
+      -n "$executor_registry_snapshot_identity" &&
+      -n "$executor_registry_source_identity" ]] || return 2
+    compatibility_validate_provider_registry \
+      "$registry_snapshot" "$registry_snapshot_identity" || return
+    compatibility_validate_lifecycle_executor_registry \
+      "$executor_registry_snapshot" "$executor_registry_snapshot_identity" ||
+      return
+    [[ "$(compatibility_stable_file_identity \
+        "$COMPATIBILITY_PROVIDER_REGISTRY" 67108864)" == \
+        "$registry_source_identity" &&
+      "$(compatibility_stable_file_identity \
+        "$COMPATIBILITY_LIFECYCLE_EXECUTOR_REGISTRY" 67108864)" == \
+        "$executor_registry_source_identity" ]] ||
+      compatibility_die "supplied registry source authority changed" || return
+  fi
+  registry_sha256="$(compatibility_provider_registry_sha256 "$registry_snapshot")" ||
+    return
+  executor_registry_sha256="$(
+    compatibility_lifecycle_executor_registry_sha256 "$executor_registry_snapshot"
+  )" || return
+  compatibility_validate_plan \
+    "$campaign" "$registry_snapshot" "$executor_registry_snapshot" || return
+
+  plan_source="$(compatibility_plan_path "$campaign")" || return
+  plan_source_identity="$(compatibility_create_stable_file_snapshot \
+    "$plan_source" "$scratch_authority/plan.snapshot.json" 67108864)" || return
+  plan="$scratch_authority/plan.snapshot.json"
+  plan_snapshot_identity="$(compatibility_stable_file_identity "$plan" 67108864)" ||
+    return
+  case "$campaign" in
+    compatibility) revision="$(jq -er '.matrix_revision' "$plan")" || return ;;
+    helper-lifecycle) revision="$(jq -er '.campaign_revision' "$plan")" || return ;;
+    *) return 2 ;;
+  esac
+  plan_sha256="${plan_snapshot_identity##*:}"
+
+  private_manifest_source_identity="$(compatibility_create_stable_file_snapshot \
+    "$private_manifest_source" \
+    "$scratch_authority/private-manifest.snapshot.sha256" \
+    67108864)" || return
+  private_manifest="$scratch_authority/private-manifest.snapshot.sha256"
+  private_manifest_snapshot_identity="$(compatibility_stable_file_identity \
+    "$private_manifest" 67108864)" || return
+  regenerated="$scratch_authority/private.sha256"
+  compatibility_directory_manifest "$private_source" "$regenerated" || return
+  cmp -s -- "$private_manifest" "$regenerated" ||
+    compatibility_die "private evidence manifest is incomplete or stale" || return
+
+  private_snapshot="$scratch_authority/private.snapshot"
+  private_source_ledger="$scratch_authority/private-source-identity.json"
+  private_snapshot_ledger="$scratch_authority/private-snapshot-identity.json"
+  compatibility_snapshot_manifest_directory \
+    "$private_source" "$private_manifest" "$private_snapshot" \
+    "$private_source_ledger" "$private_snapshot_ledger" \
+    "$private_manifest_snapshot_identity" || return
+  private_source_ledger_identity="$(compatibility_stable_file_identity \
+    "$private_source_ledger" 67108864)" || return
+  private_snapshot_ledger_identity="$(compatibility_stable_file_identity \
+    "$private_snapshot_ledger" 67108864)" || return
+  compatibility_verify_manifest_directory_source \
+    "$private_source" "$private_source_ledger" \
+    "$private_source_ledger_identity" || return
+  compatibility_verify_manifest_directory_source \
+    "$private_snapshot" "$private_snapshot_ledger" \
+    "$private_snapshot_ledger_identity" || return
+  regenerated="$scratch_authority/private-snapshot.sha256"
+  compatibility_directory_manifest "$private_snapshot" "$regenerated" || return
+  cmp -s -- "$private_manifest" "$regenerated" ||
+    compatibility_die "private evidence snapshot differs from its manifest" || return
+
+  cell="$private_snapshot/requested.json"
+  provider_result="$private_snapshot/provider-result.json"
+  private_directory="$private_snapshot"
+  compatibility_validate_json_file "$cell" || return
+  compatibility_validate_json_file "$provider_result" || return
+  launcher_source_identity="$(compatibility_create_stable_file_snapshot \
+    "$launcher_source" "$scratch_authority/provider-launcher.snapshot" \
+    16777216)" || return
+  provider_launcher="$scratch_authority/provider-launcher.snapshot"
+  chmod 0500 -- "$provider_launcher" || return
+  launcher_snapshot_identity="$(compatibility_stable_file_identity \
+    "$provider_launcher" 16777216)" || return
+  if [[ "$(jq -er '.provider' "$cell")" == \
+    preprovisioned-lifecycle-application-v1 ]]; then
+    compatibility_require_regular_file "$private_directory/source-authority.json" ||
+      return
+    source_authority_sha256="$(
+      compatibility_sha256 "$private_directory/source-authority.json"
+    )" || return
+  fi
   jq -e --slurpfile plan "$plan" '
     . as $requested |
     [$plan[0].cells[] | select(.id == $requested.id and . == $requested)] | length == 1
   ' "$cell" >/dev/null || compatibility_die "selected cell differs from the campaign plan" || return
 
   validate_provider_result "$campaign" "$cell" "$provider_result" \
-    "$revision" "$plan_sha256" "$registry_sha256" || return
+    "$revision" "$plan_sha256" "$registry_sha256" \
+    "$executor_registry_sha256" "$source_authority_sha256" \
+    "$registry_snapshot" "$executor_registry_snapshot" || return
   validate_campaign_assertions "$campaign" "$provider_result" "$plan" || return
-
-  output_parent="$(dirname -- "$output")" || return
-  compatibility_require_directory "$output_parent" || return
-  output_parent="$(cd -- "$output_parent" && pwd -P)" || return
-  scratch="$(mktemp -d "$output_parent/.compatibility-seal.XXXXXX")" || return
-  SEAL_TEMP_DIRECTORY="$scratch"
-  SEAL_TEMP_PARENT="$output_parent"
-  SEAL_TEMP_IDENTITY="$(compatibility_directory_identity "$scratch")" || return
-  trap cleanup_seal_temp EXIT
-  regenerated="$scratch/private.sha256"
-  compatibility_directory_manifest "$private_directory" "$regenerated" || return
-  cmp -s -- "$private_manifest" "$regenerated" ||
-    compatibility_die "private evidence manifest is incomplete or stale" || return
 
   if [[ "$(jq -er '.raw_evidence != null' "$provider_result")" == true ]]; then
     raw_directory="$(jq -er '.raw_evidence.directory' "$provider_result")" || return
@@ -762,27 +1086,31 @@ main() {
     [[ "$(compatibility_sha256 "$raw_manifest")" == \
       "$(jq -er '.raw_evidence.manifest_sha256' "$provider_result")" ]] ||
       compatibility_die "raw evidence manifest digest mismatch" || return
-    raw_regenerated="$scratch/raw.sha256"
+    raw_regenerated="$scratch_authority/raw.sha256"
     compatibility_directory_manifest "$raw_directory" "$raw_regenerated" || return
     cmp -s -- "$raw_manifest" "$raw_regenerated" ||
       compatibility_die "raw evidence manifest is incomplete or stale" || return
   fi
   validate_external_driver_snapshot "$provider_result" "$private_directory" || return
   validate_indexed_public_evidence \
-    "$provider_result" "$raw_directory" "$raw_manifest" "$scratch" || return
+    "$provider_result" "$raw_directory" "$raw_manifest" \
+    "$scratch_authority" || return
   validate_local_attestation_evidence \
     "$provider_result" "$raw_directory" "$cell" || return
   validate_helper_unavailable_bridge_evidence \
     "$campaign" "$provider_result" "$raw_directory" || return
+  validate_lifecycle_executor_receipt "$provider_result" "$raw_directory" || return
 
-  jq -cS '.command.argv' "$provider_result" >"$scratch/argv.json"
-  argv_sha256="$(compatibility_sha256 "$scratch/argv.json")" || return
+  jq -cS '.command.argv' "$provider_result" \
+    >"$scratch_authority/argv.json"
+  argv_sha256="$(compatibility_sha256 "$scratch_authority/argv.json")" || return
   launcher_sha256="$(compatibility_sha256 "$provider_launcher")" || return
   provider_result_sha256="$(compatibility_sha256 "$provider_result")" || return
   private_manifest_sha256="$(compatibility_sha256 "$private_manifest")" || return
   raw_manifest_sha256="$(jq -er '.raw_evidence.manifest_sha256 // ""' \
     "$provider_result")" || return
 
+  sealed_candidate="$scratch_authority/cell-record.candidate.json"
   jq -nS \
     --slurpfile result "$provider_result" \
     --arg launcher_sha256 "$launcher_sha256" \
@@ -809,7 +1137,8 @@ main() {
           launcher_sha256: $launcher_sha256,
           launcher_exit_status: $r.provider_exit_status,
           result_sha256: $result_sha256,
-          command: ($r.command | del(.argv) + {argv_sha256: $argv_sha256})
+          command: ($r.command | del(.argv) + {argv_sha256: $argv_sha256}),
+          lifecycle_executor: ($r.lifecycle_executor // null)
         },
         source: $r.source,
         runtime: $r.runtime,
@@ -822,7 +1151,47 @@ main() {
             (if $raw_manifest_sha256 == "" then null else $raw_manifest_sha256 end)
         }
       }
-    ' | compatibility_atomic_json_write "$output"
+    ' >"$sealed_candidate" || return
+  chmod 0400 -- "$sealed_candidate" || return
+  compatibility_validate_json_file "$sealed_candidate" || return
+  sealed_candidate_identity="$(compatibility_stable_file_identity \
+    "$sealed_candidate" 67108864)" || return
+
+  compatibility_verify_manifest_directory_source \
+    "$private_source" "$private_source_ledger" \
+    "$private_source_ledger_identity" ||
+    compatibility_die "private evidence source changed during sealing" || return
+  compatibility_verify_manifest_directory_source \
+    "$private_snapshot" "$private_snapshot_ledger" \
+    "$private_snapshot_ledger_identity" ||
+    compatibility_die "private evidence snapshot changed during sealing" || return
+  [[ "$(compatibility_stable_file_identity \
+      "$private_manifest_source" 67108864)" == \
+      "$private_manifest_source_identity" &&
+    "$(compatibility_stable_file_identity "$private_manifest" 67108864)" == \
+      "$private_manifest_snapshot_identity" &&
+    "$(compatibility_stable_file_identity \
+      "$COMPATIBILITY_PROVIDER_REGISTRY" 67108864)" == \
+      "$registry_source_identity" &&
+    "$(compatibility_stable_file_identity \
+      "$COMPATIBILITY_LIFECYCLE_EXECUTOR_REGISTRY" 67108864)" == \
+      "$executor_registry_source_identity" &&
+    "$(compatibility_stable_file_identity "$registry_snapshot" 67108864)" == \
+      "$registry_snapshot_identity" &&
+    "$(compatibility_stable_file_identity \
+      "$executor_registry_snapshot" 67108864)" == \
+      "$executor_registry_snapshot_identity" &&
+    "$(compatibility_stable_file_identity "$plan_source" 67108864)" == \
+      "$plan_source_identity" &&
+    "$(compatibility_stable_file_identity "$plan" 67108864)" == \
+      "$plan_snapshot_identity" &&
+    "$(compatibility_stable_file_identity "$launcher_source" 16777216)" == \
+      "$launcher_source_identity" &&
+    "$(compatibility_stable_file_identity "$provider_launcher" 16777216)" == \
+      "$launcher_snapshot_identity" ]] ||
+    compatibility_die "sealing authority changed before publication" || return
+  compatibility_publish_stable_file \
+    "$sealed_candidate" "$sealed_candidate_identity" "$output" 0644
 }
 
 main "$@"

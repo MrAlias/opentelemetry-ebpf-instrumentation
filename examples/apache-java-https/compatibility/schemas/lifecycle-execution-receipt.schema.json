@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:obi:apache-java-https:compatibility-lifecycle-execution-receipt-v1",
+  "title": "Sanitized helper lifecycle execution receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "registry_sha256", "approval", "environment",
+    "requested_cell_id", "command", "supervision"
+  ],
+  "properties": {
+    "schema": {"const": "compatibility-lifecycle-execution-receipt-v1"},
+    "registry_sha256": {"$ref": "#/$defs/sha256"},
+    "approval": {"$ref": "#/$defs/approval"},
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "sha256"],
+      "properties": {
+        "id": {"$ref": "#/$defs/token"},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "requested_cell_id": {"$ref": "#/$defs/token"},
+    "command": {"$ref": "#/$defs/command"},
+    "supervision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "executor_exit_status", "timed_out",
+        "containment_violation", "observed_descendants", "cleanup_complete"
+      ],
+      "properties": {
+        "schema": {"const": "compatibility-lifecycle-executor-supervision-v1"},
+        "executor_exit_status": {"type": "integer", "minimum": 0, "maximum": 255},
+        "timed_out": {"const": false},
+        "containment_violation": {"const": false},
+        "observed_descendants": {"const": 0},
+        "cleanup_complete": {"const": true}
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "token": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,95}$"
+    },
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "path", "sha256", "allowed_cell_ids"],
+      "properties": {
+        "id": {"$ref": "#/$defs/token"},
+        "path": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}(/[A-Za-z0-9][A-Za-z0-9._-]{0,127})*$"
+        },
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "allowed_cell_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 7,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/token"}
+        }
+      }
+    },
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["argv", "executable_sha256", "exit_status"],
+      "properties": {
+        "argv": {
+          "type": "array",
+          "minItems": 19,
+          "maxItems": 19,
+          "prefixItems": [{"const": "/proc/self/fd/9"}],
+          "items": {"type": "string", "minLength": 1, "maxLength": 4096}
+        },
+        "executable_sha256": {"$ref": "#/$defs/sha256"},
+        "exit_status": {"type": "integer", "minimum": 0, "maximum": 255}
+      }
+    }
+  }
+}

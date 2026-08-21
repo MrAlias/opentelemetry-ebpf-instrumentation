@@ -32,6 +32,20 @@ fail() {
   return 1
 }
 
+quarantine_path_for() (
+  local -r target="$1"
+  local -r parent="${target%/*}"
+  local -r name="${target##*/}"
+  local -a candidates=()
+
+  shopt -s nullglob
+  candidates=("$parent/.compatibility-quarantine.$name."*)
+  (( ${#candidates[@]} == 1 )) ||
+    fail "expected one preserved quarantine for $target; found ${#candidates[@]}" ||
+    return
+  printf '%s\n' "${candidates[0]}"
+)
+
 cleanup_test_root() {
   [[ -n "$TEST_ROOT" ]] || return 0
   compatibility_remove_owned_temp_directory \
@@ -44,6 +58,8 @@ create_clean_execution_repository() {
   local destination_parent=""
   local mock_driver_sha=""
   local registry=""
+  local lifecycle_executor_registry=""
+  local lifecycle_executor_sha=""
 
   EXECUTION_REPOSITORY="$TEST_ROOT/source-checkout"
   destination_parent="$EXECUTION_REPOSITORY/examples/apache-java-https"
@@ -54,13 +70,30 @@ create_clean_execution_repository() {
   mock_driver_sha="$(compatibility_sha256 "$TEST_DIRECTORY/mock-external-driver.sh")"
   jq -S --arg sha "$mock_driver_sha" '
     .providers["preprovisioned-host-application-v1"].approved_drivers =
-      [{id: "fixture-host-driver-v1", sha256: $sha}] |
+      [{id: "fixture-host-driver-v1", path: "providers/tests/mock-external-driver.sh", sha256: $sha}] |
     .providers["preprovisioned-jvm-application-v1"].approved_drivers =
-      [{id: "fixture-jvm-driver-v1", sha256: $sha}] |
-    .providers["preprovisioned-lifecycle-application-v1"].approved_drivers =
-      [{id: "fixture-lifecycle-driver-v1", sha256: $sha}]
+      [{id: "fixture-jvm-driver-v1", path: "providers/tests/mock-external-driver.sh", sha256: $sha}] |
+    .providers["preprovisioned-lifecycle-application-v1"].approved_drivers +=
+      [{id: "fixture-lifecycle-driver-v1", path: "providers/tests/mock-external-driver.sh", sha256: $sha}]
   ' "$registry" >"$registry.new"
+  install -d -m 0700 -- "$EXECUTION_CAMPAIGN_DIRECTORY/providers/tests"
+  install -m 0500 -- "$EXECUTION_CAMPAIGN_DIRECTORY/tests/mock-external-driver.sh" \
+    "$EXECUTION_CAMPAIGN_DIRECTORY/providers/tests/mock-external-driver.sh"
   mv -fT -- "$registry.new" "$registry"
+  lifecycle_executor_registry="$EXECUTION_CAMPAIGN_DIRECTORY/lifecycle-executor-registry-v1.json"
+  lifecycle_executor_sha="$(compatibility_sha256 \
+    "$EXECUTION_CAMPAIGN_DIRECTORY/tests/lifecycle-environment-fixture.sh")"
+  jq -S \
+    --arg sha256 "$lifecycle_executor_sha" \
+    --slurpfile plan "$EXECUTION_CAMPAIGN_DIRECTORY/helper-lifecycle-v1.json" '
+      .approved_executors = [{
+        id:"synthetic-lifecycle-executor-v1",
+        path:"tests/lifecycle-environment-fixture.sh",
+        sha256:$sha256,
+        allowed_cell_ids:($plan[0].cells | map(.id) | sort)
+      }]
+    ' "$lifecycle_executor_registry" >"$lifecycle_executor_registry.new"
+  mv -fT -- "$lifecycle_executor_registry.new" "$lifecycle_executor_registry"
   SOURCE_MARKER="$EXECUTION_REPOSITORY/source-authority-marker.txt"
   printf 'source authority marker\n' >"$SOURCE_MARKER"
   chmod 0600 -- "$SOURCE_MARKER"
@@ -108,6 +141,22 @@ expect_failure() {
 
   if "$@" >"$TEST_ROOT/$label.stdout" 2>"$TEST_ROOT/$label.stderr"; then
     fail "$label unexpectedly succeeded"
+  fi
+}
+
+expect_status() {
+  local -r label="$1"
+  local -r expected="$2"
+  shift 2
+  local observed=0
+
+  set +e
+  "$@" >"$TEST_ROOT/$label.stdout" 2>"$TEST_ROOT/$label.stderr"
+  observed=$?
+  set -e
+  if [[ "$observed" != "$expected" ]]; then
+    sed -n '1,20p' "$TEST_ROOT/$label.stderr" >&2 || true
+    fail "$label returned $observed instead of $expected"
   fi
 }
 
@@ -343,6 +392,9 @@ bind_candidate_evidence_index() {
       assertions.unavailable_bridge.diagnostics.evidence_sha256)
         path=unavailable-bridge/diagnostics.json
         ;;
+      lifecycle_executor.receipt_sha256)
+        path="lifecycle-execution-receipt.json"
+        ;;
     esac
     file="$raw/$path"
     install -d -m 0700 -- "$(dirname -- "$file")"
@@ -388,6 +440,27 @@ bind_candidate_evidence_index() {
           diagnostics:["bridge-unavailable-control"]
         }' >"$file"
         ;;
+      lifecycle_executor.receipt_sha256)
+        jq -nS --slurpfile result "$result" '
+          $result[0] as $root |
+          {
+            schema:"compatibility-lifecycle-execution-receipt-v1",
+            registry_sha256:$root.lifecycle_executor.registry_sha256,
+            approval:$root.lifecycle_executor.approval,
+            environment:$root.lifecycle_executor.environment,
+            requested_cell_id:$root.requested.id,
+            command:$root.lifecycle_executor.command,
+            supervision:{
+              cleanup_complete:true,
+              containment_violation:false,
+              executor_exit_status:$root.lifecycle_executor.command.exit_status,
+              observed_descendants:0,
+              schema:"compatibility-lifecycle-executor-supervision-v1",
+              timed_out:false
+            }
+          }
+        ' >"$file"
+        ;;
       *) printf 'synthetic proof for %s\n' "$field" >"$file" ;;
     esac
     chmod 0600 -- "$file"
@@ -432,7 +505,12 @@ write_claimed_pass_candidate() {
   local resources='{}'
   local assertions='{}'
   local external_driver=null
+  local lifecycle_executor=null
   local registry_sha256=""
+  local lifecycle_executor_registry_sha256=""
+  local lifecycle_executor_approval=""
+  local lifecycle_executor_argv=""
+  local source_authority_sha256=""
   local driver_id=""
   local command_adapter_sha256=""
 
@@ -514,6 +592,7 @@ write_claimed_pass_candidate() {
     ')"
   fi
   registry_sha256="$(compatibility_sha256 "$(test_registry_path)")"
+  source_authority_sha256="$(compatibility_sha256 "$private/source-authority.json")"
   command_adapter_sha256="$(compatibility_sha256 "$launcher")"
   if [[ "$provider" != runsh-java21-container-v1 ]]; then
     case "$provider" in
@@ -531,6 +610,43 @@ write_claimed_pass_candidate() {
         id:$id, sha256:$sha256, snapshot:"external-driver.snapshot"
       }')"
   fi
+  if [[ "$campaign" == helper-lifecycle ]]; then
+    lifecycle_executor_registry_sha256="$(compatibility_sha256 \
+      "$EXECUTION_CAMPAIGN_DIRECTORY/lifecycle-executor-registry-v1.json")"
+    lifecycle_executor_approval="$(jq -cer '.approved_executors[0]' \
+      "$EXECUTION_CAMPAIGN_DIRECTORY/lifecycle-executor-registry-v1.json")"
+    lifecycle_executor_argv="$(jq -cnS \
+      --arg revision "$revision" \
+      --arg plan_sha256 "$plan_sha256" \
+      --arg source_authority_sha256 "$source_authority_sha256" \
+      --arg environment_sha256 "$FIXTURE_SHA" '[
+        "/proc/self/fd/9",
+        "--contract", "compatibility-helper-lifecycle-environment-v1",
+        "--campaign-revision", $revision,
+        "--plan-sha256", $plan_sha256,
+        "--cell", "requested-cell.snapshot.json",
+        "--source-authority", "source-authority.snapshot.json",
+        "--source-authority-sha256", $source_authority_sha256,
+        "--environment", "lifecycle-environment.snapshot.json",
+        "--environment-sha256", $environment_sha256,
+        "--output", "environment-output"
+      ]')"
+    lifecycle_executor="$(jq -cnS \
+      --arg registry_sha256 "$lifecycle_executor_registry_sha256" \
+      --argjson approval "$lifecycle_executor_approval" \
+      --arg environment_sha256 "$FIXTURE_SHA" \
+      --argjson argv "$lifecycle_executor_argv" \
+      --arg receipt_sha256 "$FIXTURE_SHA" '{
+        schema:"compatibility-lifecycle-executor-authority-v1",
+        registry_sha256:$registry_sha256,
+        approval:$approval,
+        environment:{id:"synthetic-lifecycle-environment-v1",sha256:$environment_sha256},
+        command:{
+          argv:$argv,executable_sha256:$approval.sha256,exit_status:0
+        },
+        receipt_sha256:$receipt_sha256
+      }')"
+  fi
   jq -nS \
     --arg campaign "$campaign" \
     --arg revision "$revision" \
@@ -545,7 +661,8 @@ write_claimed_pass_candidate() {
     --arg raw_manifest_sha256 "$FIXTURE_SHA" \
     --slurpfile requested "$requested" \
     --argjson assertions "$assertions" \
-    --argjson external_driver "$external_driver" '
+    --argjson external_driver "$external_driver" \
+    --argjson lifecycle_executor "$lifecycle_executor" '
       $requested[0] as $r |
       {
         schema: "compatibility-provider-result-v1",
@@ -562,6 +679,7 @@ write_claimed_pass_candidate() {
         requested: $r,
         provider_registry_sha256: $registry_sha256,
         external_driver: $external_driver,
+        lifecycle_executor: $lifecycle_executor,
         command: {
           executed: true,
           argv: ["fixture-driver", "--cell", $r.id],
@@ -671,9 +789,113 @@ seal_candidate() {
 }
 
 test_plans() {
+  local plan_temp_parent="$TEST_ROOT/plan-temp-authority"
+  local plan_leaf_parent="$TEST_ROOT/plan-temp-leaf-replacement"
+  local plan_root_parent="$TEST_ROOT/plan-temp-root-replacement"
+  local plan_leaf_sink="$TEST_ROOT/plan-authentic-leaf"
+  local plan_authority=""
+  local plan_leaf=""
+  local -a active_plan_scratch=()
+  local -a retained_plan_scratch=()
+  local -a retained_leaf_scratch=()
+  local -a retained_root_scratch=()
+  local -a authentic_root_scratch=()
+
   jq -e . "$CAMPAIGN_DIRECTORY"/schemas/*.schema.json >/dev/null
-  "$CAMPAIGN_DIRECTORY/validate-plan.sh" compatibility
-  "$CAMPAIGN_DIRECTORY/validate-plan.sh" helper-lifecycle
+  install -d -m 0700 -- "$plan_temp_parent"
+  TMPDIR="$plan_temp_parent" \
+    "$CAMPAIGN_DIRECTORY/validate-plan.sh" compatibility
+  TMPDIR="$plan_temp_parent" \
+    "$CAMPAIGN_DIRECTORY/validate-plan.sh" helper-lifecycle
+  mapfile -t active_plan_scratch < <(
+    compgen -G "$plan_temp_parent/.compatibility-plan-authority.*" || true
+  )
+  mapfile -t retained_plan_scratch < <(
+    compgen -G \
+      "$plan_temp_parent/.compatibility-quarantine..compatibility-plan-authority.*" ||
+      true
+  )
+  (( ${#active_plan_scratch[@]} == 0 )) ||
+    fail "plan validation left an active authority scratch root"
+  (( ${#retained_plan_scratch[@]} == 2 )) ||
+    fail "plan validation did not quarantine both exact authority roots"
+
+  install -d -m 0700 -- "$plan_leaf_parent" "$plan_root_parent"
+  # shellcheck disable=SC2317 # Invoked by plan-authority cleanup as a race seam.
+  compatibility_temp_cleanup_before_quarantine() {
+    local -r authority="$1"
+    local -r authority_parent="$3"
+    local -r expected_prefix="$4"
+    local leaf=""
+
+    [[ "$expected_prefix" == "[.]compatibility-plan-authority[.]" ]] || return 0
+    case "$authority_parent" in
+      "$plan_leaf_parent")
+        for leaf in "$authority"/actual.*; do
+          [[ -f "$leaf" && ! -L "$leaf" ]] || continue
+          mv -- "$leaf" "$plan_leaf_sink"
+          printf 'foreign replacement roster\n' >"$leaf"
+          chmod 0600 -- "$leaf"
+          return 0
+        done
+        return 1
+        ;;
+      "$plan_root_parent")
+        mv -- "$authority" "$authority.authority"
+        install -d -m 0700 -- "$authority"
+        printf 'foreign replacement root\n' >"$authority/sentinel"
+        chmod 0600 -- "$authority/sentinel"
+        ;;
+    esac
+  }
+  TMPDIR="$plan_leaf_parent" compatibility_validate_plan compatibility
+  mapfile -t retained_leaf_scratch < <(
+    compgen -G \
+      "$plan_leaf_parent/.compatibility-quarantine..compatibility-plan-authority.*" ||
+      true
+  )
+  (( ${#retained_leaf_scratch[@]} == 1 )) ||
+    fail "plan leaf replacement did not retain one quarantined authority root"
+  plan_authority="${retained_leaf_scratch[0]}"
+  plan_leaf=""
+  for plan_leaf in "$plan_authority"/actual.*; do
+    [[ -f "$plan_leaf" && ! -L "$plan_leaf" ]] || continue
+    [[ "$(<"$plan_leaf")" == "foreign replacement roster" ]] ||
+      fail "plan cleanup deleted or confused the foreign replacement leaf"
+    break
+  done
+  [[ -n "$plan_leaf" && -f "$plan_leaf_sink" ]] ||
+    fail "plan cleanup lost the authentic or replacement roster leaf"
+
+  TMPDIR="$plan_root_parent" compatibility_validate_plan compatibility
+  # shellcheck disable=SC2317 # Restores the production indirect callback.
+  compatibility_temp_cleanup_before_quarantine() { :; }
+  mapfile -t retained_root_scratch < <(
+    compgen -G \
+      "$plan_root_parent/.compatibility-quarantine..compatibility-plan-authority.*" ||
+      true
+  )
+  mapfile -t authentic_root_scratch < <(
+    compgen -G \
+      "$plan_root_parent/.compatibility-plan-authority.*.authority" || true
+  )
+  (( ${#retained_root_scratch[@]} == 1 &&
+    ${#authentic_root_scratch[@]} == 1 )) ||
+    fail "plan whole-root replacement was not separated from its authority"
+  [[ "$(<"${retained_root_scratch[0]}/sentinel")" == \
+      "foreign replacement root" &&
+    -f "${authentic_root_scratch[0]}/provider-registry.snapshot.json" ]] ||
+    fail "plan whole-root replacement or authentic bytes were deleted"
+  jq -e '.approved_executors == []' \
+    "$CAMPAIGN_DIRECTORY/lifecycle-executor-registry-v1.json" >/dev/null
+  jq -e '
+    .approved_executors == [{
+      id:"synthetic-lifecycle-executor-v1",
+      path:"tests/lifecycle-environment-fixture.sh",
+      sha256:.approved_executors[0].sha256,
+      allowed_cell_ids:.approved_executors[0].allowed_cell_ids
+    }] and (.approved_executors[0].allowed_cell_ids | length) == 7
+  ' "$EXECUTION_CAMPAIGN_DIRECTORY/lifecycle-executor-registry-v1.json" >/dev/null
   [[ "$(jq -r '.cells | length' "$CAMPAIGN_DIRECTORY/campaign-v3.json")" == 45 ]]
   jq -e '
     ([.cells[] | select(.slice == "kernel-topology-deployment")] | length == 34) and
@@ -1562,6 +1784,228 @@ test_classification_and_assertion_mutations() {
     seal_candidate helper-lifecycle "$candidate"
 }
 
+test_registry_traversal_boundaries() {
+  local -r execution_lib="$EXECUTION_CAMPAIGN_DIRECTORY/lib.sh"
+
+  # shellcheck disable=SC2016 # Positional parameters belong to the inner shell.
+  expect_status provider-registry-producer-exit73 73 \
+    bash -c '
+      set -Eeuo pipefail
+      source "$1"
+      compatibility_materialize_provider_registry_roster() {
+        printf "partial-provider-roster\n" >"$2"
+        return 73
+      }
+      compatibility_validate_provider_registry
+    ' _ "$execution_lib"
+
+  # shellcheck disable=SC2016 # Positional parameters belong to the inner shell.
+  expect_status lifecycle-registry-producer-exit74 74 \
+    bash -c '
+      set -Eeuo pipefail
+      source "$1"
+      compatibility_materialize_lifecycle_executor_registry_roster() {
+        printf "partial-lifecycle-roster\n" >"$2"
+        return 74
+      }
+      compatibility_validate_lifecycle_executor_registry
+    ' _ "$execution_lib"
+
+  # shellcheck disable=SC2016 # Positional parameters belong to the inner shell.
+  expect_failure provider-registry-partial-roster \
+    bash -c '
+      set -Eeuo pipefail
+      source "$1"
+      compatibility_materialize_provider_registry_roster() {
+        : >"$2"
+      }
+      compatibility_validate_provider_registry
+    ' _ "$execution_lib"
+
+  # shellcheck disable=SC2016 # Positional parameters belong to the inner shell.
+  expect_failure lifecycle-registry-partial-roster \
+    bash -c '
+      set -Eeuo pipefail
+      source "$1"
+      compatibility_materialize_lifecycle_executor_registry_roster() {
+        : >"$2"
+      }
+      compatibility_validate_lifecycle_executor_registry
+    ' _ "$execution_lib"
+
+  # shellcheck disable=SC2016 # Positional parameters belong to the inner shell.
+  expect_failure provider-registry-snapshot-aba bash -c '
+    set -Eeuo pipefail
+    source "$1"
+    compatibility_registry_traversal_hook() {
+      local -r kind="$1"
+      local -r phase="$2"
+      local -r snapshot="$4"
+      [[ "$kind:$phase" == provider:before ]] || {
+        if [[ "$kind:$phase" == provider:after ]]; then
+          mv -- "$snapshot" "$snapshot.foreign"
+          mv -- "$snapshot.authority" "$snapshot"
+        fi
+        return 0
+      }
+      mv -- "$snapshot" "$snapshot.authority"
+      printf "{\"schema\":\"foreign-registry\"}\n" >"$snapshot"
+      chmod 0400 -- "$snapshot"
+    }
+    compatibility_validate_provider_registry
+  ' _ "$execution_lib"
+
+  # shellcheck disable=SC2016 # Positional parameters belong to the inner shell.
+  expect_failure lifecycle-registry-snapshot-aba bash -c '
+    set -Eeuo pipefail
+    source "$1"
+    compatibility_registry_traversal_hook() {
+      local -r kind="$1"
+      local -r phase="$2"
+      local -r snapshot="$4"
+      [[ "$kind:$phase" == lifecycle:before ]] || {
+        if [[ "$kind:$phase" == lifecycle:after ]]; then
+          mv -- "$snapshot" "$snapshot.foreign"
+          mv -- "$snapshot.authority" "$snapshot"
+        fi
+        return 0
+      }
+      mv -- "$snapshot" "$snapshot.authority"
+      printf "{\"schema\":\"foreign-registry\"}\n" >"$snapshot"
+      chmod 0400 -- "$snapshot"
+    }
+    compatibility_validate_lifecycle_executor_registry
+  ' _ "$execution_lib"
+
+  # shellcheck disable=SC2016 # Positional parameters belong to the inner shell.
+  expect_failure provider-registry-roster-aba bash -c '
+    set -Eeuo pipefail
+    source "$1"
+    compatibility_registry_traversal_hook() {
+      local -r kind="$1"
+      local -r phase="$2"
+      local -r roster="$5"
+      [[ "$kind:$phase" == provider:before-read ]] || {
+        if [[ "$kind:$phase" == provider:after-read ]]; then
+          mv -- "$roster" "$roster.foreign"
+          mv -- "$roster.authority" "$roster"
+        fi
+        return 0
+      }
+      mv -- "$roster" "$roster.authority"
+      printf "foreign\tproviders/foreign.sh\t%s\n" \
+        aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+        >"$roster"
+      chmod 0400 -- "$roster"
+    }
+    compatibility_validate_provider_registry
+  ' _ "$execution_lib"
+
+  # shellcheck disable=SC2016 # Positional parameters belong to the inner shell.
+  expect_failure lifecycle-registry-roster-aba bash -c '
+    set -Eeuo pipefail
+    source "$1"
+    compatibility_registry_traversal_hook() {
+      local -r kind="$1"
+      local -r phase="$2"
+      local -r roster="$5"
+      [[ "$kind:$phase" == lifecycle:before-read ]] || {
+        if [[ "$kind:$phase" == lifecycle:after-read ]]; then
+          mv -- "$roster" "$roster.foreign"
+          mv -- "$roster.authority" "$roster"
+        fi
+        return 0
+      }
+      mv -- "$roster" "$roster.authority"
+      printf "tests/foreign.sh\t%s\n" \
+        aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+        >"$roster"
+      chmod 0400 -- "$roster"
+    }
+    compatibility_validate_lifecycle_executor_registry
+  ' _ "$execution_lib"
+
+  # Each consumer must query the exact inode retained before validation.  The
+  # after hook restores the authoritative pathname, making this a true pathname
+  # ABA rather than a simple final-state substitution.
+  # shellcheck disable=SC2016 # Positional parameters belong to the inner shell.
+  expect_failure provider-registry-select-aba bash -c '
+    set -Eeuo pipefail
+    source "$1"
+    scratch="$2"
+    registry="$COMPATIBILITY_PROVIDER_REGISTRY"
+    driver="$COMPATIBILITY_DIRECTORY/providers/lifecycle-application-driver-v1.sh"
+    digest="$(compatibility_sha256 "$driver")"
+    compatibility_registry_consumer_hook() {
+      local -r kind="$1" phase="$2" current_registry="$3"
+      [[ "$kind:$phase" == provider:before-select ]] && {
+        mv -- "$current_registry" "$current_registry.authority"
+        cp -p -- "$current_registry.authority" "$current_registry"
+      }
+      [[ "$kind:$phase" == provider:after-select ]] && {
+        mv -- "$current_registry" "$scratch/provider-select-foreign"
+        mv -- "$current_registry.authority" "$current_registry"
+      }
+      return 0
+    }
+    compatibility_provider_registry_driver_id \
+      preprovisioned-lifecycle-application-v1 "$digest" "$driver" "$registry"
+  ' _ "$execution_lib" "$TEST_ROOT"
+
+  # shellcheck disable=SC2016 # Positional parameters belong to the inner shell.
+  expect_failure lifecycle-registry-select-aba bash -c '
+    set -Eeuo pipefail
+    source "$1"
+    scratch="$2"
+    registry="$COMPATIBILITY_LIFECYCLE_EXECUTOR_REGISTRY"
+    approval_id="$(jq -er ".approved_executors[0].id" "$registry")"
+    approval_path="$(jq -er ".approved_executors[0].path" "$registry")"
+    digest="$(jq -er ".approved_executors[0].sha256" "$registry")"
+    cell_id="$(jq -er ".approved_executors[0].allowed_cell_ids[0]" "$registry")"
+    compatibility_registry_consumer_hook() {
+      local -r kind="$1" phase="$2" current_registry="$3"
+      [[ "$kind:$phase" == lifecycle:before-select ]] && {
+        mv -- "$current_registry" "$current_registry.authority"
+        cp -p -- "$current_registry.authority" "$current_registry"
+      }
+      [[ "$kind:$phase" == lifecycle:after-select ]] && {
+        mv -- "$current_registry" "$scratch/lifecycle-select-foreign"
+        mv -- "$current_registry.authority" "$current_registry"
+      }
+      return 0
+    }
+    compatibility_lifecycle_executor_approval \
+      "$approval_id" "$approval_path" "$digest" "$cell_id" "$registry"
+  ' _ "$execution_lib" "$TEST_ROOT"
+
+  install -d -m 0700 -- "$TEST_ROOT/stable-jq-bin"
+  printf '{"value":"original"}\n' >"$TEST_ROOT/stable-jq-input.json"
+  chmod 0400 -- "$TEST_ROOT/stable-jq-input.json"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -Eeuo pipefail' \
+    'printf '\''{"value":"mutated"}\n'\'' >"$OBI_STABLE_QUERY_TARGET"' \
+    'chmod 0600 -- "$OBI_STABLE_QUERY_TARGET"' \
+    'printf '\''{"value":"original"}\n'\'' >"$OBI_STABLE_QUERY_TARGET"' \
+    'chmod 0400 -- "$OBI_STABLE_QUERY_TARGET"' \
+    'exec "$OBI_REAL_JQ" "$@"' \
+    >"$TEST_ROOT/stable-jq-bin/jq"
+  chmod 0500 -- "$TEST_ROOT/stable-jq-bin/jq"
+  # shellcheck disable=SC2016 # Positional parameters belong to the inner shell.
+  expect_failure stable-query-in-place-byte-mode-aba bash -c '
+    set -Eeuo pipefail
+    source "$1"
+    target="$2"
+    identity="$(compatibility_stable_file_identity "$target" 1048576)"
+    export PATH="$3:$PATH"
+    export OBI_STABLE_QUERY_TARGET="$target"
+    export OBI_REAL_JQ="$4"
+    compatibility_stable_jq_query \
+      @INPUT@ "$target" "$identity" 1048576 -- jq -e . @INPUT@
+  ' _ "$execution_lib" "$TEST_ROOT/stable-jq-input.json" \
+    "$TEST_ROOT/stable-jq-bin" "$(command -v jq)"
+}
+
 test_manifest_and_cleanup_boundaries() {
   local directory=""
   local output=""
@@ -1570,7 +2014,17 @@ test_manifest_and_cleanup_boundaries() {
   local replaced=""
   local replaced_identity=""
   local replacement_identity=""
+  local quarantine=""
+  local cleanup_attack_target=""
+  local cleanup_attack_original=""
+  local cleanup_link_target=""
+  local cleanup_parent=""
+  local cleanup_parent_original=""
+  local cleanup_parent_target=""
   local identities="$TEST_ROOT/driver-identities.jsonl"
+  local approved_provider="preprovisioned-lifecycle-application-v1"
+  local approved_driver_id=""
+  local approved_driver_sha256=""
 
   directory="$TEST_ROOT/manifest-symlink"
   install -d -m 0700 -- "$directory"
@@ -1603,27 +2057,43 @@ test_manifest_and_cleanup_boundaries() {
   install -d -m 0700 -- "$directory"
   printf 'fixture\n' >"$directory/file"
   chmod 0600 -- "$directory/file"
-  # shellcheck disable=SC2317 # Injected into the manifest subshell by name.
+  # shellcheck disable=SC2317 # Must not be used by descriptor-bound traversal.
   find() { return 71; }
-  expect_failure manifest-find-failure compatibility_directory_manifest \
-    "$directory" "$TEST_ROOT/manifest-find-failure.sha256"
+  compatibility_directory_manifest \
+    "$directory" "$TEST_ROOT/manifest-find-independent.sha256"
+  [[ "$(<"$TEST_ROOT/manifest-find-independent.sha256")" == \
+    "$(compatibility_sha256 "$directory/file")  file" ]] ||
+    fail "manifest construction trusted an ambient find implementation"
   unset -f find
 
   directory="$TEST_ROOT/manifest-sort-failure"
   install -d -m 0700 -- "$directory"
   printf 'fixture\n' >"$directory/file"
   chmod 0600 -- "$directory/file"
-  # shellcheck disable=SC2317 # Injected into the manifest subshell by name.
+  # shellcheck disable=SC2317 # Must not be used by descriptor-bound traversal.
   sort() { return 72; }
-  expect_failure manifest-sort-failure compatibility_directory_manifest \
-    "$directory" "$TEST_ROOT/manifest-sort-failure.sha256"
+  compatibility_directory_manifest \
+    "$directory" "$TEST_ROOT/manifest-sort-independent.sha256"
+  [[ "$(<"$TEST_ROOT/manifest-sort-independent.sha256")" == \
+    "$(compatibility_sha256 "$directory/file")  file" ]] ||
+    fail "manifest construction trusted an ambient sort implementation"
   unset -f sort
 
   owned="$(mktemp -d "$TEST_ROOT/.identity.XXXXXX")"
+  install -d -m 0700 -- "$owned/nested"
+  printf 'owned retained leaf\n' >"$owned/nested/leaf"
+  chmod 0600 -- "$owned/nested/leaf"
+  mkfifo -m 0600 -- "$owned/nested/fifo"
+  ln -s -- leaf "$owned/nested/link"
   owned_identity="$(compatibility_directory_identity "$owned")"
   compatibility_remove_owned_temp_directory \
     "$owned" "$owned_identity" "$TEST_ROOT" "[.]identity[.]"
   [[ ! -e "$owned" ]] || fail "identity-scoped cleanup left its exact directory"
+  quarantine="$(quarantine_path_for "$owned")"
+  [[ -f "$quarantine/nested/leaf" && -p "$quarantine/nested/fifo" &&
+    -L "$quarantine/nested/link" &&
+    "$(readlink -- "$quarantine/nested/link")" == leaf ]] ||
+    fail "owned cleanup traversed or deleted retained quarantine leaves"
 
   replaced="$(mktemp -d "$TEST_ROOT/.identity.XXXXXX")"
   replaced_identity="$(compatibility_directory_identity "$replaced")"
@@ -1634,7 +2104,103 @@ test_manifest_and_cleanup_boundaries() {
   [[ "$replacement_identity" != "$replaced_identity" ]]
   expect_failure temp-inode-replacement compatibility_remove_owned_temp_directory \
     "$replaced" "$replaced_identity" "$TEST_ROOT" "[.]identity[.]"
-  [[ -f "$replaced/sentinel" ]] || fail "cleanup deleted a replacement directory"
+  [[ ! -e "$replaced" && ! -L "$replaced" ]] ||
+    fail "cleanup left a foreign replacement at the trusted target name"
+  quarantine="$(quarantine_path_for "$replaced")"
+  [[ -f "$quarantine/sentinel" ]] ||
+    fail "cleanup did not preserve a replacement directory in quarantine"
+
+  cleanup_attack_target="$(mktemp -d "$TEST_ROOT/.post-check.XXXXXX")"
+  replaced_identity="$(compatibility_directory_identity "$cleanup_attack_target")"
+  cleanup_attack_original="$cleanup_attack_target.original"
+  # shellcheck disable=SC2317 # Called by the cleanup implementation as a race seam.
+  compatibility_temp_cleanup_before_quarantine() {
+    [[ "$1" == "$cleanup_attack_target" ]] || return 0
+    mv -- "$cleanup_attack_target" "$cleanup_attack_original"
+    install -d -m 0700 -- "$cleanup_attack_target"
+    printf 'post-check foreign directory\n' >"$cleanup_attack_target/sentinel"
+    chmod 0600 -- "$cleanup_attack_target/sentinel"
+  }
+  expect_failure temp-post-check-replacement \
+    compatibility_remove_owned_temp_directory \
+    "$cleanup_attack_target" "$replaced_identity" "$TEST_ROOT" \
+    "[.]post-check[.]"
+  # Restore the production no-op after the deterministic mutation seam.
+  # shellcheck disable=SC2317 # Restores the production indirect callback.
+  compatibility_temp_cleanup_before_quarantine() { :; }
+  quarantine="$(quarantine_path_for "$cleanup_attack_target")"
+  [[ -d "$cleanup_attack_original" && -f "$quarantine/sentinel" ]] ||
+    fail "post-check replacement was not preserved outside the trusted name"
+
+  cleanup_parent="$(mktemp -d "$TEST_ROOT/cleanup-parent.XXXXXX")"
+  cleanup_parent_original="$cleanup_parent.original"
+  cleanup_parent_target="$(mktemp -d "$cleanup_parent/.identity.XXXXXX")"
+  replaced_identity="$(compatibility_directory_identity "$cleanup_parent_target")"
+  # shellcheck disable=SC2317 # Called after parent identity capture.
+  compatibility_temp_cleanup_before_quarantine() {
+    [[ "$1" == "$cleanup_parent_target" ]] || return 0
+    mv -- "$cleanup_parent" "$cleanup_parent_original"
+    install -d -m 0700 -- "$cleanup_parent"
+    install -d -m 0700 -- "$cleanup_parent_target"
+    printf 'foreign parent replacement\n' >"$cleanup_parent_target/sentinel"
+    chmod 0600 -- "$cleanup_parent_target/sentinel"
+  }
+  expect_failure temp-parent-identity-replacement \
+    compatibility_remove_owned_temp_directory \
+    "$cleanup_parent_target" "$replaced_identity" "$cleanup_parent" \
+    "[.]identity[.]"
+  # shellcheck disable=SC2317 # Restores the production indirect callback.
+  compatibility_temp_cleanup_before_quarantine() { :; }
+  [[ -d "$cleanup_parent_original/${cleanup_parent_target##*/}" &&
+    -f "$cleanup_parent_target/sentinel" ]] ||
+    fail "parent identity substitution removed trusted or foreign bytes"
+
+  cleanup_link_target="$TEST_ROOT/cleanup-link-target"
+  printf 'symlink destination must survive\n' >"$cleanup_link_target"
+  chmod 0600 -- "$cleanup_link_target"
+  replaced="$(mktemp -d "$TEST_ROOT/.foreign-symlink.XXXXXX")"
+  replaced_identity="$(compatibility_directory_identity "$replaced")"
+  mv -- "$replaced" "$replaced.original"
+  ln -s -- "$cleanup_link_target" "$replaced"
+  expect_failure temp-foreign-symlink compatibility_remove_owned_temp_directory \
+    "$replaced" "$replaced_identity" "$TEST_ROOT" "[.]foreign-symlink[.]"
+  quarantine="$(quarantine_path_for "$replaced")"
+  [[ -L "$quarantine" && "$(readlink -- "$quarantine")" == "$cleanup_link_target" &&
+    "$(<"$cleanup_link_target")" == "symlink destination must survive" ]] ||
+    fail "foreign symlink or its destination was not preserved"
+
+  replaced="$(mktemp -d "$TEST_ROOT/.foreign-file.XXXXXX")"
+  replaced_identity="$(compatibility_directory_identity "$replaced")"
+  mv -- "$replaced" "$replaced.original"
+  printf 'foreign regular file\n' >"$replaced"
+  chmod 0600 -- "$replaced"
+  expect_failure temp-foreign-file compatibility_remove_owned_temp_directory \
+    "$replaced" "$replaced_identity" "$TEST_ROOT" "[.]foreign-file[.]"
+  quarantine="$(quarantine_path_for "$replaced")"
+  [[ -f "$quarantine" && "$(<"$quarantine")" == "foreign regular file" ]] ||
+    fail "foreign regular file was not preserved"
+
+  replaced="$(mktemp -d "$TEST_ROOT/.foreign-special.XXXXXX")"
+  replaced_identity="$(compatibility_directory_identity "$replaced")"
+  mv -- "$replaced" "$replaced.original"
+  mkfifo -m 0600 -- "$replaced"
+  expect_failure temp-foreign-special compatibility_remove_owned_temp_directory \
+    "$replaced" "$replaced_identity" "$TEST_ROOT" "[.]foreign-special[.]"
+  quarantine="$(quarantine_path_for "$replaced")"
+  [[ -p "$quarantine" ]] || fail "foreign special file was not preserved"
+
+  replaced="$(mktemp -d "$TEST_ROOT/.foreign-reuse.XXXXXX")"
+  replaced_identity="$(compatibility_directory_identity "$replaced")"
+  mv -- "$replaced" "$replaced.original"
+  install -d -m 0700 -- "$replaced"
+  printf 'reused directory\n' >"$replaced/sentinel"
+  chmod 0600 -- "$replaced/sentinel"
+  expect_failure temp-foreign-directory-reuse \
+    compatibility_remove_owned_temp_directory \
+    "$replaced" "$replaced_identity" "$TEST_ROOT" "[.]foreign-reuse[.]"
+  quarantine="$(quarantine_path_for "$replaced")"
+  [[ -f "$quarantine/sentinel" ]] ||
+    fail "reused foreign directory was not preserved"
 
   printf '{"cells":[],"cells":[]}\n' >"$TEST_ROOT/duplicate-plan.json"
   chmod 0600 -- "$TEST_ROOT/duplicate-plan.json"
@@ -1649,18 +2215,221 @@ test_manifest_and_cleanup_boundaries() {
     compatibility_validate_source_authority \
     "$TEST_ROOT/duplicate-source-authority.json"
 
-  printf '%s\n' \
-    '{"id":"driver-one","provider":"provider-one","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}' \
-    '{"id":"driver-one","provider":"provider-one","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}' \
-    >"$identities"
+  approved_driver_id="$(jq -er \
+    '.providers["preprovisioned-lifecycle-application-v1"].approved_drivers[0].id' \
+    "$(test_registry_path)")" || return
+  approved_driver_sha256="$(jq -er \
+    '.providers["preprovisioned-lifecycle-application-v1"].approved_drivers[0].sha256' \
+    "$(test_registry_path)")" || return
+  jq -cnS \
+    --arg id "$approved_driver_id" \
+    --arg provider "$approved_provider" \
+    --arg sha256 "$approved_driver_sha256" \
+    '{id:$id,provider:$provider,sha256:$sha256},
+     {id:$id,provider:$provider,sha256:$sha256}' >"$identities"
   chmod 0600 -- "$identities"
   compatibility_validate_collected_driver_identities "$identities"
-  printf '%s\n' \
-    '{"id":"driver-one","provider":"provider-one","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}' \
-    '{"id":"driver-two","provider":"provider-one","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}' \
-    >"$identities"
+  jq -s -cS '.[0], (.[0] | .sha256 = ("b" * 64))' "$identities" \
+    >"$identities.mixed"
   expect_failure mixed-approved-driver-identities \
-    compatibility_validate_collected_driver_identities "$identities"
+    compatibility_validate_collected_driver_identities "$identities.mixed"
+
+  # Restore the pathname after the query to prove collector reapproval is
+  # descriptor-bound, not merely protected by final pathname comparison.
+  compatibility_registry_consumer_hook() {
+    local -r kind="$1" phase="$2" registry="$3"
+    if [[ "$kind:$phase" == provider:before-reapproval ]]; then
+      mv -- "$registry" "$registry.authority"
+      cp -p -- "$registry.authority" "$registry"
+    elif [[ "$kind:$phase" == provider:after-reapproval ]]; then
+      mv -- "$registry" "$TEST_ROOT/provider-reapproval-foreign"
+      mv -- "$registry.authority" "$registry"
+    fi
+  }
+  expect_failure provider-registry-reapproval-aba \
+    compatibility_validate_collected_driver_identities \
+    "$identities" "$(test_registry_path)"
+  # shellcheck disable=SC2317 # Restores the production indirect callback.
+  compatibility_registry_consumer_hook() { :; }
+}
+
+test_directory_publication_boundaries() {
+  local publication_parent="$TEST_ROOT/directory-publication"
+  local source="$publication_parent/source"
+  local target="$publication_parent/target"
+  local competing="$publication_parent/competing"
+  local hook="$publication_parent/tree-publication-hook"
+  local quarantine=""
+  local identity=""
+  local competing_identity=""
+
+  install -d -m 0700 -- "$source"
+  printf 'retained publication bytes\n' >"$source/proof.txt"
+  chmod 0600 -- "$source/proof.txt"
+  identity="$(compatibility_stable_directory_identity "$source")"
+  compatibility_publish_stable_directory "$source" "$identity" "$target"
+  [[ ! -e "$source" && -f "$target/proof.txt" &&
+    "$(<"$target/proof.txt")" == "retained publication bytes" ]] ||
+    fail "stable directory publication lost or changed its retained source"
+
+  install -d -m 0700 -- "$competing"
+  competing_identity="$(compatibility_stable_directory_identity "$competing")"
+  expect_failure directory-publication-no-replace \
+    compatibility_publish_stable_directory \
+    "$competing" "$competing_identity" "$target"
+  [[ -d "$competing" && "$(<"$target/proof.txt")" == \
+    "retained publication bytes" ]] ||
+    fail "failed no-replace publication changed source or existing target"
+
+  install -d -m 0700 -- "$publication_parent/stale"
+  identity="$(compatibility_stable_directory_identity \
+    "$publication_parent/stale")"
+  printf 'identity mutation\n' >"$publication_parent/stale/new-entry"
+  chmod 0600 -- "$publication_parent/stale/new-entry"
+  expect_failure directory-publication-stale-identity \
+    compatibility_publish_stable_directory \
+    "$publication_parent/stale" "$identity" "$publication_parent/stale-target"
+  [[ -d "$publication_parent/stale" &&
+    ! -e "$publication_parent/stale-target" ]] ||
+    fail "stale directory authority was partially published"
+
+  cat >"$hook" <<'SH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+phase="$1"
+root="$2"
+case "${OBI_TREE_PUBLICATION_MUTATION:-}:$phase" in
+  lasting:directory-after-rename-final-rehash)
+    printf 'lasting foreign child\n' >"$root/proof.txt"
+    ;;
+  aba:directory-after-rename-final-rehash)
+    mv -- "$root/proof.txt" "$root/proof.txt.authority"
+    printf 'transient foreign child\n' >"$root/proof.txt"
+    chmod 0600 -- "$root/proof.txt"
+    mv -- "$root/proof.txt" "$root/proof.txt.foreign"
+    mv -- "$root/proof.txt.authority" "$root/proof.txt"
+    ;;
+  in-place:directory-after-rename-final-rehash-midpoint)
+    printf 'foreign in-place child\n' >"$root"
+    printf 'trusted in-place child\n' >"$root"
+    chmod 0600 -- "$root"
+    ;;
+esac
+SH
+  chmod 0700 -- "$hook"
+
+  install -d -m 0700 -- "$publication_parent/lasting"
+  printf 'trusted final-rehash child\n' >"$publication_parent/lasting/proof.txt"
+  chmod 0600 -- "$publication_parent/lasting/proof.txt"
+  identity="$(compatibility_stable_directory_identity \
+    "$publication_parent/lasting")"
+  OBI_TREE_PUBLICATION_MUTATION=lasting expect_failure \
+    directory-publication-final-rehash-lasting \
+    compatibility_publish_stable_directory \
+    "$publication_parent/lasting" "$identity" \
+    "$publication_parent/lasting-target" "$hook"
+  [[ ! -e "$publication_parent/lasting-target" ]] ||
+    fail "lasting final-rehash mutation remained at the trusted output name"
+  quarantine="$(find "$publication_parent" -mindepth 1 -maxdepth 1 \
+    -type d -name '.compatibility-rejected.directory.*' \
+    -exec test -f '{}/proof.txt' \; -print | LC_ALL=C sort | tail -n 1)"
+  [[ -n "$quarantine" && "$(<"$quarantine/proof.txt")" == \
+    "lasting foreign child" ]] ||
+    fail "lasting final-rehash mutation was not retained in quarantine"
+
+  install -d -m 0700 -- "$publication_parent/aba"
+  printf 'trusted ABA child\n' >"$publication_parent/aba/proof.txt"
+  chmod 0600 -- "$publication_parent/aba/proof.txt"
+  identity="$(compatibility_stable_directory_identity \
+    "$publication_parent/aba")"
+  OBI_TREE_PUBLICATION_MUTATION=aba expect_failure \
+    directory-publication-final-rehash-aba \
+    compatibility_publish_stable_directory \
+    "$publication_parent/aba" "$identity" \
+    "$publication_parent/aba-target" "$hook"
+  [[ ! -e "$publication_parent/aba-target" ]] ||
+    fail "A-to-B-to-A final-rehash mutation remained at the trusted output name"
+  quarantine="$(find "$publication_parent" -mindepth 1 -maxdepth 1 \
+    -type d -name '.compatibility-rejected.directory.*' \
+    -exec test -f '{}/proof.txt.foreign' \; -print -quit)"
+  [[ -n "$quarantine" && "$(<"$quarantine/proof.txt")" == \
+      "trusted ABA child" &&
+    "$(<"$quarantine/proof.txt.foreign")" == "transient foreign child" ]] ||
+    fail "A-to-B-to-A tree bytes were not preserved outside the trusted name"
+
+  install -d -m 0700 -- "$publication_parent/in-place"
+  printf 'trusted in-place child\n' >"$publication_parent/in-place/proof.txt"
+  chmod 0600 -- "$publication_parent/in-place/proof.txt"
+  identity="$(compatibility_stable_directory_identity \
+    "$publication_parent/in-place")"
+  OBI_TREE_PUBLICATION_MUTATION=in-place expect_failure \
+    directory-publication-in-place-final-rehash-aba \
+    compatibility_publish_stable_directory \
+    "$publication_parent/in-place" "$identity" \
+    "$publication_parent/in-place-target" "$hook"
+  [[ ! -e "$publication_parent/in-place-target" ]] ||
+    fail "in-place final-rehash ABA remained at the trusted output name"
+  quarantine="$(find "$publication_parent" -mindepth 1 -maxdepth 1 \
+    -type d -name '.compatibility-rejected.directory.*' \
+    -exec grep -lFx 'trusted in-place child' '{}/proof.txt' \; -print -quit)"
+  [[ -n "$quarantine" ]] ||
+    fail "in-place final-rehash ABA was not retained in quarantine"
+}
+
+test_file_publication_boundaries() {
+  local publication_parent="$TEST_ROOT/file-publication"
+  local source="$publication_parent/source"
+  local target="$publication_parent/target"
+  local hook="$publication_parent/file-publication-hook"
+  local identity=""
+  local quarantine=""
+  local retained=""
+
+  install -d -m 0700 -- "$publication_parent"
+  printf 'trusted file publication\n' >"$source"
+  chmod 0400 -- "$source"
+  identity="$(compatibility_stable_file_identity "$source" 1048576)"
+  cat >"$hook" <<'SH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+phase="$1"
+path="$2"
+case "${OBI_FILE_PUBLICATION_MUTATION:-}:$phase" in
+  candidate:file-candidate-before-rename|target:file-after-rename-final-rehash)
+    mv -- "$path" "$path.authentic"
+    printf 'foreign file publication\n' >"$path"
+    chmod 0600 -- "$path"
+    ;;
+esac
+SH
+  chmod 0700 -- "$hook"
+
+  OBI_FILE_PUBLICATION_MUTATION=candidate expect_failure \
+    file-publication-candidate-replacement compatibility_publish_stable_file \
+    "$source" "$identity" "$target" 0600 "$hook"
+  [[ ! -e "$target" ]] ||
+    fail "candidate replacement reached the trusted file output name"
+  retained="$(find "$publication_parent" -mindepth 1 -maxdepth 1 \
+    -type f -name '.compatibility-publish.*.authentic' -print -quit)"
+  quarantine="$(find "$publication_parent" -mindepth 1 -maxdepth 1 \
+    -type f -name '.compatibility-rejected.file.*' -print -quit)"
+  [[ -n "$retained" && -n "$quarantine" &&
+    "$(<"$retained")" == "trusted file publication" &&
+    "$(<"$quarantine")" == "foreign file publication" ]] ||
+    fail "candidate replacement bytes were deleted or confused"
+
+  target="$publication_parent/post-target"
+  OBI_FILE_PUBLICATION_MUTATION=target expect_failure \
+    file-publication-post-rename-replacement compatibility_publish_stable_file \
+    "$source" "$identity" "$target" 0600 "$hook"
+  [[ ! -e "$target" && -f "$target.authentic" &&
+    "$(<"$target.authentic")" == "trusted file publication" ]] ||
+    fail "post-rename authentic publication was lost or remained trusted"
+  quarantine="$(find "$publication_parent" -mindepth 1 -maxdepth 1 \
+    -type f -name '.compatibility-rejected.file.*' \
+    -exec grep -lFx 'foreign file publication' '{}' \; -print -quit)"
+  [[ -n "$quarantine" ]] ||
+    fail "post-rename foreign replacement was not retained in quarantine"
 }
 
 test_process_group_boundary() {
@@ -1677,6 +2446,31 @@ test_process_group_boundary() {
     fail "normal provider return left a descendant alive"
   fi
 
+  compatibility_run_bounded_process_group \
+    "$TEST_ROOT/process-setsid.stdout" "$TEST_ROOT/process-setsid.stderr" \
+    1024 5 "$fixture" leave-setsid-child "$TEST_ROOT/process-setsid.pid"
+  child_pid="$(<"$TEST_ROOT/process-setsid.pid")"
+  if kill -0 "$child_pid" 2>/dev/null; then
+    kill -KILL "$child_pid" 2>/dev/null || true
+    fail "normal provider return left a setsid descendant alive"
+  fi
+
+  set +e
+  compatibility_run_bounded_process_group \
+    "$TEST_ROOT/process-delayed-setsid.stdout" \
+    "$TEST_ROOT/process-delayed-setsid.stderr" \
+    1024 5 "$fixture" leave-delayed-double-fork-setsid-child \
+    "$TEST_ROOT/process-delayed-setsid.pid"
+  run_code=$?
+  set -e
+  [[ "$run_code" == 125 ]] ||
+    fail "delayed double-fork setsid escape was not a containment failure"
+  child_pid="$(<"$TEST_ROOT/process-delayed-setsid.pid")"
+  if kill -0 "$child_pid" 2>/dev/null; then
+    kill -KILL "$child_pid" 2>/dev/null || true
+    fail "delayed double-fork setsid descendant survived cleanup"
+  fi
+
   set +e
   compatibility_run_bounded_process_group \
     "$TEST_ROOT/process-timeout.stdout" "$TEST_ROOT/process-timeout.stderr" \
@@ -1689,6 +2483,48 @@ test_process_group_boundary() {
     kill -KILL "$child_pid" 2>/dev/null || true
     fail "timed-out provider left a descendant alive"
   fi
+
+  (
+    local foreign_pid=0
+    local foreign_identity=""
+    local foreign_starttime=0
+    local foreign_session=0
+    local foreign_group=0
+    local forged_identity=""
+
+    python3 -c 'import os, time; os.setsid(); time.sleep(300)' &
+    foreign_pid=$!
+    # shellcheck disable=SC2317 # Required only if an assertion aborts this subshell.
+    cleanup_foreign_process() {
+      if kill -0 "$foreign_pid" 2>/dev/null && [[ -n "$foreign_identity" ]]; then
+        compatibility_signal_process_identity "$foreign_identity" KILL || true
+      fi
+      wait "$foreign_pid" 2>/dev/null || true
+    }
+    trap cleanup_foreign_process EXIT
+    for _ in {1..100}; do
+      foreign_identity="$(compatibility_process_identity \
+        "$foreign_pid" 2>/dev/null || true)"
+      [[ -n "$foreign_identity" ]] && break
+      sleep 0.01
+    done
+    [[ -n "$foreign_identity" ]] || fail "foreign process identity unavailable"
+    IFS=: read -r _ foreign_starttime foreign_session foreign_group \
+      <<<"$foreign_identity"
+    forged_identity="$foreign_pid:$(( foreign_starttime + 1 )):$foreign_session:$foreign_group"
+    expect_status foreign-process-identity-reuse 75 \
+      compatibility_signal_process_identity "$forged_identity" TERM
+    kill -0 "$foreign_pid" 2>/dev/null ||
+      fail "identity mismatch signalled a foreign process"
+    expect_status foreign-process-wait-reuse 75 \
+      compatibility_wait_process_identity "$forged_identity" 1
+    kill -0 "$foreign_pid" 2>/dev/null ||
+      fail "identity-mismatched wait disturbed a foreign process"
+    compatibility_signal_process_identity "$foreign_identity" TERM
+    wait "$foreign_pid" 2>/dev/null || true
+    foreign_pid=0
+    trap - EXIT
+  )
 }
 
 test_source_status_failure_is_not_clean() {
@@ -1742,7 +2578,7 @@ test_run_cell_source_authority_drift() {
 }
 
 test_external_driver_boundaries() {
-  local driver="$TEST_DIRECTORY/mock-external-driver.sh"
+  local driver="$EXECUTION_CAMPAIGN_DIRECTORY/providers/tests/mock-external-driver.sh"
   local driver_sha=""
   local output="$TEST_ROOT/external-malformed"
   local run_code=0
@@ -1758,7 +2594,29 @@ test_external_driver_boundaries() {
   )
   local adapter_case=""
   local unapproved_driver="$TEST_ROOT/unapproved-external-driver.sh"
-  local swap_driver="$TEST_ROOT/swap-external-driver.sh"
+  local swap_driver="$TEST_ROOT/swap-external-driver.backup"
+  local source_status=""
+  local exact_argv='["/proc/self/fd/9/external-driver.snapshot","--contract","compatibility-external-provider-v1"]'
+  local canonical_argv='["/private/retained/external-driver.snapshot","--contract","compatibility-external-provider-v1"]'
+  local alternate_argv='["/private/approved-looking/external-driver.snapshot","--contract","compatibility-external-provider-v1"]'
+
+  bash -c '
+    source "$1"
+    provider_external_argv_matches "$2" "$3" "$4"
+  ' _ "$EXECUTION_CAMPAIGN_DIRECTORY/providers/provider-lib.sh" \
+    "$exact_argv" "$exact_argv" "$canonical_argv" ||
+    fail "exact external driver argv was rejected"
+  bash -c '
+    source "$1"
+    provider_external_argv_matches "$2" "$3" "$4"
+  ' _ "$EXECUTION_CAMPAIGN_DIRECTORY/providers/provider-lib.sh" \
+    "$canonical_argv" "$exact_argv" "$canonical_argv" ||
+    fail "retained snapshot canonical alias was rejected"
+  expect_failure arbitrary-external-driver-alias-with-exact-tail bash -c '
+    source "$1"
+    provider_external_argv_matches "$2" "$3" "$4"
+  ' _ "$EXECUTION_CAMPAIGN_DIRECTORY/providers/provider-lib.sh" \
+    "$alternate_argv" "$exact_argv" "$canonical_argv"
 
   driver_sha="$(compatibility_sha256 "$driver")"
   for adapter_case in "${adapter_cases[@]}"; do
@@ -1898,24 +2756,32 @@ test_external_driver_boundaries() {
   jq -e '.status == "fail" and .reason == "external-provider-result-invalid"' \
     "$output/cell.json" >/dev/null
 
-  install -m 0500 -- "$driver" "$swap_driver"
+  cp -p -- "$driver" "$swap_driver"
   output="$TEST_ROOT/external-swap-after-hash"
   set +e
-  OBI_COMPATIBILITY_LIFECYCLE_APPLICATION_DRIVER="$swap_driver" \
+  OBI_COMPATIBILITY_LIFECYCLE_APPLICATION_DRIVER="$driver" \
     OBI_COMPATIBILITY_LIFECYCLE_APPLICATION_DRIVER_SHA256="$driver_sha" \
     OBI_COMPATIBILITY_MOCK_MODE=swap-driver \
-    OBI_COMPATIBILITY_MOCK_SWAP_TARGET="$swap_driver" \
+    OBI_COMPATIBILITY_MOCK_SWAP_TARGET="$driver" \
     "$EXECUTION_CAMPAIGN_DIRECTORY/run-cell.sh" \
       --campaign helper-lifecycle \
       --cell h-jdk21-amd64-otel-getsockopt \
-      --source-authority "$RUN_SOURCE_AUTHORITY" --output "$output"
+      --source-authority "$RUN_SOURCE_AUTHORITY" --output "$output" \
+      >"$TEST_ROOT/external-swap.stdout" \
+      2>"$TEST_ROOT/external-swap.stderr"
   run_code=$?
   set -e
-  [[ "$run_code" == 1 ]] || fail "external driver swap was not rejected"
-  jq -e '.status == "fail" and
-    .reason == "external-provider-changed-during-execution" and
-    .assertions.classification == "provider-contract"' \
-    "$output/cell.json" >/dev/null
+  mv -fT -- "$swap_driver" "$driver"
+  mv -- "$driver.before-swap" "$TEST_ROOT/retired-swapped-external-driver"
+  source_status="$(git -C "$EXECUTION_REPOSITORY" status \
+    --porcelain=v1 --untracked-files=all)"
+  [[ -z "$source_status" ]] || {
+    printf 'dirty checkout after driver swap fixture:\n%s\n' "$source_status" >&2
+    fail "driver swap fixture did not restore the source checkout"
+  }
+  [[ "$run_code" != 0 ]] || fail "external driver swap was not rejected"
+  [[ ! -e "$output" && ! -L "$output" ]] ||
+    fail "source-controlled driver swap published a cell"
 }
 
 test_direct_launcher_boundary() {
@@ -1923,6 +2789,11 @@ test_direct_launcher_boundary() {
 }
 
 main() {
+  local -r test_scope="${OBI_COMPATIBILITY_TEST_SCOPE:-full}"
+
+  [[ "$test_scope" == full || "$test_scope" == lifecycle-driver ||
+    "$test_scope" == authority-boundaries ]] ||
+    fail "unknown compatibility test scope: $test_scope"
   compatibility_require_commands \
     cmp cp env find git install jq kill ln mkfifo mktemp mv python3 sed sha256sum \
     sleep stat tail timeout truncate
@@ -1934,14 +2805,33 @@ main() {
   RUN_SOURCE_AUTHORITY="$TEST_ROOT/run-source-authority.json"
   create_clean_execution_repository
   test_plans
+  test_registry_traversal_boundaries
+  if [[ "$test_scope" == authority-boundaries ]]; then
+    test_manifest_and_cleanup_boundaries
+    test_directory_publication_boundaries
+    test_file_publication_boundaries
+    test_process_group_boundary
+    printf 'PASS: focused compatibility authority boundary tests\n'
+    return
+  fi
+  if [[ "$test_scope" == lifecycle-driver ]]; then
+    "$EXECUTION_CAMPAIGN_DIRECTORY/tests/lifecycle-driver-test.sh" \
+      "$TEST_ROOT/lifecycle-driver" "$RUN_SOURCE_AUTHORITY"
+    printf 'PASS: focused lifecycle driver tests\n'
+    return
+  fi
   test_exact_aggregate_and_mutations
   test_classification_and_assertion_mutations
   test_manifest_and_cleanup_boundaries
+  test_directory_publication_boundaries
+  test_file_publication_boundaries
   test_process_group_boundary
   test_source_status_failure_is_not_clean
   test_run_cell_source_authority_drift
   test_external_driver_boundaries
   test_direct_launcher_boundary
+  "$EXECUTION_CAMPAIGN_DIRECTORY/tests/lifecycle-driver-test.sh" \
+    "$TEST_ROOT/lifecycle-driver" "$RUN_SOURCE_AUTHORITY"
   "$TEST_DIRECTORY/runsh-boundary-test.sh" "$TEST_ROOT/runsh-boundaries"
   printf 'PASS: compatibility campaign schema and mutation tests\n'
 }

@@ -35,7 +35,8 @@
       "additionalProperties": false,
       "required": [
         "name", "registry_sha256", "external_driver", "launcher_sha256",
-        "launcher_exit_status", "result_sha256", "command"
+        "launcher_exit_status", "result_sha256", "command",
+        "lifecycle_executor"
       ],
       "properties": {
         "name": {"$ref": "#/$defs/token"},
@@ -57,7 +58,13 @@
         "launcher_sha256": {"$ref": "#/$defs/sha256"},
         "launcher_exit_status": {"type": "integer", "minimum": 0, "maximum": 255},
         "result_sha256": {"$ref": "#/$defs/sha256"},
-        "command": {"type": "object"}
+        "command": {"type": "object"},
+        "lifecycle_executor": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/lifecycle_executor"}
+          ]
+        }
       }
     },
     "source": {"type": "object"},
@@ -78,7 +85,7 @@
               "field": {
                 "type": "string",
                 "maxLength": 512,
-                "pattern": "^(runtime|artifacts|assertions)([.][A-Za-z0-9_-]+)+$"
+                "pattern": "^(runtime|artifacts|assertions|lifecycle_executor)([.][A-Za-z0-9_-]+)+$"
               },
               "path": {
                 "type": "string",
@@ -109,6 +116,64 @@
     "token": {
       "type": "string",
       "pattern": "^[a-z0-9][a-z0-9-]{0,95}$"
+    },
+    "lifecycle_executor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema", "registry_sha256", "approval", "environment", "command",
+        "receipt_sha256"
+      ],
+      "properties": {
+        "schema": {"const": "compatibility-lifecycle-executor-authority-v1"},
+        "registry_sha256": {"$ref": "#/$defs/sha256"},
+        "approval": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "path", "sha256", "allowed_cell_ids"],
+          "properties": {
+            "id": {"$ref": "#/$defs/token"},
+            "path": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}(/[A-Za-z0-9][A-Za-z0-9._-]{0,127})*$"
+            },
+            "sha256": {"$ref": "#/$defs/sha256"},
+            "allowed_cell_ids": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 7,
+              "uniqueItems": true,
+              "items": {"$ref": "#/$defs/token"}
+            }
+          }
+        },
+        "environment": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "sha256"],
+          "properties": {
+            "id": {"$ref": "#/$defs/token"},
+            "sha256": {"$ref": "#/$defs/sha256"}
+          }
+        },
+        "command": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["argv", "executable_sha256", "exit_status"],
+          "properties": {
+            "argv": {
+              "type": "array",
+              "minItems": 19,
+              "maxItems": 19,
+              "prefixItems": [{"const": "/proc/self/fd/9"}],
+              "items": {"type": "string", "minLength": 1, "maxLength": 4096}
+            },
+            "executable_sha256": {"$ref": "#/$defs/sha256"},
+            "exit_status": {"type": "integer", "minimum": 0, "maximum": 255}
+          }
+        },
+        "receipt_sha256": {"$ref": "#/$defs/sha256"}
+      }
     }
   }
 }

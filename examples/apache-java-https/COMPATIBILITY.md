@@ -72,13 +72,17 @@ unique regular raw file and exact manifest entry. No status from an `auto`,
 component-test, historical, neighboring-kernel, or neighboring-architecture
 execution is projected into V3.
 
-The checked-in external-provider registry is intentionally empty. Until a
-reviewed host/JVM/lifecycle driver identity is added, those cells can only be
-recorded as explicit infrastructure `untested`; an arbitrary self-matching
-path and digest cannot authorize execution. A registry-approved driver that is
-actually invoked retains its exact ID and digest even when it returns
-infrastructure `untested`; only a pre-execution unavailable or unapproved
-boundary has no driver identity. The local Java 21 adapter separately needs
+The checked-in host and JVM external-provider approvals remain empty. The
+lifecycle provider now pins one reviewed outer-driver path and digest. Its
+separate production inner-executor registry remains empty, so all seven real
+lifecycle cells stay infrastructure `untested` until a reviewed executor path,
+digest, and exact cell roster land; an environment descriptor or outer-driver
+approval alone materializes no pass. An
+arbitrary self-matching path and digest cannot authorize execution. A
+registry-approved driver that is actually invoked retains its exact ID and
+digest even when it returns infrastructure `untested`; only a pre-execution
+unavailable or unapproved boundary has no driver identity. The local Java 21
+adapter separately needs
 exact kernel-provenance and topology-attestation files for every execution. It
 cross-binds the attested process-cgroup digest to live and retained `/proc`
 bytes, and semantically validates successful `bpftool`, Compose project/
@@ -87,6 +91,24 @@ publishing an authoritative runtime identity. Its current production evidence
 can prove supported forced selection, but cannot prove the campaign's
 unsupported control, so it fails closed instead of synthesizing `unsupported`.
 All matrix and helper statuses in this document remain pending.
+
+Registry parsing and executor containment are fail-closed source boundaries,
+not execution evidence. Registry bytes and bounded approved-entry rosters are
+consumed from one transaction-retained provider/inner snapshot pair with exact
+before/after identities; producer errors, partial output, and traversal
+substitution reject validation. Private inputs remain below retained directory
+descriptors. File publication keeps the candidate descriptor open through a
+no-replace rename, while directory publication retains and re-hashes an exact
+bounded recursive path/type/identity/content roster before and after its
+no-replace rename. The
+lifecycle executor runs beneath a child subreaper that authenticates PID,
+start-time, session, and process-group identities and uses `pidfd` signalling;
+PID reuse, missing kernel primitives, a detached survivor, or incomplete
+cleanup fails the provider contract. Temporary campaign roots are atomically
+moved whole into retained mode-0700 quarantine before identity/type validation;
+no leaf is recursively removed, so a foreign or late replacement is preserved
+and rejected rather than deleted. These controls add no pass,
+unsupported, or executed status to either pending campaign.
 
 ## Kernel, deployment mode, cgroup, and transport inventory
 

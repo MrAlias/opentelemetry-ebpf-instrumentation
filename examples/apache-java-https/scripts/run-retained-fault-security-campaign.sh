@@ -32,6 +32,9 @@ readonly -a PUBLIC_FILES=(
   README.md SANITIZATION.md fault-security-matrix.json
   derivation-receipt.json verify.sh SHA256SUMS
 )
+readonly -a PROFILE_PUBLIC_FILES=(
+  SANITIZATION.md profile.json verify.sh SHA256SUMS
+)
 
 OUTPUT_DIRECTORY=''
 OUTPUT_PARENT=''
@@ -49,14 +52,18 @@ PRIVATE_CREATED=false
 CLEANUP_REQUIRED=false
 CAMPAIGN_SUCCEEDED=false
 STICKY_CLEANUP_FAILURE=false
+PROFILE_MODE=false
+SELECTED_PROFILE_INDEX=-1
 declare -a RAW_DIRECTORIES=()
 
 usage() {
   printf '%s\n' \
     "Usage: $SCRIPT_NAME ABS_NONEXISTENT_PUBLIC_OUTPUT" \
+    "       $SCRIPT_NAME --profile ROLE ABS_NONEXISTENT_PUBLIC_OUTPUT" \
     '' \
-    'Run the clean-source five-cell Java remote-parent fault/security campaign.' \
-    'Raw evidence is destroyed before the separate six-file matrix is handed off.'
+    'Run the clean-source Java remote-parent fault/security campaign.' \
+    'Profile mode publishes one sanitized cell; default mode publishes the six-file' \
+    'matrix. Raw evidence is destroyed before either handoff becomes uploadable.'
 }
 
 log_info() {
@@ -434,16 +441,23 @@ compute_public_closure() {
   local identity=''
   local digest=''
   local -a rows=()
+  local -a files=()
 
   [[ -d "$OUTPUT_DIRECTORY" && ! -L "$OUTPUT_DIRECTORY" &&
     "$(readlink -f -- "$OUTPUT_DIRECTORY")" == "$OUTPUT_DIRECTORY" &&
     "$(stat -Lc '%u:%a' -- "$OUTPUT_DIRECTORY")" == "$EUID:555" ]] ||
     return 1
-  expected=$'README.md\tf\nSANITIZATION.md\tf\nSHA256SUMS\tf\nderivation-receipt.json\tf\nfault-security-matrix.json\tf\nverify.sh\tf'
+  if [[ "$PROFILE_MODE" == true ]]; then
+    expected=$'SANITIZATION.md\tf\nSHA256SUMS\tf\nprofile.json\tf\nverify.sh\tf'
+    files=("${PROFILE_PUBLIC_FILES[@]}")
+  else
+    expected=$'README.md\tf\nSANITIZATION.md\tf\nSHA256SUMS\tf\nderivation-receipt.json\tf\nfault-security-matrix.json\tf\nverify.sh\tf'
+    files=("${PUBLIC_FILES[@]}")
+  fi
   observed="$(find -- "$OUTPUT_DIRECTORY" -mindepth 1 -maxdepth 1 \
     -printf '%f\t%y\n' | LC_ALL=C sort)" || return 1
   [[ "$observed" == "$expected" ]] || return 1
-  for file in "${PUBLIC_FILES[@]}"; do
+  for file in "${files[@]}"; do
     [[ -f "$OUTPUT_DIRECTORY/$file" && ! -L "$OUTPUT_DIRECTORY/$file" ]] ||
       return 1
     identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
@@ -455,8 +469,13 @@ compute_public_closure() {
   done
   PUBLIC_CLOSURE_SHA256="$(printf '%s\n' "${rows[@]}" | sha256sum)"
   PUBLIC_CLOSURE_SHA256="${PUBLIC_CLOSURE_SHA256%% *}"
-  PUBLIC_EVIDENCE_ID="$(sha256sum < \
-    "$OUTPUT_DIRECTORY/derivation-receipt.json")"
+  if [[ "$PROFILE_MODE" == true ]]; then
+    PUBLIC_EVIDENCE_ID="$(jq -er '.evidence_id' \
+      "$OUTPUT_DIRECTORY/profile.json")"
+  else
+    PUBLIC_EVIDENCE_ID="$(sha256sum < \
+      "$OUTPUT_DIRECTORY/derivation-receipt.json")"
+  fi
   PUBLIC_EVIDENCE_ID="${PUBLIC_EVIDENCE_ID%% *}"
   [[ "$PUBLIC_CLOSURE_SHA256" =~ ^[0-9a-f]{64}$ &&
     "$PUBLIC_EVIDENCE_ID" =~ ^[0-9a-f]{64}$ ]]
@@ -509,6 +528,7 @@ cleanup_on_exit() {
 
 run_campaign() {
   local index=0
+  local -a projection_command=()
 
   require_commands
   sanitize_git_environment
@@ -533,18 +553,38 @@ run_campaign() {
     --file examples/apache-java-https/docker-compose.yml config --quiet
   assert_exact_clone
 
-  for index in "${!PROFILE_ROLES[@]}"; do
+  if [[ "$PROFILE_MODE" == true ]]; then
+    index="$SELECTED_PROFILE_INDEX"
     log_info "running private source profile: ${PROFILE_ROLES[index]}"
     run_profile "$index"
-  done
-  [[ "${#RAW_DIRECTORIES[@]}" == 5 && "$CLEANUP_REQUIRED" == false &&
-    "$STICKY_CLEANUP_FAILURE" == false ]] || return 1
+    [[ -n "${RAW_DIRECTORIES[index]:-}" && "$CLEANUP_REQUIRED" == false &&
+      "$STICKY_CLEANUP_FAILURE" == false ]] || return 1
+  else
+    for index in "${!PROFILE_ROLES[@]}"; do
+      log_info "running private source profile: ${PROFILE_ROLES[index]}"
+      run_profile "$index"
+    done
+    [[ "${#RAW_DIRECTORIES[@]}" == 5 && "$CLEANUP_REQUIRED" == false &&
+      "$STICKY_CLEANUP_FAILURE" == false ]] || return 1
+  fi
   assert_exact_clone
 
-  if ! "$CHECKOUT_DIRECTORY/examples/apache-java-https/scripts/project-retained-fault-security-matrix.sh" \
-      "${RAW_DIRECTORIES[0]}" "${RAW_DIRECTORIES[1]}" \
-      "${RAW_DIRECTORIES[2]}" "${RAW_DIRECTORIES[3]}" \
-      "${RAW_DIRECTORIES[4]}" "$OUTPUT_DIRECTORY" >/dev/null; then
+  if [[ "$PROFILE_MODE" == true ]]; then
+    index="$SELECTED_PROFILE_INDEX"
+    projection_command=(
+      "$CHECKOUT_DIRECTORY/examples/apache-java-https/scripts/project-retained-fault-security-matrix.sh"
+      --profile-cell-v1 "${PROFILE_ROLES[index]}" "${PROFILE_KINDS[index]}"
+      "${RAW_DIRECTORIES[index]}" "$OUTPUT_DIRECTORY"
+    )
+  else
+    projection_command=(
+      "$CHECKOUT_DIRECTORY/examples/apache-java-https/scripts/project-retained-fault-security-matrix.sh"
+      "${RAW_DIRECTORIES[0]}" "${RAW_DIRECTORIES[1]}"
+      "${RAW_DIRECTORIES[2]}" "${RAW_DIRECTORIES[3]}"
+      "${RAW_DIRECTORIES[4]}" "$OUTPUT_DIRECTORY"
+    )
+  fi
+  if ! "${projection_command[@]}" >/dev/null; then
     if [[ -d "$OUTPUT_DIRECTORY" && ! -L "$OUTPUT_DIRECTORY" &&
       "$(readlink -f -- "$OUTPUT_DIRECTORY")" == "$OUTPUT_DIRECTORY" ]]; then
       OUTPUT_CREATED=true
@@ -561,8 +601,10 @@ run_campaign() {
   [[ ! -e "$AUTHORITY_ROOT/examples/apache-java-https/.runtime/results" &&
     ! -L "$AUTHORITY_ROOT/examples/apache-java-https/.runtime/results" ]] ||
     return 1
-  "$AUTHORITY_ROOT/examples/apache-java-https/scripts/verify-retained-evidence.sh" \
-    --fault-security-matrix-v1 "$OUTPUT_DIRECTORY" >/dev/null
+  if [[ "$PROFILE_MODE" != true ]]; then
+    "$AUTHORITY_ROOT/examples/apache-java-https/scripts/verify-retained-evidence.sh" \
+      --fault-security-matrix-v1 "$OUTPUT_DIRECTORY" >/dev/null
+  fi
   (CDPATH='' cd / && bash "$OUTPUT_DIRECTORY/verify.sh" >/dev/null)
   [[ "$(stat -Lc '%d:%i:%u:%a' -- "$OUTPUT_PARENT")" == \
     "$OUTPUT_PARENT_IDENTITY" &&
@@ -579,11 +621,26 @@ campaign_entry() {
     usage
     return 0
   fi
-  [[ $# == 1 ]] || {
+  if [[ $# == 3 && "$1" == --profile ]]; then
+    PROFILE_MODE=true
+    case "$2" in
+      all-getsockopt) SELECTED_PROFILE_INDEX=0 ;;
+      all-unix) SELECTED_PROFILE_INDEX=1 ;;
+      all-auto) SELECTED_PROFILE_INDEX=2 ;;
+      pid-reuse-getsockopt) SELECTED_PROFILE_INDEX=3 ;;
+      pid-reuse-unix) SELECTED_PROFILE_INDEX=4 ;;
+      *)
+        usage >&2
+        return 2
+        ;;
+    esac
+    OUTPUT_DIRECTORY="$3"
+  elif [[ $# == 1 ]]; then
+    OUTPUT_DIRECTORY="$1"
+  else
     usage >&2
     return 2
-  }
-  OUTPUT_DIRECTORY="$1"
+  fi
   trap cleanup_on_exit EXIT
   trap 'exit 129' HUP
   trap 'exit 130' INT

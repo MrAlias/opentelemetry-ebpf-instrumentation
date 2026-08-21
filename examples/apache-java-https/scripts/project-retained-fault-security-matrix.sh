@@ -13,6 +13,7 @@ readonly SCRIPT_NAME SCRIPT_DIR VERIFIER
 readonly RAW_MAX_FILES=32768
 readonly RAW_MAX_BYTES=603979776
 readonly PUBLIC_FILE_COUNT=6
+readonly PROFILE_CELL_FILE_COUNT=4
 
 WORK_DIRECTORY=""
 WORK_IDENTITY=""
@@ -26,6 +27,8 @@ usage() {
   printf '%s\n' \
     "Usage: $SCRIPT_NAME ABS_ALL_GETSOCKOPT ABS_ALL_UNIX ABS_ALL_AUTO" \
     "       ABS_PID_REUSE_GETSOCKOPT ABS_PID_REUSE_UNIX ABS_NONEXISTENT_OUTPUT" \
+    "       $SCRIPT_NAME --profile-cell-v1 ROLE RAW_KIND ABS_RAW ABS_OUTPUT" \
+    "       $SCRIPT_NAME --aggregate-cells-v1 CELL1 CELL2 CELL3 CELL4 CELL5 ABS_OUTPUT" \
     "" \
     "Validate five private raw-v3 cells and publish one bounded six-file" \
     "fault/security matrix. Raw identifiers and raw artifacts are not copied."
@@ -276,7 +279,81 @@ profile_json() {
       },
       private_input: $private_input,
       pid_reuse: $pid_reuse
-    }'
+  }'
+}
+
+validate_profile_cell_json() {
+  local -r file="$1"
+  local profile=''
+  local expected_evidence_id=''
+
+  cmp -s -- "$file" <(jq -cS . "$file") || return 1
+  jq -e '
+    def sha256: type == "string" and test("^[0-9a-f]{64}$");
+    . as $cell |
+    keys == ["evidence_id","privacy","profile","raw_v3_profile","role",
+      "schema","source","status"] and
+    .schema == "obi-bounded-fault-security-profile-cell-v1" and
+    .status == "passed" and (.evidence_id | sha256) and
+    .privacy == {raw_identifiers_published:false,raw_inputs_retained:false} and
+    (.source | keys == ["clean","revision","source_tree_sha256"] and
+      (.revision | test("^[0-9a-f]{40}$")) and
+      (.source_tree_sha256 | sha256) and .clean == true) and
+    (.profile | keys == ["boundary_summary","id","pid_reuse","private_input",
+      "raw_v3_profile","requested_transport","scenario","selected_transport",
+      "status"] and .status == "passed" and .id == $cell.role and
+      .raw_v3_profile == $cell.raw_v3_profile and
+      (.boundary_summary | keys == ["complete","not_applicable"] and
+        .complete >= 1 and .not_applicable >= 0) and
+      (.private_input | keys == ["file_count","schema","sha256","total_bytes"] and
+        .schema == "obi-private-file-manifest-commitment-v1" and
+        (.sha256 | sha256) and .file_count >= 1 and .total_bytes >= 1)) and
+    (($cell.role == "all-getsockopt" and
+        $cell.raw_v3_profile == "acceptance-getsockopt" and
+        .profile.scenario == "all" and
+        .profile.requested_transport == "getsockopt" and
+        .profile.selected_transport == "getsockopt" and
+        .profile.pid_reuse == null) or
+     ($cell.role == "all-unix" and $cell.raw_v3_profile == "acceptance-unix" and
+        .profile.scenario == "all" and .profile.requested_transport == "unix" and
+        .profile.selected_transport == "unix" and .profile.pid_reuse == null) or
+     ($cell.role == "all-auto" and $cell.raw_v3_profile == "acceptance-auto" and
+        .profile.scenario == "all" and .profile.requested_transport == "auto" and
+        .profile.selected_transport == "getsockopt" and .profile.pid_reuse == null) or
+     ($cell.role == "pid-reuse-getsockopt" and
+        $cell.raw_v3_profile == "pid-reuse-getsockopt" and
+        .profile.scenario == "pid-reuse" and
+        .profile.requested_transport == "getsockopt" and
+        .profile.selected_transport == "getsockopt") or
+     ($cell.role == "pid-reuse-unix" and
+        $cell.raw_v3_profile == "pid-reuse-unix" and
+        .profile.scenario == "pid-reuse" and
+        .profile.requested_transport == "unix" and
+        .profile.selected_transport == "unix")) and
+    (if .profile.pid_reuse == null then true else
+      (.profile.pid_reuse | keys == ["a_reaped_before_b","authorization_maps_agree",
+        "different_lifetime","injected_residue_preserved","injected_residue_rejected",
+        "negative_status","private_artifacts_removed","recovery_parent_exact",
+        "recovery_status","same_numeric_pid","same_numeric_tid","w3c_fail_open"] and
+       .same_numeric_pid == true and .same_numeric_tid == true and
+       .different_lifetime == true and .a_reaped_before_b == true and
+       .authorization_maps_agree == true and .injected_residue_rejected == true and
+       .injected_residue_preserved == true and .w3c_fail_open == true and
+       .recovery_status == "valid" and .recovery_parent_exact == true and
+       .private_artifacts_removed == true and
+       (($cell.role == "pid-reuse-getsockopt" and
+          .negative_status == "unsupported") or
+        ($cell.role == "pid-reuse-unix" and .negative_status == "ambiguous")))
+     end)
+  ' "$file" >/dev/null || return 1
+  profile="$(jq -cS '.profile' "$file")" || return 1
+  expected_evidence_id="$(printf '%s\n' \
+    'obi-bounded-fault-security-profile-cell-v1' \
+    "$(jq -er '.source.revision' "$file")" \
+    "$(jq -er '.source.source_tree_sha256' "$file")" \
+    "$(jq -er '.role' "$file")" "$profile" | sha256sum)" || return 1
+  expected_evidence_id="${expected_evidence_id%% *}"
+  [[ "$(jq -er '.evidence_id' "$file")" == "$expected_evidence_id" ]]
 }
 
 write_portable_verifier() {
@@ -473,7 +550,258 @@ write_public_bundle() {
     awk 'END {print NR + 0}')" == "$PUBLIC_FILE_COUNT" ]] || return 1
 }
 
-main() {
+emit_profile_cell_verifier() {
+  cat <<'VERIFY_CELL'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+root="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+expected=$'SANITIZATION.md\tf\nSHA256SUMS\tf\nprofile.json\tf\nverify.sh\tf'
+observed="$(find -H "$root" -mindepth 1 -maxdepth 1 -printf '%f\t%y\n' | LC_ALL=C sort)"
+[[ "$observed" == "$expected" ]]
+[[ "$(awk 'END {print NR + 0}' "$root/SHA256SUMS")" == 3 ]]
+(CDPATH='' cd -- "$root" && sha256sum --check --strict SHA256SUMS >/dev/null)
+cmp -s -- "$root/profile.json" <(jq -cS . "$root/profile.json")
+jq -e '
+  def sha256: type == "string" and test("^[0-9a-f]{64}$");
+  . as $cell |
+  keys == ["evidence_id","privacy","profile","raw_v3_profile","role",
+    "schema","source","status"] and
+  .schema == "obi-bounded-fault-security-profile-cell-v1" and
+  .status == "passed" and (.evidence_id | sha256) and
+  .privacy == {raw_identifiers_published:false,raw_inputs_retained:false} and
+  (.source | keys == ["clean","revision","source_tree_sha256"] and
+    (.revision | test("^[0-9a-f]{40}$")) and
+    (.source_tree_sha256 | sha256) and .clean == true) and
+  (.profile | keys == ["boundary_summary","id","pid_reuse","private_input",
+    "raw_v3_profile","requested_transport","scenario","selected_transport",
+    "status"] and .status == "passed" and .id == $cell.role and
+    .raw_v3_profile == $cell.raw_v3_profile and
+    (.boundary_summary | keys == ["complete","not_applicable"] and
+      .complete >= 1 and .not_applicable >= 0) and
+    (.private_input | keys == ["file_count","schema","sha256","total_bytes"] and
+      .schema == "obi-private-file-manifest-commitment-v1" and
+      (.sha256 | sha256) and .file_count >= 1 and .total_bytes >= 1)) and
+  (($cell.role == "all-getsockopt" and
+      $cell.raw_v3_profile == "acceptance-getsockopt" and
+      .profile.scenario == "all" and .profile.requested_transport == "getsockopt" and
+      .profile.selected_transport == "getsockopt" and .profile.pid_reuse == null) or
+   ($cell.role == "all-unix" and $cell.raw_v3_profile == "acceptance-unix" and
+      .profile.scenario == "all" and .profile.requested_transport == "unix" and
+      .profile.selected_transport == "unix" and .profile.pid_reuse == null) or
+   ($cell.role == "all-auto" and $cell.raw_v3_profile == "acceptance-auto" and
+      .profile.scenario == "all" and .profile.requested_transport == "auto" and
+      .profile.selected_transport == "getsockopt" and .profile.pid_reuse == null) or
+   ($cell.role == "pid-reuse-getsockopt" and
+      $cell.raw_v3_profile == "pid-reuse-getsockopt" and
+      .profile.scenario == "pid-reuse" and
+      .profile.requested_transport == "getsockopt" and
+      .profile.selected_transport == "getsockopt") or
+   ($cell.role == "pid-reuse-unix" and
+      $cell.raw_v3_profile == "pid-reuse-unix" and
+      .profile.scenario == "pid-reuse" and .profile.requested_transport == "unix" and
+      .profile.selected_transport == "unix")) and
+  (if .profile.pid_reuse == null then true else
+    (.profile.pid_reuse | keys == ["a_reaped_before_b","authorization_maps_agree",
+      "different_lifetime","injected_residue_preserved","injected_residue_rejected",
+      "negative_status","private_artifacts_removed","recovery_parent_exact",
+      "recovery_status","same_numeric_pid","same_numeric_tid","w3c_fail_open"] and
+     .same_numeric_pid == true and .same_numeric_tid == true and
+     .different_lifetime == true and .a_reaped_before_b == true and
+     .authorization_maps_agree == true and .injected_residue_rejected == true and
+     .injected_residue_preserved == true and .w3c_fail_open == true and
+     .recovery_status == "valid" and .recovery_parent_exact == true and
+     .private_artifacts_removed == true and
+     (($cell.role == "pid-reuse-getsockopt" and
+        .negative_status == "unsupported") or
+      ($cell.role == "pid-reuse-unix" and .negative_status == "ambiguous")))
+   end)
+' "$root/profile.json" >/dev/null
+profile="$(jq -cS '.profile' "$root/profile.json")"
+expected_evidence_id="$(printf '%s\n' \
+  'obi-bounded-fault-security-profile-cell-v1' \
+  "$(jq -er '.source.revision' "$root/profile.json")" \
+  "$(jq -er '.source.source_tree_sha256' "$root/profile.json")" \
+  "$(jq -er '.role' "$root/profile.json")" "$profile" | sha256sum)"
+expected_evidence_id="${expected_evidence_id%% *}"
+[[ "$(jq -er '.evidence_id' "$root/profile.json")" == "$expected_evidence_id" ]]
+if grep -Eqi -- '(/tmp/|/home/|/proc/|"(pid|tid|trace_id|span_id|socket_path|binary|binaries)"[[:space:]]*:|\.log")' "$root/profile.json"; then
+  printf '%s\n' 'private raw identifier leaked into profile cell' >&2
+  exit 1
+fi
+printf 'bounded fault/security profile cell internally consistent: %s\n' \
+  "$(jq -er '.evidence_id' "$root/profile.json")"
+VERIFY_CELL
+}
+
+write_profile_cell_verifier() {
+  local -r output="$1"
+  emit_profile_cell_verifier >"$output" || return 1
+  chmod 0444 -- "$output"
+}
+
+write_profile_cell_bundle() {
+  local -r role="$1"
+  local -r kind="$2"
+  local -r snapshot="$3"
+  local revision=""
+  local tree=""
+  local profile=""
+  local evidence_id=""
+  local file=""
+
+  revision="$(key_value "$snapshot/environment.txt" revision)" || return 1
+  tree="$(key_value "$snapshot/environment.txt" source_tree_sha256)" || return 1
+  profile="$(profile_json "$role" "$kind" "$snapshot" | jq -cS .)" || return 1
+  evidence_id="$(printf '%s\n' 'obi-bounded-fault-security-profile-cell-v1' \
+    "$revision" "$tree" "$role" "$profile" | sha256sum)" || return 1
+  evidence_id="${evidence_id%% *}"
+  CANDIDATE_DIRECTORY="$(mktemp -d "$OUTPUT_PARENT/.fault-security-matrix.XXXXXX")" ||
+    return 1
+  CANDIDATE_DIRECTORY="$(CDPATH='' cd -- "$CANDIDATE_DIRECTORY" && pwd -P)"
+  CANDIDATE_IDENTITY="$(stat -Lc '%d:%i:%u' -- "$CANDIDATE_DIRECTORY")"
+  jq -cS -n --arg evidence_id "$evidence_id" --arg role "$role" \
+    --arg kind "$kind" --arg revision "$revision" --arg tree "$tree" \
+    --argjson profile "$profile" '{
+      schema:"obi-bounded-fault-security-profile-cell-v1",status:"passed",
+      evidence_id:$evidence_id,role:$role,raw_v3_profile:$kind,
+      source:{revision:$revision,source_tree_sha256:$tree,clean:true},
+      profile:$profile,
+      privacy:{raw_identifiers_published:false,raw_inputs_retained:false}}
+  ' >"$CANDIDATE_DIRECTORY/profile.json" || return 1
+  printf '%s\n' '# Sanitized fault/security profile cell' '' \
+    'This handoff contains a bounded profile summary and a role-bound raw manifest' \
+    'commitment only. Raw evidence was destroyed before this directory became uploadable.' \
+    >"$CANDIDATE_DIRECTORY/SANITIZATION.md" || return 1
+  write_profile_cell_verifier "$CANDIDATE_DIRECTORY/verify.sh" || return 1
+  (
+    CDPATH='' cd -- "$CANDIDATE_DIRECTORY"
+    for file in SANITIZATION.md profile.json verify.sh; do sha256sum "$file"; done
+  ) >"$CANDIDATE_DIRECTORY/SHA256SUMS" || return 1
+  find -- "$CANDIDATE_DIRECTORY" -type f -exec chmod 0444 -- {} + || return 1
+  find -- "$CANDIDATE_DIRECTORY" -depth -type d -exec chmod 0555 -- {} + ||
+    return 1
+  (CDPATH='' cd / && bash "$CANDIDATE_DIRECTORY/verify.sh" >/dev/null) || return 1
+  [[ "$(find -- "$CANDIDATE_DIRECTORY" -type f -printf '.\n' |
+    awk 'END {print NR + 0}')" == "$PROFILE_CELL_FILE_COUNT" ]] || return 1
+}
+
+prepare_projection_transaction() {
+  OUTPUT_DIRECTORY="$1"
+  [[ "$OUTPUT_DIRECTORY" == /* && ! -e "$OUTPUT_DIRECTORY" &&
+    ! -L "$OUTPUT_DIRECTORY" ]] || die "output must be absolute and nonexistent"
+  is_safe_name "${OUTPUT_DIRECTORY##*/}" || die "output name is unsafe"
+  OUTPUT_PARENT="${OUTPUT_DIRECTORY%/*}"
+  [[ -d "$OUTPUT_PARENT" && ! -L "$OUTPUT_PARENT" &&
+    "$(readlink -f -- "$OUTPUT_PARENT")" == "$OUTPUT_PARENT" &&
+    "$(stat -Lc '%u:%a' -- "$OUTPUT_PARENT")" == "$EUID:700" ]] ||
+    die "output parent must be a private physical directory owned by the caller"
+  WORK_DIRECTORY="$(mktemp -d /tmp/obi-fault-security-project.XXXXXX)" ||
+    die "could not create private projection transaction"
+  WORK_DIRECTORY="$(CDPATH='' cd -- "$WORK_DIRECTORY" && pwd -P)"
+  WORK_IDENTITY="$(stat -Lc '%d:%i:%u' -- "$WORK_DIRECTORY")"
+  [[ "$(stat -Lc '%u:%a' -- "$WORK_DIRECTORY")" == "$EUID:700" ]] ||
+    die "private projection transaction has unsafe ownership or mode"
+}
+
+profile_cell_main() {
+  local -r role="$1"
+  local -r kind="$2"
+  local -r source="$3"
+  local -r output="$4"
+  local snapshot=""
+
+  case "$role:$kind" in
+    all-getsockopt:acceptance-getsockopt|all-unix:acceptance-unix|\
+      all-auto:acceptance-auto|pid-reuse-getsockopt:pid-reuse-getsockopt|\
+      pid-reuse-unix:pid-reuse-unix)
+      ;;
+    *)
+      die "profile role and raw kind do not form an exact matrix cell"
+      ;;
+  esac
+  check_dependencies
+  [[ -x "$VERIFIER" && -f "$VERIFIER" && ! -L "$VERIFIER" ]] ||
+    die "raw verifier is not an executable regular file"
+  prepare_projection_transaction "$output"
+  snapshot="$(snapshot_raw_input "$source" "$role")" ||
+    die "could not snapshot $role"
+  "$VERIFIER" --raw-v3 "$kind" "$snapshot" >/dev/null ||
+    die "raw-v3 validation failed for $role"
+  write_profile_cell_bundle "$role" "$kind" "$snapshot" ||
+    die "could not build bounded profile cell"
+  mv -T -- "$CANDIDATE_DIRECTORY" "$OUTPUT_DIRECTORY" ||
+    die "could not publish bounded profile cell"
+  CANDIDATE_DIRECTORY=""
+  CANDIDATE_IDENTITY=""
+  (CDPATH='' cd / && bash "$OUTPUT_DIRECTORY/verify.sh" >/dev/null) ||
+    die "published profile cell did not reverify"
+}
+
+aggregate_cells_main() {
+  local -a sources=("$1" "$2" "$3" "$4" "$5")
+  local -a roles=(
+    all-getsockopt all-unix all-auto pid-reuse-getsockopt pid-reuse-unix
+  )
+  local output="$6"
+  local source=""
+  local role=""
+  local observed_role=""
+  local revision=""
+  local tree=""
+  local observed_revision=""
+  local observed_tree=""
+  local profile=""
+  local index=0
+  local expected=$'SANITIZATION.md\tf\nSHA256SUMS\tf\nprofile.json\tf\nverify.sh\tf'
+  local observed=""
+  local -a profiles=()
+
+  check_dependencies
+  prepare_projection_transaction "$output"
+  for index in "${!sources[@]}"; do
+    source="${sources[index]}"
+    [[ "$source" == /* && -d "$source" && ! -L "$source" &&
+      "$(readlink -f -- "$source")" == "$source" ]] ||
+      die "profile cell is not a physical absolute directory"
+    observed="$(find -- "$source" -mindepth 1 -maxdepth 1 \
+      -printf '%f\t%y\n' | LC_ALL=C sort)" || die "could not inspect profile cell"
+    [[ "$observed" == "$expected" ]] || die "profile cell inventory is not exact"
+    [[ "$(awk 'END {print NR + 0}' "$source/SHA256SUMS")" == 3 ]] ||
+      die "profile cell manifest is not exact"
+    (CDPATH='' cd -- "$source" &&
+      sha256sum --check --strict SHA256SUMS >/dev/null) ||
+      die "profile cell manifest failed"
+    cmp -s -- "$source/verify.sh" <(emit_profile_cell_verifier) ||
+      die "profile cell verifier bytes are not source-authenticated"
+    validate_profile_cell_json "$source/profile.json" ||
+      die "profile cell schema or bounded semantics are invalid"
+    observed_role="$(jq -er '.role' "$source/profile.json")" ||
+      die "profile cell role is absent"
+    role="${roles[index]}"
+    [[ "$observed_role" == "$role" ]] || die "profile cells are mixed or reordered"
+    observed_revision="$(jq -er '.source.revision' "$source/profile.json")" || return 1
+    observed_tree="$(jq -er '.source.source_tree_sha256' "$source/profile.json")" || return 1
+    if ((index == 0)); then revision="$observed_revision"; tree="$observed_tree"; fi
+    [[ "$observed_revision" == "$revision" && "$observed_tree" == "$tree" ]] ||
+      die "profile cells do not share one exact source"
+    profile="$(jq -cS '.profile' "$source/profile.json")" || return 1
+    profiles+=("$profile")
+  done
+  CANDIDATE_DIRECTORY="$(mktemp -d "$OUTPUT_PARENT/.fault-security-matrix.XXXXXX")" ||
+    die "could not create public matrix candidate"
+  CANDIDATE_DIRECTORY="$(CDPATH='' cd -- "$CANDIDATE_DIRECTORY" && pwd -P)"
+  CANDIDATE_IDENTITY="$(stat -Lc '%d:%i:%u' -- "$CANDIDATE_DIRECTORY")"
+  write_public_bundle "$revision" "$tree" "${profiles[@]}" ||
+    die "could not build the bounded matrix from profile cells"
+  mv -T -- "$CANDIDATE_DIRECTORY" "$OUTPUT_DIRECTORY" ||
+    die "could not publish the bounded matrix"
+  CANDIDATE_DIRECTORY=""
+  CANDIDATE_IDENTITY=""
+  (CDPATH='' cd / && bash "$OUTPUT_DIRECTORY/verify.sh" >/dev/null) ||
+    die "published bounded matrix did not reverify"
+}
+
+raw_matrix_main() {
   local -a sources=()
   local -a roles=(
     all-getsockopt all-unix all-auto pid-reuse-getsockopt pid-reuse-unix
@@ -503,22 +831,7 @@ main() {
   [[ -x "$VERIFIER" && -f "$VERIFIER" && ! -L "$VERIFIER" ]] ||
     die "raw verifier is not an executable regular file"
   sources=("$1" "$2" "$3" "$4" "$5")
-  OUTPUT_DIRECTORY="$6"
-  [[ "$OUTPUT_DIRECTORY" == /* && ! -e "$OUTPUT_DIRECTORY" &&
-    ! -L "$OUTPUT_DIRECTORY" ]] || die "output must be absolute and nonexistent"
-  is_safe_name "${OUTPUT_DIRECTORY##*/}" || die "output name is unsafe"
-  OUTPUT_PARENT="${OUTPUT_DIRECTORY%/*}"
-  [[ -d "$OUTPUT_PARENT" && ! -L "$OUTPUT_PARENT" &&
-    "$(readlink -f -- "$OUTPUT_PARENT")" == "$OUTPUT_PARENT" &&
-    "$(stat -Lc '%u:%a' -- "$OUTPUT_PARENT")" == "$EUID:700" ]] ||
-    die "output parent must be a private physical directory owned by the caller"
-
-  WORK_DIRECTORY="$(mktemp -d /tmp/obi-fault-security-project.XXXXXX)" ||
-    die "could not create private projection transaction"
-  WORK_DIRECTORY="$(CDPATH='' cd -- "$WORK_DIRECTORY" && pwd -P)"
-  WORK_IDENTITY="$(stat -Lc '%d:%i:%u' -- "$WORK_DIRECTORY")"
-  [[ "$(stat -Lc '%u:%a' -- "$WORK_DIRECTORY")" == "$EUID:700" ]] ||
-    die "private projection transaction has unsafe ownership or mode"
+  prepare_projection_transaction "$6"
 
   for index in "${!sources[@]}"; do
     source="${sources[index]}"
@@ -553,6 +866,25 @@ main() {
   (CDPATH='' cd / && bash "$OUTPUT_DIRECTORY/verify.sh" >/dev/null) ||
     die "published bounded matrix did not reverify"
   printf 'bounded fault/security matrix published: %s\n' "$OUTPUT_DIRECTORY"
+}
+
+main() {
+  case "${1:-}" in
+    --profile-cell-v1)
+      [[ $# == 5 ]] || { usage >&2; return 2; }
+      profile_cell_main "$2" "$3" "$4" "$5"
+      ;;
+    --aggregate-cells-v1)
+      [[ $# == 7 ]] || { usage >&2; return 2; }
+      aggregate_cells_main "$2" "$3" "$4" "$5" "$6" "$7"
+      ;;
+    -h|--help)
+      usage
+      ;;
+    *)
+      raw_matrix_main "$@"
+      ;;
+  esac
 }
 
 main "$@"

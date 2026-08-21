@@ -11,6 +11,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
@@ -410,184 +411,142 @@ jobs:
           include-hidden-files: false
           retention-days: 14
 
-  fault-security-matrix:
-    name: Five-cell current-source fault/security matrix
+  fault-security-profile:
+    name: Fault/security profile ${{ matrix.role }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        role:
+          - all-getsockopt
+          - all-unix
+          - all-auto
+          - pid-reuse-getsockopt
+          - pid-reuse-unix
     env:
-      MATRIX_PARENT: /tmp/obi-java-remote-parent-matrix-${{ github.run_id }}-${{ github.run_attempt }}
-      MATRIX_OUTPUT: /tmp/obi-java-remote-parent-matrix-${{ github.run_id }}-${{ github.run_attempt }}/java-remote-parent-fault-security-${{ github.sha }}
+      CELL_PARENT: /tmp/obi-java-remote-parent-cell-${{ matrix.role }}-${{ github.run_id }}-${{ github.run_attempt }}
+      CELL_OUTPUT: /tmp/obi-java-remote-parent-cell-${{ matrix.role }}-${{ github.run_id }}-${{ github.run_attempt }}/public
     steps:
-      - name: Checkout matrix authority
+      - name: Checkout exact profile authority
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Verify exact matrix execution bytes
-        run: |
-          set -Eeuo pipefail
-
-          expected_repository=MrAlias/opentelemetry-ebpf-instrumentation
-          expected_ref=refs/heads/agent/java-remote-parent-bridge
-          workflow_path=.github/workflows/java_remote_parent_acceptance_claims.yml
-          expected_workflow_ref="$expected_repository/$workflow_path@$expected_ref"
-          [[ "$GITHUB_ACTIONS" == true && "$CI" == true && \
-            "$GITHUB_EVENT_NAME" == push && \
-            "$GITHUB_REPOSITORY" == "$expected_repository" && \
-            "$GITHUB_REF" == "$expected_ref" && \
-            "$GITHUB_WORKFLOW_REF" == "$expected_workflow_ref" && \
-            "$GITHUB_WORKFLOW_SHA" == "$GITHUB_SHA" && \
-            "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$(git rev-parse --verify 'HEAD^{commit}')" == "$GITHUB_SHA" ]]
-          [[ -z "$(git status --porcelain --untracked-files=all \
-            --ignore-submodules=none)" ]]
-          while IFS=$'\t' read -r relative expected_tree_mode expected_disk_mode; do
-            [[ -f "$relative" && ! -L "$relative" && \
-              "$(readlink -f -- "$relative")" == "$GITHUB_WORKSPACE/$relative" && \
-              "$(stat -Lc '%u:%a' -- "$relative")" == \
-                "$(id -u):$expected_disk_mode" ]]
-            [[ "$(git ls-tree "$GITHUB_SHA" -- "$relative" | \
-              awk 'NR == 1 {print $1} END {if (NR != 1) exit 1}')" == \
-              "$expected_tree_mode" ]]
-            disk_sha256="$(sha256sum <"$relative")"
-            disk_sha256="${disk_sha256%% *}"
-            blob_sha256="$(git show "$GITHUB_SHA:$relative" | sha256sum)"
-            blob_sha256="${blob_sha256%% *}"
-            [[ "$disk_sha256" == "$blob_sha256" ]]
-          done <<'TRACKED_MATRIX_FILES'
-          .github/workflows/java_remote_parent_acceptance_claims.yml	100644	644
-          .github/actions/free-disk/action.yml	100644	644
-          examples/apache-java-https/run.sh	100755	755
-          examples/apache-java-https/scripts/run-retained-fault-security-campaign.sh	100755	755
-          examples/apache-java-https/scripts/project-retained-fault-security-matrix.sh	100755	755
-          examples/apache-java-https/scripts/verify-retained-evidence.sh	100755	755
-          TRACKED_MATRIX_FILES
-
-      - name: Reclaim matrix runner disk space
-        uses: ./.github/actions/free-disk
+      - uses: ./.github/actions/free-disk
         with:
           docker-prune: 'false'
 
-      - name: Set up pinned Go toolchain for matrix
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: false
 
-      - name: Set up Java 21 for matrix
-        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+      - uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
         with:
           distribution: temurin
           java-version: '21'
 
-      - name: Run five private profiles and destroy raw evidence
-        id: matrix_campaign
+      - name: Run one private profile and destroy raw evidence
+        id: profile
         env:
           RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: |
           set -Eeuo pipefail
-
-          [[ ! -e "$MATRIX_PARENT" && ! -L "$MATRIX_PARENT" ]]
-          install -d -m 0700 -- "$MATRIX_PARENT"
+          [[ ! -e "$CELL_PARENT" && ! -L "$CELL_PARENT" ]]
+          install -d -m 0700 -- "$CELL_PARENT"
           ./examples/apache-java-https/scripts/run-retained-fault-security-campaign.sh \
-            "$MATRIX_OUTPUT"
+            --profile '${{ matrix.role }}' "$CELL_OUTPUT"
 
-      - name: Independently verify bounded matrix closure
-        id: matrix_verify
-        if: steps.matrix_campaign.outcome == 'success'
+      - name: Prove profile upload is sanitized and raw-free
+        id: privacy
+        if: always()
         env:
-          EXPECTED_PARENT_IDENTITY: ${{ steps.matrix_campaign.outputs.public_parent_identity }}
-          EXPECTED_DIRECTORY_IDENTITY: ${{ steps.matrix_campaign.outputs.public_directory_identity }}
-          EXPECTED_CLOSURE_SHA256: ${{ steps.matrix_campaign.outputs.public_closure_sha256 }}
-          EXPECTED_EVIDENCE_ID: ${{ steps.matrix_campaign.outputs.public_evidence_id }}
+          PROFILE_OUTCOME: ${{ steps.profile.outcome }}
         run: |
           set -Eeuo pipefail
+          residue="$(find /tmp -mindepth 1 -maxdepth 1 -user "$(id -u)" \
+            -name 'obi-fault-security-campaign.*' -print -quit)"
+          [[ -z "$residue" ]]
+          [[ ! -e examples/apache-java-https/.runtime/results && \
+            ! -L examples/apache-java-https/.runtime/results ]]
+          if [[ "$PROFILE_OUTCOME" != success ]]; then
+            [[ -z "$(find -- "$CELL_PARENT" -mindepth 1 -print -quit 2>/dev/null || true)" ]]
+            exit 0
+          fi
+          expected=$'SANITIZATION.md\tf\nSHA256SUMS\tf\nprofile.json\tf\nverify.sh\tf'
+          [[ "$(find -- "$CELL_OUTPUT" -mindepth 1 -maxdepth 1 \
+            -printf '%f\t%y\n' | LC_ALL=C sort)" == "$expected" ]]
+          (CDPATH='' cd / && bash "$CELL_OUTPUT/verify.sh" >/dev/null)
 
-          [[ "$EXPECTED_PARENT_IDENTITY" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-7]{3,4}$ && \
-            "$EXPECTED_DIRECTORY_IDENTITY" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-7]{3,4}$ && \
-            "$EXPECTED_CLOSURE_SHA256" =~ ^[0-9a-f]{64}$ && \
-            "$EXPECTED_EVIDENCE_ID" =~ ^[0-9a-f]{64}$ ]]
-          [[ "$(stat -Lc '%d:%i:%u:%a' -- "$MATRIX_PARENT")" == \
-            "$EXPECTED_PARENT_IDENTITY" && \
-            "$(stat -Lc '%d:%i:%u:%a' -- "$MATRIX_OUTPUT")" == \
-            "$EXPECTED_DIRECTORY_IDENTITY" && \
-            "$(stat -Lc '%u:%a' -- "$MATRIX_OUTPUT")" == "$(id -u):555" ]]
-          expected=$'README.md\tf\nSANITIZATION.md\tf\nSHA256SUMS\tf\nderivation-receipt.json\tf\nfault-security-matrix.json\tf\nverify.sh\tf'
-          observed="$(find -- "$MATRIX_OUTPUT" -mindepth 1 -maxdepth 1 \
-            -printf '%f\t%y\n' | LC_ALL=C sort)"
+      - name: Upload sanitized profile cell
+        if: >-
+          !cancelled() && steps.profile.outcome == 'success' &&
+          steps.privacy.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: java-remote-parent-fault-security-cell-${{ matrix.role }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.CELL_OUTPUT }}
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 90
+
+  fault-security-matrix:
+    name: Aggregate five sanitized fault/security cells
+    needs: fault-security-profile
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CELL_ROOT: /tmp/fault-security-cells-${{ github.run_id }}-${{ github.run_attempt }}
+      MATRIX_PARENT: /tmp/fault-security-matrix-${{ github.run_id }}-${{ github.run_attempt }}
+      MATRIX_OUTPUT: /tmp/fault-security-matrix-${{ github.run_id }}-${{ github.run_attempt }}/public
+    steps:
+      - name: Checkout aggregation authority
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download exact five sanitized profile artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: java-remote-parent-fault-security-cell-*-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.CELL_ROOT }}
+          merge-multiple: false
+
+      - name: Aggregate exact cells into the existing six-file contract
+        id: aggregate
+        run: |
+          set -Eeuo pipefail
+          install -d -m 0700 -- "$MATRIX_PARENT"
+          prefix="$CELL_ROOT/java-remote-parent-fault-security-cell-"
+          suffix="-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          expected="$({
+            printf '%s\n' \
+              "java-remote-parent-fault-security-cell-all-getsockopt${suffix}" \
+              "java-remote-parent-fault-security-cell-all-unix${suffix}" \
+              "java-remote-parent-fault-security-cell-all-auto${suffix}" \
+              "java-remote-parent-fault-security-cell-pid-reuse-getsockopt${suffix}" \
+              "java-remote-parent-fault-security-cell-pid-reuse-unix${suffix}"
+          } | LC_ALL=C sort)"
+          observed="$(find -- "$CELL_ROOT" -mindepth 1 -maxdepth 1 \
+            -type d -printf '%f\n' | LC_ALL=C sort)"
           [[ "$observed" == "$expected" ]]
-          files=(README.md SANITIZATION.md fault-security-matrix.json \
-            derivation-receipt.json verify.sh SHA256SUMS)
-          closure_rows=()
-          for file in "${files[@]}"; do
-            [[ -f "$MATRIX_OUTPUT/$file" && ! -L "$MATRIX_OUTPUT/$file" ]]
-            identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
-              "$MATRIX_OUTPUT/$file")"
-            [[ "$identity" == *":$(id -u):444:1:"* ]]
-            digest="$(sha256sum <"$MATRIX_OUTPUT/$file")"
-            digest="${digest%% *}"
-            closure_rows+=("$file"$'\t'"$identity"$'\t'"$digest")
-          done
-          closure_sha256="$(printf '%s\n' "${closure_rows[@]}" | sha256sum)"
-          closure_sha256="${closure_sha256%% *}"
-          evidence_id="$(sha256sum <"$MATRIX_OUTPUT/derivation-receipt.json")"
-          evidence_id="${evidence_id%% *}"
-          [[ "$closure_sha256" == "$EXPECTED_CLOSURE_SHA256" && \
-            "$evidence_id" == "$EXPECTED_EVIDENCE_ID" ]]
+          ./examples/apache-java-https/scripts/project-retained-fault-security-matrix.sh \
+            --aggregate-cells-v1 \
+            "${prefix}all-getsockopt${suffix}" \
+            "${prefix}all-unix${suffix}" \
+            "${prefix}all-auto${suffix}" \
+            "${prefix}pid-reuse-getsockopt${suffix}" \
+            "${prefix}pid-reuse-unix${suffix}" \
+            "$MATRIX_OUTPUT"
           ./examples/apache-java-https/scripts/verify-retained-evidence.sh \
             --fault-security-matrix-v1 "$MATRIX_OUTPUT" >/dev/null
           (CDPATH='' cd / && bash "$MATRIX_OUTPUT/verify.sh" >/dev/null)
-          [[ "$(stat -Lc '%d:%i:%u:%a' -- "$MATRIX_PARENT")" == \
-            "$EXPECTED_PARENT_IDENTITY" && \
-            "$(stat -Lc '%d:%i:%u:%a' -- "$MATRIX_OUTPUT")" == \
-            "$EXPECTED_DIRECTORY_IDENTITY" ]]
-
-      - name: Prove matrix privacy boundary
-        id: matrix_privacy
-        if: always()
-        env:
-          CAMPAIGN_OUTCOME: ${{ steps.matrix_campaign.outcome }}
-          VERIFY_OUTCOME: ${{ steps.matrix_verify.outcome }}
-        run: |
-          set -Eeuo pipefail
-
-          [[ ! -e "$GITHUB_WORKSPACE/examples/apache-java-https/.runtime/results" && \
-            ! -L "$GITHUB_WORKSPACE/examples/apache-java-https/.runtime/results" ]]
-          if [[ ! -e "$MATRIX_PARENT" && ! -L "$MATRIX_PARENT" ]]; then
-            [[ "$CAMPAIGN_OUTCOME" != success ]]
-            exit 0
-          fi
-          [[ -d "$MATRIX_PARENT" && ! -L "$MATRIX_PARENT" && \
-            "$(readlink -f -- "$MATRIX_PARENT")" == "$MATRIX_PARENT" && \
-            "$(stat -Lc '%u:%a' -- "$MATRIX_PARENT")" == "$(id -u):700" ]]
-          inventory="$(find -- "$MATRIX_PARENT" -mindepth 1 -maxdepth 1 \
-            -printf '%f\t%y\n' | LC_ALL=C sort)"
-          if [[ "$CAMPAIGN_OUTCOME" != success ]]; then
-            [[ -z "$inventory" ]]
-            exit 0
-          fi
-          [[ "$VERIFY_OUTCOME" == success && \
-            "$inventory" == "${MATRIX_OUTPUT##*/}"$'\td' ]]
-          residue="$(find -- "$MATRIX_PARENT" -xdev \
-            \( -name '*.log' -o -name 'environment.txt' \
-              -o -name 'run-status.json' -o -name 'obi-metric-pairs' \
-              -o -name 'pid-reuse-controller.json' -o -name 'phases' \
-              -o -name '.fault-security-matrix.*' \) -print -quit)"
-          [[ -z "$residue" ]]
-          jq -e '
-            .status == "passed" and
-            .privacy.raw_identifiers_published == false and
-            .privacy.raw_inputs_retained == false and
-            .privacy.unsupported_pid_reuse_outcome == "rejected"
-          ' "$MATRIX_OUTPUT/fault-security-matrix.json" >/dev/null
 
       - name: Upload verified bounded fault/security matrix
-        if: >-
-          !cancelled() &&
-          steps.matrix_campaign.outcome == 'success' &&
-          steps.matrix_verify.outcome == 'success' &&
-          steps.matrix_privacy.outcome == 'success'
+        if: steps.aggregate.outcome == 'success'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: java-remote-parent-fault-security-${{ github.run_id }}-${{ github.run_attempt }}

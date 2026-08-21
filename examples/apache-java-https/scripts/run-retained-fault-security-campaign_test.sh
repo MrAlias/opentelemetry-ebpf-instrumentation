@@ -49,6 +49,9 @@ assert_profile_roster() {
   [[ "${PUBLIC_FILES[*]}" == \
     'README.md SANITIZATION.md fault-security-matrix.json derivation-receipt.json verify.sh SHA256SUMS' ]] ||
     fail 'public roster is not the exact ordered six-file closure' || return 1
+  [[ "${PROFILE_PUBLIC_FILES[*]}" == \
+    'SANITIZATION.md profile.json verify.sh SHA256SUMS' ]] ||
+    fail 'profile handoff is not the exact ordered four-file closure' || return 1
   for index in "${!expected[@]}"; do
     build_profile_command "$index" || return 1
     observed="$(printf '%s ' "${PROFILE_COMMAND[@]}")"
@@ -61,9 +64,41 @@ assert_profile_roster() {
   fi
 }
 
+assert_profile_cli_selection() {
+  if ! (
+    run_campaign() {
+      [[ "$PROFILE_MODE" == true && "$SELECTED_PROFILE_INDEX" == 2 &&
+        "$OUTPUT_DIRECTORY" == /tmp/profile-output-fixture ]]
+    }
+    campaign_entry --profile all-auto /tmp/profile-output-fixture
+  ); then
+    fail 'exact profile CLI role was not selected'
+  fi
+  if (
+    run_campaign() { :; }
+    campaign_entry --profile unknown /tmp/profile-output-fixture
+  ) >/dev/null 2>&1; then
+    fail 'unknown profile CLI role was accepted'
+  fi
+}
+
+assert_profile_workflow_contract() {
+  local -r workflow="$SCRIPT_DIRECTORY/../../../.github/workflows/java_remote_parent_acceptance_claims.yml"
+  grep -Fq -- 'fail-fast: false' "$workflow" ||
+    fail 'fault/security profile matrix lost fail-fast false'
+  grep -Fq -- 'timeout-minutes: 180' "$workflow" ||
+    fail 'fault/security profile jobs lost their bounded timeout'
+  grep -Fq -- '--aggregate-cells-v1' "$workflow" ||
+    fail 'fault/security final aggregation is absent'
+  grep -Fq -- 'retention-days: 90' "$workflow" ||
+    fail 'sanitized profile retention is not 90 days'
+}
+
 assert_private_descriptor_destroy() {
   local owned_path=''
 
+  # These globals are consumed by the sourced campaign helpers.
+  # shellcheck disable=SC2034
   PRIVATE_CREATED=false
   PRIVATE_DIRECTORY=''
   PRIVATE_DIRECTORY_FD=''
@@ -170,6 +205,8 @@ assert_failed_public_delete_stays_owned() {
   chmod 0555 -- "$output"
   if (
     OUTPUT_DIRECTORY="$output"
+    # Consumed by remove_public_output from the sourced campaign.
+    # shellcheck disable=SC2034
     OUTPUT_DIRECTORY_IDENTITY="$(stat -Lc '%d:%i:%u:%a' -- "$output")"
     OUTPUT_CREATED=true
     # This seam models a filesystem deletion failure after the output has
@@ -198,6 +235,8 @@ assert_unsupported_pid_reuse_stays_failed() {
       esac
     }
     run_scoped_cleanup() {
+      # Consumed by run_profile from the sourced campaign.
+      # shellcheck disable=SC2034
       CLEANUP_REQUIRED=false
       return 0
     }
@@ -213,6 +252,8 @@ main() {
   trap cleanup EXIT
 
   assert_profile_roster
+  assert_profile_cli_selection
+  assert_profile_workflow_contract
   assert_private_descriptor_destroy
   assert_result_discovery
   assert_public_closure_mutations

@@ -220,6 +220,19 @@ main() {
   local verifier_hash=""
   local expected_hash=""
   local file_count=""
+  local cells_parent=""
+  local aggregate_output=""
+  local role=""
+  local kind=""
+  local file=""
+  local -a roles=(
+    all-getsockopt all-unix all-auto pid-reuse-getsockopt pid-reuse-unix
+  )
+  local -a kinds=(
+    acceptance-getsockopt acceptance-unix acceptance-auto
+    pid-reuse-getsockopt pid-reuse-unix
+  )
+  local -a cells=()
 
   [[ -x "$PROJECTOR" && -x "$SOURCE_VERIFIER" ]] ||
     die 'projector or verifier is not executable'
@@ -264,6 +277,75 @@ main() {
   expected_hash="${expected_hash%% *}"
   [[ "$verifier_hash" == "$expected_hash" ]] ||
     die 'projected portable verifier bytes drifted from the source heredoc'
+
+  cells_parent="$public_parent/cells"
+  aggregate_output="$public_parent/aggregated"
+  mkdir -m 0700 -- "$cells_parent"
+  for role in "${!roles[@]}"; do
+    kind="${kinds[role]}"
+    "$TEST_DIRECTORY/scripts/project-retained-fault-security-matrix.sh" \
+      --profile-cell-v1 "${roles[role]}" "$kind" \
+      "$fixtures/${roles[role]}" "$cells_parent/${roles[role]}" >/dev/null ||
+      die "could not project sanitized profile cell ${roles[role]}"
+    cells+=("$cells_parent/${roles[role]}")
+    [[ "$(find -- "${cells[role]}" -mindepth 1 -maxdepth 1 -type f \
+      -printf '.\n' | awk 'END {print NR + 0}')" == 4 ]] ||
+      die 'profile handoff lost its exact four-file closure'
+    if grep -R -E -q 'PRIVATE_MATRIX_CANARY|424242|11111111111111111111111111111111' \
+      "${cells[role]}"; then
+      die 'sanitized profile handoff leaked private evidence'
+    fi
+  done
+  "$TEST_DIRECTORY/scripts/project-retained-fault-security-matrix.sh" \
+    --aggregate-cells-v1 "${cells[@]}" "$aggregate_output" >/dev/null ||
+    die 'five sanitized cells did not aggregate'
+  for file in README.md SANITIZATION.md fault-security-matrix.json \
+    derivation-receipt.json verify.sh SHA256SUMS; do
+    cmp -s -- "$output/$file" "$aggregate_output/$file" ||
+      die "sanitized-cell aggregation changed the existing six-file contract: $file"
+  done
+  if "$TEST_DIRECTORY/scripts/project-retained-fault-security-matrix.sh" \
+    --aggregate-cells-v1 "${cells[1]}" "${cells[0]}" "${cells[2]}" \
+    "${cells[3]}" "${cells[4]}" "$public_parent/reordered" \
+    >/dev/null 2>&1; then
+    die 'aggregation accepted reordered profile roles'
+  fi
+  if "$TEST_DIRECTORY/scripts/project-retained-fault-security-matrix.sh" \
+    --aggregate-cells-v1 "${cells[0]}" "${cells[1]}" "${cells[2]}" \
+    "${cells[3]}" "$public_parent/incomplete" >/dev/null 2>&1; then
+    die 'aggregation accepted an incomplete profile matrix'
+  fi
+  local untrusted_cell="$TEST_DIRECTORY/untrusted-profile-cell"
+  local verifier_canary="$TEST_DIRECTORY/untrusted-profile-verifier-ran"
+  local -a untrusted_cells=("$untrusted_cell" "${cells[@]:1}")
+  cp -a -- "${cells[0]}" "$untrusted_cell"
+  chmod -R u+w -- "$untrusted_cell"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    "printf pwned >$(printf '%q' "$verifier_canary")" \
+    >"$untrusted_cell/verify.sh"
+  (CDPATH='' cd -- "$untrusted_cell" &&
+    sha256sum SANITIZATION.md profile.json verify.sh >SHA256SUMS)
+  if "$TEST_DIRECTORY/scripts/project-retained-fault-security-matrix.sh" \
+    --aggregate-cells-v1 "${untrusted_cells[@]}" "$public_parent/untrusted-verifier" \
+    >/dev/null 2>&1; then
+    die 'aggregation trusted an artifact-controlled profile verifier'
+  fi
+  [[ ! -e "$verifier_canary" ]] ||
+    die 'aggregation executed an artifact-controlled profile verifier'
+  chmod -R u+w -- "${cells[0]}"
+  jq '.profile.private_binary="UFJJVkFURQ=="' "${cells[0]}/profile.json" \
+    >"${cells[0]}/profile.json.tmp"
+  mv -- "${cells[0]}/profile.json.tmp" "${cells[0]}/profile.json"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"${cells[0]}/verify.sh"
+  (CDPATH='' cd -- "${cells[0]}" &&
+    sha256sum SANITIZATION.md profile.json verify.sh >SHA256SUMS)
+  if "$TEST_DIRECTORY/scripts/project-retained-fault-security-matrix.sh" \
+    --aggregate-cells-v1 "${cells[@]}" "$public_parent/private-smuggle" \
+    >/dev/null 2>&1; then
+    die 'aggregation trusted a self-verifying cell with private extra fields'
+  fi
+  chmod -R u+rwX -- "$aggregate_output" "$cells_parent"
+  rm -rf -- "$aggregate_output" "$cells_parent"
 
   chmod -R u+rwX -- "$output"
   jq '.profiles[3].pid_reuse.same_numeric_pid = false' \

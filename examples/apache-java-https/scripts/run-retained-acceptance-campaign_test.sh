@@ -2430,14 +2430,59 @@ workflow_has_once() {
   [[ "$(grep -F -c -- "$literal" "$workflow")" == 1 ]]
 }
 
+workflow_text_has_count() {
+  local -r workflow_text="$1"
+  local -r literal="$2"
+  local -r expected_count="$3"
+  [[ "$(grep -F -c -- "$literal" <<<"$workflow_text")" == "$expected_count" ]]
+}
+
+workflow_text_has_once() {
+  workflow_text_has_count "$1" "$2" 1
+}
+
+workflow_job_text() {
+  local -r workflow="$1"
+  local -r target="$2"
+
+  awk -v target="$target" '
+    $0 == "jobs:" { in_jobs=1; next }
+    !in_jobs { next }
+    /^  [[:alnum:]_-]+:$/ {
+      current=$0
+      sub(/^  /, "", current)
+      sub(/:$/, "", current)
+      if (emit) exit
+      if (current == target) {
+        emit=1
+        found=1
+      }
+    }
+    emit { print }
+    END { if (!found) exit 42 }
+  ' "$workflow"
+}
+
 validate_workflow_contract_file() {
   local -r workflow="$1"
+  local acceptance_job=""
+  local profile_job=""
+  local aggregate_job=""
+  local workflow_jobs=""
   local upload_condition=""
   local upload_paths=""
   local expected_paths=""
+  local profile_roles=""
+  local expected_profile_roles=""
+  local aggregate_inputs=""
+  local expected_aggregate_inputs=""
+  local aggregate_upload_paths=""
+  local expected_aggregate_upload_paths=""
   local early_line=""
   local free_disk_line=""
   local literal=""
+  local -a profile_exact_literals=()
+  local -a aggregate_exact_literals=()
   local -a exact_literals=(
     '      - agent/java-remote-parent-bridge'
     '    runs-on: ubuntu-24.04'
@@ -2447,6 +2492,8 @@ validate_workflow_contract_file() {
     '      PUBLIC_PARENT: /tmp/obi-java-remote-parent-public-${{ github.run_id }}-${{ github.run_attempt }}'
     '      PUBLIC_OUTPUT: /tmp/obi-java-remote-parent-public-${{ github.run_id }}-${{ github.run_attempt }}/java-remote-parent-claims-${{ github.sha }}'
     '        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1'
+    '          fetch-depth: 0'
+    '          persist-credentials: false'
     '        uses: ./.github/actions/free-disk'
     '        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0'
     '        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0'
@@ -2479,32 +2526,169 @@ validate_workflow_contract_file() {
     '            "bounded claim bundle internally consistent (not authenticated): $evidence_id" ]]'
     '          if-no-files-found: error'
     '          include-hidden-files: false'
+    '          retention-days: 14'
+  )
+  profile_exact_literals=(
+    '  fault-security-profile:'
+    '    name: Fault/security profile ${{ matrix.role }}'
+    '    runs-on: ubuntu-24.04'
+    '    timeout-minutes: 180'
+    '    strategy:'
+    '      fail-fast: false'
+    '      matrix:'
+    '        role:'
+    '      CELL_PARENT: /tmp/obi-java-remote-parent-cell-${{ matrix.role }}-${{ github.run_id }}-${{ github.run_attempt }}'
+    '      CELL_OUTPUT: /tmp/obi-java-remote-parent-cell-${{ matrix.role }}-${{ github.run_id }}-${{ github.run_attempt }}/public'
+    '        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1'
+    '          fetch-depth: 0'
+    '          persist-credentials: false'
+    '      - uses: ./.github/actions/free-disk'
+    '      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0'
+    '      - uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0'
+    '        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1'
+    $'          docker-prune: \'false\''
+    '          cache: false'
+    '        id: profile'
+    '          RUNNER_ENVIRONMENT: ${{ runner.environment }}'
+    $'            --profile \'${{ matrix.role }}\' "$CELL_OUTPUT"'
+    '        id: privacy'
+    '        if: always()'
+    '          PROFILE_OUTCOME: ${{ steps.profile.outcome }}'
+    $'          expected=$\'SANITIZATION.md\\tf\\nSHA256SUMS\\tf\\nprofile.json\\tf\\nverify.sh\\tf\''
+    $'          (CDPATH=\'\' cd / && bash "$CELL_OUTPUT/verify.sh" >/dev/null)'
+    "          !cancelled() && steps.profile.outcome == 'success' &&"
+    "          steps.privacy.outcome == 'success'"
+    '          name: java-remote-parent-fault-security-cell-${{ matrix.role }}-${{ github.run_id }}-${{ github.run_attempt }}'
+    '          path: ${{ env.CELL_OUTPUT }}'
+    '          if-no-files-found: error'
+    '          include-hidden-files: false'
+    '          retention-days: 90'
+  )
+  aggregate_exact_literals=(
+    '  fault-security-matrix:'
+    '    name: Aggregate five sanitized fault/security cells'
+    '    needs: fault-security-profile'
+    '    runs-on: ubuntu-24.04'
+    '    timeout-minutes: 30'
+    '      CELL_ROOT: /tmp/fault-security-cells-${{ github.run_id }}-${{ github.run_attempt }}'
+    '      MATRIX_PARENT: /tmp/fault-security-matrix-${{ github.run_id }}-${{ github.run_attempt }}'
+    '      MATRIX_OUTPUT: /tmp/fault-security-matrix-${{ github.run_id }}-${{ github.run_attempt }}/public'
+    '        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1'
+    '          fetch-depth: 0'
+    '          persist-credentials: false'
+    '        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1'
+    '        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1'
+    '          pattern: java-remote-parent-fault-security-cell-*-${{ github.run_id }}-${{ github.run_attempt }}'
+    '          path: ${{ env.CELL_ROOT }}'
+    '          merge-multiple: false'
+    '          [[ "$observed" == "$expected" ]]'
+    '        id: aggregate'
+    '            "java-remote-parent-fault-security-cell-all-getsockopt${suffix}" \'
+    '            "java-remote-parent-fault-security-cell-all-unix${suffix}" \'
+    '            "java-remote-parent-fault-security-cell-all-auto${suffix}" \'
+    '            "java-remote-parent-fault-security-cell-pid-reuse-getsockopt${suffix}" \'
+    '            "java-remote-parent-fault-security-cell-pid-reuse-unix${suffix}"'
+    '            --aggregate-cells-v1 \'
+    '            --fault-security-matrix-v1 "$MATRIX_OUTPUT" >/dev/null'
+    $'          (CDPATH=\'\' cd / && bash "$MATRIX_OUTPUT/verify.sh" >/dev/null)'
+    "        if: steps.aggregate.outcome == 'success'"
+    '          name: java-remote-parent-fault-security-${{ github.run_id }}-${{ github.run_attempt }}'
+    '          path: |'
+    '            ${{ env.MATRIX_OUTPUT }}/README.md'
+    '            ${{ env.MATRIX_OUTPUT }}/SANITIZATION.md'
+    '            ${{ env.MATRIX_OUTPUT }}/fault-security-matrix.json'
+    '            ${{ env.MATRIX_OUTPUT }}/derivation-receipt.json'
+    '            ${{ env.MATRIX_OUTPUT }}/verify.sh'
+    '            ${{ env.MATRIX_OUTPUT }}/SHA256SUMS'
+    '          if-no-files-found: error'
+    '          include-hidden-files: false'
+    '          retention-days: 14'
   )
 
-  [[ "$(grep -Ec '^[[:space:]]+uses:' "$workflow")" == 5 &&
-    "$(grep -Fc 'actions/upload-artifact@' "$workflow")" == 1 &&
-    "$(grep -Fc 'RUNNER_ENVIRONMENT: ${{ runner.environment }}' "$workflow")" == 2 &&
-    "$(grep -Fc 'EXPECTED_PARENT_IDENTITY: ${{ steps.campaign.outputs.public_parent_identity }}' "$workflow")" == 2 &&
-    "$(grep -Fc 'EXPECTED_DIRECTORY_IDENTITY: ${{ steps.campaign.outputs.public_directory_identity }}' "$workflow")" == 2 &&
-    "$(grep -Fc 'EXPECTED_CLOSURE_SHA256: ${{ steps.campaign.outputs.public_closure_sha256 }}' "$workflow")" == 2 &&
-    "$(grep -Fc 'EXPECTED_EVIDENCE_ID: ${{ steps.campaign.outputs.public_evidence_id }}' "$workflow")" == 2 &&
-    "$(grep -Fc '"$observed_closure" == "$EXPECTED_CLOSURE_SHA256"' "$workflow")" == 3 &&
-    "$(grep -Fc '$(sha256sum <"$PUBLIC_OUTPUT/verify.sh")' "$workflow")" == 2 ]] ||
+  acceptance_job="$(workflow_job_text "$workflow" acceptance)" || return 1
+  profile_job="$(workflow_job_text "$workflow" fault-security-profile)" || return 1
+  aggregate_job="$(workflow_job_text "$workflow" fault-security-matrix)" || return 1
+  workflow_jobs="$(awk '
+    $0 == "jobs:" { in_jobs=1; next }
+    in_jobs && /^  [[:alnum:]_-]+:$/ {
+      sub(/^  /, "")
+      sub(/:$/, "")
+      print
+    }
+  ' "$workflow")" || return 1
+  [[ "$workflow_jobs" == $'acceptance\nfault-security-profile\nfault-security-matrix' ]] ||
+    return 1
+
+  [[ "$(grep -Ec '^[[:space:]]+(-[[:space:]]+)?uses:' "$workflow")" == 13 &&
+    "$(grep -Fc 'actions/checkout@' "$workflow")" == 3 &&
+    "$(grep -Fc 'actions/upload-artifact@' "$workflow")" == 3 &&
+    "$(grep -Fc 'actions/download-artifact@' "$workflow")" == 1 &&
+    "$(grep -Fc './.github/actions/free-disk' "$workflow")" == 2 &&
+    "$(grep -Fc 'actions/setup-go@' "$workflow")" == 2 &&
+    "$(grep -Fc 'actions/setup-java@' "$workflow")" == 2 &&
+    "$(grep -Ec '^[[:space:]]+retention-days: 14$' "$workflow")" == 2 &&
+    "$(grep -Ec '^[[:space:]]+retention-days: 90$' "$workflow")" == 1 ]] ||
+    return 1
+
+  [[ "$(grep -Ec '^[[:space:]]+(-[[:space:]]+)?uses:' <<<"$acceptance_job")" == 5 &&
+    "$(grep -Fc 'actions/upload-artifact@' <<<"$acceptance_job")" == 1 &&
+    "$(grep -Fc 'RUNNER_ENVIRONMENT: ${{ runner.environment }}' <<<"$acceptance_job")" == 2 &&
+    "$(grep -Fc 'EXPECTED_PARENT_IDENTITY: ${{ steps.campaign.outputs.public_parent_identity }}' <<<"$acceptance_job")" == 2 &&
+    "$(grep -Fc 'EXPECTED_DIRECTORY_IDENTITY: ${{ steps.campaign.outputs.public_directory_identity }}' <<<"$acceptance_job")" == 2 &&
+    "$(grep -Fc 'EXPECTED_CLOSURE_SHA256: ${{ steps.campaign.outputs.public_closure_sha256 }}' <<<"$acceptance_job")" == 2 &&
+    "$(grep -Fc 'EXPECTED_EVIDENCE_ID: ${{ steps.campaign.outputs.public_evidence_id }}' <<<"$acceptance_job")" == 2 &&
+    "$(grep -Fc '"$observed_closure" == "$EXPECTED_CLOSURE_SHA256"' <<<"$acceptance_job")" == 3 &&
+    "$(grep -Fc '$(sha256sum <"$PUBLIC_OUTPUT/verify.sh")' <<<"$acceptance_job")" == 2 ]] ||
+    return 1
+  [[ "$(grep -Ec '^[[:space:]]+(-[[:space:]]+)?uses:' <<<"$profile_job")" == 5 &&
+    "$(grep -Fc 'actions/upload-artifact@' <<<"$profile_job")" == 1 &&
+    "$(grep -Fc 'actions/download-artifact@' <<<"$profile_job")" == 0 &&
+    "$(grep -Fc 'RUNNER_ENVIRONMENT: ${{ runner.environment }}' <<<"$profile_job")" == 1 ]] ||
+    return 1
+  [[ "$(grep -Ec '^[[:space:]]+(-[[:space:]]+)?uses:' <<<"$aggregate_job")" == 3 &&
+    "$(grep -Fc 'actions/upload-artifact@' <<<"$aggregate_job")" == 1 &&
+    "$(grep -Fc 'actions/download-artifact@' <<<"$aggregate_job")" == 1 ]] ||
     return 1
   for literal in "${exact_literals[@]}"; do
-    workflow_has_once "$workflow" "$literal" || {
+    case "$literal" in
+      '      - agent/java-remote-parent-bridge' | \
+        '  group: java-remote-parent-acceptance-claims-${{ github.workflow }}-${{ github.ref }}' | \
+        '  cancel-in-progress: false')
+        workflow_has_once "$workflow" "$literal"
+        ;;
+      *)
+        workflow_text_has_once "$acceptance_job" "$literal"
+        ;;
+    esac || {
       printf 'workflow literal is not exact: %s\n' "$literal" >&2
       return 1
     }
   done
-  if grep -Eq 'workflow_dispatch:|pull_request:|schedule:|^[[:space:]]+paths:|^[[:space:]]+tags:|continue-on-error:|actions/cache@|download-artifact@' \
+  for literal in "${profile_exact_literals[@]}"; do
+    workflow_text_has_once "$profile_job" "$literal" || {
+      printf 'profile workflow literal is not exact: %s\n' "$literal" >&2
+      return 1
+    }
+  done
+  for literal in "${aggregate_exact_literals[@]}"; do
+    workflow_text_has_once "$aggregate_job" "$literal" || {
+      printf 'aggregate workflow literal is not exact: %s\n' "$literal" >&2
+      return 1
+    }
+  done
+  workflow_has_once "$workflow" '  actions: read' || return 1
+  workflow_has_once "$workflow" '  contents: read' || return 1
+  if grep -Eq 'workflow_dispatch:|pull_request:|schedule:|^[[:space:]]+paths:|^[[:space:]]+tags:|continue-on-error:|actions/cache@' \
     "$workflow"; then
     return 1
   fi
+  if grep -Fq 'download-artifact@' <<<"$acceptance_job"; then
+    return 1
+  fi
   early_line="$(grep -nF -m1 -- '- name: Verify exact push and tracked execution bytes' \
-    "$workflow")" || return 1
+    <<<"$acceptance_job")" || return 1
   free_disk_line="$(grep -nF -m1 -- '- name: Reclaim hosted-runner disk space' \
-    "$workflow")" || return 1
+    <<<"$acceptance_job")" || return 1
   early_line="${early_line%%:*}"
   free_disk_line="${free_disk_line%%:*}"
   (( early_line < free_disk_line )) || return 1
@@ -2513,7 +2697,7 @@ validate_workflow_contract_file() {
     upload && /if: >-/ { condition=1; next }
     condition && /uses:/ { exit }
     condition { gsub(/[[:space:]]/, ""); printf "%s", $0 }
-  ' "$workflow")" || return 1
+  ' <<<"$acceptance_job")" || return 1
   [[ "$upload_condition" == \
     "!cancelled()&&steps.campaign.outcome=='success'&&steps.independent_verify.outcome=='success'&&steps.privacy.outcome=='success'" ]] ||
     return 1
@@ -2521,7 +2705,7 @@ validate_workflow_contract_file() {
     /^[[:space:]]+path: \|$/ { paths=1; next }
     paths && /^[[:space:]]+if-no-files-found:/ { exit }
     paths { sub(/^[[:space:]]+/, ""); print }
-  ' "$workflow")" || return 1
+  ' <<<"$acceptance_job")" || return 1
   expected_paths="$(printf '%s\n' \
     '${{ env.PUBLIC_OUTPUT }}/README.md' \
     '${{ env.PUBLIC_OUTPUT }}/SANITIZATION.md' \
@@ -2530,7 +2714,44 @@ validate_workflow_contract_file() {
     '${{ env.PUBLIC_OUTPUT }}/derivation-receipt.json' \
     '${{ env.PUBLIC_OUTPUT }}/verify.sh' \
     '${{ env.PUBLIC_OUTPUT }}/SHA256SUMS')"
-  [[ "$upload_paths" == "$expected_paths" ]]
+  [[ "$upload_paths" == "$expected_paths" ]] || return 1
+
+  profile_roles="$(awk '
+    $0 == "        role:" { roles=1; next }
+    roles && $0 == "    env:" { exit }
+    roles {
+      sub(/^          - /, "")
+      print
+    }
+  ' <<<"$profile_job")" || return 1
+  expected_profile_roles="$(printf '%s\n' \
+    all-getsockopt all-unix all-auto pid-reuse-getsockopt pid-reuse-unix)"
+  [[ "$profile_roles" == "$expected_profile_roles" ]] || return 1
+
+  aggregate_inputs="$(awk '
+    /--aggregate-cells-v1 \\$/ { inputs=1; next }
+    inputs {
+      sub(/^[[:space:]]+/, "")
+      print
+      if ($0 == "\"$MATRIX_OUTPUT\"") exit
+    }
+  ' <<<"$aggregate_job")" || return 1
+  expected_aggregate_inputs=$'"${prefix}all-getsockopt${suffix}" \\\n"${prefix}all-unix${suffix}" \\\n"${prefix}all-auto${suffix}" \\\n"${prefix}pid-reuse-getsockopt${suffix}" \\\n"${prefix}pid-reuse-unix${suffix}" \\\n"$MATRIX_OUTPUT"'
+  [[ "$aggregate_inputs" == "$expected_aggregate_inputs" ]] || return 1
+
+  aggregate_upload_paths="$(awk '
+    /^[[:space:]]+path: \|$/ { paths=1; next }
+    paths && /^[[:space:]]+if-no-files-found:/ { exit }
+    paths { sub(/^[[:space:]]+/, ""); print }
+  ' <<<"$aggregate_job")" || return 1
+  expected_aggregate_upload_paths="$(printf '%s\n' \
+    '${{ env.MATRIX_OUTPUT }}/README.md' \
+    '${{ env.MATRIX_OUTPUT }}/SANITIZATION.md' \
+    '${{ env.MATRIX_OUTPUT }}/fault-security-matrix.json' \
+    '${{ env.MATRIX_OUTPUT }}/derivation-receipt.json' \
+    '${{ env.MATRIX_OUTPUT }}/verify.sh' \
+    '${{ env.MATRIX_OUTPUT }}/SHA256SUMS')"
+  [[ "$aggregate_upload_paths" == "$expected_aggregate_upload_paths" ]]
 }
 
 replace_first_literal() {
@@ -2538,9 +2759,11 @@ replace_first_literal() {
   local -r old="$2"
   local -r new="$3"
   local temporary="$input.next"
+  local -r occurrence="${4:-1}"
 
-  awk -v old="$old" -v new="$new" '
-    !changed && index($0, old) {
+  awk -v old="$old" -v new="$new" -v occurrence="$occurrence" '
+    index($0, old) { matches += 1 }
+    !changed && matches == occurrence && index($0, old) {
       at=index($0, old)
       $0=substr($0, 1, at - 1) new substr($0, at + length(old))
       changed=1
@@ -2555,10 +2778,11 @@ assert_workflow_mutation_rejected() {
   local -r name="$1"
   local -r old="$2"
   local -r new="$3"
+  local -r occurrence="${4:-1}"
   local mutant="$TEST_TMP_DIR/workflow-$name.yml"
 
   cp -- "$CAMPAIGN_WORKFLOW" "$mutant"
-  replace_first_literal "$mutant" "$old" "$new" ||
+  replace_first_literal "$mutant" "$old" "$new" "$occurrence" ||
     die "workflow mutation $name did not match its target"
   if validate_workflow_contract_file "$mutant" >/dev/null 2>&1; then
     die "workflow contract accepted $name mutation"
@@ -2763,6 +2987,51 @@ test_workflow_contract() {
   done
   assert_workflow_mutation_rejected cache \
     'cache: false' 'cache: true'
+  assert_workflow_mutation_rejected profile-timeout \
+    'timeout-minutes: 180' 'timeout-minutes: 181'
+  assert_workflow_mutation_rejected profile-fail-fast \
+    'fail-fast: false' 'fail-fast: true'
+  assert_workflow_mutation_rejected profile-role \
+    '          - all-auto' '          - mutated-auto'
+  assert_workflow_mutation_rejected profile-mode \
+    $'--profile \'${{ matrix.role }}\' "$CELL_OUTPUT"' \
+    $'--profile \'${{ matrix.role }}\' "$CELL_PARENT"'
+  assert_workflow_mutation_rejected profile-artifact-name \
+    'java-remote-parent-fault-security-cell-${{ matrix.role }}-' \
+    'mutated-fault-security-cell-${{ matrix.role }}-'
+  assert_workflow_mutation_rejected profile-retention \
+    'retention-days: 90' 'retention-days: 89'
+  assert_workflow_mutation_rejected profile-persist-credentials \
+    'persist-credentials: false' 'persist-credentials: true' 2
+  assert_workflow_mutation_rejected profile-fetch-depth \
+    'fetch-depth: 0' 'fetch-depth: 1' 2
+  assert_workflow_mutation_rejected aggregate-needs \
+    'needs: fault-security-profile' 'needs: acceptance'
+  assert_workflow_mutation_rejected aggregate-timeout \
+    'timeout-minutes: 30' 'timeout-minutes: 31'
+  assert_workflow_mutation_rejected aggregate-persist-credentials \
+    'persist-credentials: false' 'persist-credentials: true' 3
+  assert_workflow_mutation_rejected aggregate-fetch-depth \
+    'fetch-depth: 0' 'fetch-depth: 1' 3
+  assert_workflow_mutation_rejected download-pin \
+    3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c \
+    0000000000000000000000000000000000000000
+  assert_workflow_mutation_rejected download-pattern \
+    'java-remote-parent-fault-security-cell-*-${{ github.run_id }}-${{ github.run_attempt }}' \
+    'java-remote-parent-fault-security-cell-*'
+  assert_workflow_mutation_rejected aggregate-mode \
+    '--aggregate-cells-v1' '--aggregate-cells-v2'
+  assert_workflow_mutation_rejected aggregate-input-order \
+    '"${prefix}all-unix${suffix}" \' \
+    '"${prefix}all-auto${suffix}" \'
+  assert_workflow_mutation_rejected aggregate-artifact-name \
+    'name: java-remote-parent-fault-security-${{ github.run_id }}-${{ github.run_attempt }}' \
+    'name: mutated-fault-security-${{ github.run_id }}-${{ github.run_attempt }}'
+  assert_workflow_mutation_rejected aggregate-output \
+    '${{ env.MATRIX_OUTPUT }}/fault-security-matrix.json' \
+    '${{ env.CELL_ROOT }}/fault-security-matrix.json'
+  assert_workflow_mutation_rejected aggregate-inventory-gate \
+    '[[ "$observed" == "$expected" ]]' '[[ "$observed" != "$expected" ]]' 3
 }
 
 test_static_privacy_and_wiring_contract() {

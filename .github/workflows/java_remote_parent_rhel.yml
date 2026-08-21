@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Git ref (commit, branch, or tag) to validate"
+        description: "Exact lowercase 40-hex Git commit to validate"
         required: true
         type: string
 
@@ -16,6 +16,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
@@ -38,12 +39,23 @@ jobs:
     env:
       CAMPAIGN_OUTPUT: testoutput/java-remote-parent-${{ matrix.kernel_id }}-kernel-sockopt
       OBI_VM_KERNEL_ID: ${{ matrix.kernel_id }}
+      SAFE_CELL_PARENT: /tmp/issue11-${{ matrix.kernel_id }}-${{ github.run_id }}-${{ github.run_attempt }}
+      SAFE_CELL_OUTPUT: /tmp/issue11-${{ matrix.kernel_id }}-${{ github.run_id }}-${{ github.run_attempt }}/cell
     steps:
       - name: Checkout selected ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
+
+      - name: Bind selected revision to an immutable commit
+        env:
+          SELECTED_REVISION: ${{ inputs.ref || github.sha }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$SELECTED_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$(git rev-parse --verify 'HEAD^{commit}')" == "$SELECTED_REVISION" ]]
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
 
       - uses: ./.github/actions/free-disk
         with:
@@ -252,6 +264,32 @@ jobs:
             exit 1
           fi
 
+      - name: Project sanitized issue 11 kernel cell
+        id: safe-cell
+        if: steps.vm-preflight.outcome == 'success'
+        run: |
+          set -Eeuo pipefail
+          install -d -m 0700 -- "$SAFE_CELL_PARENT"
+          campaign_output="$(readlink -f -- "$CAMPAIGN_OUTPUT")"
+          buildinfo="$(readlink -f -- \
+            "internal/test/vm/lvh/out/vmlinuz-${OBI_VM_KERNEL_ID}-amd64.buildinfo")"
+          config="$(readlink -f -- \
+            "internal/test/vm/lvh/out/vmlinuz-${OBI_VM_KERNEL_ID}-amd64.config")"
+          ./examples/apache-java-https/scripts/project-retained-issue11-evidence.sh \
+            cell-v1 "$campaign_output" "$buildinfo" "$config" \
+            "$SAFE_CELL_OUTPUT"
+          (CDPATH='' cd / && bash "$SAFE_CELL_OUTPUT/verify.sh" >/dev/null)
+
+      - name: Upload sanitized issue 11 kernel cell
+        if: steps.safe-cell.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: issue11-kernel-cell-${{ matrix.kernel_id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.SAFE_CELL_OUTPUT }}
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 90
+
       - name: Upload kernel packaged-JVM transport evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -263,3 +301,73 @@ jobs:
             testoutput/java-remote-parent-${{ matrix.kernel_id }}-kernel-sockopt
           if-no-files-found: error
           retention-days: 14
+
+  aggregate-safe-matrix:
+    name: Aggregate bounded issue 11 kernel matrix
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CELL_ROOT: /tmp/issue11-cells-${{ github.run_id }}-${{ github.run_attempt }}
+      MATRIX_PARENT: /tmp/issue11-matrix-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout matrix projector authority
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+
+      - name: Bind matrix authority to the selected immutable commit
+        env:
+          SELECTED_REVISION: ${{ inputs.ref || github.sha }}
+        run: |
+          set -Eeuo pipefail
+          [[ "$SELECTED_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$(git rev-parse --verify 'HEAD^{commit}')" == "$SELECTED_REVISION" ]]
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
+
+      - name: Download six sanitized cells
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: issue11-kernel-cell-*-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.CELL_ROOT }}
+          merge-multiple: false
+
+      - name: Project bounded issue 11 matrix
+        id: matrix
+        run: |
+          set -Eeuo pipefail
+          install -d -m 0700 -- "$MATRIX_PARENT"
+          prefix="$CELL_ROOT/issue11-kernel-cell-"
+          suffix="-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          cells=(
+            "${prefix}5.10-lts${suffix}"
+            "${prefix}5.15-lts${suffix}"
+            "${prefix}6.1-lts${suffix}"
+            "${prefix}6.6-lts${suffix}"
+            "${prefix}6.12-lts${suffix}"
+            "${prefix}rhel9.6${suffix}"
+          )
+          expected="$(printf '%s\n' "${cells[@]##*/}" | LC_ALL=C sort)"
+          observed="$(find -- "$CELL_ROOT" -mindepth 1 -maxdepth 1 \
+            -type d -printf '%f\n' | LC_ALL=C sort)"
+          [[ "$observed" == "$expected" ]]
+          matrix_name="$(
+            ./examples/apache-java-https/scripts/project-retained-issue11-evidence.sh \
+              matrix-name-v1 "${cells[@]}"
+          )"
+          matrix_output="$MATRIX_PARENT/$matrix_name"
+          ./examples/apache-java-https/scripts/project-retained-issue11-evidence.sh \
+            matrix-v1 "${cells[@]}" "$matrix_output"
+          (CDPATH='' cd / && bash "$matrix_output/verify.sh" >/dev/null)
+          printf 'output_directory=%s\n' "$matrix_output" >> "$GITHUB_OUTPUT"
+
+      - name: Upload bounded issue 11 matrix
+        if: steps.matrix.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: issue11-kernel-matrix-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.matrix.outputs.output_directory }}
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 90

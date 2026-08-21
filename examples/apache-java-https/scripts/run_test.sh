@@ -42627,6 +42627,8 @@ main() {
   test_demo_obi_lifecycle_timeouts_are_explicit
   test_primary_live_fd_compose_topology_is_scoped
   test_unix_security_probe_topology_is_least_privilege
+  "$TEST_SCRIPT_DIR/import-retained-ci-evidence_test.sh"
+  "$TEST_SCRIPT_DIR/project-retained-issue11-evidence_test.sh"
   "$TEST_SCRIPT_DIR/project-retained-fault-security-matrix_test.sh"
   "$TEST_SCRIPT_DIR/run-retained-fault-security-campaign_test.sh"
   "$TEST_SCRIPT_DIR/verify-retained-evidence_test.sh" fault-security-profiles

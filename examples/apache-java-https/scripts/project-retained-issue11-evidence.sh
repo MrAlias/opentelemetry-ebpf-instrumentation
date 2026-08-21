@@ -262,11 +262,78 @@ validate_packaged_benchmark() {
   local -r file="$1"
   local -r source_revision="$2"
   local -r source_status_sha256="$3"
+  # Current packaged-benchmark input is schema v3. The separately digest-pinned
+  # focused-validation schema-v2 bundle is immutable historical evidence.
   validate_json_object "$file" || return 1
   jq -e --arg source "$source_revision" --arg status "$source_status_sha256" '
-    .schema_version == 2 and
+    def percentile($percent):
+      sort as $sorted |
+      $sorted[((($sorted | length) * $percent + 99) / 100 | floor) - 1];
+    def lookup_series($concurrency):
+      . as $series |
+      ($concurrency * 256) as $retained |
+      ($concurrency * 272) as $calls |
+      ($series.call_counts.primary_bpf_status_before) as $before |
+      keys == ["allocation","call_counts","correct","expected_status",
+        "latency_gate","outcome","p50_ns","p95_ns","p99_ns","samples_ns",
+        "scope","status_counts","total_timed_ns","transport"] and
+      .scope == "raw_jni" and .transport == "getsockopt" and
+      .outcome == "hit" and .expected_status == 1 and .correct == true and
+      (.samples_ns | type == "array" and length == $retained and
+        all(.[]; type == "number" and floor == . and . > 0)) and
+      .total_timed_ns == ([.samples_ns[]] | add) and
+      .p50_ns == (.samples_ns | percentile(50)) and
+      .p95_ns == (.samples_ns | percentile(95)) and
+      .p99_ns == (.samples_ns | percentile(99)) and
+      .p99_ns < 1000000 and
+      .latency_gate == {kind:"p99_lt",p50_min_ns:0,p99_max_ns:1000000,
+        passed:true} and
+      .status_counts == {unknown:0,valid:$calls,missing:0,stale:0,
+        unsupported:0,malformed:0,version_mismatch:0,ambiguous:0,
+        unauthorized:0,already_consumed:0,timeout:0,overload:0,
+        transport_error:0,disabled:0} and
+      ($before | type == "number" and floor == . and . >= 0) and
+      .call_counts == {expected_java_calls:$calls,observed_java_calls:$calls,
+        expected_native_calls:$calls,observed_native_calls:$calls,
+        expected_bridge_calls:0,observed_bridge_calls:0,
+        expected_primary_bpf_calls:$calls,observed_primary_bpf_calls:$calls,
+        primary_bpf_status:"valid",primary_bpf_status_before:$before,
+        primary_bpf_status_after:($before+$calls),
+        expected_unix_server_requests:0,observed_unix_server_requests:0,
+        unix_server_status:"not_applicable",unix_server_status_before:0,
+        unix_server_status_after:0,expected_timeout_full_requests:0,
+        observed_timeout_full_requests:0} and
+      (.allocation | keys) == ["control","control_p50_bytes",
+        "control_p95_bytes","control_p99_bytes","control_samples_bytes",
+        "control_total_bytes","method","p50_bytes","p95_bytes","p99_bytes",
+        "samples_bytes","total_bytes"] and
+      .allocation.method ==
+        "com.sun.management.ThreadMXBean.getThreadAllocatedBytes" and
+      .allocation.control ==
+        "paired consecutive counter reads on the same worker" and
+      (.allocation.samples_bytes | type == "array" and length == $retained and
+        all(.[]; type == "number" and floor == . and . >= 0)) and
+      (.allocation.control_samples_bytes | type == "array" and
+        length == $retained and
+        all(.[]; type == "number" and floor == . and . >= 0)) and
+      .allocation.total_bytes == ([.allocation.samples_bytes[]] | add) and
+      .allocation.p50_bytes == (.allocation.samples_bytes | percentile(50)) and
+      .allocation.p95_bytes == (.allocation.samples_bytes | percentile(95)) and
+      .allocation.p99_bytes == (.allocation.samples_bytes | percentile(99)) and
+      .allocation.control_total_bytes ==
+        ([.allocation.control_samples_bytes[]] | add) and
+      .allocation.control_p50_bytes ==
+        (.allocation.control_samples_bytes | percentile(50)) and
+      .allocation.control_p95_bytes ==
+        (.allocation.control_samples_bytes | percentile(95)) and
+      .allocation.control_p99_bytes ==
+        (.allocation.control_samples_bytes | percentile(99));
+    . as $artifact |
+    .schema_version == 3 and
     .benchmark == "java_remote_parent_packaged_jvm_transport" and
-    .provenance.harness == "packaged_agent_java_jni_cgroup_getsockopt" and
+    .provenance.harness == "packaged_agent_java_concurrent_transport" and
+    (.provenance.measures | index("indirect_lookup_contention_indicator")) != null and
+    (.provenance.excludes | index("exact_bpf_lock_wait")) != null and
     .source == {revision:$source,dirty:false,status_sha256:$status,
       patch_sha256:$status} and
     .runtime.architecture == "amd64" and .runtime.cgroup_mode == "v2" and
@@ -277,12 +344,57 @@ validate_packaged_benchmark() {
     (.provenance.cgroup_bpf.chains | type == "array" and length == 3) and
     .provenance.cgroup_bpf.stability_checks.query_errors == 0 and
     .provenance.cgroup_bpf.stability_checks.topology_mismatches == 0 and
+    .provenance.cgroup_bpf.stability_checks.expected_batches == 4080 and
+    .provenance.cgroup_bpf.stability_checks.observed_pre_batch_snapshots == 4080 and
+    .provenance.cgroup_bpf.stability_checks.observed_post_batch_snapshots == 4080 and
+    .provenance.cgroup_bpf.stability_checks.expected_primary_calls == 13328 and
     (.series | type == "array" and length == 14) and
+    [.series[] | [.scope,.transport,.outcome]] == [
+      ["raw_jni","getsockopt","hit"],
+      ["raw_jni","getsockopt","miss"],
+      ["raw_jni","getsockopt","stale"],
+      ["bridge_provider_jni","getsockopt","miss"],
+      ["bridge_provider_jni","getsockopt","hit"],
+      ["bridge_provider_jni","getsockopt","stale"],
+      ["raw_jni","unix","miss"],
+      ["raw_jni","unix","hit"],
+      ["raw_jni","unix","stale"],
+      ["bridge_provider_jni","unix","miss"],
+      ["bridge_provider_jni","unix","hit"],
+      ["bridge_provider_jni","unix","stale"],
+      ["raw_jni","unix","timeout"],
+      ["bridge_provider_jni","unix","timeout"]] and
     ([.series[].scope] | unique | sort) ==
       ["bridge_provider_jni","raw_jni"] and
     ([.series[].transport] | unique | sort) == ["getsockopt","unix"] and
     ([.series[].outcome] | unique | sort) == ["hit","miss","stale","timeout"] and
-    all(.series[]; .correct == true and .latency_gate.passed == true)
+    all(.series[]; .correct == true and .latency_gate.passed == true) and
+    ($artifact.lookup_contention_indicator as $indicator |
+      ($indicator | keys) == ["comparison_control","concurrency_1",
+        "concurrency_8","exact_bpf_lock_wait_measured","interpretation","kind",
+        "only_varied_dimension","relative_p99_gate"] and
+      $indicator.kind == "indirect_lookup_contention_indicator" and
+      $indicator.only_varied_dimension == "java_worker_count" and
+      $indicator.comparison_control ==
+        "fresh packaged-agent JVM; raw JNI getsockopt hit is the first retained series after identical fixture setup and per-series warmup; measurement batches, timed call, response storage, and host are controlled; Java worker count is the only intentionally varied benchmark dimension" and
+      $indicator.interpretation ==
+        "end-to-end lookup latency comparison is an indirect lookup-contention indicator; it does not measure exact BPF lock wait" and
+      $indicator.exact_bpf_lock_wait_measured == false and
+      ($indicator.concurrency_1 | lookup_series(1)) and
+      ($indicator.concurrency_8 | lookup_series(8)) and
+      $indicator.concurrency_1.call_counts.primary_bpf_status_before == 0 and
+      $indicator.concurrency_1.call_counts.primary_bpf_status_after ==
+        $indicator.concurrency_8.call_counts.primary_bpf_status_before and
+      ([ $artifact.series[] | select(.scope == "raw_jni" and
+        .transport == "getsockopt" and .outcome == "hit" and
+        .expected_status == 1) ] == [$indicator.concurrency_8]) and
+      $indicator.relative_p99_gate == {
+        kind:"concurrency_8_p99_lte_2x_concurrency_1",p99_multiplier:2,
+        concurrency_1_p99_ns:$indicator.concurrency_1.p99_ns,
+        concurrency_8_p99_ns:$indicator.concurrency_8.p99_ns,
+        concurrency_8_p99_max_ns:($indicator.concurrency_1.p99_ns * 2),
+        passed:true} and
+      $indicator.concurrency_8.p99_ns <= $indicator.concurrency_1.p99_ns * 2)
   ' "$file" >/dev/null
 }
 
@@ -324,6 +436,22 @@ packaged_summary_json() {
     series_count:(.series|length),scopes:([.series[].scope]|unique),
     transports:([.series[].transport]|unique),
     outcomes:([.series[].outcome]|unique),
+    lookup_contention_indicator:(.lookup_contention_indicator |
+      {kind,only_varied_dimension,comparison_control,interpretation,
+        exact_bpf_lock_wait_measured,
+        concurrency_1:(.concurrency_1 |
+          {scope,transport,outcome,expected_status,concurrency:1,
+            retained_samples:(.samples_ns|length),p99_ns,
+            primary_bpf_status_before:.call_counts.primary_bpf_status_before,
+            primary_bpf_status_after:.call_counts.primary_bpf_status_after,
+            latency_gate}),
+        concurrency_8:(.concurrency_8 |
+          {scope,transport,outcome,expected_status,concurrency:8,
+            retained_samples:(.samples_ns|length),p99_ns,
+            primary_bpf_status_before:.call_counts.primary_bpf_status_before,
+            primary_bpf_status_after:.call_counts.primary_bpf_status_after,
+            latency_gate}),
+        relative_p99_gate}),
     setup:{warmup_batches:.setup.warmup_batches,
       measurement_batches:.setup.measurement_batches,
       concurrency:.setup.concurrency,
@@ -335,6 +463,7 @@ packaged_summary_json() {
       attach_types:([.provenance.cgroup_bpf.chains[].attach_type]|sort),
       stability_mode:.provenance.cgroup_bpf.stability_mode,
       expected_batches:.provenance.cgroup_bpf.stability_checks.expected_batches,
+      expected_primary_calls:.provenance.cgroup_bpf.stability_checks.expected_primary_calls,
       observed_pre_batch_snapshots:.provenance.cgroup_bpf.stability_checks.observed_pre_batch_snapshots,
       observed_post_batch_snapshots:.provenance.cgroup_bpf.stability_checks.observed_post_batch_snapshots,
       query_errors:.provenance.cgroup_bpf.stability_checks.query_errors,
@@ -358,6 +487,43 @@ expected=$'README.md\tf\nSANITIZATION.md\tf\nSHA256SUMS\tf\ncell.json\tf\nverify
 (CDPATH='' cd -- "$root" && sha256sum --check --strict SHA256SUMS >/dev/null)
 cmp -s -- "$root/cell.json" <(jq -cS . "$root/cell.json")
 jq -e '
+  def lookup_summary($concurrency;$samples):
+    keys == ["concurrency","expected_status","latency_gate","outcome","p99_ns",
+      "primary_bpf_status_after","primary_bpf_status_before","retained_samples",
+      "scope","transport"] and
+    .scope == "raw_jni" and .transport == "getsockopt" and .outcome == "hit" and
+    .expected_status == 1 and .concurrency == $concurrency and
+    .retained_samples == $samples and .p99_ns > 0 and .p99_ns < 1000000 and
+    (.primary_bpf_status_before | type == "number" and floor == . and . >= 0) and
+    (.primary_bpf_status_after | type == "number" and floor == . and . >= 0) and
+    (.primary_bpf_status_after - .primary_bpf_status_before) ==
+      ($concurrency * 272) and
+    .latency_gate == {kind:"p99_lt",p50_min_ns:0,p99_max_ns:1000000,
+      passed:true};
+  def contention:
+    . as $indicator |
+    keys == ["comparison_control","concurrency_1","concurrency_8",
+      "exact_bpf_lock_wait_measured","interpretation","kind",
+      "only_varied_dimension","relative_p99_gate"] and
+    .kind == "indirect_lookup_contention_indicator" and
+    .only_varied_dimension == "java_worker_count" and
+    .comparison_control ==
+      "fresh packaged-agent JVM; raw JNI getsockopt hit is the first retained series after identical fixture setup and per-series warmup; measurement batches, timed call, response storage, and host are controlled; Java worker count is the only intentionally varied benchmark dimension" and
+    .interpretation ==
+      "end-to-end lookup latency comparison is an indirect lookup-contention indicator; it does not measure exact BPF lock wait" and
+    .exact_bpf_lock_wait_measured == false and
+    (.concurrency_1 | lookup_summary(1;256)) and
+    (.concurrency_8 | lookup_summary(8;2048)) and
+    .concurrency_1.primary_bpf_status_before == 0 and
+    .concurrency_1.primary_bpf_status_after ==
+      .concurrency_8.primary_bpf_status_before and
+    .relative_p99_gate == {
+      kind:"concurrency_8_p99_lte_2x_concurrency_1",p99_multiplier:2,
+      concurrency_1_p99_ns:$indicator.concurrency_1.p99_ns,
+      concurrency_8_p99_ns:$indicator.concurrency_8.p99_ns,
+      concurrency_8_p99_max_ns:($indicator.concurrency_1.p99_ns * 2),
+      passed:true} and
+    $indicator.concurrency_8.p99_ns <= $indicator.concurrency_1.p99_ns * 2;
   keys == ["benchmarks","coverage","evidence_class","evidence_id","kernel",
     "privacy","raw_commitment","runtime","schema","source","status","tests"] and
   .schema == "obi-issue11-kernel-cell-v1" and .status == "passed" and
@@ -378,9 +544,13 @@ jq -e '
   .tests.privileged.selected == 9 and
   .benchmarks.transport.status == "passed" and
   .benchmarks.packaged_jvm.status == "passed" and
+  .benchmarks.packaged_jvm.schema_version == 3 and
+  (.benchmarks.packaged_jvm.lookup_contention_indicator | contention) and
   .benchmarks.packaged_jvm.topology.attached_chain_count == 3 and
   .benchmarks.packaged_jvm.topology.attach_types ==
     ["CGroupGetsockopt","CGroupSetsockopt","CGroupSockOps"] and
+  .benchmarks.packaged_jvm.topology.expected_batches == 4080 and
+  .benchmarks.packaged_jvm.topology.expected_primary_calls == 13328 and
   .benchmarks.packaged_jvm.cleanup.vm_workspace_cleanup_gate_passed == true and
   .benchmarks.packaged_jvm.cleanup.compiled_artifact_and_crosslink_validators_passed == true and
   .benchmarks.packaged_jvm.cleanup.raw_samples_retained == false and
@@ -561,6 +731,44 @@ validate_cell_json() {
       keys == ["failed","passed","roster","selected","skipped","status"] and
       .status == "passed" and .selected == $count and .passed == $count and
       .failed == 0 and .skipped == 0 and .roster == $roster;
+    def lookup_summary($concurrency;$samples):
+      keys == ["concurrency","expected_status","latency_gate","outcome","p99_ns",
+        "primary_bpf_status_after","primary_bpf_status_before","retained_samples",
+        "scope","transport"] and
+      .scope == "raw_jni" and .transport == "getsockopt" and
+      .outcome == "hit" and .expected_status == 1 and
+      .concurrency == $concurrency and .retained_samples == $samples and
+      .p99_ns > 0 and .p99_ns < 1000000 and
+      (.primary_bpf_status_before | type == "number" and floor == . and . >= 0) and
+      (.primary_bpf_status_after | type == "number" and floor == . and . >= 0) and
+      (.primary_bpf_status_after - .primary_bpf_status_before) ==
+        ($concurrency * 272) and
+      .latency_gate == {kind:"p99_lt",p50_min_ns:0,p99_max_ns:1000000,
+        passed:true};
+    def contention:
+      . as $indicator |
+      keys == ["comparison_control","concurrency_1","concurrency_8",
+        "exact_bpf_lock_wait_measured","interpretation","kind",
+        "only_varied_dimension","relative_p99_gate"] and
+      .kind == "indirect_lookup_contention_indicator" and
+      .only_varied_dimension == "java_worker_count" and
+      .comparison_control ==
+        "fresh packaged-agent JVM; raw JNI getsockopt hit is the first retained series after identical fixture setup and per-series warmup; measurement batches, timed call, response storage, and host are controlled; Java worker count is the only intentionally varied benchmark dimension" and
+      .interpretation ==
+        "end-to-end lookup latency comparison is an indirect lookup-contention indicator; it does not measure exact BPF lock wait" and
+      .exact_bpf_lock_wait_measured == false and
+      (.concurrency_1 | lookup_summary(1;256)) and
+      (.concurrency_8 | lookup_summary(8;2048)) and
+      .concurrency_1.primary_bpf_status_before == 0 and
+      .concurrency_1.primary_bpf_status_after ==
+        .concurrency_8.primary_bpf_status_before and
+      .relative_p99_gate == {
+        kind:"concurrency_8_p99_lte_2x_concurrency_1",p99_multiplier:2,
+        concurrency_1_p99_ns:$indicator.concurrency_1.p99_ns,
+        concurrency_8_p99_ns:$indicator.concurrency_8.p99_ns,
+        concurrency_8_p99_max_ns:($indicator.concurrency_1.p99_ns * 2),
+        passed:true} and
+      $indicator.concurrency_8.p99_ns <= $indicator.concurrency_1.p99_ns * 2;
     keys == ["benchmarks","coverage","evidence_class","evidence_id","kernel",
       "privacy","raw_commitment","runtime","schema","source","status","tests"] and
     .schema == "obi-issue11-kernel-cell-v1" and .status == "passed" and
@@ -602,18 +810,20 @@ validate_cell_json() {
         (.gate | keys == ["kind","p50_min_ns","p99_max_ns","passed"] and
           .passed == true))) and
     (.benchmarks.packaged_jvm |
-      keys == ["benchmark","cleanup","gates","outcomes","schema_version","scopes",
-        "series_count","setup","status","topology","transports"] and
-      .status == "passed" and .schema_version == 2 and
+      keys == ["benchmark","cleanup","gates","lookup_contention_indicator",
+        "outcomes","schema_version","scopes","series_count","setup","status",
+        "topology","transports"] and
+      .status == "passed" and .schema_version == 3 and
       .benchmark == "java_remote_parent_packaged_jvm_transport" and
       .series_count == 14 and .scopes == ["bridge_provider_jni","raw_jni"] and
       .transports == ["getsockopt","unix"] and
       .outcomes == ["hit","miss","stale","timeout"] and
+      (.lookup_contention_indicator | contention) and
       (.setup | keys == ["concurrency","measurement_batches",
         "retained_calls_per_series","total_calls_per_series","warmup_batches"] and
         all(.[]; type == "number" and . >= 1)) and
       (.topology | keys == ["attach_types","attached_chain_count","expected_batches",
-        "hierarchy_depth","observed_post_batch_snapshots",
+        "expected_primary_calls","hierarchy_depth","observed_post_batch_snapshots",
         "observed_pre_batch_snapshots","pre_attach_chains_empty","query_errors",
         "stability_mode","topology_mismatches"] and
         .pre_attach_chains_empty == true) and
@@ -621,7 +831,8 @@ validate_cell_json() {
       .topology.attach_types ==
         ["CGroupGetsockopt","CGroupSetsockopt","CGroupSockOps"] and
       .topology.stability_mode == "boundary_identity_only" and
-      .topology.expected_batches >= 1 and
+      .topology.expected_batches == 4080 and
+      .topology.expected_primary_calls == 13328 and
       .topology.observed_pre_batch_snapshots == .topology.expected_batches and
       .topology.observed_post_batch_snapshots == .topology.expected_batches and
       .topology.query_errors == 0 and .topology.topology_mismatches == 0 and
@@ -743,6 +954,44 @@ jq -e --arg empty "$empty_sha" --argjson abi "$abi" \
     keys == ["failed","passed","roster","selected","skipped","status"] and
     .status == "passed" and .selected == $count and .passed == $count and
     .failed == 0 and .skipped == 0 and .roster == $roster;
+  def lookup_summary($concurrency;$samples):
+    keys == ["concurrency","expected_status","latency_gate","outcome","p99_ns",
+      "primary_bpf_status_after","primary_bpf_status_before","retained_samples",
+      "scope","transport"] and
+    .scope == "raw_jni" and .transport == "getsockopt" and
+    .outcome == "hit" and .expected_status == 1 and
+    .concurrency == $concurrency and .retained_samples == $samples and
+    .p99_ns > 0 and .p99_ns < 1000000 and
+    (.primary_bpf_status_before | type == "number" and floor == . and . >= 0) and
+    (.primary_bpf_status_after | type == "number" and floor == . and . >= 0) and
+    (.primary_bpf_status_after - .primary_bpf_status_before) ==
+      ($concurrency * 272) and
+    .latency_gate == {kind:"p99_lt",p50_min_ns:0,p99_max_ns:1000000,
+      passed:true};
+  def contention:
+    . as $indicator |
+    keys == ["comparison_control","concurrency_1","concurrency_8",
+      "exact_bpf_lock_wait_measured","interpretation","kind",
+      "only_varied_dimension","relative_p99_gate"] and
+    .kind == "indirect_lookup_contention_indicator" and
+    .only_varied_dimension == "java_worker_count" and
+    .comparison_control ==
+      "fresh packaged-agent JVM; raw JNI getsockopt hit is the first retained series after identical fixture setup and per-series warmup; measurement batches, timed call, response storage, and host are controlled; Java worker count is the only intentionally varied benchmark dimension" and
+    .interpretation ==
+      "end-to-end lookup latency comparison is an indirect lookup-contention indicator; it does not measure exact BPF lock wait" and
+    .exact_bpf_lock_wait_measured == false and
+    (.concurrency_1 | lookup_summary(1;256)) and
+    (.concurrency_8 | lookup_summary(8;2048)) and
+    .concurrency_1.primary_bpf_status_before == 0 and
+    .concurrency_1.primary_bpf_status_after ==
+      .concurrency_8.primary_bpf_status_before and
+    .relative_p99_gate == {
+      kind:"concurrency_8_p99_lte_2x_concurrency_1",p99_multiplier:2,
+      concurrency_1_p99_ns:$indicator.concurrency_1.p99_ns,
+      concurrency_8_p99_ns:$indicator.concurrency_8.p99_ns,
+      concurrency_8_p99_max_ns:($indicator.concurrency_1.p99_ns * 2),
+      passed:true} and
+    $indicator.concurrency_8.p99_ns <= $indicator.concurrency_1.p99_ns * 2;
   all(.cells[];
     keys == ["benchmarks","coverage","evidence_class","evidence_id","kernel",
       "privacy","raw_commitment","runtime","schema","source","status","tests"] and
@@ -785,18 +1034,20 @@ jq -e --arg empty "$empty_sha" --argjson abi "$abi" \
         (.gate | keys == ["kind","p50_min_ns","p99_max_ns","passed"] and
           .passed == true))) and
     (.benchmarks.packaged_jvm |
-      keys == ["benchmark","cleanup","gates","outcomes","schema_version","scopes",
-        "series_count","setup","status","topology","transports"] and
-      .status == "passed" and .schema_version == 2 and
+      keys == ["benchmark","cleanup","gates","lookup_contention_indicator",
+        "outcomes","schema_version","scopes","series_count","setup","status",
+        "topology","transports"] and
+      .status == "passed" and .schema_version == 3 and
       .benchmark == "java_remote_parent_packaged_jvm_transport" and
       .series_count == 14 and .scopes == ["bridge_provider_jni","raw_jni"] and
       .transports == ["getsockopt","unix"] and
       .outcomes == ["hit","miss","stale","timeout"] and
+      (.lookup_contention_indicator | contention) and
       (.setup | keys == ["concurrency","measurement_batches",
         "retained_calls_per_series","total_calls_per_series","warmup_batches"] and
         all(.[]; type == "number" and . >= 1)) and
       (.topology | keys == ["attach_types","attached_chain_count","expected_batches",
-        "hierarchy_depth","observed_post_batch_snapshots",
+        "expected_primary_calls","hierarchy_depth","observed_post_batch_snapshots",
         "observed_pre_batch_snapshots","pre_attach_chains_empty","query_errors",
         "stability_mode","topology_mismatches"] and
         .pre_attach_chains_empty == true) and
@@ -804,7 +1055,8 @@ jq -e --arg empty "$empty_sha" --argjson abi "$abi" \
       .topology.attach_types ==
         ["CGroupGetsockopt","CGroupSetsockopt","CGroupSockOps"] and
       .topology.stability_mode == "boundary_identity_only" and
-      .topology.expected_batches >= 1 and
+      .topology.expected_batches == 4080 and
+      .topology.expected_primary_calls == 13328 and
       .topology.observed_pre_batch_snapshots == .topology.expected_batches and
       .topology.observed_post_batch_snapshots == .topology.expected_batches and
       .topology.query_errors == 0 and .topology.topology_mismatches == 0 and

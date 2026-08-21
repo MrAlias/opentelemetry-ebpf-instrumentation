@@ -64,32 +64,86 @@ write_packaged_benchmark() {
     def series($scope;$transport;$outcome):
       {scope:$scope,transport:$transport,outcome:$outcome,
         correct:true,latency_gate:{passed:true}};
-    {schema_version:2,benchmark:"java_remote_parent_packaged_jvm_transport",
-      provenance:{harness:"packaged_agent_java_jni_cgroup_getsockopt",
+    def statuses($calls):
+      {unknown:0,valid:$calls,missing:0,stale:0,unsupported:0,malformed:0,
+        version_mismatch:0,ambiguous:0,unauthorized:0,already_consumed:0,
+        timeout:0,overload:0,transport_error:0,disabled:0};
+    def calls($calls;$before):
+      {expected_java_calls:$calls,observed_java_calls:$calls,
+        expected_native_calls:$calls,observed_native_calls:$calls,
+        expected_bridge_calls:0,observed_bridge_calls:0,
+        expected_primary_bpf_calls:$calls,observed_primary_bpf_calls:$calls,
+        primary_bpf_status:"valid",primary_bpf_status_before:$before,
+        primary_bpf_status_after:($before+$calls),
+        expected_unix_server_requests:0,observed_unix_server_requests:0,
+        unix_server_status:"not_applicable",unix_server_status_before:0,
+        unix_server_status_after:0,expected_timeout_full_requests:0,
+        observed_timeout_full_requests:0};
+    def lookup_series($concurrency;$latency;$before):
+      ($concurrency * 256) as $retained |
+      ($concurrency * 272) as $calls |
+      {scope:"raw_jni",transport:"getsockopt",outcome:"hit",expected_status:1,
+        samples_ns:[range(0;$retained)|$latency],
+        total_timed_ns:($retained*$latency),p50_ns:$latency,p95_ns:$latency,
+        p99_ns:$latency,status_counts:statuses($calls),
+        call_counts:calls($calls;$before),
+        allocation:{method:"com.sun.management.ThreadMXBean.getThreadAllocatedBytes",
+          control:"paired consecutive counter reads on the same worker",
+          samples_bytes:[range(0;$retained)|64],
+          control_samples_bytes:[range(0;$retained)|0],
+          total_bytes:($retained*64),p50_bytes:64,p95_bytes:64,p99_bytes:64,
+          control_total_bytes:0,control_p50_bytes:0,control_p95_bytes:0,
+          control_p99_bytes:0},correct:true,
+        latency_gate:{kind:"p99_lt",p50_min_ns:0,p99_max_ns:1000000,
+          passed:true}};
+    lookup_series(1;80000;0) as $lookup1 |
+    lookup_series(8;100000;272) as $lookup8 |
+    {schema_version:3,benchmark:"java_remote_parent_packaged_jvm_transport",
+      provenance:{harness:"packaged_agent_java_concurrent_transport",
+        measures:["packaged_agent","java_workers","raw_jni","bridge_provider",
+          "jni","kernel_getsockopt","cgroup_bpf","unix_server",
+          "thread_allocated_bytes","indirect_lookup_contention_indicator"],
+        excludes:["application_request","instrumentation","throughput",
+          "application_throughput","process_cpu","rss_growth",
+          "native_memory_growth","direct_memory_growth","fd_growth",
+          "thread_growth","map_growth","run_to_run_variance",
+          "native_sanitizers","exact_bpf_lock_wait"],
         unix:{socket_path_retained:false},cgroup_bpf:{pre_attach_chains_empty:true,
           cgroup_hierarchy:["/","/target"],
           chains:[{attach_type:"CGroupGetsockopt"},{attach_type:"CGroupSetsockopt"},
             {attach_type:"CGroupSockOps"}],
-          stability_mode:"boundary_identity_only",stability_checks:{expected_batches:10,
-            observed_pre_batch_snapshots:10,observed_post_batch_snapshots:10,
-            query_errors:0,topology_mismatches:0}}},
+          stability_mode:"boundary_identity_only",stability_checks:{expected_batches:4080,
+            expected_primary_calls:13328,observed_pre_batch_snapshots:4080,
+            observed_post_batch_snapshots:4080,query_errors:0,
+            topology_mismatches:0}}},
       source:{revision:$revision,dirty:false,status_sha256:$empty,patch_sha256:$empty},
       runtime:{architecture:"amd64",cgroup_mode:"v2",
         java_version:"openjdk version 21.0.12",no_new_privileges:true},
       setup:{warmup_batches:16,measurement_batches:256,concurrency:8,
         retained_calls_per_series:2048,total_calls_per_series:2176},
+      lookup_contention_indicator:{kind:"indirect_lookup_contention_indicator",
+        only_varied_dimension:"java_worker_count",comparison_control:
+          "fresh packaged-agent JVM; raw JNI getsockopt hit is the first retained series after identical fixture setup and per-series warmup; measurement batches, timed call, response storage, and host are controlled; Java worker count is the only intentionally varied benchmark dimension",
+        interpretation:
+          "end-to-end lookup latency comparison is an indirect lookup-contention indicator; it does not measure exact BPF lock wait",
+        exact_bpf_lock_wait_measured:false,concurrency_1:$lookup1,
+        concurrency_8:$lookup8,relative_p99_gate:{
+          kind:"concurrency_8_p99_lte_2x_concurrency_1",p99_multiplier:2,
+          concurrency_1_p99_ns:80000,concurrency_8_p99_ns:100000,
+          concurrency_8_p99_max_ns:160000,passed:true}},
       series:[
+        $lookup8,
         series("raw_jni";"getsockopt";"miss"),
-        series("raw_jni";"getsockopt";"hit"),
         series("raw_jni";"getsockopt";"stale"),
         series("bridge_provider_jni";"getsockopt";"miss"),
         series("bridge_provider_jni";"getsockopt";"hit"),
         series("bridge_provider_jni";"getsockopt";"stale"),
         series("raw_jni";"unix";"miss"),series("raw_jni";"unix";"hit"),
-        series("raw_jni";"unix";"stale"),series("raw_jni";"unix";"timeout"),
+        series("raw_jni";"unix";"stale"),
         series("bridge_provider_jni";"unix";"miss"),
         series("bridge_provider_jni";"unix";"hit"),
         series("bridge_provider_jni";"unix";"stale"),
+        series("raw_jni";"unix";"timeout"),
         series("bridge_provider_jni";"unix";"timeout")]}' >"$output"
 }
 
@@ -175,6 +229,22 @@ write_raw_cell() {
     "$revision"
 }
 
+expect_packaged_mutation_reject() {
+  local -r label="$1"
+  local -r slug="$2"
+  local -r revision="$3"
+  local -r mutation="$4"
+  local -r buildinfo="$5"
+  local -r config="$6"
+  local -r raw="$TEST_ROOT/raw-packaged-$slug"
+  local -r benchmark="$raw/packaged-jvm-benchmark/benchmark.json"
+  write_raw_cell "$raw" 5.10-lts "$revision"
+  jq "$mutation" "$benchmark" >"$raw/benchmark.tmp"
+  mv -- "$raw/benchmark.tmp" "$benchmark"
+  expect_reject "$label" "$PROJECTOR" cell-v1 "$raw" "$buildinfo" "$config" \
+    "$TEST_ROOT/cell-packaged-$slug"
+}
+
 project_cell() {
   local -r kernel="$1"
   local -r revision="$2"
@@ -206,13 +276,77 @@ matrix_seed_from_json() {
 test_cell_projection_and_mutations() {
   local revision=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   local cell="$TEST_ROOT/cell-good"
+  local contention_cell=''
+  local contention_identity_payload=''
+  local contention_evidence_id=''
   project_cell 5.10-lts "$revision" "$cell" || fail 'valid cell did not project'
   (CDPATH='' cd / && bash "$cell/verify.sh" >/dev/null) ||
     fail 'valid cell verifier failed'
+  jq -e '
+    .benchmarks.packaged_jvm.schema_version == 3 and
+    .benchmarks.packaged_jvm.lookup_contention_indicator.kind ==
+      "indirect_lookup_contention_indicator" and
+    .benchmarks.packaged_jvm.lookup_contention_indicator.exact_bpf_lock_wait_measured == false and
+    .benchmarks.packaged_jvm.lookup_contention_indicator.concurrency_1.concurrency == 1 and
+    .benchmarks.packaged_jvm.lookup_contention_indicator.concurrency_8.concurrency == 8 and
+    .benchmarks.packaged_jvm.lookup_contention_indicator.concurrency_1.primary_bpf_status_before == 0 and
+    .benchmarks.packaged_jvm.lookup_contention_indicator.concurrency_1.primary_bpf_status_after == 272 and
+    .benchmarks.packaged_jvm.lookup_contention_indicator.concurrency_8.primary_bpf_status_before == 272 and
+    .benchmarks.packaged_jvm.lookup_contention_indicator.concurrency_8.primary_bpf_status_after == 2448 and
+    .benchmarks.packaged_jvm.lookup_contention_indicator.relative_p99_gate.passed == true and
+    .benchmarks.packaged_jvm.topology.expected_batches == 4080 and
+    .benchmarks.packaged_jvm.topology.expected_primary_calls == 13328
+  ' "$cell/cell.json" >/dev/null || fail 'v3 contention summary was not retained'
   if grep -Eqi -- '(/tmp/|/home/|/proc/|samples_ns|samples_bytes|"program_id"[[:space:]]*:)' \
     "$cell/cell.json"; then
     fail 'cell leaked private material'
   fi
+
+  contention_cell="$TEST_ROOT/cell-contention-mutation"
+  cp -a -- "$cell" "$contention_cell"
+  chmod -R u+w -- "$contention_cell"
+  jq -cS \
+    '.benchmarks.packaged_jvm.lookup_contention_indicator.relative_p99_gate.passed=false' \
+    "$contention_cell/cell.json" >"$contention_cell/cell.tmp"
+  mv -- "$contention_cell/cell.tmp" "$contention_cell/cell.json"
+  contention_identity_payload="$(jq -cS \
+    '{source_revision:.source.revision,kernel_id:.kernel.id,
+      lvh_digest:.kernel.lvh_digest,buildinfo_sha256:.kernel.buildinfo_sha256,
+      config_sha256:.kernel.config_sha256,raw_commitment,tests,
+      transport:.benchmarks.transport,packaged_jvm:.benchmarks.packaged_jvm}' \
+    "$contention_cell/cell.json")"
+  contention_evidence_id="$(printf '%s\n' issue11-kernel-cell-v1 \
+    "$contention_identity_payload" | sha256sum)"
+  contention_evidence_id="${contention_evidence_id%% *}"
+  jq -cS --arg evidence_id "$contention_evidence_id" '.evidence_id=$evidence_id' \
+    "$contention_cell/cell.json" >"$contention_cell/cell.tmp"
+  mv -- "$contention_cell/cell.tmp" "$contention_cell/cell.json"
+  rehash_cell "$contention_cell"
+  expect_reject 'rederived projected contention gate weakening' \
+    bash "$contention_cell/verify.sh"
+
+  jq -cS \
+    '.benchmarks.packaged_jvm.lookup_contention_indicator.relative_p99_gate.passed=true |
+      .benchmarks.packaged_jvm.lookup_contention_indicator.concurrency_8.primary_bpf_status_before += 1 |
+      .benchmarks.packaged_jvm.lookup_contention_indicator.concurrency_8.primary_bpf_status_after += 1' \
+    "$contention_cell/cell.json" >"$contention_cell/cell.tmp"
+  mv -- "$contention_cell/cell.tmp" "$contention_cell/cell.json"
+  contention_identity_payload="$(jq -cS \
+    '{source_revision:.source.revision,kernel_id:.kernel.id,
+      lvh_digest:.kernel.lvh_digest,buildinfo_sha256:.kernel.buildinfo_sha256,
+      config_sha256:.kernel.config_sha256,raw_commitment,tests,
+      transport:.benchmarks.transport,packaged_jvm:.benchmarks.packaged_jvm}' \
+    "$contention_cell/cell.json")"
+  contention_evidence_id="$(printf '%s\n' issue11-kernel-cell-v1 \
+    "$contention_identity_payload" | sha256sum)"
+  contention_evidence_id="${contention_evidence_id%% *}"
+  jq -cS --arg evidence_id "$contention_evidence_id" '.evidence_id=$evidence_id' \
+    "$contention_cell/cell.json" >"$contention_cell/cell.tmp"
+  mv -- "$contention_cell/cell.tmp" "$contention_cell/cell.json"
+  rehash_cell "$contention_cell"
+  expect_reject 'rederived projected contention counter gap' \
+    bash "$contention_cell/verify.sh"
+
   chmod -R u+w -- "$cell"
   jq -cS '.coverage.issue_11.state="closed"|.coverage.issue_11.closes=[11]' \
     "$cell/cell.json" >"$cell/cell.tmp"
@@ -248,7 +382,7 @@ test_cell_projection_and_mutations() {
 
   raw="$TEST_ROOT/raw-duplicate-json"
   write_raw_cell "$raw" 5.10-lts "$revision"
-  sed -i '0,/"schema_version": 2/s//"schema_version": 2, "schema_version": 2/' \
+  sed -i '0,/"schema_version": 3/s//"schema_version": 3, "schema_version": 3/' \
     "$raw/packaged-jvm-benchmark/benchmark.json"
   expect_reject 'duplicate raw benchmark JSON key' "$PROJECTOR" cell-v1 \
     "$raw" "$TEST_ROOT/special.buildinfo" "$TEST_ROOT/special.config" \
@@ -262,6 +396,43 @@ test_cell_projection_and_mutations() {
   expect_reject 'packaged benchmark source mismatch' "$PROJECTOR" cell-v1 \
     "$raw" "$TEST_ROOT/special.buildinfo" "$TEST_ROOT/special.config" \
     "$TEST_ROOT/cell-source-mismatch"
+
+  expect_packaged_mutation_reject 'raw packaged schema v2' schema-v2 "$revision" \
+    '.schema_version=2' "$TEST_ROOT/special.buildinfo" "$TEST_ROOT/special.config"
+  expect_packaged_mutation_reject 'missing contention indicator' missing-indicator \
+    "$revision" 'del(.lookup_contention_indicator)' \
+    "$TEST_ROOT/special.buildinfo" "$TEST_ROOT/special.config"
+  expect_packaged_mutation_reject 'exact BPF lock-wait claim' exact-lock-claim \
+    "$revision" '.lookup_contention_indicator.exact_bpf_lock_wait_measured=true' \
+    "$TEST_ROOT/special.buildinfo" "$TEST_ROOT/special.config"
+  expect_packaged_mutation_reject 'contention comparison drift' comparison-drift \
+    "$revision" '.lookup_contention_indicator.only_varied_dimension="worker_count_and_fixture"' \
+    "$TEST_ROOT/special.buildinfo" "$TEST_ROOT/special.config"
+  expect_packaged_mutation_reject 'contention c1 p99 summary forgery' c1-p99 \
+    "$revision" '.lookup_contention_indicator.concurrency_1.p99_ns += 1' \
+    "$TEST_ROOT/special.buildinfo" "$TEST_ROOT/special.config"
+  expect_packaged_mutation_reject 'contention c8 canonical-copy forgery' c8-copy \
+    "$revision" '.series[0].allocation.p99_bytes += 1' \
+    "$TEST_ROOT/special.buildinfo" "$TEST_ROOT/special.config"
+  expect_packaged_mutation_reject 'packaged series order drift' series-order \
+    "$revision" '.series[1:3] |= reverse' \
+    "$TEST_ROOT/special.buildinfo" "$TEST_ROOT/special.config"
+  expect_packaged_mutation_reject 'contention relative-gate forgery' relative-gate \
+    "$revision" \
+    '.lookup_contention_indicator.relative_p99_gate.concurrency_8_p99_max_ns += 1' \
+    "$TEST_ROOT/special.buildinfo" "$TEST_ROOT/special.config"
+  expect_packaged_mutation_reject 'failed contention relative gate' failed-relative \
+    "$revision" \
+    '.lookup_contention_indicator.concurrency_1.samples_ns |= map(40000) | .lookup_contention_indicator.concurrency_1.total_timed_ns=10240000 | .lookup_contention_indicator.concurrency_1.p50_ns=40000 | .lookup_contention_indicator.concurrency_1.p95_ns=40000 | .lookup_contention_indicator.concurrency_1.p99_ns=40000 | .lookup_contention_indicator.relative_p99_gate.concurrency_1_p99_ns=40000 | .lookup_contention_indicator.relative_p99_gate.concurrency_8_p99_max_ns=80000 | .lookup_contention_indicator.relative_p99_gate.passed=false' \
+    "$TEST_ROOT/special.buildinfo" "$TEST_ROOT/special.config"
+  expect_packaged_mutation_reject 'coordinated contention status forgery' status-roster \
+    "$revision" \
+    '.lookup_contention_indicator.concurrency_1.status_counts.forged_positive=1 | .lookup_contention_indicator.concurrency_1.status_counts.forged_negative=-1' \
+    "$TEST_ROOT/special.buildinfo" "$TEST_ROOT/special.config"
+  expect_packaged_mutation_reject 'intervening primary lookup counter gap' counter-gap \
+    "$revision" \
+    '.lookup_contention_indicator.concurrency_8.call_counts.primary_bpf_status_before += 1 | .lookup_contention_indicator.concurrency_8.call_counts.primary_bpf_status_after += 1 | .series[0].call_counts.primary_bpf_status_before += 1 | .series[0].call_counts.primary_bpf_status_after += 1' \
+    "$TEST_ROOT/special.buildinfo" "$TEST_ROOT/special.config"
 }
 
 test_matrix_projection_and_mixing() {
@@ -360,12 +531,16 @@ test_workflow_contracts() {
     fail 'raw diagnostic 14-day retention is absent'
   grep -Fq -- 'description: "Exact lowercase 40-hex Git commit to validate"' \
     "$rhel" || fail 'dispatch input is not restricted to an immutable commit'
+  # These single-quoted patterns are literal workflow source contracts.
+  # shellcheck disable=SC2016
   [[ "$(grep -Fc -- 'ref: ${{ inputs.ref || github.sha }}' "$rhel")" == 2 &&
     "$(grep -Fc -- '[[ "$SELECTED_REVISION" =~ ^[0-9a-f]{40}$ ]]' "$rhel")" == 2 &&
     "$(grep -Fc -- '[[ "$(git rev-parse --verify '\''HEAD^{commit}'\'')" == "$SELECTED_REVISION" ]]' \
       "$rhel")" == 2 &&
     "$(grep -Fc -- '[[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]' \
       "$rhel")" == 2 ]] || fail 'validate and aggregate jobs lost exact source binding'
+  # This single-quoted pattern is a literal workflow source contract.
+  # shellcheck disable=SC2016
   grep -Fq -- 'campaign_output="$(readlink -f -- "$CAMPAIGN_OUTPUT")"' "$rhel" ||
     fail 'workflow passes a relative raw cell path to the safe projector'
 }

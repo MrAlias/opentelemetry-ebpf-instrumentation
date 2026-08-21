@@ -241,6 +241,187 @@ func validatePackagedJVMBenchmarkProbeSource(source string) error {
 	return nil
 }
 
+func TestPackagedJVMBenchmarkLookupContentionIndicatorSourceContract(t *testing.T) {
+	require.NotEmpty(t, packagedJVMBenchmarkV2SeriesSpecs)
+	require.Equal(t, packagedJVMBenchmarkV3LookupContentionSpec,
+		packagedJVMBenchmarkV2SeriesSpecs[0],
+		"concurrency-8 lookup hit must be the first retained series, matching the fresh concurrency-1 JVM history",
+	)
+	_, thisFile, _, ok := runtime.Caller(0)
+	require.True(t, ok)
+	fixturePath := filepath.Join(
+		filepath.Dir(thisFile), "java_remote_parent_jvm_benchmark_privileged_test.go",
+	)
+	source, err := os.ReadFile(fixturePath)
+	require.NoError(t, err)
+	text := string(source)
+	require.NoError(t, validatePackagedJVMBenchmarkLookupContentionSource(text))
+
+	mutations := []struct {
+		name   string
+		mutate func(string) string
+	}{
+		{
+			name: "baseline widened to eight workers",
+			mutate: func(source string) string {
+				return strings.Replace(source,
+					"concurrency := packagedJVMBenchmarkV3LookupContentionBaselineConcurrency",
+					"concurrency := packagedJVMBenchmarkV2Concurrency", 1)
+			},
+		},
+		{
+			name: "baseline run omitted",
+			mutate: func(source string) string {
+				return strings.Replace(source,
+					"lookupContentionConcurrency1 := runPackagedJVMBenchmarkLookupContentionBaseline(",
+					"lookupContentionConcurrency1 := packagedJVMBenchmarkV2SeriesObservation{}; omittedPackagedJVMBenchmarkLookupContentionBaseline(", 1)
+			},
+		},
+		{
+			name: "baseline samples not retained",
+			mutate: func(source string) string {
+				return mutatePackagedJVMBenchmarkProbeMethod(
+					source,
+					"func runPackagedJVMBenchmarkLookupContentionBaseline(",
+					"func authorizePackagedJVMBenchmarkProcess(",
+					func(method string) string {
+						return strings.Replace(method,
+							"observation.SamplesNS = append(observation.SamplesNS,",
+							"omitted.SamplesNS = append(observation.SamplesNS,", 1)
+					},
+				)
+			},
+		},
+		{
+			name: "baseline pre-call topology bracket omitted",
+			mutate: func(source string) string {
+				return mutatePackagedJVMBenchmarkProbeMethod(
+					source,
+					"func runPackagedJVMBenchmarkLookupContentionBaseline(",
+					"func authorizePackagedJVMBenchmarkProcess(",
+					func(method string) string {
+						return strings.Replace(method,
+							"require.NoError(t, stabilityTracker.ObservePreCall(",
+							"require.NoError(t, omittedStabilityTracker.ObservePreCall(", 1)
+					},
+				)
+			},
+		},
+		{
+			name: "baseline post-call topology bracket omitted",
+			mutate: func(source string) string {
+				return mutatePackagedJVMBenchmarkProbeMethod(
+					source,
+					"func runPackagedJVMBenchmarkLookupContentionBaseline(",
+					"func authorizePackagedJVMBenchmarkProcess(",
+					func(method string) string {
+						return strings.Replace(method,
+							"require.NoError(t, stabilityTracker.ObservePostCall(",
+							"require.NoError(t, omittedStabilityTracker.ObservePostCall(", 1)
+					},
+				)
+			},
+		},
+		{
+			name: "concurrency-8 canonical sample disconnected",
+			mutate: func(source string) string {
+				return strings.Replace(source,
+					"Concurrency8: lookupContentionConcurrency8,",
+					"Concurrency8: lookupContentionConcurrency1,", 1)
+			},
+		},
+		{
+			name: "concurrency-1 absolute gate not enforced",
+			mutate: func(source string) string {
+				return strings.Replace(source,
+					"artifact.LookupContentionIndicator.Concurrency1.LatencyGate.Passed,",
+					"true,", 1)
+			},
+		},
+		{
+			name: "relative p99 gate not enforced",
+			mutate: func(source string) string {
+				return strings.Replace(source,
+					"artifact.LookupContentionIndicator.RelativeP99Gate.Passed,",
+					"true,", 1)
+			},
+		},
+	}
+	for _, mutation := range mutations {
+		mutation := mutation
+		t.Run(mutation.name, func(t *testing.T) {
+			mutated := mutation.mutate(text)
+			require.NotEqual(t, text, mutated)
+			require.Error(t, validatePackagedJVMBenchmarkLookupContentionSource(mutated))
+		})
+	}
+}
+
+func validatePackagedJVMBenchmarkLookupContentionSource(source string) error {
+	main, err := packagedJVMBenchmarkSourceSection(
+		source,
+		"func TestJavaRemoteParentPackagedJVMTransportBenchmark(",
+		"func runPackagedJVMBenchmarkLookupContentionBaseline(",
+	)
+	if err != nil {
+		return err
+	}
+	baselineCall := strings.Index(
+		main, "lookupContentionConcurrency1 := runPackagedJVMBenchmarkLookupContentionBaseline(",
+	)
+	concurrency8Launch := strings.Index(main, "command := exec.CommandContext(")
+	writeArtifact := strings.Index(main, "writePackagedJVMBenchmarkArtifactV3(artifactPath, artifact)")
+	absoluteGate := strings.Index(
+		main, "artifact.LookupContentionIndicator.Concurrency1.LatencyGate.Passed,",
+	)
+	relativeGate := strings.Index(
+		main, "artifact.LookupContentionIndicator.RelativeP99Gate.Passed,",
+	)
+	if baselineCall < 0 || concurrency8Launch <= baselineCall || writeArtifact < 0 ||
+		absoluteGate <= writeArtifact || relativeGate <= absoluteGate {
+		return errors.New("packaged JVM lookup-contention comparison is not run and enforced in order")
+	}
+	for _, required := range []string{
+		"packagedJVMBenchmarkWarmupIterations + packagedJVMBenchmarkMeasurementIterations",
+		"if spec == packagedJVMBenchmarkV3LookupContentionSpec {",
+		"lookupContentionConcurrency8 = observation",
+		"require.True(t, lookupContentionConcurrency8Found",
+		"Concurrency1: lookupContentionConcurrency1,",
+		"Concurrency8: lookupContentionConcurrency8,",
+	} {
+		if !strings.Contains(main, required) {
+			return fmt.Errorf("packaged JVM lookup-contention comparison lacks %q", required)
+		}
+	}
+
+	baseline, err := packagedJVMBenchmarkSourceSection(
+		source,
+		"func runPackagedJVMBenchmarkLookupContentionBaseline(",
+		"func authorizePackagedJVMBenchmarkProcess(",
+	)
+	if err != nil {
+		return err
+	}
+	for _, required := range []string{
+		"concurrency := packagedJVMBenchmarkV3LookupContentionBaselineConcurrency",
+		"strconv.Itoa(concurrency)",
+		`"workers":                strconv.Itoa(concurrency)`,
+		"spec := packagedJVMBenchmarkV3LookupContentionSpec",
+		"Calls:                  packagedJVMBenchmarkExpectedCallsV2(spec, concurrency)",
+		"stabilityTracker.ObservePreCall(",
+		"stabilityTracker.ObservePostCall(",
+		"observation.SamplesNS = append(observation.SamplesNS,",
+		"requirePackagedJVMBenchmarkExactTakeStats(",
+		"concurrency*(packagedJVMBenchmarkWarmupIterations+packagedJVMBenchmarkMeasurementIterations)",
+		"removePackagedJVMBenchmarkProcessAuthorization(t, maps, process)",
+	} {
+		if !strings.Contains(baseline, required) {
+			return fmt.Errorf("packaged JVM concurrency-1 lookup sample lacks %q", required)
+		}
+	}
+	return nil
+}
+
 type packagedJVMBenchmarkTeardownStage struct {
 	name      string
 	run       func() error
@@ -2225,8 +2406,8 @@ const (
 	packagedJVMBenchmarkExclusiveTopologyPremise                = "operator_controlled_no_concurrent_cgroup_bpf_mutation"
 	packagedJVMBenchmarkRevisionPremiseNotRequired              = "not_required_all_direct_queries_revision_supported"
 	packagedJVMBenchmarkExpectedCalls                           = 2 * (packagedJVMBenchmarkWarmupIterations + packagedJVMBenchmarkMeasurementIterations)
-	packagedJVMBenchmarkArtifactV2SchemaVersion                 = 2
-	packagedJVMBenchmarkArtifactV2Name                          = "java_remote_parent_packaged_jvm_transport"
+	packagedJVMBenchmarkArtifactV3SchemaVersion                 = 3
+	packagedJVMBenchmarkArtifactV3Name                          = "java_remote_parent_packaged_jvm_transport"
 	packagedJVMBenchmarkV2Harness                               = "packaged_agent_java_concurrent_transport"
 	packagedJVMBenchmarkV2Concurrency                           = 8
 	packagedJVMBenchmarkV2PrimaryP99LimitNS                     = int64(time.Millisecond)
@@ -2234,7 +2415,14 @@ const (
 	packagedJVMBenchmarkV2TimeoutP50MinimumNS                   = int64(50 * time.Millisecond)
 	packagedJVMBenchmarkV2TimeoutP99LimitNS                     = int64(100 * time.Millisecond)
 	packagedJVMBenchmarkV2TimeoutMillis                         = 50
-	packagedJVMBenchmarkV2MaxArtifactBytes                      = packagedJVMBenchmarkMaxArtifactBytes
+	packagedJVMBenchmarkV3LookupContentionBaselineConcurrency   = 1
+	packagedJVMBenchmarkV3LookupContentionP99Multiplier         = 2
+	packagedJVMBenchmarkV3LookupContentionKind                  = "indirect_lookup_contention_indicator"
+	packagedJVMBenchmarkV3LookupContentionOnlyVariedDimension   = "java_worker_count"
+	packagedJVMBenchmarkV3LookupContentionComparisonControl     = "fresh packaged-agent JVM; raw JNI getsockopt hit is the first retained series after identical fixture setup and per-series warmup; measurement batches, timed call, response storage, and host are controlled; Java worker count is the only intentionally varied benchmark dimension"
+	packagedJVMBenchmarkV3LookupContentionInterpretation        = "end-to-end lookup latency comparison is an indirect lookup-contention indicator; it does not measure exact BPF lock wait"
+	packagedJVMBenchmarkV3LookupContentionRelativeGateKind      = "concurrency_8_p99_lte_2x_concurrency_1"
+	packagedJVMBenchmarkV3MaxArtifactBytes                      = packagedJVMBenchmarkMaxArtifactBytes
 	packagedJVMBenchmarkRetrievalTTL                            = 30 * time.Second
 	packagedJVMBenchmarkStaleAge                                = 31 * time.Second
 	packagedJVMBenchmarkUnixSocketRoot                          = "/tmp"
@@ -2244,9 +2432,16 @@ const (
 	packagedJVMBenchmarkUnixSetupControl                        = "direct root-owned 0750 directory beneath nofollow-opened root:root sticky /tmp whose device and inode remain stable across setup; pinned nofollow root, child, and socket identities retained through one-shot server close/wait and identity-checked root-relative socket and child unlink; path ENOENT plus pinned inode link-count-zero proofs before closing fixture FDs; credential-dropped JVM lstat and access preflight; non-mutating exact authorized/incarnation capability and retirement-absence checks before and after CONFIG; exactly one NEGOTIATE/MISSING configuration; after every stale series validate and exact-key delete only the final per-worker stale fallback and terminal, then prove the direct owner-generation state, index, owner, ambiguity, claim, guard, replay, and task surface absent before retaining the series or issuing the next CONFIG"
 )
 
+var packagedJVMBenchmarkV3LookupContentionSpec = packagedJVMBenchmarkV2SeriesSpec{
+	Scope:          "raw_jni",
+	Transport:      "getsockopt",
+	Outcome:        "hit",
+	ExpectedStatus: int(javabridge.StatusValid),
+}
+
 var packagedJVMBenchmarkV2SeriesSpecs = []packagedJVMBenchmarkV2SeriesSpec{
+	packagedJVMBenchmarkV3LookupContentionSpec,
 	{Scope: "raw_jni", Transport: "getsockopt", Outcome: "miss", ExpectedStatus: int(javabridge.StatusMissing)},
-	{Scope: "raw_jni", Transport: "getsockopt", Outcome: "hit", ExpectedStatus: int(javabridge.StatusValid)},
 	{Scope: "raw_jni", Transport: "getsockopt", Outcome: "stale", ExpectedStatus: int(javabridge.StatusStale)},
 	{Scope: "bridge_provider_jni", Transport: "getsockopt", Outcome: "miss", ExpectedStatus: int(javabridge.StatusMissing)},
 	{Scope: "bridge_provider_jni", Transport: "getsockopt", Outcome: "hit", ExpectedStatus: int(javabridge.StatusValid)},
@@ -2261,16 +2456,18 @@ var packagedJVMBenchmarkV2SeriesSpecs = []packagedJVMBenchmarkV2SeriesSpec{
 	{Scope: "bridge_provider_jni", Transport: "unix", Outcome: "timeout", ExpectedStatus: int(javabridge.StatusTimeout)},
 }
 
-var expectedPackagedJVMBenchmarkV2Provenance = packagedJVMBenchmarkArtifactV2Provenance{
+var expectedPackagedJVMBenchmarkV3Provenance = packagedJVMBenchmarkArtifactV2Provenance{
 	Harness: packagedJVMBenchmarkV2Harness,
 	Measures: []string{
 		"packaged_agent", "java_workers", "raw_jni", "bridge_provider", "jni",
 		"kernel_getsockopt", "cgroup_bpf", "unix_server", "thread_allocated_bytes",
+		"indirect_lookup_contention_indicator",
 	},
 	Excludes: []string{
 		"application_request", "instrumentation", "throughput", "application_throughput", "process_cpu",
 		"rss_growth", "native_memory_growth", "direct_memory_growth", "fd_growth",
 		"thread_growth", "map_growth", "run_to_run_variance", "native_sanitizers",
+		"exact_bpf_lock_wait",
 	},
 }
 
@@ -2528,19 +2725,20 @@ type packagedJVMBenchmarkArtifactLatency struct {
 	Passed   bool   `json:"passed"`
 }
 
-// Schema v2 is additive to the retained schema-v1 contract above. It gives concurrency,
-// transport, provider, allocation, and exact call accounting their own identities instead of
-// changing the meaning of the single-thread getsockopt fields.
-type packagedJVMBenchmarkArtifactV2 struct {
-	SchemaVersion int                                      `json:"schema_version"`
-	Benchmark     string                                   `json:"benchmark"`
-	CreatedAt     string                                   `json:"created_at"`
-	Provenance    packagedJVMBenchmarkArtifactV2Provenance `json:"provenance"`
-	Source        packagedJVMBenchmarkArtifactSource       `json:"source"`
-	Inputs        packagedJVMBenchmarkArtifactInputs       `json:"inputs"`
-	Runtime       packagedJVMBenchmarkArtifactRuntime      `json:"runtime"`
-	Setup         packagedJVMBenchmarkArtifactV2Setup      `json:"setup"`
-	Series        []packagedJVMBenchmarkArtifactV2Series   `json:"series"`
+// Schema v3 retains the v2 concurrency, transport, provider, allocation, and exact-call
+// structures, and adds the required lookup-contention indicator. The V2 suffixes below identify
+// wire structures introduced in v2; they do not make the v3 root backward-compatible with v2.
+type packagedJVMBenchmarkArtifactV3 struct {
+	SchemaVersion             int                                                     `json:"schema_version"`
+	Benchmark                 string                                                  `json:"benchmark"`
+	CreatedAt                 string                                                  `json:"created_at"`
+	Provenance                packagedJVMBenchmarkArtifactV2Provenance                `json:"provenance"`
+	Source                    packagedJVMBenchmarkArtifactSource                      `json:"source"`
+	Inputs                    packagedJVMBenchmarkArtifactInputs                      `json:"inputs"`
+	Runtime                   packagedJVMBenchmarkArtifactRuntime                     `json:"runtime"`
+	Setup                     packagedJVMBenchmarkArtifactV2Setup                     `json:"setup"`
+	LookupContentionIndicator packagedJVMBenchmarkArtifactV3LookupContentionIndicator `json:"lookup_contention_indicator"`
+	Series                    []packagedJVMBenchmarkArtifactV2Series                  `json:"series"`
 }
 
 type packagedJVMBenchmarkArtifactV2Provenance struct {
@@ -2623,6 +2821,11 @@ type packagedJVMBenchmarkV2SeriesObservation struct {
 	Calls                  packagedJVMBenchmarkArtifactV2Calls
 }
 
+type packagedJVMBenchmarkV3LookupContentionObservations struct {
+	Concurrency1 packagedJVMBenchmarkV2SeriesObservation
+	Concurrency8 packagedJVMBenchmarkV2SeriesObservation
+}
+
 type packagedJVMBenchmarkArtifactV2Series struct {
 	Scope          string                                   `json:"scope"`
 	Transport      string                                   `json:"transport"`
@@ -2698,6 +2901,26 @@ type packagedJVMBenchmarkArtifactV2Latency struct {
 	P50MinNS int64  `json:"p50_min_ns"`
 	P99MaxNS int64  `json:"p99_max_ns"`
 	Passed   bool   `json:"passed"`
+}
+
+type packagedJVMBenchmarkArtifactV3LookupContentionIndicator struct {
+	Kind                     string                                        `json:"kind"`
+	OnlyVariedDimension      string                                        `json:"only_varied_dimension"`
+	ComparisonControl        string                                        `json:"comparison_control"`
+	Interpretation           string                                        `json:"interpretation"`
+	ExactBPFLockWaitMeasured bool                                          `json:"exact_bpf_lock_wait_measured"`
+	Concurrency1             packagedJVMBenchmarkArtifactV2Series          `json:"concurrency_1"`
+	Concurrency8             packagedJVMBenchmarkArtifactV2Series          `json:"concurrency_8"`
+	RelativeP99Gate          packagedJVMBenchmarkArtifactV3RelativeP99Gate `json:"relative_p99_gate"`
+}
+
+type packagedJVMBenchmarkArtifactV3RelativeP99Gate struct {
+	Kind                 string `json:"kind"`
+	P99Multiplier        int    `json:"p99_multiplier"`
+	Concurrency1P99NS    int64  `json:"concurrency_1_p99_ns"`
+	Concurrency8P99NS    int64  `json:"concurrency_8_p99_ns"`
+	Concurrency8P99MaxNS int64  `json:"concurrency_8_p99_max_ns"`
+	Passed               bool   `json:"passed"`
 }
 
 func newPackagedJVMBenchmarkArtifact(
@@ -2780,20 +3003,22 @@ func packagedJVMBenchmarkPercentile(sortedSamples []int64, percentage int) int64
 	return sortedSamples[rank-1]
 }
 
-func newPackagedJVMBenchmarkArtifactV2(
+func newPackagedJVMBenchmarkArtifactV3(
 	createdAt time.Time,
 	source packagedJVMBenchmarkArtifactSource,
 	inputs packagedJVMBenchmarkArtifactInputs,
 	cgroupBPF packagedJVMBenchmarkArtifactCgroupBPF,
 	runtimeIdentity packagedJVMBenchmarkArtifactRuntime,
 	observations []packagedJVMBenchmarkV2SeriesObservation,
-) packagedJVMBenchmarkArtifactV2 {
+	lookupContention packagedJVMBenchmarkV3LookupContentionObservations,
+) packagedJVMBenchmarkArtifactV3 {
 	series := make([]packagedJVMBenchmarkArtifactV2Series, len(observations))
 	for index := range observations {
 		series[index] = summarizePackagedJVMBenchmarkSeriesV2(observations[index])
 	}
-	totalBatches := len(packagedJVMBenchmarkV2SeriesSpecs) *
-		(packagedJVMBenchmarkWarmupIterations + packagedJVMBenchmarkMeasurementIterations)
+	totalBatches := len(packagedJVMBenchmarkV2SeriesSpecs)*
+		(packagedJVMBenchmarkWarmupIterations+packagedJVMBenchmarkMeasurementIterations) +
+		packagedJVMBenchmarkWarmupIterations + packagedJVMBenchmarkMeasurementIterations
 	totalCalls := packagedJVMBenchmarkV2Concurrency *
 		(packagedJVMBenchmarkWarmupIterations + packagedJVMBenchmarkMeasurementIterations)
 	primarySeries := 0
@@ -2802,14 +3027,17 @@ func newPackagedJVMBenchmarkArtifactV2(
 			primarySeries++
 		}
 	}
-	return packagedJVMBenchmarkArtifactV2{
-		SchemaVersion: packagedJVMBenchmarkArtifactV2SchemaVersion,
-		Benchmark:     packagedJVMBenchmarkArtifactV2Name,
+	expectedPrimaryCalls := primarySeries*totalCalls +
+		packagedJVMBenchmarkV3LookupContentionBaselineConcurrency*
+			(packagedJVMBenchmarkWarmupIterations+packagedJVMBenchmarkMeasurementIterations)
+	return packagedJVMBenchmarkArtifactV3{
+		SchemaVersion: packagedJVMBenchmarkArtifactV3SchemaVersion,
+		Benchmark:     packagedJVMBenchmarkArtifactV3Name,
 		CreatedAt:     createdAt.UTC().Format(time.RFC3339Nano),
 		Provenance: packagedJVMBenchmarkArtifactV2Provenance{
-			Harness:  expectedPackagedJVMBenchmarkV2Provenance.Harness,
-			Measures: slices.Clone(expectedPackagedJVMBenchmarkV2Provenance.Measures),
-			Excludes: slices.Clone(expectedPackagedJVMBenchmarkV2Provenance.Excludes),
+			Harness:  expectedPackagedJVMBenchmarkV3Provenance.Harness,
+			Measures: slices.Clone(expectedPackagedJVMBenchmarkV3Provenance.Measures),
+			Excludes: slices.Clone(expectedPackagedJVMBenchmarkV3Provenance.Excludes),
 			CgroupBPF: packagedJVMBenchmarkArtifactV2CgroupBPF{
 				TargetCgroup:             cgroupBPF.TargetCgroup,
 				CgroupHierarchy:          slices.Clone(cgroupBPF.CgroupHierarchy),
@@ -2821,7 +3049,7 @@ func newPackagedJVMBenchmarkArtifactV2(
 				ExclusiveTopologyPremise: cgroupBPF.ExclusiveTopologyPremise,
 				StabilityChecks: packagedJVMBenchmarkArtifactV2Stability{
 					ExpectedBatches:            totalBatches,
-					ExpectedPrimaryCalls:       primarySeries * totalCalls,
+					ExpectedPrimaryCalls:       expectedPrimaryCalls,
 					ObservedPreBatchSnapshots:  cgroupBPF.StabilityChecks.ObservedPreCallSnapshots,
 					ObservedPostBatchSnapshots: cgroupBPF.StabilityChecks.ObservedPostCallSnapshots,
 					QueryErrors:                cgroupBPF.StabilityChecks.QueryErrors,
@@ -2869,7 +3097,44 @@ func newPackagedJVMBenchmarkArtifactV2(
 			},
 			Environment: slices.Clone(expectedPackagedJVMBenchmarkEnvironment),
 		},
+		LookupContentionIndicator: summarizePackagedJVMBenchmarkLookupContentionIndicator(
+			lookupContention,
+		),
 		Series: series,
+	}
+}
+
+func summarizePackagedJVMBenchmarkLookupContentionIndicator(
+	observations packagedJVMBenchmarkV3LookupContentionObservations,
+) packagedJVMBenchmarkArtifactV3LookupContentionIndicator {
+	concurrency1 := summarizePackagedJVMBenchmarkSeriesV2(observations.Concurrency1)
+	concurrency8 := summarizePackagedJVMBenchmarkSeriesV2(observations.Concurrency8)
+	return packagedJVMBenchmarkArtifactV3LookupContentionIndicator{
+		Kind:                     packagedJVMBenchmarkV3LookupContentionKind,
+		OnlyVariedDimension:      packagedJVMBenchmarkV3LookupContentionOnlyVariedDimension,
+		ComparisonControl:        packagedJVMBenchmarkV3LookupContentionComparisonControl,
+		Interpretation:           packagedJVMBenchmarkV3LookupContentionInterpretation,
+		ExactBPFLockWaitMeasured: false,
+		Concurrency1:             concurrency1,
+		Concurrency8:             concurrency8,
+		RelativeP99Gate: packagedJVMBenchmarkV3LookupContentionGate(
+			concurrency1.P99NS, concurrency8.P99NS,
+		),
+	}
+}
+
+func packagedJVMBenchmarkV3LookupContentionGate(
+	concurrency1P99NS int64,
+	concurrency8P99NS int64,
+) packagedJVMBenchmarkArtifactV3RelativeP99Gate {
+	maximum := concurrency1P99NS * packagedJVMBenchmarkV3LookupContentionP99Multiplier
+	return packagedJVMBenchmarkArtifactV3RelativeP99Gate{
+		Kind:                 packagedJVMBenchmarkV3LookupContentionRelativeGateKind,
+		P99Multiplier:        packagedJVMBenchmarkV3LookupContentionP99Multiplier,
+		Concurrency1P99NS:    concurrency1P99NS,
+		Concurrency8P99NS:    concurrency8P99NS,
+		Concurrency8P99MaxNS: maximum,
+		Passed:               concurrency8P99NS <= maximum,
 	}
 }
 
@@ -3958,7 +4223,7 @@ func validatePackagedJVMBenchmarkArtifactCICrosslinks(
 }
 
 func validatePackagedJVMBenchmarkArtifactV2CICrosslinks(
-	artifact packagedJVMBenchmarkArtifactV2,
+	artifact packagedJVMBenchmarkArtifactV3,
 	crosslinks packagedJVMBenchmarkArtifactCICrosslinks,
 ) error {
 	legacy := packagedJVMBenchmarkArtifact{
@@ -4081,19 +4346,19 @@ func validatePackagedJVMBenchmarkSeries(
 	return nil
 }
 
-func validatePackagedJVMBenchmarkArtifactV2(artifact packagedJVMBenchmarkArtifactV2) error {
-	if artifact.SchemaVersion != packagedJVMBenchmarkArtifactV2SchemaVersion ||
-		artifact.Benchmark != packagedJVMBenchmarkArtifactV2Name {
-		return fmt.Errorf("unexpected packaged JVM benchmark v2 identity: %d/%q", artifact.SchemaVersion, artifact.Benchmark)
+func validatePackagedJVMBenchmarkArtifactV3(artifact packagedJVMBenchmarkArtifactV3) error {
+	if artifact.SchemaVersion != packagedJVMBenchmarkArtifactV3SchemaVersion ||
+		artifact.Benchmark != packagedJVMBenchmarkArtifactV3Name {
+		return fmt.Errorf("unexpected packaged JVM benchmark v3 identity: %d/%q", artifact.SchemaVersion, artifact.Benchmark)
 	}
 	createdAt, err := time.Parse(time.RFC3339Nano, artifact.CreatedAt)
 	if err != nil || createdAt.Location() != time.UTC {
-		return fmt.Errorf("invalid packaged JVM benchmark v2 creation time: %q", artifact.CreatedAt)
+		return fmt.Errorf("invalid packaged JVM benchmark v3 creation time: %q", artifact.CreatedAt)
 	}
-	if artifact.Provenance.Harness != expectedPackagedJVMBenchmarkV2Provenance.Harness ||
-		!slices.Equal(artifact.Provenance.Measures, expectedPackagedJVMBenchmarkV2Provenance.Measures) ||
-		!slices.Equal(artifact.Provenance.Excludes, expectedPackagedJVMBenchmarkV2Provenance.Excludes) {
-		return errors.New("unexpected packaged JVM benchmark v2 provenance")
+	if artifact.Provenance.Harness != expectedPackagedJVMBenchmarkV3Provenance.Harness ||
+		!slices.Equal(artifact.Provenance.Measures, expectedPackagedJVMBenchmarkV3Provenance.Measures) ||
+		!slices.Equal(artifact.Provenance.Excludes, expectedPackagedJVMBenchmarkV3Provenance.Excludes) {
+		return errors.New("unexpected packaged JVM benchmark v3 provenance")
 	}
 	expectedUnix := packagedJVMBenchmarkArtifactV2UnixProvenance{
 		Server:             "javabridge.NewServer production authenticated Unix server in an identity-bound /tmp child removed and proven absent per series",
@@ -4103,7 +4368,7 @@ func validatePackagedJVMBenchmarkArtifactV2(artifact packagedJVMBenchmarkArtifac
 		SocketPathRetained: false,
 	}
 	if artifact.Provenance.Unix != expectedUnix {
-		return errors.New("unexpected packaged JVM benchmark v2 Unix provenance")
+		return errors.New("unexpected packaged JVM benchmark v3 Unix provenance")
 	}
 	if err := validatePackagedJVMBenchmarkSource(artifact.Source); err != nil {
 		return err
@@ -4151,15 +4416,20 @@ func validatePackagedJVMBenchmarkArtifactV2(artifact packagedJVMBenchmarkArtifac
 		Environment: slices.Clone(expectedPackagedJVMBenchmarkEnvironment),
 	}
 	if !packagedJVMBenchmarkV2SetupEqual(artifact.Setup, expectedSetup) {
-		return errors.New("unexpected packaged JVM benchmark v2 setup")
+		return errors.New("unexpected packaged JVM benchmark v3 setup")
 	}
 	if len(artifact.Series) != len(packagedJVMBenchmarkV2SeriesSpecs) {
-		return fmt.Errorf("unexpected packaged JVM benchmark v2 series count: %d", len(artifact.Series))
+		return fmt.Errorf("unexpected packaged JVM benchmark v3 series count: %d", len(artifact.Series))
 	}
 	for index, spec := range packagedJVMBenchmarkV2SeriesSpecs {
 		if err := validatePackagedJVMBenchmarkSeriesV2(artifact.Series[index], spec); err != nil {
-			return fmt.Errorf("packaged JVM benchmark v2 series %d: %w", index, err)
+			return fmt.Errorf("packaged JVM benchmark v3 series %d: %w", index, err)
 		}
+	}
+	if err := validatePackagedJVMBenchmarkLookupContentionIndicator(
+		artifact.LookupContentionIndicator, artifact.Series,
+	); err != nil {
+		return err
 	}
 	return nil
 }
@@ -4197,8 +4467,9 @@ func validatePackagedJVMBenchmarkCgroupBPFV2(
 	cgroup packagedJVMBenchmarkArtifactV2CgroupBPF,
 	target string,
 ) error {
-	totalBatches := len(packagedJVMBenchmarkV2SeriesSpecs) *
-		(packagedJVMBenchmarkWarmupIterations + packagedJVMBenchmarkMeasurementIterations)
+	totalBatches := len(packagedJVMBenchmarkV2SeriesSpecs)*
+		(packagedJVMBenchmarkWarmupIterations+packagedJVMBenchmarkMeasurementIterations) +
+		packagedJVMBenchmarkWarmupIterations + packagedJVMBenchmarkMeasurementIterations
 	totalCalls := packagedJVMBenchmarkV2Concurrency *
 		(packagedJVMBenchmarkWarmupIterations + packagedJVMBenchmarkMeasurementIterations)
 	primarySeries := 0
@@ -4207,13 +4478,16 @@ func validatePackagedJVMBenchmarkCgroupBPFV2(
 			primarySeries++
 		}
 	}
+	expectedPrimaryCalls := primarySeries*totalCalls +
+		packagedJVMBenchmarkV3LookupContentionBaselineConcurrency*
+			(packagedJVMBenchmarkWarmupIterations+packagedJVMBenchmarkMeasurementIterations)
 	checks := cgroup.StabilityChecks
 	if checks.ExpectedBatches != totalBatches ||
-		checks.ExpectedPrimaryCalls != primarySeries*totalCalls ||
+		checks.ExpectedPrimaryCalls != expectedPrimaryCalls ||
 		checks.ObservedPreBatchSnapshots != totalBatches ||
 		checks.ObservedPostBatchSnapshots != totalBatches ||
 		checks.QueryErrors != 0 || checks.TopologyMismatches != 0 {
-		return errors.New("packaged JVM benchmark v2 BPF stability checks are incomplete or failed")
+		return errors.New("packaged JVM benchmark v3 BPF stability checks are incomplete or failed")
 	}
 	legacy := packagedJVMBenchmarkArtifactCgroupBPF{
 		TargetCgroup:             cgroup.TargetCgroup,
@@ -4240,15 +4514,25 @@ func validatePackagedJVMBenchmarkSeriesV2(
 	series packagedJVMBenchmarkArtifactV2Series,
 	spec packagedJVMBenchmarkV2SeriesSpec,
 ) error {
+	return validatePackagedJVMBenchmarkSeriesV2AtConcurrency(
+		series, spec, packagedJVMBenchmarkV2Concurrency,
+	)
+}
+
+func validatePackagedJVMBenchmarkSeriesV2AtConcurrency(
+	series packagedJVMBenchmarkArtifactV2Series,
+	spec packagedJVMBenchmarkV2SeriesSpec,
+	concurrency int,
+) error {
 	if series.Scope != spec.Scope || series.Transport != spec.Transport ||
 		series.Outcome != spec.Outcome || series.ExpectedStatus != spec.ExpectedStatus {
 		return fmt.Errorf("unexpected identity: got %s/%s/%s/%d", series.Scope, series.Transport, series.Outcome, series.ExpectedStatus)
 	}
-	retainedCalls := packagedJVMBenchmarkV2Concurrency * packagedJVMBenchmarkMeasurementIterations
+	retainedCalls := concurrency * packagedJVMBenchmarkMeasurementIterations
 	if len(series.SamplesNS) != retainedCalls ||
 		len(series.Allocation.SamplesBytes) != retainedCalls ||
 		len(series.Allocation.ControlSamplesBytes) != retainedCalls {
-		return errors.New("unexpected packaged JVM benchmark v2 retained sample count")
+		return errors.New("unexpected packaged JVM benchmark v3 retained sample count")
 	}
 	if err := validatePackagedJVMBenchmarkV2Summary(
 		series.SamplesNS, true, series.TotalTimedNS, series.P50NS, series.P95NS, series.P99NS,
@@ -4257,7 +4541,7 @@ func validatePackagedJVMBenchmarkSeriesV2(
 	}
 	if series.Allocation.Method != "com.sun.management.ThreadMXBean.getThreadAllocatedBytes" ||
 		series.Allocation.Control != "paired consecutive counter reads on the same worker" {
-		return errors.New("unexpected packaged JVM benchmark v2 allocation method")
+		return errors.New("unexpected packaged JVM benchmark v3 allocation method")
 	}
 	if err := validatePackagedJVMBenchmarkV2Summary(
 		series.Allocation.SamplesBytes, false, series.Allocation.TotalBytes,
@@ -4272,11 +4556,11 @@ func validatePackagedJVMBenchmarkSeriesV2(
 	); err != nil {
 		return fmt.Errorf("allocation control: %w", err)
 	}
-	totalCalls := packagedJVMBenchmarkV2Concurrency *
+	totalCalls := concurrency *
 		(packagedJVMBenchmarkWarmupIterations + packagedJVMBenchmarkMeasurementIterations)
 	if series.Statuses.total() != totalCalls ||
 		packagedJVMBenchmarkV2StatusCount(series.Statuses, spec.ExpectedStatus) != totalCalls {
-		return errors.New("unexpected packaged JVM benchmark v2 status distribution")
+		return errors.New("unexpected packaged JVM benchmark v3 status distribution")
 	}
 	expectedBridge := 0
 	if spec.Scope == "bridge_provider_jni" {
@@ -4316,7 +4600,7 @@ func validatePackagedJVMBenchmarkSeriesV2(
 		expectedCalls.PrimaryBPFStatusAfter = series.Calls.PrimaryBPFStatusAfter
 		if series.Calls.PrimaryBPFStatusAfter < series.Calls.PrimaryBPFStatusBefore ||
 			series.Calls.PrimaryBPFStatusAfter-series.Calls.PrimaryBPFStatusBefore != uint64(expectedPrimary) {
-			return errors.New("packaged JVM benchmark v2 primary BPF status delta is inconsistent")
+			return errors.New("packaged JVM benchmark v3 primary BPF status delta is inconsistent")
 		}
 	}
 	if expectedServer != 0 || expectedTimeout != 0 {
@@ -4326,18 +4610,74 @@ func validatePackagedJVMBenchmarkSeriesV2(
 		expectedDelta := expectedServer + expectedTimeout
 		if series.Calls.UnixServerStatusAfter < series.Calls.UnixServerStatusBefore ||
 			series.Calls.UnixServerStatusAfter-series.Calls.UnixServerStatusBefore != uint64(expectedDelta) {
-			return errors.New("packaged JVM benchmark v2 Unix server status delta is inconsistent")
+			return errors.New("packaged JVM benchmark v3 Unix server status delta is inconsistent")
 		}
 	}
 	if series.Calls != expectedCalls {
-		return errors.New("packaged JVM benchmark v2 call deltas are incomplete or inconsistent")
+		return errors.New("packaged JVM benchmark v3 call deltas are incomplete or inconsistent")
 	}
 	if !series.Correct {
-		return errors.New("packaged JVM benchmark v2 series is not correct")
+		return errors.New("packaged JVM benchmark v3 series is not correct")
 	}
 	expectedGate := packagedJVMBenchmarkV2Gate(spec, series.P50NS, series.P99NS)
 	if series.LatencyGate != expectedGate {
-		return errors.New("inconsistent packaged JVM benchmark v2 latency gate")
+		return errors.New("inconsistent packaged JVM benchmark v3 latency gate")
+	}
+	return nil
+}
+
+func validatePackagedJVMBenchmarkLookupContentionIndicator(
+	indicator packagedJVMBenchmarkArtifactV3LookupContentionIndicator,
+	series []packagedJVMBenchmarkArtifactV2Series,
+) error {
+	if indicator.Kind != packagedJVMBenchmarkV3LookupContentionKind ||
+		indicator.OnlyVariedDimension != packagedJVMBenchmarkV3LookupContentionOnlyVariedDimension ||
+		indicator.ComparisonControl != packagedJVMBenchmarkV3LookupContentionComparisonControl ||
+		indicator.Interpretation != packagedJVMBenchmarkV3LookupContentionInterpretation ||
+		indicator.ExactBPFLockWaitMeasured {
+		return errors.New("packaged JVM benchmark lookup-contention indicator attribution is invalid")
+	}
+	if err := validatePackagedJVMBenchmarkSeriesV2AtConcurrency(
+		indicator.Concurrency1,
+		packagedJVMBenchmarkV3LookupContentionSpec,
+		packagedJVMBenchmarkV3LookupContentionBaselineConcurrency,
+	); err != nil {
+		return fmt.Errorf("packaged JVM benchmark concurrency-1 lookup-contention sample: %w", err)
+	}
+	if err := validatePackagedJVMBenchmarkSeriesV2AtConcurrency(
+		indicator.Concurrency8,
+		packagedJVMBenchmarkV3LookupContentionSpec,
+		packagedJVMBenchmarkV2Concurrency,
+	); err != nil {
+		return fmt.Errorf("packaged JVM benchmark concurrency-8 lookup-contention sample: %w", err)
+	}
+	if indicator.Concurrency1.Calls.PrimaryBPFStatusBefore != 0 ||
+		indicator.Concurrency1.Calls.PrimaryBPFStatusAfter !=
+			indicator.Concurrency8.Calls.PrimaryBPFStatusBefore {
+		return errors.New("packaged JVM benchmark lookup-contention status-counter continuity is invalid")
+	}
+	var canonicalConcurrency8 *packagedJVMBenchmarkArtifactV2Series
+	for index := range series {
+		candidate := &series[index]
+		if candidate.Scope == packagedJVMBenchmarkV3LookupContentionSpec.Scope &&
+			candidate.Transport == packagedJVMBenchmarkV3LookupContentionSpec.Transport &&
+			candidate.Outcome == packagedJVMBenchmarkV3LookupContentionSpec.Outcome &&
+			candidate.ExpectedStatus == packagedJVMBenchmarkV3LookupContentionSpec.ExpectedStatus {
+			if canonicalConcurrency8 != nil {
+				return errors.New("packaged JVM benchmark lookup-contention series is not unique")
+			}
+			canonicalConcurrency8 = candidate
+		}
+	}
+	if canonicalConcurrency8 == nil || !reflect.DeepEqual(indicator.Concurrency8, *canonicalConcurrency8) {
+		return errors.New("packaged JVM benchmark concurrency-8 lookup-contention sample differs from the canonical series")
+	}
+	expectedGate := packagedJVMBenchmarkV3LookupContentionGate(
+		indicator.Concurrency1.P99NS,
+		indicator.Concurrency8.P99NS,
+	)
+	if indicator.RelativeP99Gate != expectedGate {
+		return errors.New("packaged JVM benchmark lookup-contention relative p99 gate is inconsistent")
 	}
 	return nil
 }
@@ -4408,20 +4748,20 @@ func packagedJVMBenchmarkV2StatusCount(
 	}
 }
 
-func writePackagedJVMBenchmarkArtifactV2(
+func writePackagedJVMBenchmarkArtifactV3(
 	artifactPath string,
-	artifact packagedJVMBenchmarkArtifactV2,
+	artifact packagedJVMBenchmarkArtifactV3,
 ) error {
-	if err := validatePackagedJVMBenchmarkArtifactV2(artifact); err != nil {
+	if err := validatePackagedJVMBenchmarkArtifactV3(artifact); err != nil {
 		return err
 	}
 	payload, err := json.Marshal(artifact)
 	if err != nil {
-		return fmt.Errorf("marshal packaged JVM benchmark v2 artifact: %w", err)
+		return fmt.Errorf("marshal packaged JVM benchmark v3 artifact: %w", err)
 	}
 	payload = append(payload, '\n')
-	if len(payload) > packagedJVMBenchmarkV2MaxArtifactBytes {
-		return errors.New("packaged JVM benchmark v2 artifact is too large")
+	if len(payload) > packagedJVMBenchmarkV3MaxArtifactBytes {
+		return errors.New("packaged JVM benchmark v3 artifact is too large")
 	}
 
 	directoryFD, artifactName, err := openBenchmarkArtifactDirectory(artifactPath)
@@ -4444,20 +4784,20 @@ func writePackagedJVMBenchmarkArtifactV2(
 		}
 	}()
 	if _, err := temporary.Write(payload); err != nil {
-		return fmt.Errorf("write packaged JVM benchmark v2 artifact: %w", err)
+		return fmt.Errorf("write packaged JVM benchmark v3 artifact: %w", err)
 	}
 	if err := temporary.Chmod(0o600); err != nil {
-		return fmt.Errorf("set packaged JVM benchmark v2 artifact permissions: %w", err)
+		return fmt.Errorf("set packaged JVM benchmark v3 artifact permissions: %w", err)
 	}
 	if err := temporary.Sync(); err != nil {
-		return fmt.Errorf("sync packaged JVM benchmark v2 artifact: %w", err)
+		return fmt.Errorf("sync packaged JVM benchmark v3 artifact: %w", err)
 	}
 	if err := temporary.Close(); err != nil {
-		return fmt.Errorf("close packaged JVM benchmark v2 artifact: %w", err)
+		return fmt.Errorf("close packaged JVM benchmark v3 artifact: %w", err)
 	}
 	temporaryClosed = true
 	if err := unix.Linkat(directoryFD, temporaryName, directoryFD, artifactName, 0); err != nil {
-		return fmt.Errorf("publish packaged JVM benchmark v2 artifact: %w", err)
+		return fmt.Errorf("publish packaged JVM benchmark v3 artifact: %w", err)
 	}
 	published = true
 	_ = unix.Unlinkat(directoryFD, temporaryName, 0)
@@ -4553,59 +4893,59 @@ func decodePackagedJVMBenchmarkArtifact(input io.Reader) (packagedJVMBenchmarkAr
 	return artifact, nil
 }
 
-func decodePackagedJVMBenchmarkArtifactV2(
+func decodePackagedJVMBenchmarkArtifactV3(
 	input io.Reader,
-) (packagedJVMBenchmarkArtifactV2, error) {
-	payload, err := io.ReadAll(io.LimitReader(input, packagedJVMBenchmarkV2MaxArtifactBytes+1))
+) (packagedJVMBenchmarkArtifactV3, error) {
+	payload, err := io.ReadAll(io.LimitReader(input, packagedJVMBenchmarkV3MaxArtifactBytes+1))
 	if err != nil {
-		return packagedJVMBenchmarkArtifactV2{}, fmt.Errorf("read packaged JVM benchmark v2 artifact: %w", err)
+		return packagedJVMBenchmarkArtifactV3{}, fmt.Errorf("read packaged JVM benchmark v3 artifact: %w", err)
 	}
-	if len(payload) > packagedJVMBenchmarkV2MaxArtifactBytes {
-		return packagedJVMBenchmarkArtifactV2{}, errors.New("packaged JVM benchmark v2 artifact is too large")
+	if len(payload) > packagedJVMBenchmarkV3MaxArtifactBytes {
+		return packagedJVMBenchmarkArtifactV3{}, errors.New("packaged JVM benchmark v3 artifact is too large")
 	}
-	if err := validatePackagedJVMBenchmarkV2UniqueJSON(payload); err != nil {
-		return packagedJVMBenchmarkArtifactV2{}, err
+	if err := validatePackagedJVMBenchmarkV3UniqueJSON(payload); err != nil {
+		return packagedJVMBenchmarkArtifactV3{}, err
 	}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
-	var artifact packagedJVMBenchmarkArtifactV2
+	var artifact packagedJVMBenchmarkArtifactV3
 	if err := decoder.Decode(&artifact); err != nil {
-		return artifact, fmt.Errorf("decode packaged JVM benchmark v2 artifact: %w", err)
+		return artifact, fmt.Errorf("decode packaged JVM benchmark v3 artifact: %w", err)
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return artifact, errors.New("packaged JVM benchmark v2 artifact has trailing JSON")
+		return artifact, errors.New("packaged JVM benchmark v3 artifact has trailing JSON")
 	}
-	if err := validatePackagedJVMBenchmarkArtifactV2(artifact); err != nil {
+	if err := validatePackagedJVMBenchmarkArtifactV3(artifact); err != nil {
 		return artifact, err
 	}
 	return artifact, nil
 }
 
-func validatePackagedJVMBenchmarkV2UniqueJSON(payload []byte) error {
+func validatePackagedJVMBenchmarkV3UniqueJSON(payload []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.UseNumber()
 	if err := consumePackagedJVMBenchmarkJSONValue(
-		decoder, packagedJVMBenchmarkV2JSONSchema(), "$",
+		decoder, packagedJVMBenchmarkV3JSONSchema(), "$",
 	); err != nil {
-		return fmt.Errorf("validate packaged JVM benchmark v2 JSON: %w", err)
+		return fmt.Errorf("validate packaged JVM benchmark v3 JSON: %w", err)
 	}
 	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
 		if err == nil {
-			return errors.New("packaged JVM benchmark v2 artifact has trailing JSON")
+			return errors.New("packaged JVM benchmark v3 artifact has trailing JSON")
 		}
-		return fmt.Errorf("inspect packaged JVM benchmark v2 trailing JSON: %w", err)
+		return fmt.Errorf("inspect packaged JVM benchmark v3 trailing JSON: %w", err)
 	}
 	return nil
 }
 
-func packagedJVMBenchmarkV2JSONSchema() *packagedJVMBenchmarkJSONSchema {
-	return packagedJVMBenchmarkV2JSONSchemaForType(
-		reflect.TypeOf(packagedJVMBenchmarkArtifactV2{}),
+func packagedJVMBenchmarkV3JSONSchema() *packagedJVMBenchmarkJSONSchema {
+	return packagedJVMBenchmarkV3JSONSchemaForType(
+		reflect.TypeOf(packagedJVMBenchmarkArtifactV3{}),
 	)
 }
 
-func packagedJVMBenchmarkV2JSONSchemaForType(
+func packagedJVMBenchmarkV3JSONSchemaForType(
 	typeOf reflect.Type,
 ) *packagedJVMBenchmarkJSONSchema {
 	switch typeOf.Kind() {
@@ -4619,7 +4959,7 @@ func packagedJVMBenchmarkV2JSONSchemaForType(
 	case reflect.Slice, reflect.Array:
 		return &packagedJVMBenchmarkJSONSchema{
 			kind:    packagedJVMBenchmarkJSONKindArray,
-			element: packagedJVMBenchmarkV2JSONSchemaForType(typeOf.Elem()),
+			element: packagedJVMBenchmarkV3JSONSchemaForType(typeOf.Elem()),
 		}
 	case reflect.Struct:
 		fields := make(map[string]*packagedJVMBenchmarkJSONSchema, typeOf.NumField())
@@ -4632,14 +4972,14 @@ func packagedJVMBenchmarkV2JSONSchemaForType(
 			if name == "-" {
 				continue
 			}
-			fields[name] = packagedJVMBenchmarkV2JSONSchemaForType(field.Type)
+			fields[name] = packagedJVMBenchmarkV3JSONSchemaForType(field.Type)
 		}
 		return &packagedJVMBenchmarkJSONSchema{
 			kind:   packagedJVMBenchmarkJSONKindObject,
 			fields: fields,
 		}
 	default:
-		panic(fmt.Sprintf("unsupported packaged JVM benchmark v2 JSON type %s", typeOf))
+		panic(fmt.Sprintf("unsupported packaged JVM benchmark v3 JSON type %s", typeOf))
 	}
 }
 
@@ -6361,7 +6701,7 @@ func TestValidatePackagedJVMBenchmarkArtifactFile(t *testing.T) {
 	file, err := os.Open(artifactPath)
 	require.NoError(t, err)
 	defer file.Close()
-	_, err = decodePackagedJVMBenchmarkArtifactV2(file)
+	_, err = decodePackagedJVMBenchmarkArtifactV3(file)
 	require.NoError(t, err)
 }
 
@@ -6393,7 +6733,7 @@ func TestValidatePackagedJVMBenchmarkArtifactCICrosslinks(t *testing.T) {
 	file, err := os.Open(artifactPath)
 	require.NoError(t, err)
 	defer file.Close()
-	artifact, err := decodePackagedJVMBenchmarkArtifactV2(file)
+	artifact, err := decodePackagedJVMBenchmarkArtifactV3(file)
 	require.NoError(t, err)
 	agentIdentity, err := packagedJVMBenchmarkFileIdentityAtPath(agentPath)
 	require.NoError(t, err)
@@ -6480,9 +6820,9 @@ func TestValidatePackagedJVMBenchmarkArtifactCICrosslinksRejectsMutations(t *tes
 	}
 }
 
-func TestPackagedJVMBenchmarkArtifactV2StrictContract(t *testing.T) {
-	artifact := validPackagedJVMBenchmarkArtifactV2()
-	require.NoError(t, validatePackagedJVMBenchmarkArtifactV2(artifact))
+func TestPackagedJVMBenchmarkArtifactV3StrictContract(t *testing.T) {
+	artifact := validPackagedJVMBenchmarkArtifactV3()
+	require.NoError(t, validatePackagedJVMBenchmarkArtifactV3(artifact))
 	require.Len(t, artifact.Series, 14)
 	for index, spec := range packagedJVMBenchmarkV2SeriesSpecs {
 		require.Equal(t, spec.Scope, artifact.Series[index].Scope)
@@ -6490,46 +6830,145 @@ func TestPackagedJVMBenchmarkArtifactV2StrictContract(t *testing.T) {
 		require.Equal(t, spec.Outcome, artifact.Series[index].Outcome)
 		require.Equal(t, spec.ExpectedStatus, artifact.Series[index].ExpectedStatus)
 	}
+	indicator := artifact.LookupContentionIndicator
+	require.Equal(t, packagedJVMBenchmarkV3LookupContentionKind, indicator.Kind)
+	require.Equal(t, packagedJVMBenchmarkV3LookupContentionOnlyVariedDimension, indicator.OnlyVariedDimension)
+	require.False(t, indicator.ExactBPFLockWaitMeasured)
+	require.Len(t, indicator.Concurrency1.SamplesNS,
+		packagedJVMBenchmarkV3LookupContentionBaselineConcurrency*packagedJVMBenchmarkMeasurementIterations)
+	require.Equal(t, artifact.Series[0], indicator.Concurrency8)
+	require.Zero(t, indicator.Concurrency1.Calls.PrimaryBPFStatusBefore)
+	require.Equal(t, indicator.Concurrency1.Calls.PrimaryBPFStatusAfter,
+		indicator.Concurrency8.Calls.PrimaryBPFStatusBefore)
+	require.Equal(t, packagedJVMBenchmarkV3LookupContentionP99Multiplier,
+		indicator.RelativeP99Gate.P99Multiplier)
+	require.True(t, indicator.Concurrency1.LatencyGate.Passed)
+	require.True(t, indicator.Concurrency8.LatencyGate.Passed)
+	require.True(t, indicator.RelativeP99Gate.Passed)
 	payload, err := json.Marshal(artifact)
 	require.NoError(t, err)
-	require.Less(t, len(payload), packagedJVMBenchmarkV2MaxArtifactBytes)
-	decoded, err := decodePackagedJVMBenchmarkArtifactV2(bytes.NewReader(payload))
+	require.Less(t, len(payload), packagedJVMBenchmarkV3MaxArtifactBytes)
+	decoded, err := decodePackagedJVMBenchmarkArtifactV3(bytes.NewReader(payload))
 	require.NoError(t, err)
 	require.Equal(t, artifact, decoded)
 }
 
-func TestPackagedJVMBenchmarkArtifactV2RejectsSemanticMutations(t *testing.T) {
+func TestPackagedJVMBenchmarkArtifactV3RejectsSemanticMutations(t *testing.T) {
 	tests := []struct {
 		name      string
-		mutate    func(*packagedJVMBenchmarkArtifactV2)
+		mutate    func(*packagedJVMBenchmarkArtifactV3)
 		wantError string
 	}{
-		{"schema", func(a *packagedJVMBenchmarkArtifactV2) { a.SchemaVersion = 1 }, "v2 identity"},
-		{"series order", func(a *packagedJVMBenchmarkArtifactV2) { a.Series[0], a.Series[1] = a.Series[1], a.Series[0] }, "unexpected identity"},
-		{"latency sample", func(a *packagedJVMBenchmarkArtifactV2) { a.Series[0].SamplesNS[0]++ }, "summary does not match"},
-		{"allocation sample", func(a *packagedJVMBenchmarkArtifactV2) { a.Series[0].Allocation.SamplesBytes[0]++ }, "summary does not match"},
-		{"allocation control", func(a *packagedJVMBenchmarkArtifactV2) { a.Series[0].Allocation.ControlSamplesBytes[0]++ }, "summary does not match"},
-		{"status", func(a *packagedJVMBenchmarkArtifactV2) { a.Series[0].Statuses.Missing-- }, "status distribution"},
-		{"native calls", func(a *packagedJVMBenchmarkArtifactV2) { a.Series[0].Calls.ObservedNativeCalls-- }, "call deltas"},
-		{"BPF delta", func(a *packagedJVMBenchmarkArtifactV2) { a.Series[0].Calls.PrimaryBPFStatusAfter-- }, "BPF status delta"},
-		{"server delta", func(a *packagedJVMBenchmarkArtifactV2) { a.Series[6].Calls.UnixServerStatusAfter-- }, "Unix server status delta"},
-		{"gate", func(a *packagedJVMBenchmarkArtifactV2) { a.Series[0].LatencyGate.Passed = false }, "latency gate"},
-		{"batch snapshots", func(a *packagedJVMBenchmarkArtifactV2) {
+		{"schema v2", func(a *packagedJVMBenchmarkArtifactV3) { a.SchemaVersion = 2 }, "v3 identity"},
+		{"series order", func(a *packagedJVMBenchmarkArtifactV3) { a.Series[0], a.Series[1] = a.Series[1], a.Series[0] }, "unexpected identity"},
+		{"latency sample", func(a *packagedJVMBenchmarkArtifactV3) { a.Series[0].SamplesNS[0]++ }, "summary does not match"},
+		{"allocation sample", func(a *packagedJVMBenchmarkArtifactV3) { a.Series[0].Allocation.SamplesBytes[0]++ }, "summary does not match"},
+		{"allocation control", func(a *packagedJVMBenchmarkArtifactV3) { a.Series[0].Allocation.ControlSamplesBytes[0]++ }, "summary does not match"},
+		{"status", func(a *packagedJVMBenchmarkArtifactV3) { a.Series[0].Statuses.Missing-- }, "status distribution"},
+		{"native calls", func(a *packagedJVMBenchmarkArtifactV3) { a.Series[0].Calls.ObservedNativeCalls-- }, "call deltas"},
+		{"BPF delta", func(a *packagedJVMBenchmarkArtifactV3) { a.Series[0].Calls.PrimaryBPFStatusAfter-- }, "BPF status delta"},
+		{"server delta", func(a *packagedJVMBenchmarkArtifactV3) { a.Series[6].Calls.UnixServerStatusAfter-- }, "Unix server status delta"},
+		{"gate", func(a *packagedJVMBenchmarkArtifactV3) { a.Series[0].LatencyGate.Passed = false }, "latency gate"},
+		{"contention kind", func(a *packagedJVMBenchmarkArtifactV3) {
+			a.LookupContentionIndicator.Kind = "bpf_lock_wait"
+		}, "indicator attribution"},
+		{"contention varied dimension", func(a *packagedJVMBenchmarkArtifactV3) {
+			a.LookupContentionIndicator.OnlyVariedDimension = "worker_count_and_fixture"
+		}, "indicator attribution"},
+		{"contention control", func(a *packagedJVMBenchmarkArtifactV3) {
+			a.LookupContentionIndicator.ComparisonControl = "none"
+		}, "indicator attribution"},
+		{"contention interpretation", func(a *packagedJVMBenchmarkArtifactV3) {
+			a.LookupContentionIndicator.Interpretation = "exact BPF lock wait"
+		}, "indicator attribution"},
+		{"contention exact lock claim", func(a *packagedJVMBenchmarkArtifactV3) {
+			a.LookupContentionIndicator.ExactBPFLockWaitMeasured = true
+		}, "indicator attribution"},
+		{"contention c1 sample", func(a *packagedJVMBenchmarkArtifactV3) {
+			a.LookupContentionIndicator.Concurrency1.SamplesNS[0]++
+		}, "summary does not match"},
+		{"contention c1 status", func(a *packagedJVMBenchmarkArtifactV3) {
+			a.LookupContentionIndicator.Concurrency1.Statuses.Valid--
+		}, "status distribution"},
+		{"contention c1 calls", func(a *packagedJVMBenchmarkArtifactV3) {
+			a.LookupContentionIndicator.Concurrency1.Calls.ObservedPrimaryBPFCalls--
+		}, "call deltas"},
+		{"contention c1 counter origin", func(a *packagedJVMBenchmarkArtifactV3) {
+			a.LookupContentionIndicator.Concurrency1.Calls.PrimaryBPFStatusBefore++
+			a.LookupContentionIndicator.Concurrency1.Calls.PrimaryBPFStatusAfter++
+		}, "status-counter continuity"},
+		{"contention intervening primary work", func(a *packagedJVMBenchmarkArtifactV3) {
+			a.LookupContentionIndicator.Concurrency8.Calls.PrimaryBPFStatusBefore++
+			a.LookupContentionIndicator.Concurrency8.Calls.PrimaryBPFStatusAfter++
+			a.Series[0].Calls.PrimaryBPFStatusBefore++
+			a.Series[0].Calls.PrimaryBPFStatusAfter++
+		}, "status-counter continuity"},
+		{"contention c1 absolute gate", func(a *packagedJVMBenchmarkArtifactV3) {
+			a.LookupContentionIndicator.Concurrency1.LatencyGate.Passed = false
+		}, "latency gate"},
+		{"contention c8 canonical copy", func(a *packagedJVMBenchmarkArtifactV3) {
+			a.LookupContentionIndicator.Concurrency8.SamplesNS[0]++
+		}, "summary does not match"},
+		{"contention relative multiplier", func(a *packagedJVMBenchmarkArtifactV3) {
+			a.LookupContentionIndicator.RelativeP99Gate.P99Multiplier++
+		}, "relative p99 gate"},
+		{"contention relative c1 p99", func(a *packagedJVMBenchmarkArtifactV3) {
+			a.LookupContentionIndicator.RelativeP99Gate.Concurrency1P99NS++
+		}, "relative p99 gate"},
+		{"contention relative c8 p99", func(a *packagedJVMBenchmarkArtifactV3) {
+			a.LookupContentionIndicator.RelativeP99Gate.Concurrency8P99NS++
+		}, "relative p99 gate"},
+		{"contention relative maximum", func(a *packagedJVMBenchmarkArtifactV3) {
+			a.LookupContentionIndicator.RelativeP99Gate.Concurrency8P99MaxNS++
+		}, "relative p99 gate"},
+		{"contention relative result", func(a *packagedJVMBenchmarkArtifactV3) {
+			a.LookupContentionIndicator.RelativeP99Gate.Passed = false
+		}, "relative p99 gate"},
+		{"batch snapshots", func(a *packagedJVMBenchmarkArtifactV3) {
 			a.Provenance.CgroupBPF.StabilityChecks.ObservedPostBatchSnapshots--
 		}, "stability checks"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			artifact := validPackagedJVMBenchmarkArtifactV2()
+			artifact := validPackagedJVMBenchmarkArtifactV3()
 			test.mutate(&artifact)
-			require.ErrorContains(t, validatePackagedJVMBenchmarkArtifactV2(artifact), test.wantError)
+			require.ErrorContains(t, validatePackagedJVMBenchmarkArtifactV3(artifact), test.wantError)
 		})
 	}
 }
 
-func TestDecodePackagedJVMBenchmarkArtifactV2RejectsStructuralMutations(t *testing.T) {
-	payload, err := json.Marshal(validPackagedJVMBenchmarkArtifactV2())
+func TestPackagedJVMBenchmarkArtifactV3RetainsFailedLookupContentionGate(t *testing.T) {
+	artifact := validPackagedJVMBenchmarkArtifactV3()
+	baseline := artifact.LookupContentionIndicator.Concurrency1
+	observation := packagedJVMBenchmarkV2SeriesObservation{
+		Spec:                   packagedJVMBenchmarkV3LookupContentionSpec,
+		SamplesNS:              slices.Repeat([]int64{40_000}, len(baseline.SamplesNS)),
+		AllocatedBytes:         baseline.Allocation.SamplesBytes,
+		AllocationControlBytes: baseline.Allocation.ControlSamplesBytes,
+		Statuses:               baseline.Statuses,
+		Calls:                  baseline.Calls,
+	}
+	artifact.LookupContentionIndicator.Concurrency1 =
+		summarizePackagedJVMBenchmarkSeriesV2(observation)
+	artifact.LookupContentionIndicator.RelativeP99Gate = packagedJVMBenchmarkV3LookupContentionGate(
+		artifact.LookupContentionIndicator.Concurrency1.P99NS,
+		artifact.LookupContentionIndicator.Concurrency8.P99NS,
+	)
+	require.False(t, artifact.LookupContentionIndicator.RelativeP99Gate.Passed)
+	require.True(t, artifact.LookupContentionIndicator.Concurrency1.LatencyGate.Passed)
+	require.True(t, artifact.LookupContentionIndicator.Concurrency8.LatencyGate.Passed)
+	require.NoError(t, validatePackagedJVMBenchmarkArtifactV3(artifact))
+}
+
+func TestDecodePackagedJVMBenchmarkArtifactV3RejectsStructuralMutations(t *testing.T) {
+	payload, err := json.Marshal(validPackagedJVMBenchmarkArtifactV3())
 	require.NoError(t, err)
+	indicatorStart := bytes.Index(payload, []byte(`"lookup_contention_indicator":`))
+	require.GreaterOrEqual(t, indicatorStart, 0)
+	seriesStart := bytes.Index(payload[indicatorStart:], []byte(`,"series":`))
+	require.GreaterOrEqual(t, seriesStart, 0)
+	seriesStart += indicatorStart
+	missingIndicator := append(slices.Clone(payload[:indicatorStart]), payload[seriesStart+1:]...)
 	tests := []struct {
 		name      string
 		payload   []byte
@@ -6537,20 +6976,36 @@ func TestDecodePackagedJVMBenchmarkArtifactV2RejectsStructuralMutations(t *testi
 	}{
 		{
 			name: "unknown",
-			payload: bytes.Replace(payload, []byte(`{"schema_version":2,`),
-				[]byte(`{"unknown_root":0,"schema_version":2,`), 1),
+			payload: bytes.Replace(payload, []byte(`{"schema_version":3,`),
+				[]byte(`{"unknown_root":0,"schema_version":3,`), 1),
 			wantError: "unknown field",
 		},
 		{
 			name: "duplicate",
-			payload: bytes.Replace(payload, []byte(`{"schema_version":2,`),
-				[]byte(`{"schema_version":2,"schema_version":2,`), 1),
+			payload: bytes.Replace(payload, []byte(`{"schema_version":3,`),
+				[]byte(`{"schema_version":3,"schema_version":3,`), 1),
 			wantError: "duplicate JSON name",
 		},
 		{
 			name:      "null",
 			payload:   bytes.Replace(payload, []byte(`"correct":true`), []byte(`"correct":null`), 1),
 			wantError: "must not be null",
+		},
+		{
+			name:      "missing contention indicator",
+			payload:   missingIndicator,
+			wantError: `missing required field "lookup_contention_indicator"`,
+		},
+		{
+			name: "null exact lock measurement",
+			payload: bytes.Replace(payload, []byte(`"exact_bpf_lock_wait_measured":false`),
+				[]byte(`"exact_bpf_lock_wait_measured":null`), 1),
+			wantError: "must not be null",
+		},
+		{
+			name:      "missing relative multiplier",
+			payload:   bytes.Replace(payload, []byte(`"p99_multiplier":2,`), nil, 1),
+			wantError: `missing required field "p99_multiplier"`,
 		},
 		{
 			name:      "omitted zero",
@@ -6565,16 +7020,17 @@ func TestDecodePackagedJVMBenchmarkArtifactV2RejectsStructuralMutations(t *testi
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			_, err := decodePackagedJVMBenchmarkArtifactV2(bytes.NewReader(test.payload))
+			_, err := decodePackagedJVMBenchmarkArtifactV3(bytes.NewReader(test.payload))
 			require.ErrorContains(t, err, test.wantError)
 		})
 	}
 }
 
-func validPackagedJVMBenchmarkArtifactV2() packagedJVMBenchmarkArtifactV2 {
+func validPackagedJVMBenchmarkArtifactV3() packagedJVMBenchmarkArtifactV3 {
 	legacy := validPackagedJVMBenchmarkArtifact()
-	totalBatches := len(packagedJVMBenchmarkV2SeriesSpecs) *
-		(packagedJVMBenchmarkWarmupIterations + packagedJVMBenchmarkMeasurementIterations)
+	totalBatches := len(packagedJVMBenchmarkV2SeriesSpecs)*
+		(packagedJVMBenchmarkWarmupIterations+packagedJVMBenchmarkMeasurementIterations) +
+		packagedJVMBenchmarkWarmupIterations + packagedJVMBenchmarkMeasurementIterations
 	legacy.Provenance.CgroupBPF.StabilityChecks = packagedJVMBenchmarkArtifactStabilityChecks{
 		ExpectedCalls:             totalBatches,
 		ObservedPreCallSnapshots:  totalBatches,
@@ -6582,6 +7038,10 @@ func validPackagedJVMBenchmarkArtifactV2() packagedJVMBenchmarkArtifactV2 {
 	}
 	retained := packagedJVMBenchmarkV2Concurrency * packagedJVMBenchmarkMeasurementIterations
 	total := packagedJVMBenchmarkV2Concurrency *
+		(packagedJVMBenchmarkWarmupIterations + packagedJVMBenchmarkMeasurementIterations)
+	concurrency1Retained := packagedJVMBenchmarkV3LookupContentionBaselineConcurrency *
+		packagedJVMBenchmarkMeasurementIterations
+	concurrency1Total := packagedJVMBenchmarkV3LookupContentionBaselineConcurrency *
 		(packagedJVMBenchmarkWarmupIterations + packagedJVMBenchmarkMeasurementIterations)
 	observations := make([]packagedJVMBenchmarkV2SeriesObservation, len(packagedJVMBenchmarkV2SeriesSpecs))
 	for index, spec := range packagedJVMBenchmarkV2SeriesSpecs {
@@ -6610,6 +7070,9 @@ func validPackagedJVMBenchmarkArtifactV2() packagedJVMBenchmarkArtifactV2 {
 			calls.ExpectedPrimaryBPFCalls, calls.ObservedPrimaryBPFCalls = total, total
 			calls.PrimaryBPFStatus = javabridge.Status(spec.ExpectedStatus).String()
 			calls.PrimaryBPFStatusBefore = uint64(100 + index*total)
+			if spec == packagedJVMBenchmarkV3LookupContentionSpec {
+				calls.PrimaryBPFStatusBefore = uint64(concurrency1Total)
+			}
 			calls.PrimaryBPFStatusAfter = calls.PrimaryBPFStatusBefore + uint64(total)
 		} else {
 			calls.UnixServerStatus = javabridge.Status(spec.ExpectedStatus).String()
@@ -6629,9 +7092,34 @@ func validPackagedJVMBenchmarkArtifactV2() packagedJVMBenchmarkArtifactV2 {
 			Calls:                  calls,
 		}
 	}
-	return newPackagedJVMBenchmarkArtifactV2(
+	concurrency1Statuses := packagedJVMBenchmarkArtifactV2Statuses{Valid: concurrency1Total}
+	concurrency1Calls := packagedJVMBenchmarkArtifactV2Calls{
+		ExpectedJavaCalls:       concurrency1Total,
+		ObservedJavaCalls:       concurrency1Total,
+		ExpectedNativeCalls:     concurrency1Total,
+		ObservedNativeCalls:     concurrency1Total,
+		ExpectedPrimaryBPFCalls: concurrency1Total,
+		ObservedPrimaryBPFCalls: concurrency1Total,
+		PrimaryBPFStatus:        javabridge.StatusValid.String(),
+		PrimaryBPFStatusBefore:  0,
+		PrimaryBPFStatusAfter:   uint64(concurrency1Total),
+		UnixServerStatus:        "not_applicable",
+	}
+	lookupContention := packagedJVMBenchmarkV3LookupContentionObservations{
+		Concurrency1: packagedJVMBenchmarkV2SeriesObservation{
+			Spec:                   packagedJVMBenchmarkV3LookupContentionSpec,
+			SamplesNS:              slices.Repeat([]int64{80_000}, concurrency1Retained),
+			AllocatedBytes:         slices.Repeat([]int64{64}, concurrency1Retained),
+			AllocationControlBytes: slices.Repeat([]int64{0}, concurrency1Retained),
+			Statuses:               concurrency1Statuses,
+			Calls:                  concurrency1Calls,
+		},
+		Concurrency8: observations[0],
+	}
+	return newPackagedJVMBenchmarkArtifactV3(
 		time.Date(2026, time.August, 13, 0, 0, 0, 0, time.UTC),
 		legacy.Source, legacy.Inputs, legacy.Provenance.CgroupBPF, legacy.Runtime, observations,
+		lookupContention,
 	)
 }
 

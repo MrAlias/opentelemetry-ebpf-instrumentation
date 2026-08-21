@@ -103,13 +103,21 @@ func TestJavaRemoteParentPackagedJVMTransportBenchmark(t *testing.T) {
 		os.Getenv(javaRemoteParentPackagedJVMBenchmarkExclusiveCgroupBPFEnv),
 	)
 	require.NoError(t, err)
-	expectedBatches := len(packagedJVMBenchmarkV2SeriesSpecs) *
-		(packagedJVMBenchmarkWarmupIterations + packagedJVMBenchmarkMeasurementIterations)
+	expectedBatches := len(packagedJVMBenchmarkV2SeriesSpecs)*
+		(packagedJVMBenchmarkWarmupIterations+packagedJVMBenchmarkMeasurementIterations) +
+		packagedJVMBenchmarkWarmupIterations + packagedJVMBenchmarkMeasurementIterations
 	cgroupBPFStabilityTracker :=
 		newPackagedJVMBenchmarkCgroupBPFStabilityTrackerForCalls(expectedBatches)
 
 	ctx, cancel := context.WithTimeout(context.Background(), packagedJVMBenchmarkTimeout)
 	defer cancel()
+	nextGeneration := packagedJVMBenchmarkFirstGeneration
+	nextNonce := uint64(1)
+	lookupContentionConcurrency1 := runPackagedJVMBenchmarkLookupContentionBaseline(
+		t, ctx, shell, setpriv, java, javaEnvironment, agentPath, agentIdentity,
+		&objects.BpfJavaRemoteParentMaps, cgroupPath, attachedCgroupBPF,
+		cgroupBPFStabilityTracker, &nextGeneration, &nextNonce,
+	)
 	command := exec.CommandContext(
 		ctx,
 		shell.ResolvedPath,
@@ -165,12 +173,7 @@ func TestJavaRemoteParentPackagedJVMTransportBenchmark(t *testing.T) {
 		waited = exited
 		require.NoErrorf(t, err, "resolve gated launcher process identity: %s", diagnostic)
 	}
-	require.NoError(t, objects.JavaAuthorizedProcesses.Update(
-		process, packagedJVMBenchmarkCapability, ebpf.UpdateAny,
-	))
-	require.NoError(t, objects.JavaProcessIncarnations.Update(
-		process, packagedJVMBenchmarkCapability, ebpf.UpdateAny,
-	))
+	authorizePackagedJVMBenchmarkProcess(t, &objects.BpfJavaRemoteParentMaps, process)
 	_, err = io.WriteString(stdin, "\n")
 	require.NoError(t, err)
 
@@ -269,9 +272,9 @@ func TestJavaRemoteParentPackagedJVMTransportBenchmark(t *testing.T) {
 		require.Equal(t, workers[index].javaSocketCookie, seededSocketCookie)
 	}
 
-	nextGeneration := packagedJVMBenchmarkFirstGeneration
-	nextNonce := uint64(1)
 	observations := make([]packagedJVMBenchmarkV2SeriesObservation, 0, len(packagedJVMBenchmarkV2SeriesSpecs))
+	var lookupContentionConcurrency8 packagedJVMBenchmarkV2SeriesObservation
+	lookupContentionConcurrency8Found := false
 	for _, spec := range packagedJVMBenchmarkV2SeriesSpecs {
 		serverPath := "-"
 		serverUID := uint64(0)
@@ -312,7 +315,7 @@ func TestJavaRemoteParentPackagedJVMTransportBenchmark(t *testing.T) {
 			SamplesNS:              make([]int64, 0, packagedJVMBenchmarkV2Concurrency*packagedJVMBenchmarkMeasurementIterations),
 			AllocatedBytes:         make([]int64, 0, packagedJVMBenchmarkV2Concurrency*packagedJVMBenchmarkMeasurementIterations),
 			AllocationControlBytes: make([]int64, 0, packagedJVMBenchmarkV2Concurrency*packagedJVMBenchmarkMeasurementIterations),
-			Calls:                  packagedJVMBenchmarkExpectedCallsV2(spec),
+			Calls:                  packagedJVMBenchmarkExpectedCallsV2(spec, len(workers)),
 		}
 		var primaryStatsBefore [javaRemoteParentStatCount]uint64
 		if spec.Transport == "getsockopt" {
@@ -562,7 +565,13 @@ func TestJavaRemoteParentPackagedJVMTransportBenchmark(t *testing.T) {
 			)
 		}
 		observations = append(observations, observation)
+		if spec == packagedJVMBenchmarkV3LookupContentionSpec {
+			lookupContentionConcurrency8 = observation
+			lookupContentionConcurrency8Found = true
+		}
 	}
+	require.True(t, lookupContentionConcurrency8Found,
+		"packaged JVM benchmark did not retain the concurrency-8 lookup-contention sample")
 
 	retainedSamples := len(packagedJVMBenchmarkV2SeriesSpecs) *
 		packagedJVMBenchmarkV2Concurrency * packagedJVMBenchmarkMeasurementIterations
@@ -604,10 +613,7 @@ func TestJavaRemoteParentPackagedJVMTransportBenchmark(t *testing.T) {
 	workerDuplicatesClosed = true
 	require.NoError(t, unix.Close(pidfd))
 	pidfdClosed = true
-	deleteBenchmarkMapKey(t, objects.JavaProcessIncarnations, process)
-	deleteBenchmarkMapKey(t, objects.JavaAuthorizedProcesses, process)
-	requireBenchmarkMapKeyAbsent(t, objects.JavaProcessIncarnations, process)
-	requireBenchmarkMapKeyAbsent(t, objects.JavaAuthorizedProcesses, process)
+	removePackagedJVMBenchmarkProcessAuthorization(t, &objects.BpfJavaRemoteParentMaps, process)
 	require.NoError(t, bpfResources.Close(), "close all benchmark BPF links, programs, and maps before publication")
 	require.NoError(t, validatePackagedJVMBenchmarkCgroupBPFPreAttach(
 		queryPackagedJVMBenchmarkCgroupBPF(t, cgroupPath),
@@ -639,7 +645,7 @@ func TestJavaRemoteParentPackagedJVMTransportBenchmark(t *testing.T) {
 	runtimeIdentity := packagedJVMBenchmarkRuntimeIdentity(
 		t, java, javaEnvironment, cgroupPath,
 	)
-	artifact := newPackagedJVMBenchmarkArtifactV2(
+	artifact := newPackagedJVMBenchmarkArtifactV3(
 		startedAt,
 		sourceIdentity,
 		packagedJVMBenchmarkArtifactInputs{
@@ -652,9 +658,13 @@ func TestJavaRemoteParentPackagedJVMTransportBenchmark(t *testing.T) {
 		cgroupBPFAttribution,
 		runtimeIdentity,
 		observations,
+		packagedJVMBenchmarkV3LookupContentionObservations{
+			Concurrency1: lookupContentionConcurrency1,
+			Concurrency8: lookupContentionConcurrency8,
+		},
 	)
 	// Publish structurally valid failed measurements before enforcing the predeclared gate.
-	require.NoError(t, writePackagedJVMBenchmarkArtifactV2(artifactPath, artifact))
+	require.NoError(t, writePackagedJVMBenchmarkArtifactV3(artifactPath, artifact))
 	for _, series := range artifact.Series {
 		require.Truef(
 			t,
@@ -666,6 +676,374 @@ func TestJavaRemoteParentPackagedJVMTransportBenchmark(t *testing.T) {
 			time.Duration(series.LatencyGate.P99MaxNS),
 		)
 	}
+	require.Truef(
+		t,
+		artifact.LookupContentionIndicator.Concurrency1.LatencyGate.Passed,
+		"packaged JVM concurrency-1 lookup sample failed %s: p99=%s p99_limit=%s",
+		artifact.LookupContentionIndicator.Concurrency1.LatencyGate.Kind,
+		time.Duration(artifact.LookupContentionIndicator.Concurrency1.P99NS),
+		time.Duration(artifact.LookupContentionIndicator.Concurrency1.LatencyGate.P99MaxNS),
+	)
+	require.Truef(
+		t,
+		artifact.LookupContentionIndicator.RelativeP99Gate.Passed,
+		"packaged JVM indirect lookup-contention indicator failed %s: concurrency_1_p99=%s concurrency_8_p99=%s concurrency_8_p99_limit=%s",
+		artifact.LookupContentionIndicator.RelativeP99Gate.Kind,
+		time.Duration(artifact.LookupContentionIndicator.RelativeP99Gate.Concurrency1P99NS),
+		time.Duration(artifact.LookupContentionIndicator.RelativeP99Gate.Concurrency8P99NS),
+		time.Duration(artifact.LookupContentionIndicator.RelativeP99Gate.Concurrency8P99MaxNS),
+	)
+}
+
+// runPackagedJVMBenchmarkLookupContentionBaseline records the concurrency-1 half of an
+// end-to-end lookup-latency comparison in a fresh JVM. The concurrency-8 lookup hit is likewise
+// the first retained series in its fresh JVM. The comparison is only an indirect contention
+// indicator; it does not measure exact BPF lock wait.
+func runPackagedJVMBenchmarkLookupContentionBaseline(
+	t *testing.T,
+	ctx context.Context,
+	shell packagedJVMBenchmarkExecutableBinding,
+	setpriv string,
+	java string,
+	javaEnvironment []string,
+	agentPath string,
+	expectedAgentIdentity packagedJVMBenchmarkArtifactFileIdentity,
+	maps *BpfJavaRemoteParentMaps,
+	cgroupPath string,
+	attachedCgroupBPF packagedJVMBenchmarkCgroupBPFSnapshot,
+	stabilityTracker *packagedJVMBenchmarkCgroupBPFStabilityTracker,
+	nextGeneration *uint64,
+	nextNonce *uint64,
+) packagedJVMBenchmarkV2SeriesObservation {
+	t.Helper()
+	concurrency := packagedJVMBenchmarkV3LookupContentionBaselineConcurrency
+	agentArtifact := openPackagedJVMBenchmarkRegularFile(
+		t, agentPath, "concurrency-1 lookup-contention agent artifact",
+	)
+	agentArtifactClosed := false
+	defer func() {
+		if !agentArtifactClosed {
+			_ = agentArtifact.Close()
+		}
+	}()
+	require.Equal(t, expectedAgentIdentity, packagedJVMBenchmarkOpenFileIdentity(
+		t, agentArtifact, "concurrency-1 lookup-contention agent artifact",
+	))
+
+	command := exec.CommandContext(
+		ctx,
+		shell.ResolvedPath,
+		"-c",
+		`IFS= read -r _; exec "$@"`,
+		"sh",
+		setpriv,
+		"--reuid="+strconv.Itoa(packagedJVMBenchmarkJavaID),
+		"--regid="+strconv.Itoa(packagedJVMBenchmarkJavaID),
+		"--clear-groups",
+		"--no-new-privs",
+		"--inh-caps=-all",
+		"--ambient-caps=-all",
+		"--bounding-set=-all",
+		"--",
+		java,
+		"-javaagent:/proc/self/fd/3="+packagedJVMBenchmarkAgentOptions,
+		"-cp",
+		"/proc/self/fd/3",
+		packagedJVMBenchmarkProbeClass,
+		"127.0.0.1",
+		strconv.FormatUint(packagedJVMBenchmarkCapability, 10),
+		strconv.Itoa(packagedJVMBenchmarkWarmupIterations),
+		strconv.Itoa(packagedJVMBenchmarkMeasurementIterations),
+		strconv.Itoa(concurrency),
+	)
+	command.Args[0] = shell.InvocationPath
+	command.Dir = "/"
+	command.Env = javaEnvironment
+	command.ExtraFiles = []*os.File{agentArtifact}
+	stdin, err := command.StdinPipe()
+	require.NoError(t, err)
+	stdout, err := command.StdoutPipe()
+	require.NoError(t, err)
+	var stderr javaRemoteParentJVMProbeLog
+	command.Stderr = &stderr
+	require.NoError(t, command.Start())
+	waited := false
+	defer func() {
+		_ = stdin.Close()
+		if waited {
+			return
+		}
+		if command.Process != nil {
+			_ = command.Process.Kill()
+		}
+		_ = command.Wait()
+	}()
+
+	process, err := packagedJVMBenchmarkProcessKey(command.Process.Pid)
+	if err != nil {
+		exited, diagnostic := packagedJVMBenchmarkEarlyLaunchDiagnostic(command, &stderr)
+		waited = exited
+		require.NoErrorf(t, err, "resolve concurrency-1 gated launcher process identity: %s", diagnostic)
+	}
+	processAuthorized := false
+	defer func() {
+		if processAuthorized {
+			_ = maps.JavaProcessIncarnations.Delete(process)
+			_ = maps.JavaAuthorizedProcesses.Delete(process)
+		}
+	}()
+	authorizePackagedJVMBenchmarkProcess(t, maps, process)
+	processAuthorized = true
+	_, err = io.WriteString(stdin, "\n")
+	require.NoError(t, err)
+
+	lines := packagedJVMBenchmarkProbeResults(stdout)
+	listen := waitForPackagedJVMBenchmarkProbe(t, ctx, lines, "LISTEN", &stderr)
+	requirePackagedJVMBenchmarkFields(t, listen, map[string]string{"port": listen["port"]})
+	port := parsePackagedJVMBenchmarkInt(t, listen, "port")
+	require.Greater(t, port, 0)
+	require.LessOrEqual(t, port, 65535)
+	connection, err := net.DialTCP(
+		"tcp4", nil, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port},
+	)
+	require.NoError(t, err)
+	connectionClosed := false
+	defer func() {
+		if !connectionClosed {
+			_ = connection.Close()
+		}
+	}()
+
+	ready := waitForPackagedJVMBenchmarkProbe(t, ctx, lines, "READY", &stderr)
+	requirePackagedJVMBenchmarkFields(t, ready, map[string]string{
+		"worker":                 "0",
+		"tid":                    ready["tid"],
+		"fd":                     ready["fd"],
+		"allocation_thread_id":   ready["allocation_thread_id"],
+		"warmup_iterations":      strconv.Itoa(packagedJVMBenchmarkWarmupIterations),
+		"measurement_iterations": strconv.Itoa(packagedJVMBenchmarkMeasurementIterations),
+		"workers":                strconv.Itoa(concurrency),
+		"allocation_supported":   "1",
+		"allocation_enabled":     "1",
+	})
+	worker := packagedJVMBenchmarkWorker{
+		index:        0,
+		tid:          javaRemoteParentJVMProbeUint32(t, ready, "tid"),
+		javaThreadID: positivePackagedJVMBenchmarkProbeInt64(t, ready, "allocation_thread_id"),
+		javaFD:       javaRemoteParentJVMProbeInt(t, ready, "fd"),
+		duplicateFD:  -1,
+		connection:   connection,
+	}
+	requirePackagedJVMBenchmarkUnprivilegedProcess(t, command.Process.Pid)
+	descriptors, err := packagedJVMBenchmarkBPFDescriptors(command.Process.Pid)
+	require.NoError(t, err)
+	require.Empty(t, descriptors, "concurrency-1 Java child received BPF descriptors: %v", descriptors)
+	pidfd, err := unix.PidfdOpen(command.Process.Pid, 0)
+	require.NoError(t, err)
+	pidfdClosed := false
+	defer func() {
+		if !pidfdClosed {
+			_ = unix.Close(pidfd)
+		}
+	}()
+	worker.duplicateFD, err = unix.PidfdGetfd(pidfd, worker.javaFD, 0)
+	require.NoError(t, err)
+	duplicateClosed := false
+	defer func() {
+		if !duplicateClosed && worker.duplicateFD >= 0 {
+			_ = unix.Close(worker.duplicateFD)
+		}
+	}()
+	worker.javaSocketCookie = socketCookie(t, worker.duplicateFD)
+	worker.owner = process
+	worker.owner.Tid = worker.tid
+	worker.connectionInfo = javaRemoteParentJVMConnectionInfo(t, worker.connection)
+	worker.netns = currentNamespaceID(t, fmt.Sprintf("/proc/%d/ns/net", command.Process.Pid))
+	var seededSocketCookie uint64
+	require.NoError(t, maps.JavaRemoteParentSocketCookies.Lookup(
+		uint32(worker.duplicateFD), &seededSocketCookie,
+	))
+	require.Equal(t, worker.javaSocketCookie, seededSocketCookie)
+
+	_, err = fmt.Fprintf(
+		stdin, "CONFIG getsockopt - %d 0\n", packagedJVMBenchmarkV2TimeoutMillis,
+	)
+	require.NoError(t, err)
+	configured := waitForPackagedJVMBenchmarkProbe(t, ctx, lines, "CONFIGURED", &stderr)
+	requirePackagedJVMBenchmarkFields(t, configured, map[string]string{
+		"transport":      "getsockopt",
+		"timeout_millis": strconv.Itoa(packagedJVMBenchmarkV2TimeoutMillis),
+		"server_uid":     "0",
+	})
+
+	spec := packagedJVMBenchmarkV3LookupContentionSpec
+	observation := packagedJVMBenchmarkV2SeriesObservation{
+		Spec:                   spec,
+		SamplesNS:              make([]int64, 0, concurrency*packagedJVMBenchmarkMeasurementIterations),
+		AllocatedBytes:         make([]int64, 0, concurrency*packagedJVMBenchmarkMeasurementIterations),
+		AllocationControlBytes: make([]int64, 0, concurrency*packagedJVMBenchmarkMeasurementIterations),
+		Calls:                  packagedJVMBenchmarkExpectedCallsV2(spec, concurrency),
+	}
+	primaryStatsBefore := javaRemoteParentStats(t, maps.JavaRemoteParentStats)
+	statIndex := packagedJVMBenchmarkTakeStatIndex(t, spec.ExpectedStatus)
+	observation.Calls.PrimaryBPFStatusBefore = primaryStatsBefore[statIndex]
+
+	for _, phase := range []struct {
+		name       string
+		iterations int
+		retain     bool
+	}{
+		{name: "warmup", iterations: packagedJVMBenchmarkWarmupIterations},
+		{name: "measurement", iterations: packagedJVMBenchmarkMeasurementIterations, retain: true},
+	} {
+		for iteration := range phase.iterations {
+			generation := *nextGeneration
+			*nextGeneration = generation + 1
+			nonce := *nextNonce
+			*nextNonce = nonce + 1
+			stageRemoteParentAt(
+				t, maps, process, worker.owner, packagedJVMBenchmarkCapability,
+				worker.connectionInfo, worker.netns, worker.javaSocketCookie,
+				generation, nonce, monotonicNowNS(t),
+			)
+			_, err = fmt.Fprintf(
+				stdin, "ARM_BATCH %s %s %s %s %d %d %d\n",
+				phase.name, spec.Scope, spec.Transport, spec.Outcome, iteration,
+				spec.ExpectedStatus, generation,
+			)
+			require.NoError(t, err)
+			armed := waitForPackagedJVMBenchmarkProbe(t, ctx, lines, "ARMED", &stderr)
+			requirePackagedJVMBenchmarkFields(t, armed, map[string]string{
+				"phase": phase.name, "scope": spec.Scope, "transport": spec.Transport,
+				"outcome": spec.Outcome, "iteration": strconv.Itoa(iteration),
+				"worker": "0", "emit": "1", "nonce": strconv.FormatUint(nonce, 10),
+			})
+			negotiation := socketNegotiation(t, maps.JavaRemoteParentNegotiations, worker.duplicateFD)
+			require.NoError(t, validatePackagedJVMBenchmarkNegotiationAuthority(
+				packagedJVMBenchmarkNegotiationAuthority{
+					Process:            negotiation.Process,
+					ProcessIncarnation: negotiation.ProcessIncarnation,
+					Connection:         negotiation.Connection,
+					ConnectionNetns:    negotiation.ConnectionNetns,
+					Generation:         negotiation.Generation,
+				},
+				packagedJVMBenchmarkNegotiationAuthority{
+					Process: process, ProcessIncarnation: packagedJVMBenchmarkCapability,
+					Connection: worker.connectionInfo, ConnectionNetns: worker.netns,
+					Generation: generation,
+				},
+			))
+
+			preCallCgroupBPF, preCallQueryErr := tryQueryPackagedJVMBenchmarkCgroupBPF(cgroupPath)
+			require.NoError(t, stabilityTracker.ObservePreCall(
+				attachedCgroupBPF, preCallCgroupBPF, preCallQueryErr,
+			))
+			_, err = fmt.Fprintf(
+				stdin, "TAKE_BATCH %s %s %s %s %d\n",
+				phase.name, spec.Scope, spec.Transport, spec.Outcome, iteration,
+			)
+			require.NoError(t, err)
+			sample := waitForPackagedJVMBenchmarkProbe(t, ctx, lines, "SAMPLE", &stderr)
+			postCallCgroupBPF, postCallQueryErr := tryQueryPackagedJVMBenchmarkCgroupBPF(cgroupPath)
+			require.NoError(t, stabilityTracker.ObservePostCall(
+				attachedCgroupBPF, postCallCgroupBPF, postCallQueryErr,
+			))
+			requirePackagedJVMBenchmarkFields(t, sample, map[string]string{
+				"phase": phase.name, "scope": spec.Scope, "transport": spec.Transport,
+				"outcome": spec.Outcome, "iteration": strconv.Itoa(iteration),
+				"worker": "0", "status": strconv.Itoa(spec.ExpectedStatus),
+				"generation":               strconv.FormatUint(generation, 10),
+				"duration_ns":              sample["duration_ns"],
+				"allocated_bytes":          sample["allocated_bytes"],
+				"allocation_control_bytes": sample["allocation_control_bytes"],
+				"java_calls":               "1",
+				"native_calls":             "1",
+				"bridge_calls":             "0",
+			})
+			require.NoError(t, observation.Statuses.add(spec.ExpectedStatus))
+			observation.Calls.ObservedJavaCalls++
+			observation.Calls.ObservedNativeCalls++
+			if phase.retain {
+				observation.SamplesNS = append(observation.SamplesNS,
+					positivePackagedJVMBenchmarkProbeInt64(t, sample, "duration_ns"))
+				observation.AllocatedBytes = append(observation.AllocatedBytes,
+					nonnegativePackagedJVMBenchmarkProbeInt64(t, sample, "allocated_bytes"))
+				observation.AllocationControlBytes = append(observation.AllocationControlBytes,
+					nonnegativePackagedJVMBenchmarkProbeInt64(t, sample, "allocation_control_bytes"))
+			}
+			requirePackagedJVMBenchmarkGenerationCleaned(t, maps, worker.owner, generation)
+			requirePackagedJVMBenchmarkDataAckMissing(
+				t, maps.JavaRemoteParentDataAcks, process, nonce,
+			)
+		}
+	}
+
+	primaryStatsAfter := javaRemoteParentStats(t, maps.JavaRemoteParentStats)
+	observation.Calls.PrimaryBPFStatusAfter = primaryStatsAfter[statIndex]
+	observation.Calls.ObservedPrimaryBPFCalls = int(
+		observation.Calls.PrimaryBPFStatusAfter - observation.Calls.PrimaryBPFStatusBefore,
+	)
+	requirePackagedJVMBenchmarkExactTakeStats(
+		t, primaryStatsBefore, primaryStatsAfter, statIndex,
+		concurrency*(packagedJVMBenchmarkWarmupIterations+packagedJVMBenchmarkMeasurementIterations),
+	)
+
+	_, err = io.WriteString(stdin, "DONE\n")
+	require.NoError(t, err)
+	done := waitForPackagedJVMBenchmarkProbe(t, ctx, lines, "DONE", &stderr)
+	requirePackagedJVMBenchmarkFields(t, done, map[string]string{
+		"samples": strconv.Itoa(concurrency * packagedJVMBenchmarkMeasurementIterations),
+	})
+	require.NoError(t, stdin.Close())
+	waitForPackagedJVMBenchmarkProbeEOF(t, ctx, lines, &stderr)
+	err = command.Wait()
+	waited = true
+	if ctx.Err() != nil {
+		t.Fatalf("packaged JVM concurrency-1 lookup-contention sample timed out: %s", stderr.String())
+	}
+	require.NoErrorf(t, err, "packaged JVM concurrency-1 lookup-contention sample failed:\n%s", stderr.String())
+
+	require.NoError(t, connection.Close())
+	connectionClosed = true
+	require.NoError(t, unix.Close(worker.duplicateFD))
+	worker.duplicateFD = -1
+	duplicateClosed = true
+	require.NoError(t, unix.Close(pidfd))
+	pidfdClosed = true
+	removePackagedJVMBenchmarkProcessAuthorization(t, maps, process)
+	processAuthorized = false
+	require.Equal(t, expectedAgentIdentity, packagedJVMBenchmarkOpenFileIdentity(
+		t, agentArtifact, "concurrency-1 lookup-contention agent artifact after execution",
+	))
+	require.NoError(t, agentArtifact.Close())
+	agentArtifactClosed = true
+	return observation
+}
+
+func authorizePackagedJVMBenchmarkProcess(
+	t *testing.T,
+	maps *BpfJavaRemoteParentMaps,
+	process BpfJavaRemoteParentPidKeyT,
+) {
+	t.Helper()
+	require.NoError(t, maps.JavaAuthorizedProcesses.Update(
+		process, packagedJVMBenchmarkCapability, ebpf.UpdateAny,
+	))
+	require.NoError(t, maps.JavaProcessIncarnations.Update(
+		process, packagedJVMBenchmarkCapability, ebpf.UpdateAny,
+	))
+}
+
+func removePackagedJVMBenchmarkProcessAuthorization(
+	t *testing.T,
+	maps *BpfJavaRemoteParentMaps,
+	process BpfJavaRemoteParentPidKeyT,
+) {
+	t.Helper()
+	deleteBenchmarkMapKey(t, maps.JavaProcessIncarnations, process)
+	deleteBenchmarkMapKey(t, maps.JavaAuthorizedProcesses, process)
+	requireBenchmarkMapKeyAbsent(t, maps.JavaProcessIncarnations, process)
+	requireBenchmarkMapKeyAbsent(t, maps.JavaAuthorizedProcesses, process)
 }
 
 type packagedJVMBenchmarkWorker struct {
@@ -1220,8 +1598,9 @@ func requirePackagedJVMBenchmarkUnixTransitionAuthority(
 
 func packagedJVMBenchmarkExpectedCallsV2(
 	spec packagedJVMBenchmarkV2SeriesSpec,
+	concurrency int,
 ) packagedJVMBenchmarkArtifactV2Calls {
-	total := packagedJVMBenchmarkV2Concurrency *
+	total := concurrency *
 		(packagedJVMBenchmarkWarmupIterations + packagedJVMBenchmarkMeasurementIterations)
 	calls := packagedJVMBenchmarkArtifactV2Calls{
 		ExpectedJavaCalls:   total,

@@ -21,7 +21,13 @@ performance cell fail regardless of latency.
 - Unix timeout p50 at or above its 50 ms absolute deadline and p99 at or
   below 100 ms;
 - steady-state application throughput and p99 latency regression no worse than
-  10% against the same official-agent baseline.
+  10% against the same official-agent baseline;
+- population coefficient of variation no greater than 10% for both
+  per-repetition throughput and per-repetition p99 in every core application
+  cell; and
+- exploratory sampled-JFR allocation weight per successful request regression
+  no greater than the larger of 10% of the `bridge-disabled` baseline or
+  1,024 bytes per successful request for the comparable Java-measured cells.
 
 These are PoC acceptance gates, not production SLOs.
 
@@ -29,6 +35,9 @@ The harness mechanically evaluates the currently supported subset in
 `poc-gates.json`: zero failures in the six core correctness cells; exactly five
 steady-state repetitions; at most 10% median-throughput and median-p99
 regression for the comparable instrumented cells against `bridge-disabled`;
+at most 10% population CV for throughput and repetition p99 in all six core
+cells; the sampled-JFR allocation-weight allowance above for
+`getsockopt-hit`, `unix-hit`, and `getsockopt-w3c` against `bridge-disabled`;
 and bounded process FD/thread growth from the before and idle-recovery samples.
 Unavailable required process samples fail that process dimension closed, and
 unavailable descriptive map samples prevent successful harness completion.
@@ -43,15 +52,18 @@ are excluded, and missing, changing, malformed, or unattributed rosters fail
 the map dimension closed. The bridge-disabled cell still has the minimized
 bridge maps (maximum one entry), so its samples are required rather than
 treated as not applicable. The overall status remains `partial` and its result
-becomes `failed` if a supported correctness, performance, process-growth, or
-owned-map-growth dimension fails. Selected forced-`getsockopt` cells now also
+becomes `failed` if a supported correctness, performance, sampled-allocation,
+process-growth, or owned-map-growth dimension fails. Selected forced-`getsockopt` cells now also
 retain exact-owned kernel-reported program execution-count and cumulative
 run-time deltas across the sustained measurement window. Those counters are
 descriptive and are not host, process, or cgroup CPU utilization, CPU-isolation,
 or synchronization/lock-wait evidence. The core cells also retain bounded JFR
 sampled-allocation and monitor/park indicators, NMT summary totals/deltas, and
 the direct-buffer-pool delta described below. They are diagnostic indicators,
-not exact allocation or all-native-memory counts. Primary cgroup-sockopt
+not exact allocation or all-native-memory counts. `poc-gates.json` evaluates
+the sampled allocation *weight* per successful request only as an exploratory
+regression indicator. A pass never converts it into exact allocation evidence,
+and the size-bounded recording may retain only a bounded tail. Primary cgroup-sockopt
 program CPU utilization and BPF lock contention remain uncollected. A `passed`
 `summary.json` status
 means only that the requested harness execution completed; it is neither a
@@ -316,10 +328,12 @@ dedicated harness for the comparable core cells.
 | `getsockopt-helper-idle` | official Java agent, extension, and OBI | active forced `getsockopt`; direct Java HTTPS workload | no Apache upstream handoff in the exact window; not a state-map-miss proof |
 
 The default `--cells core` run produces the sustained application benchmark.
-`variance.json` retains each cell's five repetitions and their median and
-observed range. `poc-gates.json` applies the predeclared zero-failure and 10%
-regression thresholds to the supported core dimensions, while preserving the
-partial resource result described above.
+Schema-v2 `variance.json` retains each cell's exactly five repetitions, median,
+observed range, and population variability fields for throughput and
+per-repetition p99. Schema-v2 `poc-gates.json` applies the predeclared
+zero-failure, 10% regression, 10% population-CV, and exploratory sampled-JFR
+allocation-weight thresholds to the supported core dimensions, while
+preserving the partial resource result described above.
 
 ### Bounded Java runtime indicators
 
@@ -459,6 +473,20 @@ all third-party native memory, and the direct pool is not all native/off-heap
 memory. These measurements do not establish a production SLO or complete the
 linked benchmark issue.
 
+For the comparable Java-measured cells, the gate divides each sealed cell's
+retained `jfr.allocation_sample.weight_bytes` by the sum of successful requests
+in that cell's five retained repetitions. It compares `getsockopt-hit`,
+`unix-hit`, and `getsockopt-w3c` with `bridge-disabled`. The permitted increase
+is exactly
+`max(baseline_bytes_per_successful_request * 10 / 100, 1024)` bytes per
+successful request. Zero sampled records and zero weight are valid observations;
+because recordings are independent samples, a lower or zero candidate weight
+is not treated as a counter reset or negative regression. Missing, malformed,
+duplicated, stale, or unsealed Java evidence makes this exploratory dimension
+`not_evaluated`. Even when it passes, the artifact labels the result
+`exploratory_sampled_indicator_not_exact_allocation`, retains
+`acceptance_evidence: false`, and does not claim whole-window sampling.
+
 `--cells complete` additionally produces `lookup-paths.json` and
 `native-jni/benchmark.json`. It runs one bounded correctness execution for the
 getsockopt and Unix hit paths, getsockopt and Unix stale paths, Unix timeout,
@@ -571,7 +599,7 @@ the exact recorded client session, then discards only an allowlisted
 parent identity is unchanged; outside/malformed paths and directories fail
 closed, and a final symlink is unlinked without following its target.
 
-The schema-v2 manifest preserves its `w3c_headers: false` baseline for existing
+The schema-v3 manifest preserves its `w3c_headers: false` baseline for existing
 consumers. Its authoritative per-cell traffic record is
 `workload.w3c_headers_by_cell`: only `getsockopt-w3c` is `true`; the four
 other Apache comparison controls and the direct-Java helper-idle control are
@@ -766,17 +794,23 @@ samples, or individual requests. `summary.json` links that artifact only when
 it is available.
 
 For every retained per-repetition value, `variance.json` reports the observed
-minimum, numeric median, and maximum. With an odd sample count, the median is
-the middle sorted value; with an even count, it is the arithmetic mean of the
-two middle values. The observed minimum--maximum range is a spread, not a
-variance estimator or confidence interval. In particular, a latency p99 median
+minimum, numeric median, and maximum. The fixed five-value median is the middle
+sorted value. The observed minimum--maximum range is a spread, not a confidence
+interval. For throughput and repetition p99, schema v2 additionally retains
+the exact sample count, sum, positive mean, sum of squared deviations,
+population variance, population standard deviation, and population CV. The
+divisor is population `N=5`, not `N-1`, and the gate recomputes
+`sqrt(sum((x-mean)^2)/N)/mean*100`; a non-positive or non-finite mean is invalid.
+In particular, a latency p99 median
 is the median of repetition p99 values, not a pooled all-request p99. Missing,
 malformed, failed, symlinked, or unexpected numeric repetition artifacts fail the
 harness instead of being dropped or converted to zero.
 
 `variance.json` is the application performance benchmark and is descriptive by
 itself; it does not establish a production SLO. `poc-gates.json` applies the
-predeclared threshold to its fixed-five-repetition medians and evaluates the
+predeclared thresholds to its fixed-five-repetition medians and population CVs,
+evaluates the exploratory sampled-JFR allocation-weight-per-successful-request
+comparison, and evaluates the
 exact OBI-owned Java bridge maps, but its overall result remains partial while
 the other declared resource dimensions are unavailable. `summary.json` links
 both artifacts without turning unavailable measurements into zeroes or treating
@@ -801,8 +835,8 @@ the complete matrix for the open fork issue linked above. The retained
 supplies bounded eight-worker Java-to-native and bridge/provider percentiles
 plus per-thread allocation observations. End-to-end application state-map-miss
 performance, sustained application stale/timeout/pressure performance,
-acceptance-grade native-memory evidence, CPU isolation, contention evidence, and run-to-run
-variance still require separate measurement before declaring the benchmark
+acceptance-grade native-memory evidence, CPU isolation, contention evidence,
+and independent full-run/host variance still require separate measurement before declaring the benchmark
 issue complete. The privileged Go transport artifact, native deterministic
 fixture, and packaged-JVM record are complementary evidence; none fills those
 application-workload cells or turns a comparison-matrix row into a pass.
@@ -881,9 +915,12 @@ enable host-global BPF statistics as part of a shared benchmark host without an
 explicit host-level measurement plan.
 
 The harness requires exactly five measurement repetitions and records the
-per-cell median and observed spread in `variance.json`; report it with the
-fixed-host artifact rather than pooling transport configurations or lookup
-paths. Do not combine primary and fallback lookup latency into one percentile.
+per-cell median, observed spread, and throughput/p99 population CV in
+`variance.json`; report it with the fixed-host artifact rather than pooling
+transport configurations or lookup paths. Report sampled-JFR allocation only
+as the exploratory weight-per-successful-request indicator with its sealed
+evidence links and allowance components, never as exact allocation. Do not
+combine primary and fallback lookup latency into one percentile.
 Stop the scoped stack afterward:
 
 ```bash

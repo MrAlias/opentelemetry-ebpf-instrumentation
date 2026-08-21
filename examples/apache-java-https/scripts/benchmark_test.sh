@@ -4156,7 +4156,7 @@ test_complete_manifest_links_bounded_artifacts_and_scopes() {
   mkdir -- "$OUTPUT_DIR"
   write_manifest
   jq -e '
-    .cells_mode == "complete" and
+    .schema_version == 3 and .cells_mode == "complete" and
     .bounded_path_observations.requested == true and
     .bounded_path_observations.cells == [
       "getsockopt-stale", "unix-stale", "unix-timeout", "getsockopt-pressure"
@@ -4171,6 +4171,16 @@ test_complete_manifest_links_bounded_artifacts_and_scopes() {
     .unavailable_dimensions.application_cpu_rss_fd_threads ==
       "requested_for_bounded_growth_gate" and
     .predeclared_poc_gates.repetitions.required == 5 and
+    .predeclared_poc_gates.repetitions.population_variability == {
+      formula: "sqrt(sum((x-mean)^2)/N)/mean*100",
+      divisor: "population_N",
+      metrics: ["throughput_per_second", "p99_latency_nanos"],
+      required_cells: [
+        "uninstrumented", "bridge-disabled", "getsockopt-hit", "unix-hit",
+        "getsockopt-w3c", "getsockopt-helper-idle"
+      ],
+      maximum_cv_percent: 10
+    } and
     .predeclared_poc_gates.steady_state_application == {
       baseline_cell: "bridge-disabled",
       comparison_cells: [
@@ -4181,7 +4191,30 @@ test_complete_manifest_links_bounded_artifacts_and_scopes() {
         getsockopt_helper_idle: "direct_java_workload_is_not_comparable_to_the_apache_baseline"
       },
       throughput_regression_max_percent: 10,
-      p99_latency_regression_max_percent: 10
+      p99_latency_regression_max_percent: 10,
+      population_cv_max_percent: 10
+    } and
+    .predeclared_poc_gates.sampled_jfr_allocation == {
+      baseline_cell: "bridge-disabled",
+      comparison_cells: ["getsockopt-hit", "unix-hit", "getsockopt-w3c"],
+      metric: "sampled_allocation_weight_bytes_per_successful_request",
+      regression_allowance:
+        "max(baseline_bytes_per_successful_request*percent/100,minimum_bytes_per_successful_request)",
+      maximum_regression_percent: 10,
+      minimum_allowance_bytes_per_successful_request: 1024,
+      classification: "exploratory_sampled_indicator_not_exact_allocation",
+      exact_allocation: false,
+      acceptance_evidence: false
+    } and
+    .java_runtime_indicator_evidence.sampled_allocation_gate == {
+      artifact: "poc-gates.json",
+      baseline_cell: "bridge-disabled",
+      comparison_cells: ["getsockopt-hit", "unix-hit", "getsockopt-w3c"],
+      metric: "sampled_allocation_weight_bytes_per_successful_request",
+      maximum_regression_percent: 10,
+      minimum_allowance_bytes_per_successful_request: 1024,
+      classification: "exploratory_sampled_indicator_not_exact_allocation",
+      acceptance_evidence: false
     } and
     .predeclared_poc_gates.bounded_growth.unavailable_samples_fail_closed == true and
     .predeclared_poc_gates.bounded_growth.java_bridge_map_evaluation == {
@@ -4294,6 +4327,105 @@ write_variance_fixture_cell() {
       "$p95_nanos" \
       "$p99_nanos"
   done
+}
+
+write_sampled_allocation_fixture() {
+  local -r cell="$1"
+  local -r sampled_weight_bytes="${2:-2000000}"
+  local -r cell_dir="$OUTPUT_DIR/cells/$cell"
+  local -r evidence="$cell_dir/java-measurement/evidence.json"
+  local -r receipt="$cell_dir/java-measurement-publication.json"
+  local sample_records=5
+  local evidence_sha256=""
+
+  [[ "$sampled_weight_bytes" =~ ^[0-9]+$ ]] || return 1
+  if ((sampled_weight_bytes == 0)); then
+    sample_records=0
+  fi
+  mkdir -p -- "$cell_dir/java-measurement"
+  jq -n \
+    --arg cell "$cell" \
+    --argjson sample_records "$sample_records" \
+    --argjson sampled_weight_bytes "$sampled_weight_bytes" '
+      {
+        status: "complete",
+        acceptance_evidence: false,
+        cell: $cell,
+        jfr: {
+          status: "available",
+          whole_window_retention_attested: false,
+          allocation_sample: {
+            records: $sample_records,
+            weight_bytes: $sampled_weight_bytes
+          }
+        },
+        interpretation: {
+          allocation_sample_weight_is_not_an_exact_allocation_count: true
+        }
+      }
+    ' >"$evidence" || return 1
+  evidence_sha256="$(sha256_regular_file "$evidence")" || return 1
+  jq -n \
+    --arg cell "$cell" \
+    --arg evidence_sha256 "$evidence_sha256" '
+      {
+        cell: $cell,
+        evidence_sha256: $evidence_sha256,
+        tree_manifest_sha256:
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    ' >"$receipt"
+}
+
+validate_sampled_allocation_fixture_seal() {
+  local -r cell_dir="$1"
+  local -r cell="${cell_dir##*/}"
+  local -r evidence="$cell_dir/java-measurement/evidence.json"
+  local -r receipt="$cell_dir/java-measurement-publication.json"
+  local expected_raw_value_count=""
+  local observed_raw_value_count=""
+  local canonical=""
+
+  [[ -f "$evidence" && ! -L "$evidence" &&
+    -f "$receipt" && ! -L "$receipt" ]] || return 1
+  canonical="$(jq -c . "$evidence")" || return 1
+  expected_raw_value_count="$(jq --stream -n '
+    reduce inputs as $event (0;
+      if ($event | length) == 2 then . + 1 else . end)
+  ' <<<"$canonical")" || return 1
+  observed_raw_value_count="$(raw_json_value_count "$evidence")" || return 1
+  [[ "$observed_raw_value_count" == "$expected_raw_value_count" ]] || return 1
+  jq -se --arg cell "$cell" '
+    length == 1 and (.[0] |
+      (keys) == ["acceptance_evidence", "cell", "interpretation", "jfr", "status"] and
+      .status == "complete" and .acceptance_evidence == false and .cell == $cell and
+      (.jfr | (keys) == [
+        "allocation_sample", "status", "whole_window_retention_attested"
+      ] and .status == "available" and .whole_window_retention_attested == false and
+        (.allocation_sample | (keys) == ["records", "weight_bytes"] and
+          (.records | type == "number" and isfinite and floor == . and . >= 0) and
+          (.weight_bytes | type == "number" and isfinite and floor == . and . >= 0) and
+          ((.records == 0 and .weight_bytes == 0) or
+            (.records > 0 and .weight_bytes > 0)))) and
+      .interpretation == {
+        allocation_sample_weight_is_not_an_exact_allocation_count: true
+      })
+  ' "$evidence" >/dev/null || return 1
+  canonical="$(jq -c . "$receipt")" || return 1
+  expected_raw_value_count="$(jq --stream -n '
+    reduce inputs as $event (0;
+      if ($event | length) == 2 then . + 1 else . end)
+  ' <<<"$canonical")" || return 1
+  observed_raw_value_count="$(raw_json_value_count "$receipt")" || return 1
+  [[ "$observed_raw_value_count" == "$expected_raw_value_count" ]] || return 1
+  jq -se \
+    --arg cell "$cell" \
+    --arg evidence_sha256 "$(sha256_regular_file "$evidence")" '
+      length == 1 and (.[0] |
+        (keys) == ["cell", "evidence_sha256", "tree_manifest_sha256"] and
+        .cell == $cell and .evidence_sha256 == $evidence_sha256 and
+        (.tree_manifest_sha256 | test("^[0-9a-f]{64}$")))
+    ' "$receipt" >/dev/null
 }
 
 prepare_variance_fixture() {
@@ -4418,6 +4550,11 @@ prepare_poc_gate_fixture() {
         write_java_map_growth_fixture "$cell_dir/resources-idle-recovery/obi-metrics.prom" 1 10000
       fi
     fi
+    case "$cell" in
+      bridge-disabled|getsockopt-hit|unix-hit|getsockopt-w3c)
+        write_sampled_allocation_fixture "$cell"
+        ;;
+    esac
   done
   write_variance_summary
 }
@@ -4816,17 +4953,19 @@ test_variance_summary_records_ordered_per_cell_statistics() (
   local -r output="$TEST_TMP_DIR/variance-summary"
   local -r mutated="$TEST_TMP_DIR/variance-summary-mutated.json"
   local canonical=""
+  local compact=""
+  local mutated_json=""
   local repetition=0
   local repetition_label=""
-  local -a successful_requests=(120 20 100 40 80 60)
-  local -a throughput_per_second=(60 10 50 20 40 30)
-  local -a p50_nanos=(6 1 5 2 4 3)
-  local -a p95_nanos=(6 1 5 2 4 3)
-  local -a p99_nanos=(6 1 5 2 4 3)
+  local -a successful_requests=(100 20 80 40 60)
+  local -a throughput_per_second=(50 10 40 20 30)
+  local -a p50_nanos=(5 1 4 2 3)
+  local -a p95_nanos=(5 1 4 2 3)
+  local -a p99_nanos=(5 1 4 2 3)
 
   reset_options
   DURATION_SECONDS=2
-  REPETITIONS=6
+  REPETITIONS=5
   prepare_variance_fixture "$output"
   cell_spec getsockopt-hit
   for ((repetition = 1; repetition <= REPETITIONS; repetition++)); do
@@ -4850,12 +4989,19 @@ test_variance_summary_records_ordered_per_cell_statistics() (
     return 1
   }
   jq -e '
-    .schema_version == 1 and
+    .schema_version == 2 and
     .kind == "application-performance-repetition-summary" and
     .status == "complete" and
     .acceptance_evidence == false and
     .manifest == "manifest.json" and
     .aggregation.sample_unit == "one completed sustained-client repetition" and
+    .aggregation.population_variability == {
+      formula: "sqrt(sum((x-mean)^2)/N)/mean*100",
+      divisor: "population_N",
+      required_sample_count: 5,
+      positive_finite_mean_required: true,
+      metrics: ["throughput_per_second", "p99_latency_nanos"]
+    } and
     .aggregation.cross_cell_aggregation == false and
     .aggregation.per_request_latency_aggregation == false and
     (.cells | map(.cell)) == [
@@ -4873,25 +5019,39 @@ test_variance_summary_records_ordered_per_cell_statistics() (
   jq -e '
     (.cells[] | select(.cell == "getsockopt-hit")) as $cell |
     $cell.contract == "cells/getsockopt-hit/preflight/contract.json" and
-    $cell.expected_sample_count == 6 and
-    $cell.valid_sample_count == 6 and
+    $cell.expected_sample_count == 5 and
+    $cell.valid_sample_count == 5 and
     ($cell.samples | map({repetition, source})) == [
       {repetition: 1, source: "cells/getsockopt-hit/measurements/rep-01.json"},
       {repetition: 2, source: "cells/getsockopt-hit/measurements/rep-02.json"},
       {repetition: 3, source: "cells/getsockopt-hit/measurements/rep-03.json"},
       {repetition: 4, source: "cells/getsockopt-hit/measurements/rep-04.json"},
-      {repetition: 5, source: "cells/getsockopt-hit/measurements/rep-05.json"},
-      {repetition: 6, source: "cells/getsockopt-hit/measurements/rep-06.json"}
+      {repetition: 5, source: "cells/getsockopt-hit/measurements/rep-05.json"}
     ] and
-    $cell.statistics.successful_requests == {min: 20, median: 70, max: 120} and
+    $cell.statistics.successful_requests == {min: 20, median: 60, max: 100} and
     $cell.statistics.failed_requests == {min: 0, median: 0, max: 0} and
     $cell.statistics.traffic_elapsed_nanos == {min: 2000000000, median: 2000000000, max: 2000000000} and
-    $cell.statistics.throughput_per_second == {min: 10, median: 35, max: 60} and
-    $cell.statistics.latency.p50_nanos == {min: 1, median: 3.5, max: 6} and
-    $cell.statistics.latency.p95_nanos == {min: 1, median: 3.5, max: 6} and
-    $cell.statistics.latency.p99_nanos == {min: 1, median: 3.5, max: 6} and
-    (.cells[] | select(.cell == "unix-hit").statistics.throughput_per_second) ==
-      {min: 1, median: 1, max: 1}
+    ($cell.statistics.throughput_per_second |
+      .min == 10 and .median == 30 and .max == 50 and
+      .population_variability == {
+        sample_count: 5, sum: 150, mean: 30,
+        squared_deviation_sum: 1000, population_variance: 200,
+        population_standard_deviation: (200 | sqrt),
+        coefficient_of_variation_percent: ((200 | sqrt) / 30 * 100)
+      }) and
+    $cell.statistics.latency.p50_nanos == {min: 1, median: 3, max: 5} and
+    $cell.statistics.latency.p95_nanos == {min: 1, median: 3, max: 5} and
+    ($cell.statistics.latency.p99_nanos |
+      .min == 1 and .median == 3 and .max == 5 and
+      .population_variability == {
+        sample_count: 5, sum: 15, mean: 3,
+        squared_deviation_sum: 10, population_variance: 2,
+        population_standard_deviation: (2 | sqrt),
+        coefficient_of_variation_percent: ((2 | sqrt) / 3 * 100)
+      }) and
+    (.cells[] | select(.cell == "unix-hit").statistics.throughput_per_second |
+      .min == 1 and .median == 1 and .max == 1 and
+      .population_variability.coefficient_of_variation_percent == 0)
   ' "$output/variance.json" >/dev/null || {
     printf 'variance summary did not preserve ordered samples or numeric per-cell statistics\n' >&2
     return 1
@@ -4907,6 +5067,21 @@ test_variance_summary_records_ordered_per_cell_statistics() (
     "$output/variance.json" >"$mutated"
   if validate_variance_summary_schema "$mutated"; then
     printf 'variance validator accepted a mutated derived statistic\n' >&2
+    return 1
+  fi
+  jq '(.cells[] | select(.cell == "getsockopt-hit") |
+    .statistics.throughput_per_second.population_variability.coefficient_of_variation_percent) = 0' \
+    "$output/variance.json" >"$mutated"
+  if validate_variance_summary_schema "$mutated"; then
+    printf 'variance validator accepted a mutated population CV\n' >&2
+    return 1
+  fi
+  compact="$(jq -c . "$output/variance.json")" || return 1
+  mutated_json="${compact/\"schema_version\":2/\"schema_version\":2,\"schema_version\":2}"
+  [[ "$mutated_json" != "$compact" ]] || return 1
+  printf '%s\n' "$mutated_json" >"$mutated"
+  if validate_variance_summary_schema "$mutated"; then
+    printf 'variance validator accepted a duplicate schema key\n' >&2
     return 1
   fi
   jq '.throughput_per_second = 61' \
@@ -4925,7 +5100,7 @@ test_variance_summary_rejects_invalid_repetition_sets() (
   local output=""
   local measurement_dir=""
 
-  for mode in missing extra multi_document symlink; do
+  for mode in configured_count missing extra multi_document symlink; do
     reset_options
     DURATION_SECONDS=2
     REPETITIONS=5
@@ -4933,6 +5108,10 @@ test_variance_summary_rejects_invalid_repetition_sets() (
     prepare_variance_fixture "$output"
     measurement_dir="$output/cells/getsockopt-hit/measurements"
     case "$mode" in
+      configured_count)
+        REPETITIONS=6
+        write_variance_fixture_cell getsockopt-hit
+        ;;
       missing)
         rm -f -- "$measurement_dir/rep-05.json"
         ;;
@@ -4979,6 +5158,35 @@ rewrite_cell_performance_fixture() {
     mv -T -- "$temporary" "$result" || return 1
   done
   rm -f -- "$OUTPUT_DIR/variance.json"
+  write_variance_summary
+}
+
+rewrite_cell_population_cv_fixture() {
+  local -r cell="$1"
+  local -r mode="$2"
+  local -r duration_seconds="${3:-2}"
+  local repetition=0
+  local repetition_label=""
+  local throughput=""
+  local result=""
+  local -a values=()
+
+  case "$mode" in
+    boundary) values=(85 95 100 105 115) ;;
+    failure) values=(84 95 100 105 116) ;;
+    *) return 1 ;;
+  esac
+  cell_spec "$cell" || return 1
+  for ((repetition = 1; repetition <= REQUIRED_REPETITIONS; repetition++)); do
+    printf -v repetition_label 'rep-%02d' "$repetition"
+    result="$OUTPUT_DIR/cells/$cell/measurements/$repetition_label.json"
+    throughput="${values[repetition - 1]}"
+    write_valid_benchmark_result \
+      "$result" "$duration_seconds" "$((throughput * duration_seconds))" 0 \
+      "$((duration_seconds * 1000000000))" "$throughput" \
+      "$throughput" "$throughput" "$throughput"
+  done
+  rm -f -- "$OUTPUT_DIR/variance.json" "$OUTPUT_DIR/poc-gates.json"
   write_variance_summary
 }
 
@@ -5165,9 +5373,32 @@ test_predeclared_poc_gate_stays_partial_and_evaluates_supported_dimensions() (
   local -r correctness_failure_output="$TEST_TMP_DIR/poc-gate-correctness-failure"
   local -r boundary_output="$TEST_TMP_DIR/poc-gate-boundary"
   local -r performance_failure_output="$TEST_TMP_DIR/poc-gate-performance-failure"
+  local -r cv_boundary_output="$TEST_TMP_DIR/poc-gate-cv-boundary"
+  local -r cv_failure_output="$TEST_TMP_DIR/poc-gate-cv-failure"
+  local -r allocation_boundary_output="$TEST_TMP_DIR/poc-gate-allocation-boundary"
+  local -r allocation_failure_output="$TEST_TMP_DIR/poc-gate-allocation-failure"
+  local -r allocation_percentage_boundary_output="$TEST_TMP_DIR/poc-gate-allocation-percentage-boundary"
+  local -r allocation_percentage_failure_output="$TEST_TMP_DIR/poc-gate-allocation-percentage-failure"
+  local -r allocation_zero_output="$TEST_TMP_DIR/poc-gate-allocation-zero"
+  local -r allocation_reset_output="$TEST_TMP_DIR/poc-gate-allocation-reset"
+  local -r allocation_malformed_output="$TEST_TMP_DIR/poc-gate-allocation-malformed"
+  local -r allocation_missing_receipt_output="$TEST_TMP_DIR/poc-gate-allocation-missing-receipt"
+  local -r allocation_receipt_drift_output="$TEST_TMP_DIR/poc-gate-allocation-receipt-drift"
+  local -r allocation_receipt_drift_marker="$TEST_TMP_DIR/poc-gate-allocation-receipt-drift.marker"
   local -r mutated_gate="$TEST_TMP_DIR/poc-gate-mutated.json"
   local canonical_gate=""
+  local compact=""
+  local mutated_json=""
   local result=""
+
+  # Unit fixtures retain the same evidence/receipt binding consumed by the
+  # production gate. The full hermetic run below exercises the production
+  # whole-tree validator; this focused test substitutes only its expensive
+  # tree walk so arithmetic and source-staleness mutations stay deterministic.
+  validate_published_java_measurement() {
+    # shellcheck disable=SC2317 # Dynamically called by the sourced gate builder.
+    validate_sampled_allocation_fixture_seal "$1"
+  }
 
   reset_options
   prepare_poc_gate_fixture "$stable_output"
@@ -5195,6 +5426,24 @@ test_predeclared_poc_gate_stays_partial_and_evaluates_supported_dimensions() (
     return 1
   fi
   jq '
+    (.sampled_allocation.comparisons[] | select(.cell == "getsockopt-hit")) |= (
+      .allowed_regression_bytes_per_successful_request = 2048 |
+      .maximum_candidate_bytes_per_successful_request = 4048
+    )
+  ' "$stable_output/poc-gates.json" >"$mutated_gate"
+  if validate_poc_gate_schema "$mutated_gate"; then
+    printf 'PoC validator accepted coordinated forged sampled-allocation derivations\n' >&2
+    return 1
+  fi
+  compact="$(jq -c . "$stable_output/poc-gates.json")" || return 1
+  mutated_json="${compact/\"schema_version\":2/\"schema_version\":2,\"schema_version\":2}"
+  [[ "$mutated_json" != "$compact" ]] || return 1
+  printf '%s\n' "$mutated_json" >"$mutated_gate"
+  if validate_poc_gate_schema "$mutated_gate"; then
+    printf 'PoC validator accepted a duplicate top-level schema key\n' >&2
+    return 1
+  fi
+  jq '
     .correctness.cells[0].status = "failed" |
     .correctness.cells[0].reason = "forged" |
     .correctness.observed_failures = 1 |
@@ -5213,14 +5462,44 @@ test_predeclared_poc_gate_stays_partial_and_evaluates_supported_dimensions() (
     return 1
   fi
   jq -e '
+    .schema_version == 2 and
     .status == "partial" and .result == "not_evaluated" and
     .correctness.observed_failures == 0 and
     .correctness.status == "complete" and .correctness.result == "passed" and
     .performance.required_repetitions == 5 and
     .performance.status == "complete" and .performance.result == "passed" and
+    .performance.population_variability.status == "complete" and
+    .performance.population_variability.result == "passed" and
+    .performance.population_variability.maximum_coefficient_of_variation_percent == 10 and
+    all(.performance.population_variability.cells[];
+      .result == "passed" and
+      .throughput_per_second.sample_count == 5 and
+      .throughput_per_second.coefficient_of_variation_percent == 0 and
+      .p99_latency_nanos.sample_count == 5 and
+      .p99_latency_nanos.coefficient_of_variation_percent == 0) and
     all(.performance.comparisons[];
       .throughput_per_second.regression_percent == 0 and
       .p99_latency_nanos.regression_percent == 0 and
+      .result == "passed") and
+    .sampled_allocation.status == "complete" and
+    .sampled_allocation.result == "passed" and
+    .sampled_allocation.classification ==
+      "exploratory_sampled_indicator_not_exact_allocation" and
+    .sampled_allocation.exact_allocation == false and
+    .sampled_allocation.acceptance_evidence == false and
+    .sampled_allocation.baseline == {
+      cell: "bridge-disabled", sampled_allocation_records: 5,
+      sampled_allocation_weight_bytes: 2000000, successful_requests: 1000,
+      sampled_allocation_weight_bytes_per_successful_request: 2000
+    } and
+    all(.sampled_allocation.comparisons[];
+      .baseline_sampled_allocation_weight_bytes_per_successful_request == 2000 and
+      .candidate_sampled_allocation_weight_bytes_per_successful_request == 2000 and
+      .percentage_allowance_bytes_per_successful_request == 200 and
+      .minimum_allowance_bytes_per_successful_request == 1024 and
+      .allowed_regression_bytes_per_successful_request == 1024 and
+      .maximum_candidate_bytes_per_successful_request == 3024 and
+      .observed_regression_bytes_per_successful_request == 0 and
       .result == "passed") and
     .performance.excluded_cells.getsockopt_helper_idle ==
       "direct_java_workload_is_not_comparable_to_the_apache_baseline" and
@@ -5266,7 +5545,9 @@ test_predeclared_poc_gate_stays_partial_and_evaluates_supported_dimensions() (
       .status == "complete" and .result == "passed") and
     .issue_acceptance_complete == false and
     .unmeasured_dimensions == {
-      jfr_nmt_allocation_native_direct_memory:
+      exact_java_allocation:
+        "sampled_jfr_weight_evaluated_as_exploratory_indicator_only_exact_allocation_not_collected",
+      nmt_native_and_direct_memory:
         "bounded_indicators_retained_not_evaluated_as_acceptance_gate",
       primary_cgroupsockopt_program_cpu: "not_collected",
       bpf_lock_contention: "not_collected"
@@ -5431,6 +5712,237 @@ test_predeclared_poc_gate_stays_partial_and_evaluates_supported_dimensions() (
     return 1
   fi
 
+  reset_options
+  prepare_poc_gate_fixture "$cv_boundary_output"
+  rewrite_cell_population_cv_fixture getsockopt-hit boundary
+  write_poc_gate_summary
+  validate_supported_poc_dimensions_pass "$cv_boundary_output/poc-gates.json" || {
+    printf 'exact ten-percent population CV boundary did not pass\n' >&2
+    return 1
+  }
+  jq -e '
+    (.performance.population_variability.cells[] |
+      select(.cell == "getsockopt-hit")) as $cell |
+    $cell.result == "passed" and
+    $cell.throughput_per_second.coefficient_of_variation_percent == 10 and
+    $cell.p99_latency_nanos.coefficient_of_variation_percent == 10 and
+    $cell.throughput_per_second.squared_deviation_sum == 500 and
+    $cell.p99_latency_nanos.squared_deviation_sum == 500
+  ' "$cv_boundary_output/poc-gates.json" >/dev/null || {
+    printf 'population CV boundary omitted its recomputable fields\n' >&2
+    return 1
+  }
+
+  reset_options
+  prepare_poc_gate_fixture "$cv_failure_output"
+  rewrite_cell_population_cv_fixture getsockopt-hit failure
+  write_poc_gate_summary
+  jq -e '
+    .status == "partial" and .result == "failed" and
+    .performance.result == "failed" and
+    .performance.population_variability.result == "failed" and
+    (.performance.population_variability.cells[] |
+      select(.cell == "getsockopt-hit") |
+      .result == "failed" and
+      .throughput_per_second.coefficient_of_variation_percent > 10 and
+      .p99_latency_nanos.coefficient_of_variation_percent > 10)
+  ' "$cv_failure_output/poc-gates.json" >/dev/null || {
+    printf 'greater-than-ten-percent population CV did not fail\n' >&2
+    return 1
+  }
+  if validate_supported_poc_dimensions_pass "$cv_failure_output/poc-gates.json"; then
+    printf 'supported PoC dimensions passed despite excessive population CV\n' >&2
+    return 1
+  fi
+
+  reset_options
+  prepare_poc_gate_fixture "$allocation_boundary_output"
+  write_sampled_allocation_fixture getsockopt-hit 3024000
+  rm -f -- "$allocation_boundary_output/poc-gates.json"
+  write_poc_gate_summary
+  validate_supported_poc_dimensions_pass \
+    "$allocation_boundary_output/poc-gates.json" || {
+    printf 'sampled-allocation minimum-allowance boundary did not pass\n' >&2
+    return 1
+  }
+  jq -e '
+    (.sampled_allocation.comparisons[] | select(.cell == "getsockopt-hit")) |
+    .candidate_sampled_allocation_weight_bytes_per_successful_request == 3024 and
+    .observed_regression_bytes_per_successful_request == 1024 and
+    .allowed_regression_bytes_per_successful_request == 1024 and
+    .result == "passed"
+  ' "$allocation_boundary_output/poc-gates.json" >/dev/null || return 1
+
+  reset_options
+  prepare_poc_gate_fixture "$allocation_failure_output"
+  write_sampled_allocation_fixture getsockopt-hit 3024001
+  rm -f -- "$allocation_failure_output/poc-gates.json"
+  write_poc_gate_summary
+  jq -e '
+    .status == "partial" and .result == "failed" and
+    .sampled_allocation.status == "complete" and
+    .sampled_allocation.result == "failed" and
+    (.sampled_allocation.comparisons[] | select(.cell == "getsockopt-hit") |
+      .observed_regression_bytes_per_successful_request >
+        .allowed_regression_bytes_per_successful_request and
+      .result == "failed")
+  ' "$allocation_failure_output/poc-gates.json" >/dev/null || {
+    printf 'sampled-allocation over-boundary regression did not fail\n' >&2
+    return 1
+  }
+
+  reset_options
+  prepare_poc_gate_fixture "$allocation_percentage_boundary_output"
+  write_sampled_allocation_fixture bridge-disabled 20000000
+  write_sampled_allocation_fixture getsockopt-hit 22000000
+  rm -f -- "$allocation_percentage_boundary_output/poc-gates.json"
+  write_poc_gate_summary
+  validate_supported_poc_dimensions_pass \
+    "$allocation_percentage_boundary_output/poc-gates.json" || {
+    printf 'sampled-allocation ten-percent allowance boundary did not pass\n' >&2
+    return 1
+  }
+  jq -e '
+    (.sampled_allocation.comparisons[] | select(.cell == "getsockopt-hit")) |
+    .baseline_sampled_allocation_weight_bytes_per_successful_request == 20000 and
+    .candidate_sampled_allocation_weight_bytes_per_successful_request == 22000 and
+    .percentage_allowance_bytes_per_successful_request == 2000 and
+    .allowed_regression_bytes_per_successful_request == 2000 and
+    .observed_regression_bytes_per_successful_request == 2000 and
+    .result == "passed"
+  ' "$allocation_percentage_boundary_output/poc-gates.json" >/dev/null || return 1
+
+  reset_options
+  prepare_poc_gate_fixture "$allocation_percentage_failure_output"
+  write_sampled_allocation_fixture bridge-disabled 20000000
+  write_sampled_allocation_fixture getsockopt-hit 22000001
+  rm -f -- "$allocation_percentage_failure_output/poc-gates.json"
+  write_poc_gate_summary
+  jq -e '
+    .status == "partial" and .result == "failed" and
+    .sampled_allocation.status == "complete" and
+    .sampled_allocation.result == "failed" and
+    (.sampled_allocation.comparisons[] | select(.cell == "getsockopt-hit") |
+      .percentage_allowance_bytes_per_successful_request == 2000 and
+      .allowed_regression_bytes_per_successful_request == 2000 and
+      .observed_regression_bytes_per_successful_request > 2000 and
+      .result == "failed")
+  ' "$allocation_percentage_failure_output/poc-gates.json" >/dev/null || {
+    printf 'sampled-allocation over-ten-percent boundary did not fail\n' >&2
+    return 1
+  }
+
+  reset_options
+  prepare_poc_gate_fixture "$allocation_zero_output"
+  for result in bridge-disabled getsockopt-hit unix-hit getsockopt-w3c; do
+    write_sampled_allocation_fixture "$result" 0
+  done
+  rm -f -- "$allocation_zero_output/poc-gates.json"
+  write_poc_gate_summary
+  validate_supported_poc_dimensions_pass "$allocation_zero_output/poc-gates.json" || {
+    printf 'zero-record sampled-allocation observations did not pass safely\n' >&2
+    return 1
+  }
+  jq -e '
+    .sampled_allocation.baseline.sampled_allocation_records == 0 and
+    .sampled_allocation.baseline.sampled_allocation_weight_bytes_per_successful_request == 0 and
+    all(.sampled_allocation.comparisons[];
+      .percentage_allowance_bytes_per_successful_request == 0 and
+      .allowed_regression_bytes_per_successful_request == 1024 and
+      .result == "passed")
+  ' "$allocation_zero_output/poc-gates.json" >/dev/null || return 1
+
+  reset_options
+  prepare_poc_gate_fixture "$allocation_reset_output"
+  for result in getsockopt-hit unix-hit getsockopt-w3c; do
+    write_sampled_allocation_fixture "$result" 0
+  done
+  rm -f -- "$allocation_reset_output/poc-gates.json"
+  write_poc_gate_summary
+  validate_supported_poc_dimensions_pass "$allocation_reset_output/poc-gates.json" || {
+    printf 'independent lower/reset sampled weight was treated as a regression\n' >&2
+    return 1
+  }
+  jq -e 'all(.sampled_allocation.comparisons[];
+    .candidate_sampled_allocation_weight_bytes_per_successful_request == 0 and
+    .observed_regression_bytes_per_successful_request == 0 and
+    .result == "passed")' \
+    "$allocation_reset_output/poc-gates.json" >/dev/null || return 1
+
+  reset_options
+  prepare_poc_gate_fixture "$allocation_malformed_output"
+  jq '.jfr.allocation_sample.weight_bytes = "malformed"' \
+    "$allocation_malformed_output/cells/getsockopt-hit/java-measurement/evidence.json" \
+    >"$mutated_gate"
+  mv -T -- "$mutated_gate" \
+    "$allocation_malformed_output/cells/getsockopt-hit/java-measurement/evidence.json"
+  rm -f -- "$allocation_malformed_output/poc-gates.json"
+  write_poc_gate_summary
+  validate_poc_gate_schema "$allocation_malformed_output/poc-gates.json" || return 1
+  jq -e '
+    .sampled_allocation.status == "partial" and
+    .sampled_allocation.result == "not_evaluated" and
+    (.sampled_allocation.observations[] | select(.cell == "getsockopt-hit") |
+      .status == "not_available")
+  ' "$allocation_malformed_output/poc-gates.json" >/dev/null || {
+    printf 'malformed sampled-allocation evidence was not failed closed\n' >&2
+    return 1
+  }
+  if validate_supported_poc_dimensions_pass \
+    "$allocation_malformed_output/poc-gates.json"; then
+    printf 'supported PoC dimensions passed malformed sampled-allocation evidence\n' >&2
+    return 1
+  fi
+
+  reset_options
+  prepare_poc_gate_fixture "$allocation_missing_receipt_output"
+  rm -f -- \
+    "$allocation_missing_receipt_output/cells/getsockopt-hit/java-measurement-publication.json" \
+    "$allocation_missing_receipt_output/poc-gates.json"
+  write_poc_gate_summary
+  validate_poc_gate_schema \
+    "$allocation_missing_receipt_output/poc-gates.json" || return 1
+  jq -e '
+    .sampled_allocation.status == "partial" and
+    .sampled_allocation.result == "not_evaluated" and
+    (.sampled_allocation.observations[] | select(.cell == "getsockopt-hit") |
+      .status == "not_available" and
+      .reason == "sealed_java_measurement_evidence_unavailable_or_invalid")
+  ' "$allocation_missing_receipt_output/poc-gates.json" >/dev/null || {
+    printf 'missing sampled-allocation publication receipt did not fail closed\n' >&2
+    return 1
+  }
+  if validate_supported_poc_dimensions_pass \
+    "$allocation_missing_receipt_output/poc-gates.json"; then
+    printf 'supported PoC dimensions passed missing sampled-allocation publication receipt\n' >&2
+    return 1
+  fi
+
+  jq '.jfr.allocation_sample.weight_bytes += 1' \
+    "$stable_output/cells/getsockopt-hit/java-measurement/evidence.json" \
+    >"$mutated_gate"
+  mv -T -- "$mutated_gate" \
+    "$stable_output/cells/getsockopt-hit/java-measurement/evidence.json"
+  if validate_poc_gate_schema "$stable_output/poc-gates.json"; then
+    printf 'PoC validator accepted stale sampled-allocation source evidence\n' >&2
+    return 1
+  fi
+
+  prepare_poc_gate_fixture "$TEST_TMP_DIR/poc-gate-allocation-duplicate-source"
+  compact="$(jq -c . \
+    "$OUTPUT_DIR/cells/getsockopt-hit/java-measurement/evidence.json")" || return 1
+  mutated_json="${compact/\"cell\":\"getsockopt-hit\"/\"cell\":\"getsockopt-hit\",\"cell\":\"getsockopt-hit\"}"
+  [[ "$mutated_json" != "$compact" ]] || return 1
+  printf '%s\n' "$mutated_json" \
+    >"$OUTPUT_DIR/cells/getsockopt-hit/java-measurement/evidence.json"
+  write_poc_gate_summary
+  jq -e '.sampled_allocation.status == "partial" and
+    (.sampled_allocation.observations[] | select(.cell == "getsockopt-hit") |
+      .status == "not_available")' "$OUTPUT_DIR/poc-gates.json" >/dev/null || {
+    printf 'duplicate sampled-allocation evidence key did not fail closed\n' >&2
+    return 1
+  }
+
   jq '.completed_at = "2026-08-10T00:00:01Z"' \
     "$stable_output/cells/unix-hit/status.json" \
     >"$stable_output/cells/unix-hit/status.json.tmp"
@@ -5440,6 +5952,36 @@ test_predeclared_poc_gate_stays_partial_and_evaluates_supported_dimensions() (
     printf 'PoC validator accepted an artifact stale against a retained cell status\n' >&2
     return 1
   fi
+
+  reset_options
+  prepare_poc_gate_fixture "$allocation_receipt_drift_output"
+  validate_published_java_measurement() {
+    # shellcheck disable=SC2317 # Dynamically called by the sourced gate builder.
+    local -r cell_dir="$1"
+    local -r receipt="$cell_dir/java-measurement-publication.json"
+    local temporary=""
+
+    if [[ "${cell_dir##*/}" == "getsockopt-hit" ]]; then
+      if [[ -f "$allocation_receipt_drift_marker" ]]; then
+        temporary="$receipt.tmp"
+        jq '.tree_manifest_sha256 =
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"' \
+          "$receipt" >"$temporary" || return 1
+        mv -T -- "$temporary" "$receipt" || return 1
+      else
+        : >"$allocation_receipt_drift_marker"
+      fi
+    fi
+    validate_sampled_allocation_fixture_seal "$cell_dir"
+  }
+  if write_poc_gate_summary >/dev/null 2>&1; then
+    printf 'sampled-allocation gate accepted publication receipt drift between seal checks\n' >&2
+    return 1
+  fi
+  [[ ! -e "$allocation_receipt_drift_output/poc-gates.json" ]] || {
+    printf 'sampled-allocation gate published after publication receipt drift\n' >&2
+    return 1
+  }
 )
 
 test_summary_resource_scope_is_independent_of_nonresource_failures() (
@@ -8048,6 +8590,24 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
   jq -e '
     .status == "partial" and .result == "not_evaluated" and
     .issue_acceptance_complete == false and
+    .performance.population_variability.status == "complete" and
+    .performance.population_variability.result == "passed" and
+    all(.performance.population_variability.cells[];
+      .throughput_per_second.coefficient_of_variation_percent == 0 and
+      .p99_latency_nanos.coefficient_of_variation_percent == 0 and
+      .result == "passed") and
+    .sampled_allocation.status == "complete" and
+    .sampled_allocation.result == "passed" and
+    .sampled_allocation.classification ==
+      "exploratory_sampled_indicator_not_exact_allocation" and
+    .sampled_allocation.exact_allocation == false and
+    all(.sampled_allocation.observations[];
+      .status == "complete" and
+      .sampled_allocation_records == 5 and
+      .sampled_allocation_weight_bytes == 500 and
+      .successful_requests == 20 and
+      .sampled_allocation_weight_bytes_per_successful_request == 25) and
+    all(.sampled_allocation.comparisons[]; .result == "passed") and
     .resources.map_dimension.status == "complete" and
     .resources.map_dimension.result == "passed" and
     .resources.map_sampling_scope.ownership_attribution == true and
@@ -8296,7 +8856,7 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
   mv -T -- "$TEST_TMP_DIR/owned-runtime-end-fence.json" \
     "$output/cells/getsockopt-hit/resources-measurement-end/obi-metrics-fence.json"
   jq -e '
-    .schema_version == 1 and
+    .schema_version == 2 and
     .kind == "application-performance-repetition-summary" and
     .status == "complete" and
     .acceptance_evidence == false and
@@ -8325,10 +8885,22 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
       .statistics.successful_requests == {min: 4, median: 4, max: 4} and
       .statistics.failed_requests == {min: 0, median: 0, max: 0} and
       .statistics.traffic_elapsed_nanos == {min: 2000000000, median: 2000000000, max: 2000000000} and
-      .statistics.throughput_per_second == {min: 2, median: 2, max: 2} and
+      (.statistics.throughput_per_second |
+        .min == 2 and .median == 2 and .max == 2 and
+        .population_variability == {
+          sample_count: 5, sum: 10, mean: 2, squared_deviation_sum: 0,
+          population_variance: 0, population_standard_deviation: 0,
+          coefficient_of_variation_percent: 0
+        }) and
       .statistics.latency.p50_nanos == {min: 1, median: 1, max: 1} and
       .statistics.latency.p95_nanos == {min: 1, median: 1, max: 1} and
-      .statistics.latency.p99_nanos == {min: 1, median: 1, max: 1}
+      (.statistics.latency.p99_nanos |
+        .min == 1 and .median == 1 and .max == 1 and
+        .population_variability == {
+          sample_count: 5, sum: 5, mean: 1, squared_deviation_sum: 0,
+          population_variance: 0, population_standard_deviation: 0,
+          coefficient_of_variation_percent: 0
+        })
     )
   ' "$output/variance.json" >/dev/null || {
     printf 'hermetic run did not retain complete per-cell repetition variance\n' >&2
@@ -8613,7 +9185,7 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
     printf 'manifest omitted the bounded measurement drain tolerance\n' >&2
     return 1
   }
-  jq -e '.schema_version == 2 and
+  jq -e '.schema_version == 3 and
     .measurement_boundary_resource_evidence ==
       "cells/*/resources-measurement-{baseline,end}/snapshot.json" and
     .exact_owned_cgroup_sockopt_program_evidence == {
@@ -8984,6 +9556,14 @@ main() {
   if [[ "${BENCHMARK_TEST_ONLY:-}" == "complete-mode" ]]; then
     test_complete_mode_fake_run_publishes_resolvable_bounded_evidence
     printf 'benchmark.sh complete-mode test passed\n'
+    return 0
+  fi
+  if [[ "${BENCHMARK_TEST_ONLY:-}" == "benchmark-variability" ]]; then
+    test_complete_manifest_links_bounded_artifacts_and_scopes
+    test_variance_summary_records_ordered_per_cell_statistics
+    test_variance_summary_rejects_invalid_repetition_sets
+    test_predeclared_poc_gate_stays_partial_and_evaluates_supported_dimensions
+    printf 'benchmark.sh variability and sampled-allocation tests passed\n'
     return 0
   fi
   if [[ "${BENCHMARK_TEST_ONLY:-}" == "council-repairs" ]]; then

@@ -105,7 +105,11 @@ readonly JAVA_BENCHMARK_TOOL_ENV=(
   PATH=/opt/java/openjdk/bin:/usr/bin:/bin TZ=UTC
 )
 readonly MAX_PERFORMANCE_REGRESSION_PERCENT=10
+readonly MAX_POPULATION_CV_PERCENT=10
+readonly MAX_SAMPLED_ALLOCATION_REGRESSION_PERCENT=10
+readonly MIN_SAMPLED_ALLOCATION_ALLOWANCE_BYTES_PER_REQUEST=1024
 readonly CORE_CELLS=(uninstrumented bridge-disabled getsockopt-hit unix-hit getsockopt-w3c getsockopt-helper-idle)
+readonly SAMPLED_ALLOCATION_COMPARISON_CELLS=(getsockopt-hit unix-hit getsockopt-w3c)
 readonly BOUNDED_PATH_CELLS=(getsockopt-stale unix-stale unix-timeout getsockopt-pressure)
 readonly PATH_OBSERVATION_CELLS=(getsockopt-hit unix-hit "${BOUNDED_PATH_CELLS[@]}")
 readonly NATIVE_BENCHMARK_COMPILE_FLAGS=(
@@ -1444,6 +1448,11 @@ write_manifest() {
     --argjson bounded_path_cells "$bounded_path_cells_json" \
     --argjson complete_requested "$complete_requested" \
     --argjson jni_benchmark_iterations "$JNI_BENCHMARK_ITERATIONS" \
+    --argjson maximum_population_cv_percent "$MAX_POPULATION_CV_PERCENT" \
+    --argjson maximum_sampled_allocation_regression_percent \
+      "$MAX_SAMPLED_ALLOCATION_REGRESSION_PERCENT" \
+    --argjson minimum_sampled_allocation_allowance_bytes_per_request \
+      "$MIN_SAMPLED_ALLOCATION_ALLOWANCE_BYTES_PER_REQUEST" \
     --argjson w3c_discard_cells "$w3c_discard_cells_json" \
     --argjson w3c_headers_by_cell "$w3c_headers_by_cell_json" \
     --argjson workload_by_cell "$workload_by_cell_json" \
@@ -1451,7 +1460,7 @@ write_manifest() {
       (WARMUP_SECONDS + (REPETITIONS * DURATION_SECONDS)) * CONCURRENCY * ${#CORE_CELLS[@]}
     ))" \
     '{
-      schema_version: 2,
+      schema_version: 3,
       status: "in_progress",
       started_at: $started_at,
       invocation: $invocation,
@@ -1487,6 +1496,20 @@ write_manifest() {
         ],
         normalized_receipt:
           "low_cardinality_counts_deltas_and_digests_without_payload_fields",
+        sampled_allocation_gate: {
+          artifact: "poc-gates.json",
+          baseline_cell: "bridge-disabled",
+          comparison_cells: [
+            "getsockopt-hit", "unix-hit", "getsockopt-w3c"
+          ],
+          metric: "sampled_allocation_weight_bytes_per_successful_request",
+          maximum_regression_percent:
+            $maximum_sampled_allocation_regression_percent,
+          minimum_allowance_bytes_per_successful_request:
+            $minimum_sampled_allocation_allowance_bytes_per_request,
+          classification: "exploratory_sampled_indicator_not_exact_allocation",
+          acceptance_evidence: false
+        },
         acceptance_evidence: false
       },
       application_source_identity: "application-source-identity.json",
@@ -1521,7 +1544,14 @@ write_manifest() {
         correctness_failures_max: 0,
         repetitions: {
           required: 5,
-          variance_summary: "variance.json"
+          variance_summary: "variance.json",
+          population_variability: {
+            formula: "sqrt(sum((x-mean)^2)/N)/mean*100",
+            divisor: "population_N",
+            metrics: ["throughput_per_second", "p99_latency_nanos"],
+            required_cells: $cells,
+            maximum_cv_percent: $maximum_population_cv_percent
+          }
         },
         steady_state_application: {
           baseline_cell: "bridge-disabled",
@@ -1533,7 +1563,24 @@ write_manifest() {
             getsockopt_helper_idle: "direct_java_workload_is_not_comparable_to_the_apache_baseline"
           },
           throughput_regression_max_percent: 10,
-          p99_latency_regression_max_percent: 10
+          p99_latency_regression_max_percent: 10,
+          population_cv_max_percent: $maximum_population_cv_percent
+        },
+        sampled_jfr_allocation: {
+          baseline_cell: "bridge-disabled",
+          comparison_cells: [
+            "getsockopt-hit", "unix-hit", "getsockopt-w3c"
+          ],
+          metric: "sampled_allocation_weight_bytes_per_successful_request",
+          regression_allowance:
+            "max(baseline_bytes_per_successful_request*percent/100,minimum_bytes_per_successful_request)",
+          maximum_regression_percent:
+            $maximum_sampled_allocation_regression_percent,
+          minimum_allowance_bytes_per_successful_request:
+            $minimum_sampled_allocation_allowance_bytes_per_request,
+          classification: "exploratory_sampled_indicator_not_exact_allocation",
+          exact_allocation: false,
+          acceptance_evidence: false
         },
         bounded_growth: {
           fd_delta_max: 0,
@@ -1576,7 +1623,8 @@ write_manifest() {
         bpf_map_evictions: (if $complete_requested then "not_applicable_non_evicting_hash_pressure" else "not_collected" end),
         bpf_lock_contention: "not_collected",
         application_cpu_rss_fd_threads: "requested_for_bounded_growth_gate",
-        java_allocations: "sampled_indicator_requested_not_exact_count",
+        java_allocations:
+          "exploratory_sampled_regression_gate_requested_exact_allocation_not_collected",
         java_native_memory: "nmt_summary_indicator_requested",
         java_direct_memory: "direct_buffer_pool_indicator_requested"
       }
@@ -6380,6 +6428,7 @@ variance_summary_cell() {
   local -a samples=()
 
   cell_spec "$cell" || return 1
+  [[ "$REPETITIONS" == "$REQUIRED_REPETITIONS" ]] || return 1
   [[ -d "$measurement_dir" && ! -L "$measurement_dir" ]] || return 1
   [[ -f "$status_file" && ! -L "$status_file" ]] || return 1
   [[ -f "$contract_file" && ! -L "$contract_file" ]] || return 1
@@ -6453,6 +6502,33 @@ variance_summary_cell() {
             max: $ordered[$count - 1]
           }
         end;
+      def population_variability:
+        . as $values |
+        ($values | length) as $sample_count |
+        if $sample_count != 5 or
+          any($values[]; type != "number" or (isfinite | not))
+        then error("population variability requires exactly five finite samples")
+        else
+          ($values | add) as $sum |
+          ($sum / $sample_count) as $mean |
+          if ($mean | isfinite | not) or $mean <= 0
+          then error("population variability requires a positive finite mean")
+          else
+            ([$values[] | (. - $mean) * (. - $mean)] | add) as $squared_deviation_sum |
+            ($squared_deviation_sum / $sample_count) as $population_variance |
+            ($population_variance | sqrt) as $population_standard_deviation |
+            {
+              sample_count: $sample_count,
+              sum: $sum,
+              mean: $mean,
+              squared_deviation_sum: $squared_deviation_sum,
+              population_variance: $population_variance,
+              population_standard_deviation: $population_standard_deviation,
+              coefficient_of_variation_percent:
+                ($population_standard_deviation / $mean * 100)
+            }
+          end
+        end;
       {
         cell: $cell,
         contract: $contract,
@@ -6463,11 +6539,21 @@ variance_summary_cell() {
           successful_requests: ($samples | map(.successful_requests) | observed_stats),
           failed_requests: ($samples | map(.failed_requests) | observed_stats),
           traffic_elapsed_nanos: ($samples | map(.traffic_elapsed_nanos) | observed_stats),
-          throughput_per_second: ($samples | map(.throughput_per_second) | observed_stats),
+          throughput_per_second: (
+            ($samples | map(.throughput_per_second)) as $values |
+            ($values | observed_stats) + {
+              population_variability: ($values | population_variability)
+            }
+          ),
           latency: {
             p50_nanos: ($samples | map(.latency.p50_nanos) | observed_stats),
             p95_nanos: ($samples | map(.latency.p95_nanos) | observed_stats),
-            p99_nanos: ($samples | map(.latency.p99_nanos) | observed_stats)
+            p99_nanos: (
+              ($samples | map(.latency.p99_nanos)) as $values |
+              ($values | observed_stats) + {
+                population_variability: ($values | population_variability)
+              }
+            )
           }
         }
       }
@@ -6497,7 +6583,7 @@ variance_summary_json() {
     --arg manifest manifest.json \
     --argjson cells "$cells_json" '
       {
-        schema_version: 1,
+        schema_version: 2,
         kind: "application-performance-repetition-summary",
         status: "complete",
         acceptance_evidence: false,
@@ -6507,12 +6593,20 @@ variance_summary_json() {
           sample_selection: "all requested schema-valid repetitions for one cell; none are dropped",
           median: "odd: middle sorted numeric value; even: arithmetic mean of the two middle sorted numeric values",
           spread: "observed minimum and maximum; not a variance estimator or confidence interval",
+          population_variability: {
+            formula: "sqrt(sum((x-mean)^2)/N)/mean*100",
+            divisor: "population_N",
+            required_sample_count: 5,
+            positive_finite_mean_required: true,
+            metrics: ["throughput_per_second", "p99_latency_nanos"]
+          },
           cross_cell_aggregation: false,
           per_request_latency_aggregation: false
         },
         cells: $cells,
         notes: [
           "Each latency statistic summarizes one percentile value from each completed repetition.",
+          "Population CV uses all exactly five retained repetition values; no sample is dropped or substituted.",
           "This application performance artifact applies no threshold itself and does not establish a production SLO; poc-gates.json evaluates the predeclared PoC threshold."
         ]
       }
@@ -7573,16 +7667,403 @@ resource_growth_gate() {
     '
 }
 
+sampled_allocation_observation() (
+  local -r root="$1"
+  local -r cell="$2"
+  local -r cell_dir="$root/cells/$cell"
+  local -r artifact="$cell_dir/java-measurement/evidence.json"
+  local -r receipt="$cell_dir/java-measurement-publication.json"
+  local evidence_sha256=""
+  local evidence_sha256_after=""
+  local receipt_sha256=""
+  local receipt_sha256_after=""
+  local receipt_evidence_sha256=""
+  local tree_manifest_sha256=""
+  local sample_records=""
+  local sampled_weight_bytes=""
+  local successful_requests=""
+
+  unavailable_observation() {
+    jq -cn \
+      --arg cell "$cell" \
+      --arg source "cells/$cell/java-measurement/evidence.json" \
+      --arg publication_receipt \
+        "cells/$cell/java-measurement-publication.json" '
+        {
+          cell: $cell,
+          status: "not_available",
+          reason: "sealed_java_measurement_evidence_unavailable_or_invalid",
+          source: $source,
+          publication_receipt: $publication_receipt
+        }
+      '
+  }
+
+  if ! validate_published_java_measurement "$cell_dir" >/dev/null 2>&1; then
+    unavailable_observation
+    return 0
+  fi
+  evidence_sha256="$(sha256_regular_file "$artifact")" || return 1
+  receipt_sha256="$(sha256_regular_file "$receipt")" || return 1
+  read -r receipt_evidence_sha256 tree_manifest_sha256 < <(jq -ser '
+    if length == 1 then
+      [.[0].evidence_sha256, .[0].tree_manifest_sha256] | @tsv
+    else empty end
+  ' "$receipt") || return 1
+  read -r sample_records sampled_weight_bytes < <(jq -ser \
+    --arg cell "$cell" '
+      if length == 1 and (.[0] |
+        .status == "complete" and .acceptance_evidence == false and
+        .cell == $cell and .jfr.status == "available" and
+        .jfr.whole_window_retention_attested == false and
+        .interpretation.allocation_sample_weight_is_not_an_exact_allocation_count == true and
+        (.jfr.allocation_sample | (keys) == ["records", "weight_bytes"] and
+          (.records | type == "number" and isfinite and floor == . and . >= 0) and
+          (.weight_bytes | type == "number" and isfinite and floor == . and . >= 0) and
+          ((.records == 0 and .weight_bytes == 0) or
+            (.records > 0 and .weight_bytes > 0))))
+      then .[0].jfr.allocation_sample | [.records, .weight_bytes] | @tsv
+      else empty end
+    ' "$artifact") || return 1
+  successful_requests="$(jq -ser --arg cell "$cell" '
+    if length == 1 then
+      [.[0].cells[] | select(.cell == $cell) | .samples[].successful_requests] as $values |
+      if ($values | length) == 5 and
+        all($values[]; type == "number" and isfinite and floor == . and . > 0)
+      then ($values | add) else empty end
+    else empty end
+  ' "$root/variance.json")" || return 1
+  sample_records="$(normalize_decimal \
+    "$sample_records" "$MAX_JFR_RECORDS" true)" || return 1
+  sampled_weight_bytes="$(normalize_decimal \
+    "$sampled_weight_bytes" "$MAX_SEED" true)" || return 1
+  successful_requests="$(normalize_decimal \
+    "$successful_requests" "$MAX_SUSTAINED_WORKLOAD_SUCCESSFUL_REQUESTS" false)" || return 1
+  validate_published_java_measurement "$cell_dir" >/dev/null 2>&1 || return 1
+  evidence_sha256_after="$(sha256_regular_file "$artifact")" || return 1
+  receipt_sha256_after="$(sha256_regular_file "$receipt")" || return 1
+  [[ "$evidence_sha256" =~ ^[0-9a-f]{64}$ &&
+    "$evidence_sha256_after" == "$evidence_sha256" &&
+    "$receipt_sha256" =~ ^[0-9a-f]{64}$ &&
+    "$receipt_sha256_after" == "$receipt_sha256" &&
+    "$receipt_evidence_sha256" == "$evidence_sha256" &&
+    "$tree_manifest_sha256" =~ ^[0-9a-f]{64}$ &&
+    "$sample_records" =~ ^[0-9]+$ && "$sampled_weight_bytes" =~ ^[0-9]+$ &&
+    "$successful_requests" =~ ^[1-9][0-9]*$ ]] || return 1
+  jq -cn \
+    --arg cell "$cell" \
+    --arg source "cells/$cell/java-measurement/evidence.json" \
+    --arg publication_receipt "cells/$cell/java-measurement-publication.json" \
+    --arg successful_request_source \
+      "cells/$cell/measurements/rep-*.json" \
+    --arg evidence_sha256 "$evidence_sha256" \
+    --arg tree_manifest_sha256 "$tree_manifest_sha256" \
+    --argjson sample_records "$sample_records" \
+    --argjson sampled_weight_bytes "$sampled_weight_bytes" \
+    --argjson successful_requests "$successful_requests" '
+      {
+        cell: $cell,
+        status: "complete",
+        source: $source,
+        publication_receipt: $publication_receipt,
+        successful_request_source: $successful_request_source,
+        evidence_sha256: $evidence_sha256,
+        tree_manifest_sha256: $tree_manifest_sha256,
+        sampled_allocation_records: $sample_records,
+        sampled_allocation_weight_bytes: $sampled_weight_bytes,
+        successful_requests: $successful_requests,
+        sampled_allocation_weight_bytes_per_successful_request:
+          ($sampled_weight_bytes / $successful_requests)
+      }
+    '
+)
+
+sampled_allocation_gate() {
+  local -r root="${1:-$OUTPUT_DIR}"
+  local cell=""
+  local observation=""
+  local observations_json=""
+  local -a observations=()
+  local -a selected_cells=(bridge-disabled "${SAMPLED_ALLOCATION_COMPARISON_CELLS[@]}")
+
+  for cell in "${selected_cells[@]}"; do
+    observation="$(sampled_allocation_observation "$root" "$cell")" || return 1
+    observations+=("$observation")
+  done
+  observations_json="$(printf '%s\n' "${observations[@]}" | jq -s .)" || return 1
+  jq -cn \
+    --argjson observations "$observations_json" \
+    --argjson maximum_regression_percent \
+      "$MAX_SAMPLED_ALLOCATION_REGRESSION_PERCENT" \
+    --argjson minimum_allowance_bytes_per_successful_request \
+      "$MIN_SAMPLED_ALLOCATION_ALLOWANCE_BYTES_PER_REQUEST" '
+      def maximum($left; $right): if $left >= $right then $left else $right end;
+      (["getsockopt-hit", "unix-hit", "getsockopt-w3c"]) as $comparison_cells |
+      ($observations | map(select(.cell == "bridge-disabled"))) as $baselines |
+      ($observations | all(.status == "complete")) as $all_complete |
+      if $all_complete and ($baselines | length) == 1 then
+        $baselines[0] as $baseline_observation |
+        $baseline_observation.sampled_allocation_weight_bytes_per_successful_request as $baseline_rate |
+        ([
+          $comparison_cells[] as $cell |
+          ($observations | map(select(.cell == $cell))) as $matches |
+          if ($matches | length) != 1 then
+            error("sampled allocation comparison cell is missing or duplicated")
+          else
+            $matches[0] as $candidate |
+            ($baseline_rate * $maximum_regression_percent / 100) as $percentage_allowance |
+            maximum(
+              $percentage_allowance;
+              $minimum_allowance_bytes_per_successful_request
+            ) as $allowed_regression |
+            (maximum(
+              0;
+              ($candidate.sampled_allocation_weight_bytes_per_successful_request -
+                $baseline_rate)
+            )) as $observed_regression |
+            {
+              cell: $cell,
+              baseline_sampled_allocation_weight_bytes_per_successful_request:
+                $baseline_rate,
+              candidate_sampled_allocation_weight_bytes_per_successful_request:
+                $candidate.sampled_allocation_weight_bytes_per_successful_request,
+              observed_regression_bytes_per_successful_request: $observed_regression,
+              percentage_allowance_bytes_per_successful_request: $percentage_allowance,
+              minimum_allowance_bytes_per_successful_request:
+                $minimum_allowance_bytes_per_successful_request,
+              allowed_regression_bytes_per_successful_request: $allowed_regression,
+              maximum_candidate_bytes_per_successful_request:
+                ($baseline_rate + $allowed_regression),
+              result: (
+                if $observed_regression <= $allowed_regression
+                then "passed" else "failed" end
+              )
+            }
+          end
+        ]) as $comparisons |
+        {
+          status: "complete",
+          result: (if all($comparisons[]; .result == "passed") then "passed" else "failed" end),
+          classification: "exploratory_sampled_indicator_not_exact_allocation",
+          acceptance_evidence: false,
+          exact_allocation: false,
+          metric: "sampled_allocation_weight_bytes_per_successful_request",
+          measurement_window:
+            "one_sealed_bounded_jfr_window_across_exactly_five_repetitions",
+          baseline_cell: "bridge-disabled",
+          comparison_cells: $comparison_cells,
+          regression_allowance:
+            "max(baseline_bytes_per_successful_request*percent/100,minimum_bytes_per_successful_request)",
+          maximum_regression_percent: $maximum_regression_percent,
+          minimum_allowance_bytes_per_successful_request:
+            $minimum_allowance_bytes_per_successful_request,
+          observations: $observations,
+          baseline: {
+            cell: "bridge-disabled",
+            sampled_allocation_records:
+              $baseline_observation.sampled_allocation_records,
+            sampled_allocation_weight_bytes:
+              $baseline_observation.sampled_allocation_weight_bytes,
+            successful_requests: $baseline_observation.successful_requests,
+            sampled_allocation_weight_bytes_per_successful_request: $baseline_rate
+          },
+          comparisons: $comparisons,
+          excluded_cells: {
+            uninstrumented: "no_official_agent",
+            getsockopt_helper_idle:
+              "direct_java_workload_is_not_comparable_to_the_apache_baseline"
+          },
+          interpretation: {
+            sampled_weight_is_not_exact_allocation: true,
+            bounded_recording_may_retain_only_a_tail: true,
+            independent_cell_recordings_may_have_zero_or_lower_sampled_weight: true,
+            production_slo_evidence: false,
+            issue_acceptance_evidence: false
+          }
+        }
+      else
+        {
+          status: "partial",
+          result: "not_evaluated",
+          classification: "exploratory_sampled_indicator_not_exact_allocation",
+          acceptance_evidence: false,
+          exact_allocation: false,
+          metric: "sampled_allocation_weight_bytes_per_successful_request",
+          measurement_window:
+            "one_sealed_bounded_jfr_window_across_exactly_five_repetitions",
+          baseline_cell: "bridge-disabled",
+          comparison_cells: $comparison_cells,
+          regression_allowance:
+            "max(baseline_bytes_per_successful_request*percent/100,minimum_bytes_per_successful_request)",
+          maximum_regression_percent: $maximum_regression_percent,
+          minimum_allowance_bytes_per_successful_request:
+            $minimum_allowance_bytes_per_successful_request,
+          observations: $observations,
+          baseline: null,
+          comparisons: [],
+          excluded_cells: {
+            uninstrumented: "no_official_agent",
+            getsockopt_helper_idle:
+              "direct_java_workload_is_not_comparable_to_the_apache_baseline"
+          },
+          interpretation: {
+            sampled_weight_is_not_exact_allocation: true,
+            bounded_recording_may_retain_only_a_tail: true,
+            independent_cell_recordings_may_have_zero_or_lower_sampled_weight: true,
+            production_slo_evidence: false,
+            issue_acceptance_evidence: false
+          }
+        }
+      end
+    '
+}
+
 validate_poc_gate_shape() {
   local -r artifact="$1"
 
   [[ -f "$artifact" && ! -L "$artifact" ]] || return 1
   jq -se \
     --argjson required_repetitions "$REQUIRED_REPETITIONS" \
-    --argjson maximum_regression "$MAX_PERFORMANCE_REGRESSION_PERCENT" '
+    --argjson maximum_regression "$MAX_PERFORMANCE_REGRESSION_PERCENT" \
+    --argjson maximum_population_cv "$MAX_POPULATION_CV_PERCENT" \
+    --argjson maximum_sampled_allocation_regression \
+      "$MAX_SAMPLED_ALLOCATION_REGRESSION_PERCENT" \
+    --argjson minimum_sampled_allocation_allowance \
+      "$MIN_SAMPLED_ALLOCATION_ALLOWANCE_BYTES_PER_REQUEST" '
       def nonnegative_integer:
         type == "number" and isfinite and floor == . and . >= 0;
       def positive_integer: nonnegative_integer and . > 0;
+      def finite_nonnegative: type == "number" and isfinite and . >= 0;
+      def population_metric_is_exact:
+        ((keys | sort) == [
+          "coefficient_of_variation_percent",
+          "maximum_coefficient_of_variation_percent", "mean",
+          "population_standard_deviation", "population_variance", "result",
+          "sample_count", "squared_deviation_sum", "sum"
+        ]) and
+        .sample_count == $required_repetitions and
+        (.sum | type == "number" and isfinite and . > 0) and
+        (.mean | type == "number" and isfinite and . > 0) and
+        (.squared_deviation_sum | finite_nonnegative) and
+        (.population_variance | finite_nonnegative) and
+        (.population_standard_deviation | finite_nonnegative) and
+        (.coefficient_of_variation_percent | finite_nonnegative) and
+        .maximum_coefficient_of_variation_percent == $maximum_population_cv and
+        .result == (
+          if .coefficient_of_variation_percent <=
+            .maximum_coefficient_of_variation_percent
+          then "passed" else "failed" end
+        );
+      def sampled_allocation_observation_is_exact:
+        (.cell | type == "string" and length > 0) and
+        .source == ("cells/" + .cell + "/java-measurement/evidence.json") and
+        .publication_receipt ==
+          ("cells/" + .cell + "/java-measurement-publication.json") and
+        if .status == "complete" then
+          ((keys | sort) == [
+            "cell", "evidence_sha256", "publication_receipt",
+            "sampled_allocation_records", "sampled_allocation_weight_bytes",
+            "sampled_allocation_weight_bytes_per_successful_request", "source",
+            "status", "successful_request_source", "successful_requests",
+            "tree_manifest_sha256"
+          ]) and
+          .successful_request_source ==
+            ("cells/" + .cell + "/measurements/rep-*.json") and
+          (.evidence_sha256 | test("^[0-9a-f]{64}$")) and
+          (.tree_manifest_sha256 | test("^[0-9a-f]{64}$")) and
+          (.sampled_allocation_records | nonnegative_integer) and
+          (.sampled_allocation_weight_bytes | nonnegative_integer) and
+          (((.sampled_allocation_records == 0) and
+            (.sampled_allocation_weight_bytes == 0)) or
+           ((.sampled_allocation_records > 0) and
+            (.sampled_allocation_weight_bytes > 0))) and
+          (.successful_requests | positive_integer) and
+          (.sampled_allocation_weight_bytes_per_successful_request |
+            finite_nonnegative)
+        else
+          ((keys | sort) == [
+            "cell", "publication_receipt", "reason", "source", "status"
+          ]) and
+          .status == "not_available" and
+          .reason == "sealed_java_measurement_evidence_unavailable_or_invalid"
+        end;
+      def sampled_allocation_is_exact:
+        ((keys | sort) == [
+          "acceptance_evidence", "baseline", "baseline_cell", "classification",
+          "comparison_cells", "comparisons", "exact_allocation", "excluded_cells",
+          "interpretation", "maximum_regression_percent", "measurement_window",
+          "metric", "minimum_allowance_bytes_per_successful_request", "observations",
+          "regression_allowance", "result", "status"
+        ]) and
+        .classification == "exploratory_sampled_indicator_not_exact_allocation" and
+        .acceptance_evidence == false and .exact_allocation == false and
+        .metric == "sampled_allocation_weight_bytes_per_successful_request" and
+        .measurement_window ==
+          "one_sealed_bounded_jfr_window_across_exactly_five_repetitions" and
+        .baseline_cell == "bridge-disabled" and
+        .comparison_cells == ["getsockopt-hit", "unix-hit", "getsockopt-w3c"] and
+        .regression_allowance ==
+          "max(baseline_bytes_per_successful_request*percent/100,minimum_bytes_per_successful_request)" and
+        .maximum_regression_percent == $maximum_sampled_allocation_regression and
+        .minimum_allowance_bytes_per_successful_request ==
+          $minimum_sampled_allocation_allowance and
+        .excluded_cells == {
+          uninstrumented: "no_official_agent",
+          getsockopt_helper_idle:
+            "direct_java_workload_is_not_comparable_to_the_apache_baseline"
+        } and
+        .interpretation == {
+          sampled_weight_is_not_exact_allocation: true,
+          bounded_recording_may_retain_only_a_tail: true,
+          independent_cell_recordings_may_have_zero_or_lower_sampled_weight: true,
+          production_slo_evidence: false,
+          issue_acceptance_evidence: false
+        } and
+        ([.observations[].cell] == [
+          "bridge-disabled", "getsockopt-hit", "unix-hit", "getsockopt-w3c"
+        ]) and
+        all(.observations[]; sampled_allocation_observation_is_exact) and
+        if .status == "complete" then
+          .result == (if all(.comparisons[]; .result == "passed") then "passed" else "failed" end) and
+          (.baseline |
+            ((keys | sort) == [
+              "cell", "sampled_allocation_records", "sampled_allocation_weight_bytes",
+              "sampled_allocation_weight_bytes_per_successful_request",
+              "successful_requests"
+            ]) and .cell == "bridge-disabled" and
+            (.sampled_allocation_records | nonnegative_integer) and
+            (.sampled_allocation_weight_bytes | nonnegative_integer) and
+            (.successful_requests | positive_integer) and
+            (.sampled_allocation_weight_bytes_per_successful_request |
+              finite_nonnegative)) and
+          ([.comparisons[].cell] == .comparison_cells) and
+          all(.comparisons[];
+            ((keys | sort) == [
+              "allowed_regression_bytes_per_successful_request",
+              "baseline_sampled_allocation_weight_bytes_per_successful_request",
+              "candidate_sampled_allocation_weight_bytes_per_successful_request", "cell",
+              "maximum_candidate_bytes_per_successful_request",
+              "minimum_allowance_bytes_per_successful_request",
+              "observed_regression_bytes_per_successful_request",
+              "percentage_allowance_bytes_per_successful_request", "result"
+            ]) and
+            all([
+              .allowed_regression_bytes_per_successful_request,
+              .baseline_sampled_allocation_weight_bytes_per_successful_request,
+              .candidate_sampled_allocation_weight_bytes_per_successful_request,
+              .maximum_candidate_bytes_per_successful_request,
+              .minimum_allowance_bytes_per_successful_request,
+              .observed_regression_bytes_per_successful_request,
+              .percentage_allowance_bytes_per_successful_request
+            ][]; finite_nonnegative) and
+            .minimum_allowance_bytes_per_successful_request ==
+              $minimum_sampled_allocation_allowance and
+            (.result == "passed" or .result == "failed"))
+        else
+          .status == "partial" and .result == "not_evaluated" and
+          .baseline == null and .comparisons == [] and
+          any(.observations[]; .status == "not_available")
+        end;
       def process_sources_are_exact:
         .sources == {
           before: ("cells/" + .cell + "/resources-before/" + .service + "-proc.txt"),
@@ -7715,7 +8196,12 @@ validate_poc_gate_shape() {
         end;
       length == 1 and
       (.[0] |
-        .schema_version == 1 and
+        ((keys | sort) == [
+          "correctness", "issue_acceptance_complete", "kind", "performance",
+          "resources", "result", "sampled_allocation", "schema_version", "status",
+          "thresholds", "unmeasured_dimensions"
+        ]) and
+        .schema_version == 2 and
         .kind == "predeclared-java-remote-parent-poc-gate-evaluation" and
         .status == "partial" and
         (.result == "not_evaluated" or .result == "failed") and
@@ -7726,6 +8212,11 @@ validate_poc_gate_shape() {
           .required_repetitions == $required_repetitions and
           .throughput_regression_max_percent == $maximum_regression and
           .p99_latency_regression_max_percent == $maximum_regression and
+          .population_cv_max_percent == $maximum_population_cv and
+          .sampled_allocation_regression_max_percent ==
+            $maximum_sampled_allocation_regression and
+          .sampled_allocation_minimum_allowance_bytes_per_successful_request ==
+            $minimum_sampled_allocation_allowance and
           .fd_delta_max == 0 and .thread_delta_max == 0 and
           .java_bridge_map_entries_delta_max == 0) and
         (.correctness |
@@ -7743,8 +8234,42 @@ validate_poc_gate_shape() {
             uninstrumented: "no_official_agent",
             getsockopt_helper_idle: "direct_java_workload_is_not_comparable_to_the_apache_baseline"
           } and
+          (.population_variability |
+            ((keys | sort) == [
+              "cells", "divisor", "formula",
+              "maximum_coefficient_of_variation_percent", "required_repetitions",
+              "result", "source", "status"
+            ]) and
+            .status == "complete" and (.result == "passed" or .result == "failed") and
+            .source == "variance.json" and
+            .formula == "sqrt(sum((x-mean)^2)/N)/mean*100" and
+            .divisor == "population_N" and
+            .required_repetitions == $required_repetitions and
+            .maximum_coefficient_of_variation_percent == $maximum_population_cv and
+            ([.cells[].cell] == [
+              "uninstrumented", "bridge-disabled", "getsockopt-hit", "unix-hit",
+              "getsockopt-w3c", "getsockopt-helper-idle"
+            ]) and
+            all(.cells[];
+              ((keys | sort) == [
+                "cell", "p99_latency_nanos", "result", "throughput_per_second"
+              ]) and
+              (.throughput_per_second | population_metric_is_exact) and
+              (.p99_latency_nanos | population_metric_is_exact) and
+              .result == (
+                if .throughput_per_second.result == "passed" and
+                   .p99_latency_nanos.result == "passed"
+                then "passed" else "failed" end
+              )) and
+            .result == (if all(.cells[]; .result == "passed") then "passed" else "failed" end)) and
           all(.comparisons[];
-            .result == "passed" or .result == "failed")) and
+            .result == "passed" or .result == "failed") and
+          .result == (
+            if all(.comparisons[]; .result == "passed") and
+              .population_variability.result == "passed"
+            then "passed" else "failed" end
+          )) and
+        (.sampled_allocation | sampled_allocation_is_exact) and
         (.resources |
           .status == "partial" and
           .required_samples == ["before", "idle_recovery"] and
@@ -7839,7 +8364,9 @@ validate_poc_gate_shape() {
                 })
               end))) and
         .unmeasured_dimensions == {
-          jfr_nmt_allocation_native_direct_memory:
+          exact_java_allocation:
+            "sampled_jfr_weight_evaluated_as_exploratory_indicator_only_exact_allocation_not_collected",
+          nmt_native_and_direct_memory:
             "bounded_indicators_retained_not_evaluated_as_acceptance_gate",
           primary_cgroupsockopt_program_cpu: "not_collected",
           bpf_lock_contention: "not_collected"
@@ -7847,6 +8374,7 @@ validate_poc_gate_shape() {
         .result == (
           if .correctness.result == "failed" or
              .performance.result == "failed" or
+             .sampled_allocation.result == "failed" or
              .resources.result == "failed"
           then "failed" else "not_evaluated" end
         )
@@ -7867,6 +8395,17 @@ validate_supported_poc_dimensions_pass() {
         .observed_failures == 0
       ) and
       .performance.status == "complete" and .performance.result == "passed" and
+      (.performance.population_variability |
+        .status == "complete" and .result == "passed" and
+          all(.cells[];
+            .result == "passed" and
+            .throughput_per_second.result == "passed" and
+            .p99_latency_nanos.result == "passed")
+      ) and
+      .sampled_allocation.status == "complete" and
+      .sampled_allocation.result == "passed" and
+      all(.sampled_allocation.observations[]; .status == "complete") and
+      all(.sampled_allocation.comparisons[]; .result == "passed") and
       .resources.process_dimension == {status: "complete", result: "passed"} and
       all(.resources.process_observations[];
         .status == "complete" and .result == "passed") and
@@ -7889,6 +8428,7 @@ poc_gate_summary_json() {
   local status_file=""
   local statuses_json=""
   local resources_json=""
+  local sampled_allocation_json=""
   local -a statuses=()
 
   [[ -d "$root" && ! -L "$root" &&
@@ -7924,11 +8464,14 @@ poc_gate_summary_json() {
   done
   statuses_json="$(printf '%s\n' "${statuses[@]}" | jq -s .)" || return 1
   resources_json="$(resource_growth_gate)" || return 1
+  sampled_allocation_json="$(sampled_allocation_gate "$root")" || return 1
   jq -n \
     --argjson required_repetitions "$REQUIRED_REPETITIONS" \
     --argjson maximum_regression "$MAX_PERFORMANCE_REGRESSION_PERCENT" \
+    --argjson maximum_population_cv "$MAX_POPULATION_CV_PERCENT" \
     --argjson statuses "$statuses_json" \
     --argjson resources "$resources_json" \
+    --argjson sampled_allocation "$sampled_allocation_json" \
     --slurpfile variance "$root/variance.json" '
       def regression_percent($baseline; $candidate; $higher_is_better):
         if $higher_is_better then
@@ -7976,11 +8519,42 @@ poc_gate_summary_json() {
         )
       ]) as $comparisons |
       ([
+        $variance[0].cells[] |
+        {
+          cell: .cell,
+          throughput_per_second: (
+            .statistics.throughput_per_second.population_variability + {
+              maximum_coefficient_of_variation_percent: $maximum_population_cv,
+              result: (
+                if .statistics.throughput_per_second.population_variability.coefficient_of_variation_percent <=
+                  $maximum_population_cv
+                then "passed" else "failed" end
+              )
+            }
+          ),
+          p99_latency_nanos: (
+            .statistics.latency.p99_nanos.population_variability + {
+              maximum_coefficient_of_variation_percent: $maximum_population_cv,
+              result: (
+                if .statistics.latency.p99_nanos.population_variability.coefficient_of_variation_percent <=
+                  $maximum_population_cv
+                then "passed" else "failed" end
+              )
+            }
+          )
+        } |
+        .result = (
+          if .throughput_per_second.result == "passed" and
+             .p99_latency_nanos.result == "passed"
+          then "passed" else "failed" end
+        )
+      ]) as $population_variability_cells |
+      ([
         $variance[0].cells[].samples[].failed_requests,
         ($statuses[] | if .status == "passed" then 0 else 1 end)
       ] | add) as $observed_failures |
       {
-        schema_version: 1,
+        schema_version: 2,
         kind: "predeclared-java-remote-parent-poc-gate-evaluation",
         issue_acceptance_complete: false,
         thresholds: {
@@ -7989,6 +8563,11 @@ poc_gate_summary_json() {
           required_repetitions: $required_repetitions,
           throughput_regression_max_percent: $maximum_regression,
           p99_latency_regression_max_percent: $maximum_regression,
+          population_cv_max_percent: $maximum_population_cv,
+          sampled_allocation_regression_max_percent:
+            $sampled_allocation.maximum_regression_percent,
+          sampled_allocation_minimum_allowance_bytes_per_successful_request:
+            $sampled_allocation.minimum_allowance_bytes_per_successful_request,
           fd_delta_max: 0,
           thread_delta_max: 0,
           java_bridge_map_entries_delta_max: 0
@@ -8005,7 +8584,11 @@ poc_gate_summary_json() {
         },
         performance: {
           status: "complete",
-          result: (if all($comparisons[]; .result == "passed") then "passed" else "failed" end),
+          result: (
+            if all($comparisons[]; .result == "passed") and
+              all($population_variability_cells[]; .result == "passed")
+            then "passed" else "failed" end
+          ),
           source: "variance.json",
           required_repetitions: $required_repetitions,
           baseline: {
@@ -8014,14 +8597,30 @@ poc_gate_summary_json() {
             p99_latency_nanos_median: $baseline.statistics.latency.p99_nanos.median
           },
           comparisons: $comparisons,
+          population_variability: {
+            status: "complete",
+            result: (
+              if all($population_variability_cells[]; .result == "passed")
+              then "passed" else "failed" end
+            ),
+            source: "variance.json",
+            formula: "sqrt(sum((x-mean)^2)/N)/mean*100",
+            divisor: "population_N",
+            required_repetitions: $required_repetitions,
+            maximum_coefficient_of_variation_percent: $maximum_population_cv,
+            cells: $population_variability_cells
+          },
           excluded_cells: {
             uninstrumented: "no_official_agent",
             getsockopt_helper_idle: "direct_java_workload_is_not_comparable_to_the_apache_baseline"
           }
         },
+        sampled_allocation: $sampled_allocation,
         resources: $resources,
         unmeasured_dimensions: {
-          jfr_nmt_allocation_native_direct_memory:
+          exact_java_allocation:
+            "sampled_jfr_weight_evaluated_as_exploratory_indicator_only_exact_allocation_not_collected",
+          nmt_native_and_direct_memory:
             "bounded_indicators_retained_not_evaluated_as_acceptance_gate",
           primary_cgroupsockopt_program_cpu: "not_collected",
           bpf_lock_contention: "not_collected"
@@ -8029,9 +8628,10 @@ poc_gate_summary_json() {
       } |
       .status = "partial" |
       .result = (
-        if .correctness.result == "failed" or
-           .performance.result == "failed" or
-           .resources.result == "failed"
+          if .correctness.result == "failed" or
+             .performance.result == "failed" or
+             .sampled_allocation.result == "failed" or
+             .resources.result == "failed"
         then "failed" else "not_evaluated" end
       )
     '
@@ -8041,10 +8641,19 @@ validate_poc_gate_schema() {
   local -r artifact="$1"
   local artifact_root=""
   local expected=""
+  local expected_raw_value_count=""
+  local observed_raw_value_count=""
 
   validate_poc_gate_shape "$artifact" || return 1
   artifact_root="$(cd -- "${artifact%/*}" && pwd -P)" || return 1
   expected="$(poc_gate_summary_json "$artifact_root")" || return 1
+  expected_raw_value_count="$(jq --stream -n '
+    reduce inputs as $event (0;
+      if ($event | length) == 2 then . + 1 else . end)
+  ' <<<"$expected")" || return 1
+  observed_raw_value_count="$(raw_json_value_count "$artifact")" || return 1
+  [[ "$expected_raw_value_count" =~ ^[1-9][0-9]*$ &&
+    "$observed_raw_value_count" == "$expected_raw_value_count" ]] || return 1
   jq -se --argjson expected "$expected" '
     length == 1 and .[0] == $expected
   ' "$artifact" >/dev/null
@@ -10786,10 +11395,60 @@ validate_variance_summary_schema() {
   local -r artifact="$1"
   local artifact_root=""
   local expected=""
+  local expected_raw_value_count=""
+  local observed_raw_value_count=""
 
   [[ -f "$artifact" && ! -L "$artifact" ]] || return 1
   artifact_root="$(cd -- "${artifact%/*}" && pwd -P)" || return 1
   expected="$(variance_summary_json "$artifact_root")" || return 1
+  expected_raw_value_count="$(jq --stream -n '
+    reduce inputs as $event (0;
+      if ($event | length) == 2 then . + 1 else . end)
+  ' <<<"$expected")" || return 1
+  observed_raw_value_count="$(raw_json_value_count "$artifact")" || return 1
+  [[ "$expected_raw_value_count" =~ ^[1-9][0-9]*$ &&
+    "$observed_raw_value_count" == "$expected_raw_value_count" ]] || return 1
+  jq -se --argjson required_repetitions "$REQUIRED_REPETITIONS" '
+    def finite_nonnegative: type == "number" and isfinite and . >= 0;
+    def population_is_exact:
+      ((keys | sort) == [
+        "coefficient_of_variation_percent", "mean", "population_standard_deviation",
+        "population_variance", "sample_count", "squared_deviation_sum", "sum"
+      ]) and
+      .sample_count == $required_repetitions and
+      (.sum | type == "number" and isfinite and . > 0) and
+      (.mean | type == "number" and isfinite and . > 0) and
+      (.squared_deviation_sum | finite_nonnegative) and
+      (.population_variance | finite_nonnegative) and
+      (.population_standard_deviation | finite_nonnegative) and
+      (.coefficient_of_variation_percent | finite_nonnegative);
+    length == 1 and (.[0] |
+      ((keys | sort) == [
+        "acceptance_evidence", "aggregation", "cells", "kind", "manifest",
+        "notes", "schema_version", "status"
+      ]) and
+      .schema_version == 2 and
+      .kind == "application-performance-repetition-summary" and
+      .status == "complete" and .acceptance_evidence == false and
+      .manifest == "manifest.json" and
+      ([.cells[].cell] == [
+        "uninstrumented", "bridge-disabled", "getsockopt-hit", "unix-hit",
+        "getsockopt-w3c", "getsockopt-helper-idle"
+      ]) and
+      all(.cells[];
+        ((keys | sort) == [
+          "cell", "contract", "expected_sample_count", "samples", "statistics",
+          "valid_sample_count"
+        ]) and
+        .expected_sample_count == $required_repetitions and
+        .valid_sample_count == $required_repetitions and
+        (.samples | length) == $required_repetitions and
+        ([.samples[].repetition] == [1, 2, 3, 4, 5]) and
+        (.statistics.throughput_per_second.population_variability |
+          population_is_exact) and
+        (.statistics.latency.p99_nanos.population_variability |
+          population_is_exact)))
+  ' "$artifact" >/dev/null || return 1
   jq -se --argjson expected "$expected" '
     length == 1 and .[0] == $expected
   ' "$artifact" >/dev/null
@@ -11039,7 +11698,7 @@ write_summary() {
       },
       notes: [
         "The bounded preflight and post-load sentinel establish the declared correctness assertion for each cell.",
-        "variance.json is the sustained application performance benchmark; poc-gates.json applies the predeclared PoC thresholds to its fixed five-repetition medians.",
+        "variance.json is the sustained application performance benchmark; poc-gates.json applies the predeclared PoC thresholds to its fixed five-repetition medians and throughput/p99 population CVs.",
         "Midpoint resource snapshots are unsynchronized point samples and do not prove full in-load coverage.",
         "Unavailable dimensions in manifest.json are not measured as zero.",
         "The process-growth dimension requires complete before and idle-recovery FD and thread samples; unavailable samples cannot pass that dimension.",
@@ -11048,7 +11707,8 @@ write_summary() {
         "docker-daemon.json proves only that the selected endpoint was a stable existing non-symlink Unix socket; it does not prove where the daemon process runs.",
         "Each available process sample separately binds the exact inspected container ID to bounded local procfs cgroup, PID-start-time, and cgroup-digest evidence.",
         "A passed summary status means the harness completed successfully; poc-gates.json remains partial and is not issue-acceptance evidence.",
-        "JFR sampled-allocation weights, monitor/park events, NMT summary totals/deltas, and the direct-buffer pool are bounded indicators; they are not exact full allocation counts, all native/off-heap memory, production SLO evidence, or issue-acceptance evidence.",
+        "Sealed JFR sampled-allocation weight per successful request is evaluated only as an exploratory regression indicator with the declared max(10% baseline, 1024-byte) allowance; it is not an exact allocation count, production SLO evidence, or issue-acceptance evidence.",
+        "JFR monitor/park events, NMT summary totals/deltas, and the direct-buffer pool remain bounded indicators; they are not all native/off-heap memory or issue-acceptance evidence.",
         "The size-bounded JFR may retain only a bounded tail if its 32 MiB limit is reached; whole-window event retention is explicitly not attested.",
         "Every available Java runtime indicator cell is bound to one exact benchmark image, helper JAR/source, and JFR settings attestation shared across the six-cell aggregate.",
         "The retained raw JFR is private bounded diagnostic input; normalized receipts expose only low-cardinality counts, deltas, and digests and never class names, stack frames, JVM arguments, system properties, request markers, or source paths.",

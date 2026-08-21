@@ -48,9 +48,12 @@ owned-map-growth dimension fails. Selected forced-`getsockopt` cells now also
 retain exact-owned kernel-reported program execution-count and cumulative
 run-time deltas across the sustained measurement window. Those counters are
 descriptive and are not host, process, or cgroup CPU utilization, CPU-isolation,
-or synchronization/lock-wait evidence. JFR/NMT allocation,
-native/direct-memory growth, primary cgroup-sockopt program CPU utilization,
-and BPF lock contention remain uncollected. A `passed` `summary.json` status
+or synchronization/lock-wait evidence. The core cells also retain bounded JFR
+sampled-allocation and monitor/park indicators, NMT summary totals/deltas, and
+the direct-buffer-pool delta described below. They are diagnostic indicators,
+not exact allocation or all-native-memory counts. Primary cgroup-sockopt
+program CPU utilization and BPF lock contention remain uncollected. A `passed`
+`summary.json` status
 means only that the requested harness execution completed; it is neither a
 passing PoC gate nor issue-acceptance evidence.
 
@@ -317,6 +320,144 @@ The default `--cells core` run produces the sustained application benchmark.
 observed range. `poc-gates.json` applies the predeclared zero-failure and 10%
 regression thresholds to the supported core dimensions, while preserving the
 partial resource result described above.
+
+### Bounded Java runtime indicators
+
+Only the six selected sustained core cells use the image's explicit
+`benchmark-runtime` JDK target and the distinct
+`obi-apache-java-https-backend-benchmark:local` image tag. The harness
+overwrites inherited `JAVA_IMAGE_TARGET`, `JAVA_BACKEND_IMAGE`, and
+`JAVA_BENCHMARK_TOOL_OPTIONS_SUFFIX` values: core cells receive the fixed
+benchmark target, tag, and suffix, while every bounded path cell receives the
+ordinary `runtime` target, `obi-apache-java-https-backend:local` tag, and an
+empty suffix. The Compose and Dockerfile defaults remain the JRE-only
+`runtime` target with the ordinary tag and an empty suffix, so an ordinary
+`docker compose up`, `run.sh`, or direct default image build cannot reuse the
+benchmark image and does not enable NMT, JFR, `jcmd`, or the benchmark helper.
+
+The fixed core-cell suffix enables NMT `summary` and one bootstrap JFR with a
+3,600-second duration, 32 MiB maximum size, no maximum-age eviction, no exit
+dump, the checked-in low-cardinality settings, and the fixed private
+`/tmp/obi-benchmark-bootstrap.jfr` container path. After warmup and the existing
+OBI measurement-baseline capture, the harness attaches to the exact Java PID
+and stops the bootstrap recording to that exact path. A separately
+identity-bracketed helper atomically moves that non-symlink regular file into a
+fresh owner-only quarantine, opens and retains its descriptor, enforces the
+32 MiB cap while hashing through that descriptor, deletes only the
+identity-matched quarantined entry, and proves the fixed source path remains
+absent. The harness then accepts only the exact JDK 21 `Baseline taken`
+response, confirms the NMT baseline with `summary.diff scale=1`, reads the
+direct buffer pool, and starts a fresh measurement recording with the same
+duration and size bounds. Measurement traffic is not admitted until those
+operations finish.
+
+The first post-load action records a canonical UTC RFC3339Nano timestamp and
+initiates the measurement JFR stop; it is not claimed to occur instantaneously.
+The existing OBI end-boundary confirmation follows. The helper then makes one
+bounded copy into a fresh owner-only directory while retaining its `FileChannel`.
+`RecordingFile` opens `/proc/<helper-pid>/fd/<held-fd>`, the helper verifies and
+hashes through that same descriptor, and the retained raw JFR is streamed from
+that descriptor in the same invocation. The parser summary is emitted on a
+separate bounded stream. There is no later reopen of the stopped source path for
+the raw evidence. The helper closes the held descriptor and attempts exact-key
+private-file and directory cleanup even when its final verification fails,
+while preserving the primary failure and any cleanup failure. Post-load NMT
+`summary` and `summary.diff` observations and a direct-buffer reading follow.
+The JFR is deliberately a conservative outer
+bracket: it includes the fixed identity/JMX confirmation work around its start
+and stop commands as well as the admitted workload. Those diagnostic events
+are not attributed to application requests.
+
+The retained JFR start/stop command outputs must have the exact bounded JDK 21
+four-line form: container PID 1, a bounded numeric byte/kB/MB size where
+applicable, one blank separator, and the one configured bootstrap or measurement
+path. The measurement stop's formatted size must reconcile exactly with the
+retained raw byte count under the JDK 21 binary byte/kB/MB formatting rules.
+Alternate paths, missing separators, extra lines, and size disagreement fail
+closed.
+
+Every `jcmd` and JMX operation is enclosed by two RuntimeMXBean observations;
+each of those observations is itself bracketed by independently captured
+Compose container ID, Docker-reported host PID, local `/proc` start time,
+cgroup digest/full-container-ID binding, project, and owner sentinel receipts.
+All receipts must remain byte-identical, RuntimeMXBean PID must remain container
+PID 1, and its positive start epoch must remain exact. Attaching to a replacement
+JVM or container fails before publication. Missing exact executables or
+artifacts at the pre-execution facility check is classified as
+`infrastructure_unavailable`. Once those facilities are present, any command
+failure, malformed response, missing assertion, attach/JFR/NMT/BufferPool
+failure, or evidence omission is `measurement_contract_failed`; this source
+does not manufacture a product-unsupported outcome. JFR identity comes from
+the exact brackets around the named start, stop, descriptor-snapshot/parser,
+NMT, and JMX operations; the parser does not echo caller-supplied PID/start
+values as though they came from the recording.
+
+Before measurement, the harness also brackets and retains the exact Docker
+image ID and configured benchmark tag, helper JAR digest and size, helper source
+digest and exact equality with the checked-in source authority, and JFR settings
+digest, size, and exact equality with the checked-in JFC authority. The same
+runtime-artifact attestation digest is required in all six cells before a
+passed aggregate can be written. A substituted image, helper, source, settings
+file, or mixed per-cell attestation fails closed.
+
+The JFR settings enable only sampled allocation, Java monitor-enter,
+thread-park, and data-loss events needed by this slice. Allocation, monitor,
+and park stack traces are explicitly disabled; unrelated environment, system
+property, execution-sample, old-object, JVM-information, and application events
+remain disabled. Any unexpected recorded event or any JFR data-loss event fails
+normalization. `jdk.JVMInformation` stays disabled specifically because it
+carries JVM arguments and flags; process binding is established by the outer
+receipts above instead of retaining that payload event. The private raw
+recording is limited to 32 MiB and 3600 seconds, and normalization stops at
+600,000 records. Because the recording is size-bounded and has no age eviction,
+the retained recording may still be a bounded tail if it reaches 32 MiB; the
+harness explicitly records `whole_window_retention_attested: false` and does
+not claim whole-window event retention. Its size and SHA-256 must remain exact
+across descriptor-bound parsing, verification, and raw streaming. Each tool
+response is limited to 1 MiB, and the raw and normalized helper streams have
+independent hard file-size limits. No unpublished Java evidence tree may exceed
+128 entries. Those bounds remain active on failure or interruption; the scoped
+container cleanup destroys its bounded recording, while the harness removes
+only the exact owner-private `.java-measurement.partial` tree whose parent and
+root identities still match. Directory traversal is materialized with checked
+`find` and `sort` statuses, repeated, capped, and compared for drift. Symlinks
+are unlinked without following them, and outside paths, directories in place of
+the publication target, identity changes, special files, traversal failure,
+and over-cap trees are refused. Parent/root identities and the full evidence
+tree are revalidated before and after the final atomic publication. A separate
+owner-only publication receipt then binds the exact parent/root identities,
+evidence digest, runtime-artifact attestation, and a canonical digest over every
+tree path, entry identity, and regular-file content. The immediate `operations/`
+roster must be exactly the ordered eleven named operation directories; sibling
+files, symlinks, extra directories, and special entries are rejected. Aggregate
+collection rejects an otherwise valid tree when its receipt is missing,
+duplicated, stale, cross-root, or no longer matches that whole-tree digest. A
+root substituted in the final check-to-rename window fails the
+identity check and is moved away from the collectable `java-measurement` name;
+the hidden rejected entry is not claimed to be atomically erased against a
+same-UID adversary.
+
+NMT is retained at `summary` level only. The immediate baseline confirmation
+and post-load diff must reconstruct the same positive baseline totals; missing,
+ambiguous, unsafe-integer, reset, or negative total deltas fail closed. A
+separate post-load summary is retained and digested because it is a later
+snapshot, not falsely equated with the diff's instant. Direct-buffer count,
+used bytes, and capacity must be safe non-negative integers at each
+RuntimeMXBean snapshot. Their retained delta is signed because reclamation can
+legitimately reduce any of those pool gauges; it is not mislabeled as a
+cumulative allocation counter or a reset.
+
+Each private per-cell directory retains the bounded raw JFR, raw aggregate NMT
+outputs, and exact identity brackets. Its public `evidence.json` has an exact,
+duplicate-aware schema and exposes only low-cardinality counts, byte/duration
+deltas, timestamps, limits, and SHA-256 digests. It never publishes class
+names, stack frames, JVM arguments, environment or system properties, request
+markers, or source/filesystem paths. `acceptance_evidence` remains `false`:
+JFR allocation weights are samples rather than exact full allocation counts,
+NMT committed bytes cover HotSpot-tracked native categories rather than RSS or
+all third-party native memory, and the direct pool is not all native/off-heap
+memory. These measurements do not establish a production SLO or complete the
+linked benchmark issue.
 
 `--cells complete` additionally produces `lookup-paths.json` and
 `native-jni/benchmark.json`. It runs one bounded correctness execution for the
@@ -642,10 +783,11 @@ both artifacts without turning unavailable measurements into zeroes or treating
 successful harness completion as issue acceptance.
 
 The optional complete mode adds native transport/provider lookup percentiles
-and bounded pressure capacity/cleanup evidence as described above. It does not
-invoke the separate packaged-JVM transport fixture or collect JFR/NMT
-allocation/native/direct-memory summaries, primary cgroup-sockopt program CPU
-utilization, or BPF lock contention. The exact-owned cumulative run-time and
+and bounded pressure capacity/cleanup evidence as described above. Its six core
+cells retain the same bounded Java runtime indicators, but its four additional
+path cells do not enable the benchmark JDK instrumentation. It does not invoke
+the separate packaged-JVM transport fixture or collect primary cgroup-sockopt
+program CPU utilization or BPF lock contention. The exact-owned cumulative run-time and
 execution counters described above remain descriptive non-acceptance evidence.
 Its capacity-rejection observation is not a general
 BPF map-insertion-failure counter, and its non-evicting-map check is not an
@@ -659,7 +801,7 @@ the complete matrix for the open fork issue linked above. The retained
 supplies bounded eight-worker Java-to-native and bridge/provider percentiles
 plus per-thread allocation observations. End-to-end application state-map-miss
 performance, sustained application stale/timeout/pressure performance,
-native-memory evidence, CPU isolation, contention evidence, and run-to-run
+acceptance-grade native-memory evidence, CPU isolation, contention evidence, and run-to-run
 variance still require separate measurement before declaring the benchmark
 issue complete. The privileged Go transport artifact, native deterministic
 fixture, and packaged-JVM record are complementary evidence; none fills those

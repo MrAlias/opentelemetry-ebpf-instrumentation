@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Benchmark-only, low-cardinality JFR configuration. The retained recording is
+  private diagnostic input. Stack traces and unrelated payload-bearing events
+  stay disabled so the normalized benchmark receipt can expose only aggregate
+  counts, durations, weights, sizes, and digests.
+-->
+<configuration version="2.0" label="OBI benchmark" description="Bounded allocation and blocking indicators" provider="OpenTelemetry">
+  <event name="jdk.ObjectAllocationSample">
+    <setting name="enabled">true</setting>
+    <setting name="throttle">150/s</setting>
+    <setting name="stackTrace">false</setting>
+  </event>
+
+  <event name="jdk.JavaMonitorEnter">
+    <setting name="enabled">true</setting>
+    <setting name="threshold">20 ms</setting>
+    <setting name="stackTrace">false</setting>
+  </event>
+
+  <event name="jdk.ThreadPark">
+    <setting name="enabled">true</setting>
+    <setting name="threshold">20 ms</setting>
+    <setting name="stackTrace">false</setting>
+  </event>
+
+  <event name="jdk.DataLoss">
+    <setting name="enabled">true</setting>
+  </event>
+</configuration>

@@ -75,6 +75,101 @@ fake_diagnostics_increment() {
     >"$FAKE_DIAGNOSTICS_FILE"
 }
 
+fake_java_runtime_snapshot() {
+  local load_count=0
+
+  if [[ -n "${FAKE_JAVA_MEASUREMENT_STATE_FILE:-}" &&
+    -f "$FAKE_JAVA_MEASUREMENT_STATE_FILE" ]]; then
+    load_count="$(<"$FAKE_JAVA_MEASUREMENT_STATE_FILE")"
+    if [[ "$load_count" == pre ]]; then
+      load_count=0
+    fi
+  fi
+  [[ "$load_count" =~ ^[0-9]+$ ]] || return 64
+  jq -cn --argjson load_count "$load_count" '{
+    schema_version: 1,
+    target_pid: 1,
+    runtime_pid: 1,
+    jvm_start_epoch_millis: 1770000000000,
+    direct_buffer: {
+      count: (2 + $load_count),
+      memory_used_bytes: (200 + 100 * $load_count),
+      total_capacity_bytes: (200 + 100 * $load_count)
+    }
+  }'
+}
+
+fake_jfr_summary() {
+  local size=""
+  local digest=""
+
+  [[ -n "${FAKE_JFR_FILE:-}" && -f "$FAKE_JFR_FILE" &&
+    ! -L "$FAKE_JFR_FILE" ]] || return 64
+  size="$(stat --format '%s' -- "$FAKE_JFR_FILE")" || return 64
+  digest="$(sha256sum -- "$FAKE_JFR_FILE")" || return 64
+  digest="${digest%% *}"
+  jq -cn --argjson size "$size" --arg digest "$digest" '{
+    schema_version: 1,
+    file_size_bytes: $size,
+    raw_sha256: $digest,
+    snapshot_semantics: "single_source_descriptor_bounded_private_copy",
+    total_records: 7,
+    allocation_sample: {records: 5, weight_bytes: 500},
+    java_monitor_enter: {records: 1, duration_nanos: 20000000},
+    thread_park: {records: 1, duration_nanos: 30000000},
+    data_loss: {records: 0, bytes: 0}
+  }'
+}
+
+fake_bootstrap_jfr_discard() {
+  local size=""
+  local digest=""
+
+  [[ -n "${FAKE_BOOTSTRAP_JFR_FILE:-}" &&
+    -f "$FAKE_BOOTSTRAP_JFR_FILE" && ! -L "$FAKE_BOOTSTRAP_JFR_FILE" ]] || return 64
+  size="$(stat --format '%s' -- "$FAKE_BOOTSTRAP_JFR_FILE")" || return 64
+  digest="$(sha256sum -- "$FAKE_BOOTSTRAP_JFR_FILE")" || return 64
+  digest="${digest%% *}"
+  [[ "$size" =~ ^[1-9][0-9]*$ && "$size" -le 33554432 ]] || return 64
+  command rm -f -- "$FAKE_BOOTSTRAP_JFR_FILE" || return 64
+  [[ ! -e "$FAKE_BOOTSTRAP_JFR_FILE" && ! -L "$FAKE_BOOTSTRAP_JFR_FILE" ]] || return 64
+  jq -cn --argjson size "$size" --arg digest "$digest" '{
+    schema_version: 1,
+    status: "discarded",
+    size_bytes: $size,
+    sha256: $digest,
+    discard_semantics: "atomic_move_then_descriptor_bounded_delete"
+  }'
+}
+
+fake_jfr_formatted_size() {
+  local -r file="$1"
+  local size=""
+
+  [[ -f "$file" && ! -L "$file" ]] || return 64
+  size="$(stat --format '%s' -- "$file")" || return 64
+  if ((size == 1)); then
+    printf '1 byte\n'
+  elif ((size < 1024)); then
+    printf '%s bytes\n' "$size"
+  elif ((size < 1024 * 1024)); then
+    awk -v bytes="$size" 'BEGIN { printf "%.1f kB\n", bytes / 1024 }'
+  else
+    awk -v bytes="$size" 'BEGIN { printf "%.1f MB\n", bytes / 1048576 }'
+  fi
+}
+
+fake_java_measurement_increment() {
+  local load_count=""
+
+  [[ -n "${FAKE_JAVA_MEASUREMENT_STATE_FILE:-}" &&
+    -f "$FAKE_JAVA_MEASUREMENT_STATE_FILE" ]] || return 64
+  load_count="$(<"$FAKE_JAVA_MEASUREMENT_STATE_FILE")"
+  [[ "$load_count" == pre ]] && return 0
+  [[ "$load_count" =~ ^[0-9]+$ ]] || return 64
+  printf '%s\n' "$((load_count + 1))" >"$FAKE_JAVA_MEASUREMENT_STATE_FILE"
+}
+
 fake_bpf_metrics_increment() {
   local -r report_increment="$1"
   local -r candidate_increment="${2:-0}"
@@ -995,6 +1090,26 @@ fake_runner() {
       return 64
       ;;
   esac
+  case "$scenario" in
+    primary-w3c-stale|unix-w3c-stale|w3c-fault|pressure)
+      [[ "${JAVA_IMAGE_TARGET:-}" == runtime &&
+        "${JAVA_BACKEND_IMAGE:-}" == obi-apache-java-https-backend:local &&
+        -z "${JAVA_BENCHMARK_TOOL_OPTIONS_SUFFIX:-}" ]] || return 64
+      printf 'java-runtime default %s\n' "$scenario" >>"$FAKE_RUNNER_LOG"
+      ;;
+    *)
+      [[ "${JAVA_IMAGE_TARGET:-}" == benchmark-runtime &&
+        "${JAVA_BACKEND_IMAGE:-}" == \
+          obi-apache-java-https-backend-benchmark:local &&
+        "${JAVA_BENCHMARK_TOOL_OPTIONS_SUFFIX:-}" == \
+          ' -XX:NativeMemoryTracking=summary -XX:StartFlightRecording=name=obi-benchmark-bootstrap,settings=/otel/obi-benchmark.jfc,filename=/tmp/obi-benchmark-bootstrap.jfr,disk=true,dumponexit=false,duration=3600s,maxsize=32m' &&
+        -n "${FAKE_BOOTSTRAP_JFR_FILE:-}" ]] || return 64
+      printf 'FLR-fake-bounded-bootstrap-recording\n' >"$FAKE_BOOTSTRAP_JFR_FILE"
+      printf 'java-runtime benchmark %s\n' "$scenario" >>"$FAKE_RUNNER_LOG"
+      ;;
+  esac
+  [[ -n "${FAKE_JAVA_MEASUREMENT_STATE_FILE:-}" ]] || return 64
+  printf 'pre\n' >"$FAKE_JAVA_MEASUREMENT_STATE_FILE"
   result_directory="$FAKE_RESULTS_ROOT/$project"
   SEED="$seed"
   fake_write_runner_artifacts \
@@ -1082,6 +1197,7 @@ fake_benchmark_result() {
   if [[ "$w3c" == true ]]; then
     fake_diagnostics_increment 4 4 || return $?
   fi
+  fake_java_measurement_increment || return $?
   fake_bpf_metrics_increment 0 0 0 0 0 0 0 0 4 4000 || return $?
   printf 'benchmark duration=%s concurrency=%s\n' "$duration" "$concurrency" >>"$FAKE_DOCKER_LOG"
   # Give the harness enough real time to verify the dedicated client session.
@@ -1285,11 +1401,148 @@ fake_docker() {
     return 0
   fi
   if [[ "${1:-}" == exec ]]; then
-    [[ "${2:-}" == "$FAKE_CONTAINER_ID" && "${3:-}" == cat &&
-      "${4:-}" == /run/obi-demo/certs/ca.crt && $# == 4 &&
-      -n "${FAKE_CA_FILE:-}" && -f "$FAKE_CA_FILE" ]] || return 64
-    command cat -- "$FAKE_CA_FILE"
-    return 0
+    [[ "${2:-}" == "$FAKE_CONTAINER_ID" ]] || return 64
+    if [[ "${3:-}" == env ]]; then
+      [[ "${4:-}" == -i && "${5:-}" == HOME=/tmp &&
+        "${6:-}" == LANG=C && "${7:-}" == LC_ALL=C &&
+        "${8:-}" == PATH=/opt/java/openjdk/bin:/usr/bin:/bin &&
+        "${9:-}" == TZ=UTC && $# -ge 10 ]] || return 64
+      set -- "${arguments[@]:0:2}" "${arguments[@]:9}"
+    fi
+    if [[ "${3:-}" == /usr/bin/test && $# == 5 ]]; then
+      case "${4:-} ${5:-}" in
+        '-x /opt/java/openjdk/bin/java'|'-x /opt/java/openjdk/bin/jcmd'|\
+        '-x /usr/bin/sha256sum'|'-x /usr/bin/stat')
+          return 0
+          ;;
+        '-f /otel/obi-benchmark-runtime-snapshot.jar')
+          [[ -n "${FAKE_RUNTIME_HELPER_JAR_FILE:-}" &&
+            -f "$FAKE_RUNTIME_HELPER_JAR_FILE" &&
+            ! -L "$FAKE_RUNTIME_HELPER_JAR_FILE" ]]
+          return $?
+          ;;
+        '-f /otel/benchmark-source/RuntimeSnapshot.java')
+          [[ -n "${FAKE_RUNTIME_HELPER_SOURCE_FILE:-}" &&
+            -f "$FAKE_RUNTIME_HELPER_SOURCE_FILE" &&
+            ! -L "$FAKE_RUNTIME_HELPER_SOURCE_FILE" ]]
+          return $?
+          ;;
+        '-f /otel/obi-benchmark.jfc')
+          [[ -n "${FAKE_RUNTIME_JFR_SETTINGS_FILE:-}" &&
+            -f "$FAKE_RUNTIME_JFR_SETTINGS_FILE" &&
+            ! -L "$FAKE_RUNTIME_JFR_SETTINGS_FILE" ]]
+          return $?
+          ;;
+        *) return 64 ;;
+      esac
+    fi
+    if [[ "${3:-}" == /usr/bin/sha256sum && "${4:-}" == -- && $# == 7 &&
+      "${5:-}" == /otel/obi-benchmark-runtime-snapshot.jar &&
+      "${6:-}" == /otel/benchmark-source/RuntimeSnapshot.java &&
+      "${7:-}" == /otel/obi-benchmark.jfc ]]; then
+      local digest=""
+      digest="$(sha256sum -- "$FAKE_RUNTIME_HELPER_JAR_FILE")" || return 64
+      printf '%s  %s\n' "${digest%% *}" "$5"
+      digest="$(sha256sum -- "$FAKE_RUNTIME_HELPER_SOURCE_FILE")" || return 64
+      printf '%s  %s\n' "${digest%% *}" "$6"
+      digest="$(sha256sum -- "$FAKE_RUNTIME_JFR_SETTINGS_FILE")" || return 64
+      printf '%s  %s\n' "${digest%% *}" "$7"
+      return 0
+    fi
+    if [[ "${3:-}" == /usr/bin/stat && "${4:-}" == --format=%s &&
+      "${5:-}" == -- && $# == 8 &&
+      "${6:-}" == /otel/obi-benchmark-runtime-snapshot.jar &&
+      "${7:-}" == /otel/benchmark-source/RuntimeSnapshot.java &&
+      "${8:-}" == /otel/obi-benchmark.jfc ]]; then
+      stat --format '%s' -- "$FAKE_RUNTIME_HELPER_JAR_FILE" \
+        "$FAKE_RUNTIME_HELPER_SOURCE_FILE" "$FAKE_RUNTIME_JFR_SETTINGS_FILE"
+      return $?
+    fi
+    if [[ "${3:-}" == cat && "${4:-}" == /run/obi-demo/certs/ca.crt && $# == 4 &&
+      -n "${FAKE_CA_FILE:-}" && -f "$FAKE_CA_FILE" ]]; then
+      command cat -- "$FAKE_CA_FILE"
+      return 0
+    fi
+    if [[ "${3:-}" == java && "$*" == *' runtime-snapshot 1' ]]; then
+      fake_java_runtime_snapshot
+      return $?
+    fi
+    if [[ "${3:-}" == java && "$*" == *' jfr-snapshot /tmp/obi-benchmark-measurement.jfr '* ]]; then
+      fake_jfr_summary >&2 || return $?
+      command cat -- "$FAKE_JFR_FILE"
+      return $?
+    fi
+    if [[ "${3:-}" == java && "$*" == *' discard-bootstrap-jfr 33554432' ]]; then
+      fake_bootstrap_jfr_discard
+      return $?
+    fi
+    if [[ "${3:-}" == jcmd && "${4:-}" == 1 ]]; then
+      case "${5:-} ${6:-}" in
+        'JFR.stop name=obi-benchmark-bootstrap')
+          [[ -n "${FAKE_BOOTSTRAP_JFR_FILE:-}" &&
+            -f "$FAKE_BOOTSTRAP_JFR_FILE" ]] || return 64
+          local fake_formatted_size=""
+          fake_formatted_size="$(fake_jfr_formatted_size \
+            "$FAKE_BOOTSTRAP_JFR_FILE")" || return 64
+          printf '%s\n' \
+            '1:' \
+            "Stopped recording \"obi-benchmark-bootstrap\", ${fake_formatted_size} written to:" \
+            '' \
+            '/tmp/obi-benchmark-bootstrap.jfr'
+          return 0
+          ;;
+        'JFR.stop name=obi-benchmark-measurement')
+          local fake_formatted_size=""
+          fake_formatted_size="$(fake_jfr_formatted_size "$FAKE_JFR_FILE")" || return 64
+          printf '%s\n' \
+            '1:' \
+            "Stopped recording \"obi-benchmark-measurement\", ${fake_formatted_size} written to:" \
+            '' \
+            '/tmp/obi-benchmark-measurement.jfr'
+          return 0
+          ;;
+        'JFR.start name=obi-benchmark-measurement')
+          [[ -n "${FAKE_JAVA_MEASUREMENT_STATE_FILE:-}" ]] || return 64
+          printf '0\n' >"$FAKE_JAVA_MEASUREMENT_STATE_FILE"
+          printf '%s\n' \
+            '1:' \
+            'Started recording 2. The result will be written to:' \
+            '' \
+            '/tmp/obi-benchmark-measurement.jfr'
+          return 0
+          ;;
+        'VM.native_memory baseline')
+          printf '1:\nBaseline taken\n'
+          return 0
+          ;;
+        'VM.native_memory summary.diff')
+          local fake_load_count=""
+          fake_load_count="$(<"$FAKE_JAVA_MEASUREMENT_STATE_FILE")"
+          if [[ "$fake_load_count" == pre ]]; then
+            printf '%s\n' \
+              '1:' 'Native Memory Tracking:' \
+              'Total: reserved=1000100 +100, committed=500050 +50'
+          elif [[ "$fake_load_count" =~ ^[0-9]+$ ]]; then
+            printf '%s\n' \
+              '1:' 'Native Memory Tracking:' \
+              "Total: reserved=$((1000000 + 1000 * fake_load_count)) +$((1000 * fake_load_count)), committed=$((500000 + 500 * fake_load_count)) +$((500 * fake_load_count))"
+          else
+            return 64
+          fi
+          return 0
+          ;;
+        'VM.native_memory summary')
+          local fake_load_count=""
+          fake_load_count="$(<"$FAKE_JAVA_MEASUREMENT_STATE_FILE")"
+          [[ "$fake_load_count" =~ ^[0-9]+$ ]] || return 64
+          printf '%s\n' \
+            '1:' 'Native Memory Tracking:' \
+            "Total: reserved=$((1000000 + 1000 * fake_load_count)), committed=$((500000 + 500 * fake_load_count))"
+          return 0
+          ;;
+      esac
+    fi
+    return 64
   fi
   if [[ "${1:-}" == inspect ]]; then
     while (($# > 0)); do
@@ -1305,8 +1558,10 @@ fake_docker() {
         -f "$FAKE_COMPOSE_PROJECT_FILE" ]] || return 64
       project="$(<"$FAKE_COMPOSE_PROJECT_FILE")"
       [[ "$project" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || return 64
-      printf '%s %s %s %s\n' \
-        "$FAKE_CONTAINER_ID" "$FAKE_PID" "$project" "acceptance-demo-v1"
+      printf '%s %s %s %s %s\n' \
+        "$FAKE_CONTAINER_ID" \
+        sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+        "$FAKE_PID" "$project" "acceptance-demo-v1"
     else
       printf '[{"Id":"%s"}]\n' "$FAKE_CONTAINER_ID"
     fi
@@ -1473,6 +1728,7 @@ run_benchmark_with_fake_bound_proc() {
       {
         printf "service=%s\n" "$service"
         printf "container_id=%s\n" "$FAKE_CONTAINER_ID"
+        printf "image_id=sha256:%064d\n" 0
         printf "host_pid=%s\n" "$FAKE_PID"
         printf "proc_start_time=123456\n"
         printf "proc_cgroup_sha256=%064d\n" 0
@@ -1596,6 +1852,14 @@ reset_options() {
   BENCHMARK_DURATION_SECONDS=""
   BENCHMARK_CELL_DIR=""
   BENCHMARK_OUTPUT_PARENT_IDENTITY=""
+  JAVA_MEASUREMENT_PARTIAL=""
+  JAVA_MEASUREMENT_CELL_DIR=""
+  JAVA_MEASUREMENT_PARENT_IDENTITY=""
+  JAVA_MEASUREMENT_ROOT_IDENTITY=""
+  JAVA_MEASUREMENT_JVM_START_EPOCH_MILLIS=""
+  JAVA_MEASUREMENT_RUNTIME_ARTIFACT_SHA256=""
+  JAVA_MEASUREMENT_STARTED_AT=""
+  JAVA_MEASUREMENT_STOP_INITIATED_AT=""
   HARNESS_INVOCATION=""
   DOCKER_ACTIVE_CONTEXT=""
   DOCKER_ACTIVE_ENDPOINT=""
@@ -1629,7 +1893,8 @@ reset_options() {
   CELL_EXPECTED_JAVA_STATUS=""
   CELL_EXTRA_RUNNER_FILES=()
   COMPOSE=()
-  unset BENCHMARK_CA_SOURCE
+  unset BENCHMARK_CA_SOURCE JAVA_IMAGE_TARGET JAVA_BACKEND_IMAGE \
+    JAVA_BENCHMARK_TOOL_OPTIONS_SUFFIX
 }
 
 expect_parse_failure() {
@@ -1993,6 +2258,7 @@ test_benchmark_documentation_binds_partial_status_to_mralias_issue() (
   local -r issue_link='[MrAlias/opentelemetry-ebpf-instrumentation issue #37](https://github.com/MrAlias/opentelemetry-ebpf-instrumentation/issues/37)'
   local flattened=""
   local result_cap_mib=0
+  local jfr_cap_mib=0
   local -a issue_lines=()
 
   [[ "$(grep -Fc -- "$issue_link" "$document")" == 1 ]] || {
@@ -2013,6 +2279,14 @@ test_benchmark_documentation_binds_partial_status_to_mralias_issue() (
   result_cap_mib="$((MAX_BENCHMARK_RESULT_BYTES / 1024 / 1024))"
   [[ "$flattened" == *"and to $result_cap_mib MiB before publication"* ]] || {
     printf 'benchmark documentation drifted from the enforced result byte cap\n' >&2
+    return 1
+  }
+  ((MAX_JFR_BYTES % (1024 * 1024) == 0)) || return 1
+  jfr_cap_mib="$((MAX_JFR_BYTES / 1024 / 1024))"
+  [[ "$flattened" == *"limited to $jfr_cap_mib MiB and $JAVA_JFR_MAX_DURATION_SECONDS seconds"* &&
+    "$flattened" == *"normalization stops at 600,000 records"* &&
+    "$flattened" == *"may exceed $MAX_JAVA_EVIDENCE_FILES entries"* ]] || {
+    printf 'benchmark documentation drifted from Java evidence bounds\n' >&2
     return 1
   }
 )
@@ -3920,7 +4194,8 @@ test_complete_manifest_links_bounded_artifacts_and_scopes() {
         "stable_exact_obi_process_bpf_fd_rosters_bracketing_each_metrics_scrape"
     } and
     .predeclared_poc_gates.issue_acceptance_complete == false and
-    .unavailable_dimensions.jfr_nmt_allocation_native_direct_memory == "not_collected" and
+    .unavailable_dimensions.jfr_nmt_allocation_native_direct_memory ==
+      "bounded_indicators_requested" and
     .unavailable_dimensions.bpf_lock_contention == "not_collected" and
     .unavailable_dimensions.bpf_map_evictions ==
       "not_applicable_non_evicting_hash_pressure"
@@ -4991,7 +5266,8 @@ test_predeclared_poc_gate_stays_partial_and_evaluates_supported_dimensions() (
       .status == "complete" and .result == "passed") and
     .issue_acceptance_complete == false and
     .unmeasured_dimensions == {
-      jfr_nmt_allocation_native_direct_memory: "not_collected",
+      jfr_nmt_allocation_native_direct_memory:
+        "bounded_indicators_retained_not_evaluated_as_acceptance_gate",
       primary_cgroupsockopt_program_cpu: "not_collected",
       bpf_lock_contention: "not_collected"
     }
@@ -5922,6 +6198,9 @@ test_helper_idle_sustained_rejects_delayed_post_workload_lifecycle() (
   local metrics_captures=0
   local diagnostics_captures=0
   local measurement_repetitions=0
+  local java_measurement_begins=0
+  local java_measurement_stops=0
+  local java_measurement_finishes=0
   local run_status=0
   local candidate_result=""
 
@@ -5975,6 +6254,21 @@ test_helper_idle_sustained_rejects_delayed_post_workload_lifecycle() (
     [[ "$2" == measurement_baseline || "$2" == measurement_end ]] || return 1
     mkdir -- "$1"
   }
+  java_measurement_facilities_available() {
+    [[ "$1" == "$cell_dir" ]]
+  }
+  begin_java_measurement() {
+    [[ "$1" == "$cell_dir" ]] || return 1
+    ((java_measurement_begins += 1))
+  }
+  stop_java_measurement() {
+    [[ "$1" == "$cell_dir" && "$java_measurement_begins" == 1 ]] || return 1
+    ((java_measurement_stops += 1))
+  }
+  finish_java_measurement() {
+    [[ "$1" == "$cell_dir" && "$java_measurement_stops" == 1 ]] || return 1
+    ((java_measurement_finishes += 1))
+  }
   run_helper_idle_measurement_rep() {
     local -r measurement_cell_dir="$1"
     local -r repetition="$2"
@@ -5993,7 +6287,8 @@ test_helper_idle_sustained_rejects_delayed_post_workload_lifecycle() (
     run_status=$?
   fi
   [[ "$run_status" != 0 && "$metrics_captures" == 6 && "$diagnostics_captures" == 2 &&
-    "$measurement_repetitions" == 5 ]] || {
+    "$measurement_repetitions" == 5 && "$java_measurement_begins" == 1 &&
+    "$java_measurement_stops" == 1 && "$java_measurement_finishes" == 1 ]] || {
     printf 'helper-idle sustained delayed-publication control did not consume both boundary fences\n' >&2
     return 1
   }
@@ -6864,6 +7159,721 @@ test_benchmark_ca_rejects_untrusted_inputs() (
   }
 )
 
+assert_java_measurement_mutation_rejected() {
+  local -r source="$1"
+  local -r mutation="$2"
+  local -r kind="$3"
+  local artifact=""
+  local compact=""
+  local mutated=""
+  local temporary=""
+
+  [[ -d "$source" && ! -L "$source" && ! -e "$mutation" && ! -L "$mutation" ]] || return 1
+  cp -a -- "$source" "$mutation" || return 1
+  artifact="$mutation/evidence.json"
+  case "$kind" in
+    duplicate-top)
+      compact="$(jq -c . "$artifact")" || return 1
+      mutated="$(sed \
+        's/"acceptance_evidence":false/"acceptance_evidence":false,"acceptance_evidence":false/' \
+        <<<"$compact")" || return 1
+      [[ "$mutated" != "$compact" ]] || return 1
+      printf '%s\n' "$mutated" >"$artifact"
+      ;;
+    duplicate-nested)
+      compact="$(jq -c . "$artifact")" || return 1
+      mutated="$(sed \
+        's/"allocation_sample":{"records":5/"allocation_sample":{"records":5,"records":5/' \
+        <<<"$compact")" || return 1
+      [[ "$mutated" != "$compact" ]] || return 1
+      printf '%s\n' "$mutated" >"$artifact"
+      ;;
+    unexpected-key)
+      temporary="$(mktemp "$mutation/.evidence.XXXXXX")" || return 1
+      jq '.unexpected = 1' "$artifact" >"$temporary" &&
+        mv -T -- "$temporary" "$artifact" || return 1
+      ;;
+    missing-key)
+      temporary="$(mktemp "$mutation/.evidence.XXXXXX")" || return 1
+      jq 'del(.jfr.raw_sha256)' "$artifact" >"$temporary" &&
+        mv -T -- "$temporary" "$artifact" || return 1
+      ;;
+    epoch-timestamp)
+      temporary="$(mktemp "$mutation/.evidence.XXXXXX")" || return 1
+      jq '.measurement_window.started_at = "1970-01-01T00:00:00Z"' \
+        "$artifact" >"$temporary" && mv -T -- "$temporary" "$artifact" || return 1
+      ;;
+    reversed-timestamps)
+      temporary="$(mktemp "$mutation/.evidence.XXXXXX")" || return 1
+      jq '.measurement_window.started_at = "2026-08-20T00:00:02Z" |
+          .measurement_window.stop_initiated_at = "2026-08-20T00:00:01Z"' \
+        "$artifact" >"$temporary" && mv -T -- "$temporary" "$artifact" || return 1
+      ;;
+    runtime-identity-drift)
+      temporary="$(mktemp "$mutation/.runtime.XXXXXX")" || return 1
+      jq '.jvm_start_epoch_millis += 1' \
+        "$mutation/operations/05-runtime-baseline/runtime-after.json" \
+        >"$temporary" && mv -T -- "$temporary" \
+          "$mutation/operations/05-runtime-baseline/runtime-after.json" || return 1
+      ;;
+    duplicate-runtime-key)
+      artifact="$mutation/operations/05-runtime-baseline/runtime-after.json"
+      compact="$(jq -c . "$artifact")" || return 1
+      mutated="$(sed \
+        's/"direct_buffer":{"count":2/"direct_buffer":{"count":2,"count":2/' \
+        <<<"$compact")" || return 1
+      [[ "$mutated" != "$compact" ]] || return 1
+      printf '%s\n' "$mutated" >"$artifact"
+      ;;
+    duplicate-jfr-key)
+      artifact="$mutation/operations/08-jfr-summary/output"
+      compact="$(jq -c . "$artifact")" || return 1
+      mutated="$(sed \
+        's/"data_loss":{"records":0/"data_loss":{"records":0,"records":0/' \
+        <<<"$compact")" || return 1
+      [[ "$mutated" != "$compact" ]] || return 1
+      printf '%s\n' "$mutated" >"$artifact"
+      ;;
+    snapshot-semantics-changed)
+      artifact="$mutation/operations/08-jfr-summary/output"
+      temporary="$(mktemp "$mutation/.jfr-summary.XXXXXX")" || return 1
+      jq '.snapshot_semantics = "path_reopen"' "$artifact" >"$temporary" &&
+        mv -T -- "$temporary" "$artifact" || return 1
+      ;;
+    runtime-image-substitution)
+      artifact="$mutation/runtime-artifacts.json"
+      temporary="$(mktemp "$mutation/.runtime-artifacts.XXXXXX")" || return 1
+      jq '.image_id = "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"' \
+        "$artifact" >"$temporary" && mv -T -- "$temporary" "$artifact" || return 1
+      ;;
+    runtime-helper-substitution)
+      artifact="$mutation/runtime-artifacts.json"
+      temporary="$(mktemp "$mutation/.runtime-artifacts.XXXXXX")" || return 1
+      jq '.helper_jar.sha256 = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"' \
+        "$artifact" >"$temporary" && mv -T -- "$temporary" "$artifact" || return 1
+      ;;
+    runtime-helper-source-substitution)
+      artifact="$mutation/runtime-artifacts.json"
+      temporary="$(mktemp "$mutation/.runtime-artifacts.XXXXXX")" || return 1
+      jq '.helper_source.sha256 = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"' \
+        "$artifact" >"$temporary" && mv -T -- "$temporary" "$artifact" || return 1
+      ;;
+    runtime-jfc-substitution)
+      artifact="$mutation/runtime-artifacts.json"
+      temporary="$(mktemp "$mutation/.runtime-artifacts.XXXXXX")" || return 1
+      jq '.jfr_settings.sha256 = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"' \
+        "$artifact" >"$temporary" && mv -T -- "$temporary" "$artifact" || return 1
+      ;;
+    runtime-artifact-missing)
+      rm -f -- "$mutation/runtime-artifacts.json"
+      ;;
+    retention-overclaim)
+      temporary="$(mktemp "$mutation/.evidence.XXXXXX")" || return 1
+      jq '.jfr.whole_window_retention_attested = true' "$artifact" >"$temporary" &&
+        mv -T -- "$temporary" "$artifact" || return 1
+      ;;
+    stop-size-mismatch)
+      sed -i \
+        '2cStopped recording "obi-benchmark-measurement", 32.0 MB written to:' \
+        "$mutation/operations/07-jfr-stop/output"
+      ;;
+    bootstrap-discard-semantics)
+      artifact="$mutation/operations/02-bootstrap-discard/output"
+      temporary="$(mktemp "$mutation/.bootstrap-discard.XXXXXX")" || return 1
+      jq '.discard_semantics = "path_delete"' "$artifact" >"$temporary" &&
+        mv -T -- "$temporary" "$artifact" || return 1
+      ;;
+    negative-nmt-delta)
+      sed -i 's/ +5000, committed=/ -1, committed=/' \
+        "$mutation/operations/11-nmt-postload-diff/output"
+      ;;
+    bootstrap-alternate-path)
+      sed -i 's#/tmp/obi-benchmark-bootstrap.jfr#/tmp/alternate-bootstrap.jfr#' \
+        "$mutation/operations/01-bootstrap-stop/output"
+      ;;
+    measurement-stop-extra-line)
+      printf 'unexpected\n' >>"$mutation/operations/07-jfr-stop/output"
+      ;;
+    bootstrap-discard-missing)
+      rm -f -- "$mutation/operations/02-bootstrap-discard/output"
+      ;;
+    nmt-baseline-old-wording)
+      sed -i 's/Baseline taken/Baseline succeeded/' \
+        "$mutation/operations/03-nmt-baseline/output"
+      ;;
+    raw-jfr-drift)
+      printf 'unexpected\n' >>"$mutation/measurement.jfr"
+      ;;
+    raw-jfr-oversized)
+      head -c "$((MAX_JFR_BYTES + 1))" /dev/zero >"$mutation/measurement.jfr"
+      ;;
+    missing-raw-jfr)
+      rm -f -- "$mutation/measurement.jfr"
+      ;;
+    operations-foreign-file)
+      printf 'foreign\n' >"$mutation/operations/foreign-file"
+      chmod 0600 -- "$mutation/operations/foreign-file"
+      ;;
+    operations-foreign-symlink)
+      ln -s -- ../identity.txt "$mutation/operations/foreign-symlink"
+      ;;
+    operations-foreign-directory)
+      mkdir -- "$mutation/operations/foreign-directory"
+      chmod 0700 -- "$mutation/operations/foreign-directory"
+      ;;
+    operations-foreign-special)
+      mkfifo -m 0600 -- "$mutation/operations/foreign-fifo"
+      ;;
+    *) return 1 ;;
+  esac
+  chmod 0600 -- "$artifact" 2>/dev/null || true
+  if validate_java_measurement_evidence "$mutation/evidence.json" >/dev/null 2>&1; then
+    printf 'Java measurement validator accepted mutation: %s\n' "$kind" >&2
+    return 1
+  fi
+}
+
+assert_java_direct_buffer_reclamation_is_retained() {
+  local -r source="$1"
+  local -r reclamation="$2"
+  local snapshot=""
+  local temporary=""
+  local cell=""
+  local started_at=""
+  local stop_initiated_at=""
+
+  [[ -d "$source" && ! -L "$source" &&
+    ! -e "$reclamation" && ! -L "$reclamation" ]] || return 1
+  cp -a -- "$source" "$reclamation" || return 1
+  for snapshot in \
+    "$reclamation/operations/12-runtime-postload/runtime-before.json" \
+    "$reclamation/operations/12-runtime-postload/runtime-after.json"; do
+    temporary="$(mktemp "$reclamation/.runtime.XXXXXX")" || return 1
+    jq '.direct_buffer = {
+      count: 1, memory_used_bytes: 100, total_capacity_bytes: 100
+    }' "$snapshot" >"$temporary" &&
+      mv -T -- "$temporary" "$snapshot" || return 1
+  done
+  cell="$(jq -er '.cell' "$reclamation/evidence.json")" || return 1
+  started_at="$(jq -er '.measurement_window.started_at' \
+    "$reclamation/evidence.json")" || return 1
+  stop_initiated_at="$(jq -er '.measurement_window.stop_initiated_at' \
+    "$reclamation/evidence.json")" || return 1
+  # shellcheck disable=SC2034 # Consumed by the sourced evidence renderer/validator.
+  JAVA_MEASUREMENT_JVM_START_EPOCH_MILLIS="$(jq -er \
+    '.process_binding.java_runtime_start_epoch_millis' \
+    "$reclamation/evidence.json")" || return 1
+  temporary="$(mktemp "$reclamation/.evidence.XXXXXX")" || return 1
+  java_measurement_evidence_json \
+    "$reclamation" "$cell" "$started_at" "$stop_initiated_at" \
+    >"$temporary" && mv -T -- "$temporary" \
+      "$reclamation/evidence.json" || return 1
+  validate_java_measurement_evidence "$reclamation/evidence.json" || return 1
+  jq -e '.direct_buffer.signed_delta == {
+    count: -1, memory_used_bytes: -100, total_capacity_bytes: -100
+  }' "$reclamation/evidence.json" >/dev/null
+}
+
+test_java_measurement_partial_cleanup_is_identity_safe() (
+  local -r output="$TEST_TMP_DIR/java-partial-cleanup-output"
+  local -r cell_dir="$output/cells/getsockopt-hit"
+  local -r partial="$cell_dir/.java-measurement.partial"
+  local -r outside="$TEST_TMP_DIR/java-partial-outside"
+  local -r sentinel="$TEST_TMP_DIR/java-partial-sentinel.txt"
+  local -r cap_cell_dir="$output/cells/unix-hit"
+  local -r cap_partial="$cap_cell_dir/.java-measurement.partial"
+  local -r bounded_output_dir="$TEST_TMP_DIR/java-bounded-output"
+  local parent_identity=""
+  local root_identity=""
+  local index=0
+
+  reset_options
+  OUTPUT_DIR="$output"
+  CELL_SLUG=getsockopt-hit
+  mkdir -p -- "$partial/nested" "$outside"
+  chmod 0700 -- "$output" "$output/cells" "$cell_dir" "$partial" "$partial/nested" "$outside"
+  printf 'preserve\n' >"$sentinel"
+  printf 'partial\n' >"$partial/nested/output"
+  ln -s -- "$sentinel" "$partial/nested/untrusted-link"
+  parent_identity="$(stat --format '%d:%i:%u:%a' -- "$cell_dir")" || return 1
+  root_identity="$(stat --format '%d:%i:%u:%a' -- "$partial")" || return 1
+  # shellcheck disable=SC2034 # Consumed by discard_active_java_measurement in sourced benchmark.sh.
+  JAVA_MEASUREMENT_PARTIAL="$partial"
+  JAVA_MEASUREMENT_CELL_DIR="$cell_dir"
+  # shellcheck disable=SC2034 # Consumed by discard_active_java_measurement in sourced benchmark.sh.
+  JAVA_MEASUREMENT_PARENT_IDENTITY="$parent_identity"
+  # shellcheck disable=SC2034 # Consumed by discard_active_java_measurement in sourced benchmark.sh.
+  JAVA_MEASUREMENT_ROOT_IDENTITY="$root_identity"
+  discard_active_java_measurement || return 1
+  [[ ! -e "$partial" && ! -L "$partial" &&
+    "$(<"$sentinel")" == preserve &&
+    -z "$JAVA_MEASUREMENT_PARTIAL" && -z "$JAVA_MEASUREMENT_CELL_DIR" ]] || {
+    printf 'Java partial cleanup followed a symlink or retained active globals\n' >&2
+    return 1
+  }
+
+  printf 'outside\n' >"$outside/output"
+  if discard_java_measurement_partial \
+    "$outside" "$cell_dir" "$parent_identity" \
+    "$(stat --format '%d:%i:%u:%a' -- "$outside")"; then
+    printf 'Java partial cleanup accepted an outside path\n' >&2
+    return 1
+  fi
+  [[ "$(<"$outside/output")" == outside ]] || return 1
+
+  mkdir -- "$partial"
+  chmod 0700 -- "$partial"
+  root_identity="$(stat --format '%d:%i:%u:%a' -- "$partial")" || return 1
+  mkdir -- "$cell_dir/java-measurement"
+  if discard_java_measurement_partial \
+    "$partial" "$cell_dir" "$parent_identity" "$root_identity"; then
+    printf 'Java partial cleanup accepted an existing final directory\n' >&2
+    return 1
+  fi
+  [[ -d "$partial" && -d "$cell_dir/java-measurement" ]] || return 1
+
+  mkdir -p -- "$cap_partial" "$bounded_output_dir"
+  chmod 0700 -- "$cap_cell_dir" "$cap_partial" "$bounded_output_dir"
+  for ((index = 0; index <= MAX_JAVA_EVIDENCE_FILES; index++)); do
+    printf 'bounded\n' >"$cap_partial/entry-$index"
+  done
+  parent_identity="$(stat --format '%d:%i:%u:%a' -- "$cap_cell_dir")" || return 1
+  root_identity="$(stat --format '%d:%i:%u:%a' -- "$cap_partial")" || return 1
+  if discard_java_measurement_partial \
+    "$cap_partial" "$cap_cell_dir" "$parent_identity" "$root_identity"; then
+    printf 'Java partial cleanup accepted an over-cap evidence tree\n' >&2
+    return 1
+  fi
+  [[ -f "$cap_partial/entry-$MAX_JAVA_EVIDENCE_FILES" ]] || return 1
+
+  if capture_bounded_private_output \
+    "$bounded_output_dir/oversized" 16 5 head -c 17 /dev/zero; then
+    printf 'bounded Java tool capture accepted oversized output\n' >&2
+    return 1
+  fi
+  [[ ! -e "$bounded_output_dir/oversized" &&
+    -z "$(find "$bounded_output_dir" -mindepth 1 -print -quit)" ]] || return 1
+
+  capture_bounded_private_streams \
+    "$bounded_output_dir/raw" 16 \
+    "$bounded_output_dir/summary" 16 5 \
+    bash -c 'printf raw; printf summary >&2' || return 1
+  [[ "$(<"$bounded_output_dir/raw")" == raw &&
+    "$(<"$bounded_output_dir/summary")" == summary ]] || return 1
+  rm -f -- "$bounded_output_dir/raw" "$bounded_output_dir/summary"
+
+  if capture_bounded_private_streams \
+    "$bounded_output_dir/raw-too-large" 16 \
+    "$bounded_output_dir/summary-for-raw" 16 5 \
+    bash -c 'head -c 17 /dev/zero; printf summary >&2'; then
+    printf 'bounded Java dual-stream capture accepted oversized raw output\n' >&2
+    return 1
+  fi
+  [[ -z "$(find "$bounded_output_dir" -mindepth 1 -print -quit)" ]] || return 1
+
+  if capture_bounded_private_streams \
+    "$bounded_output_dir/raw-for-summary" 16 \
+    "$bounded_output_dir/summary-too-large" 16 5 \
+    bash -c 'printf raw; head -c 17 /dev/zero >&2'; then
+    printf 'bounded Java dual-stream capture accepted oversized summary output\n' >&2
+    return 1
+  fi
+  [[ -z "$(find "$bounded_output_dir" -mindepth 1 -print -quit)" ]] || return 1
+)
+
+test_java_benchmark_tooling_is_opt_in_and_payload_bounded() {
+  local -r compose_file="$EXAMPLE_DIR/docker-compose.yml"
+  local -r dockerfile="$EXAMPLE_DIR/java/Dockerfile"
+  local -r jfc="$EXAMPLE_DIR/java/benchmark/obi-benchmark.jfc"
+  local -a event_names=()
+
+  mapfile -t event_names < <(
+    sed -n 's/.*<event name="\([^"]*\)">.*/\1/p' "$jfc"
+  )
+
+  [[ "$(grep -Fc 'target: ${JAVA_IMAGE_TARGET:-runtime}' "$compose_file")" == 1 &&
+    "$(grep -Fc 'image: ${JAVA_BACKEND_IMAGE:-obi-apache-java-https-backend:local}' \
+      "$compose_file")" == 1 &&
+    "$(grep -Fc '${JAVA_BENCHMARK_TOOL_OPTIONS_SUFFIX:-}' "$compose_file")" == 1 &&
+    "$(grep -Fc 'COPY java/benchmark/RuntimeSnapshot.java /otel/benchmark-source/RuntimeSnapshot.java' \
+      "$dockerfile")" == 1 &&
+    "$(grep -Fc 'FROM runtime-base AS runtime' "$dockerfile")" == 1 &&
+    "$(tail -n 1 "$dockerfile")" == 'FROM runtime-base AS runtime' &&
+    "${event_names[*]}" == \
+      'jdk.ObjectAllocationSample jdk.JavaMonitorEnter jdk.ThreadPark jdk.DataLoss' &&
+    "$(grep -Fc '<setting name="stackTrace">false</setting>' "$jfc")" == 3 &&
+    "$(grep -Fc '<setting name="stackTrace">true</setting>' "$jfc")" == 0 &&
+    "$(grep -Ec '<event name="jdk\.(InitialSystemProperty|InitialEnvironmentVariable|ExecutionSample|NativeMethodSample|OldObjectSample)"' "$jfc" || true)" == 0 ]] || {
+    printf 'benchmark JVM tooling is not opt-in, JRE-default, and payload-bounded\n' >&2
+    return 1
+  }
+}
+
+test_runtime_snapshot_source_and_jfc_are_exact_authorities() (
+  local -r source="$EXAMPLE_DIR/java/benchmark/RuntimeSnapshot.java"
+  local -r jfc="$EXAMPLE_DIR/java/benchmark/obi-benchmark.jfc"
+  local -r source_mutation="$TEST_TMP_DIR/RuntimeSnapshot-mutated.java"
+  local -r jfc_mutation="$TEST_TMP_DIR/obi-benchmark-mutated.jfc"
+
+  validate_benchmark_runtime_source "$source" || return 1
+  validate_benchmark_jfr_settings_source "$jfc" || return 1
+  grep -Fq 'new RecordingFile(snapshot.descriptorPath())' "$source" &&
+    grep -Fq 'FileChannel.open(source, Set.of(StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS))' \
+      "$source" &&
+    grep -Fq 'readBoundedDescriptor(sourceDescriptor, sourceDescriptorPath, maximumBytes)' \
+      "$source" &&
+    grep -Fq 'streamRaw(System.out)' "$source" &&
+    grep -Fq 'System.err.printf(' "$source" &&
+    grep -Fq 'failure.addSuppressed(exception)' "$source" &&
+    grep -Fq 'descriptor.close();' "$source" &&
+    grep -Fq 'readBoundedDescriptor(descriptor, descriptorPath, maximumBytes)' "$source" &&
+    ! grep -Fq 'exec cat "$JAVA_MEASUREMENT_JFR_CONTAINER_PATH"' \
+      "$TEST_SCRIPT_DIR/benchmark.sh" || {
+    printf 'JFR normalization/raw retention is not bound to one held descriptor\n' >&2
+    return 1
+  }
+  cp -- "$source" "$source_mutation"
+  sed -i 's/snapshot.descriptorPath()/snapshot.file()/g' "$source_mutation"
+  if validate_benchmark_runtime_source "$source_mutation" >/dev/null 2>&1; then
+    printf 'runtime helper source authority accepted a path-reopen mutation\n' >&2
+    return 1
+  fi
+  cp -- "$jfc" "$jfc_mutation"
+  sed -i 's/<setting name="stackTrace">false/<setting name="stackTrace">true/' \
+    "$jfc_mutation"
+  if validate_benchmark_jfr_settings_source "$jfc_mutation" >/dev/null 2>&1; then
+    printf 'JFC source authority accepted a payload-expansion mutation\n' >&2
+    return 1
+  fi
+)
+
+test_java_tree_traversal_and_publication_identity_fail_closed() (
+  local -r output="$TEST_TMP_DIR/java-tree-identity-output"
+  local -r cell_dir="$output/cells/getsockopt-hit"
+  local -r partial="$cell_dir/.java-measurement.partial"
+  local -r final="$cell_dir/java-measurement"
+  local -r listing="$cell_dir/listing"
+  local old_partial="$cell_dir/old-partial"
+
+  reset_options
+  OUTPUT_DIR="$output"
+  CELL_SLUG=getsockopt-hit
+  mkdir -p -- "$partial/operations"
+  chmod 0700 -- "$output" "$output/cells" "$cell_dir" "$partial" "$partial/operations"
+  printf 'fixture\n' >"$partial/fixture"
+  JAVA_MEASUREMENT_CELL_DIR="$cell_dir"
+  JAVA_MEASUREMENT_PARTIAL="$partial"
+  JAVA_MEASUREMENT_PARENT_IDENTITY="$(stat --format '%d:%i:%u:%a' -- "$cell_dir")"
+  JAVA_MEASUREMENT_ROOT_IDENTITY="$(stat --format '%d:%i:%u:%a' -- "$partial")"
+  java_measurement_root_identity_matches "$partial" partial || return 1
+  capture_stable_java_listing "$partial" all "$listing" || return 1
+  rm -f -- "$listing"
+
+  find() { return 70; }
+  if capture_stable_java_listing "$partial" all "$listing" >/dev/null 2>&1; then
+    printf 'Java tree traversal hid an injected find failure\n' >&2
+    return 1
+  fi
+  unset -f find
+  [[ ! -e "$listing" && ! -L "$listing" ]] || return 1
+  sort() { return 71; }
+  if capture_stable_java_listing "$partial" all "$listing" >/dev/null 2>&1; then
+    printf 'Java tree traversal hid an injected sort failure\n' >&2
+    return 1
+  fi
+  unset -f sort
+  [[ ! -e "$listing" && ! -L "$listing" ]] || return 1
+
+  chmod 0750 -- "$cell_dir"
+  if java_measurement_root_identity_matches "$partial" partial >/dev/null 2>&1; then
+    printf 'Java measurement accepted parent identity drift\n' >&2
+    return 1
+  fi
+  chmod 0700 -- "$cell_dir"
+  # shellcheck disable=SC2034 # Consumed by the sourced root identity validator.
+  JAVA_MEASUREMENT_PARENT_IDENTITY="$(stat --format '%d:%i:%u:%a' -- "$cell_dir")"
+  mv -- "$partial" "$old_partial"
+  mkdir --mode=0700 -- "$partial"
+  if java_measurement_root_identity_matches "$partial" partial >/dev/null 2>&1; then
+    printf 'Java measurement accepted root inode substitution\n' >&2
+    return 1
+  fi
+  rmdir -- "$partial"
+  mv -- "$old_partial" "$partial"
+  # shellcheck disable=SC2034 # Consumed by the sourced root identity validator.
+  JAVA_MEASUREMENT_ROOT_IDENTITY="$(stat --format '%d:%i:%u:%a' -- "$partial")"
+  mv -T -- "$partial" "$final"
+  java_measurement_root_identity_matches "$final" published || return 1
+  chmod 0750 -- "$final"
+  if java_measurement_root_identity_matches "$final" published >/dev/null 2>&1; then
+    printf 'Java measurement accepted post-publication root identity drift\n' >&2
+    return 1
+  fi
+)
+
+test_java_publication_substitution_is_quarantined() (
+  local -r output="$TEST_TMP_DIR/java-publication-substitution-output"
+  local -r cell_dir="$output/cells/getsockopt-hit"
+  local -r partial="$cell_dir/.java-measurement.partial"
+  local -r final="$cell_dir/java-measurement"
+  local -r expected_saved="$cell_dir/expected-root"
+  local -r rejected="$cell_dir/.java-measurement.rejected"
+
+  reset_options
+  OUTPUT_DIR="$output"
+  CELL_SLUG=getsockopt-hit
+  mkdir -p -- "$partial"
+  chmod 0700 -- "$output" "$output/cells" "$cell_dir" "$partial"
+  printf 'expected\n' >"$partial/expected"
+  JAVA_MEASUREMENT_CELL_DIR="$cell_dir"
+  JAVA_MEASUREMENT_PARTIAL="$partial"
+  JAVA_MEASUREMENT_PARENT_IDENTITY="$(stat --format '%d:%i:%u:%a' -- "$cell_dir")"
+  JAVA_MEASUREMENT_ROOT_IDENTITY="$(stat --format '%d:%i:%u:%a' -- "$partial")"
+  mv() {
+    local -r source="${*: -2:1}"
+    local -r destination="${*: -1}"
+
+    if [[ "$source" == "$partial" && "$destination" == "$final" ]]; then
+      command mv -T -- "$partial" "$expected_saved" || return 1
+      mkdir --mode=0700 -- "$partial" || return 1
+      printf 'untrusted replacement\n' >"$partial/untrusted" || return 1
+    fi
+    command mv "$@"
+  }
+  if publish_java_measurement_tree "$partial" "$final"; then
+    printf 'Java publication accepted a last-window root substitution\n' >&2
+    return 1
+  fi
+  unset -f mv
+  [[ -f "$final/untrusted" && -f "$expected_saved/expected" &&
+    ! -e "$cell_dir/java-measurement-publication.json" ]] || return 1
+  quarantine_failed_java_measurement_publication "$cell_dir" || return 1
+  [[ ! -e "$final" && ! -L "$final" &&
+    ! -e "$cell_dir/java-measurement-publication.json" &&
+    -f "$rejected/untrusted" ]] || return 1
+  if validate_published_java_measurement "$cell_dir" >/dev/null 2>&1; then
+    printf 'collector accepted quarantined unsealed Java evidence\n' >&2
+    return 1
+  fi
+)
+
+test_java_measurement_failure_classification_is_exact() (
+  local -r output="$TEST_TMP_DIR/java-classification-output"
+  local -r cell_dir="$output/cells/getsockopt-hit"
+  local begin_calls=0
+  local facility_status=1
+  local begin_status=0
+
+  reset_options
+  OUTPUT_DIR="$output"
+  CELL_SLUG=getsockopt-hit
+  mkdir -p -- "$cell_dir"
+  java_measurement_facilities_available() { return "$facility_status"; }
+  begin_java_measurement() { ((begin_calls += 1)); return "$begin_status"; }
+  if begin_java_measurement_with_classification "$cell_dir"; then
+    return 1
+  fi
+  [[ "$begin_calls" == 0 ]] || return 1
+  jq -e '.status == "unavailable" and
+    .classification == "infrastructure_unavailable" and
+    .stage == "post_warmup_preflight"' \
+    "$cell_dir/java-measurement-status.json" >/dev/null || return 1
+  rm -f -- "$cell_dir/java-measurement-status.json"
+
+  facility_status=0
+  begin_status=65
+  if begin_java_measurement_with_classification "$cell_dir"; then
+    return 1
+  fi
+  [[ "$begin_calls" == 1 ]] || return 1
+  jq -e '.status == "failed" and
+    .classification == "measurement_contract_failed" and
+    .stage == "post_warmup_baseline"' \
+    "$cell_dir/java-measurement-status.json" >/dev/null || return 1
+  rm -f -- "$cell_dir/java-measurement-status.json"
+  if write_java_measurement_status \
+    "$cell_dir" post_load_stop product_unsupported >/dev/null 2>&1; then
+    printf 'Java status writer accepted a fabricated unsupported classification\n' >&2
+    return 1
+  fi
+)
+
+assert_java_publication_receipt_mutations_rejected() {
+  local -r output="$1"
+  local -r cell_dir="$output/cells/getsockopt-hit"
+  local -r receipt="$cell_dir/java-measurement-publication.json"
+  local -r backup="$TEST_TMP_DIR/java-measurement-publication.backup.json"
+  local compact=""
+  local mutated=""
+  local temporary=""
+  local tree_entry=""
+  local expected_file="$cell_dir/java-measurement/operations/03-nmt-baseline/output"
+  local expected_backup="$TEST_TMP_DIR/java-measurement-expected-file.backup"
+  local kind=""
+  local -a tree_mutations=(regular symlink directory special)
+
+  validate_published_java_measurement "$cell_dir" || return 1
+  cp -- "$receipt" "$backup" || return 1
+  rm -f -- "$receipt"
+  if validate_published_java_measurement "$cell_dir" >/dev/null 2>&1; then
+    printf 'collector accepted Java evidence without its publication receipt\n' >&2
+    return 1
+  fi
+  cp -- "$backup" "$receipt" && chmod 0600 -- "$receipt" || return 1
+
+  temporary="$(mktemp "$cell_dir/.publication.XXXXXX")" || return 1
+  jq '.root_identity = "1:1:1:700"' "$receipt" >"$temporary" &&
+    mv -T -- "$temporary" "$receipt" || return 1
+  if validate_published_java_measurement "$cell_dir" >/dev/null 2>&1; then
+    printf 'collector accepted a cross-root Java publication receipt\n' >&2
+    return 1
+  fi
+  cp -- "$backup" "$receipt" && chmod 0600 -- "$receipt" || return 1
+
+  compact="$(jq -c . "$receipt")" || return 1
+  mutated="${compact/\"status\":\"sealed\"/\"status\":\"sealed\",\"status\":\"sealed\"}"
+  [[ "$mutated" != "$compact" ]] || return 1
+  printf '%s\n' "$mutated" >"$receipt"
+  if validate_published_java_measurement "$cell_dir" >/dev/null 2>&1; then
+    printf 'collector accepted a duplicate-key Java publication receipt\n' >&2
+    return 1
+  fi
+  cp -- "$backup" "$receipt" && chmod 0600 -- "$receipt" || return 1
+
+  temporary="$(mktemp "$cell_dir/.publication.XXXXXX")" || return 1
+  jq '.tree_manifest_sha256 =
+    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"' \
+    "$receipt" >"$temporary" && mv -T -- "$temporary" "$receipt" || return 1
+  if validate_published_java_measurement "$cell_dir" >/dev/null 2>&1; then
+    printf 'collector accepted a stale Java tree-manifest digest\n' >&2
+    return 1
+  fi
+  cp -- "$backup" "$receipt" && chmod 0600 -- "$receipt" || return 1
+
+  for kind in "${tree_mutations[@]}"; do
+    tree_entry="$cell_dir/java-measurement/operations/foreign-$kind"
+    case "$kind" in
+      regular)
+        printf 'foreign\n' >"$tree_entry" && chmod 0600 -- "$tree_entry" || return 1
+        ;;
+      symlink)
+        ln -s -- ../identity.txt "$tree_entry" || return 1
+        ;;
+      directory)
+        mkdir -- "$tree_entry" && chmod 0700 -- "$tree_entry" || return 1
+        ;;
+      special)
+        mkfifo -m 0600 -- "$tree_entry" || return 1
+        ;;
+      *) return 1 ;;
+    esac
+    if validate_published_java_measurement "$cell_dir" >/dev/null 2>&1; then
+      printf 'collector accepted a post-publication Java %s entry\n' "$kind" >&2
+      return 1
+    fi
+    if [[ "$kind" == directory ]]; then
+      rmdir -- "$tree_entry" || return 1
+    else
+      rm -f -- "$tree_entry" || return 1
+    fi
+    validate_published_java_measurement "$cell_dir" || return 1
+  done
+
+  cp -- "$expected_file" "$expected_backup" || return 1
+  printf 'post-publication mutation\n' >>"$expected_file"
+  if validate_published_java_measurement "$cell_dir" >/dev/null 2>&1; then
+    printf 'collector accepted a changed expected Java evidence file\n' >&2
+    return 1
+  fi
+  cp -- "$expected_backup" "$expected_file" && chmod 0600 -- "$expected_file" || return 1
+  validate_published_java_measurement "$cell_dir" || return 1
+
+  # The writer must reject both roster and expected-content drift before a
+  # receipt exists; it may not bless the mutation by hashing the changed tree.
+  JAVA_MEASUREMENT_CELL_DIR="$cell_dir"
+  JAVA_MEASUREMENT_PARTIAL="$cell_dir/.java-measurement.partial"
+  JAVA_MEASUREMENT_PARENT_IDENTITY="$(stat --format '%d:%i:%u:%a' -- \
+    "$cell_dir")" || return 1
+  JAVA_MEASUREMENT_ROOT_IDENTITY="$(stat --format '%d:%i:%u:%a' -- \
+    "$cell_dir/java-measurement")" || return 1
+  JAVA_MEASUREMENT_RUNTIME_ARTIFACT_SHA256="$(jq -er \
+    '.runtime_artifacts.attestation_sha256' \
+    "$cell_dir/java-measurement/evidence.json")" || return 1
+  CELL_SLUG=getsockopt-hit
+  rm -f -- "$receipt"
+  tree_entry="$cell_dir/java-measurement/operations/foreign-before-receipt"
+  printf 'foreign\n' >"$tree_entry" && chmod 0600 -- "$tree_entry" || return 1
+  if write_java_measurement_publication_receipt "$cell_dir" >/dev/null 2>&1; then
+    printf 'receipt writer accepted a foreign pre-receipt Java entry\n' >&2
+    return 1
+  fi
+  [[ ! -e "$receipt" && ! -L "$receipt" ]] || return 1
+  rm -f -- "$tree_entry"
+  cp -- "$backup" "$receipt" && chmod 0600 -- "$receipt" || return 1
+  validate_published_java_measurement "$cell_dir" || return 1
+
+  rm -f -- "$receipt"
+  printf 'pre-receipt mutation\n' >>"$expected_file"
+  if write_java_measurement_publication_receipt "$cell_dir" >/dev/null 2>&1; then
+    printf 'receipt writer accepted changed expected Java evidence\n' >&2
+    return 1
+  fi
+  [[ ! -e "$receipt" && ! -L "$receipt" ]] || return 1
+  cp -- "$expected_backup" "$expected_file" && chmod 0600 -- "$expected_file" || return 1
+  cp -- "$backup" "$receipt" && chmod 0600 -- "$receipt" || return 1
+  clear_active_java_measurement
+  validate_published_java_measurement "$cell_dir"
+}
+
+assert_mixed_java_runtime_artifact_identity_rejected() {
+  local -r output="$1"
+  local -r root="$output/cells/getsockopt-hit/java-measurement"
+  local artifact="$root/runtime-artifacts.json"
+  local evidence="$root/evidence.json"
+  local temporary=""
+  local cell=""
+  local started_at=""
+  local stopped_at=""
+
+  temporary="$(mktemp "$root/.runtime-artifacts.XXXXXX")" || return 1
+  jq '.helper_jar.sha256 =
+    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"' \
+    "$artifact" >"$temporary" && mv -T -- "$temporary" "$artifact" || return 1
+  cell="$(jq -er '.cell' "$evidence")" || return 1
+  started_at="$(jq -er '.measurement_window.started_at' "$evidence")" || return 1
+  stopped_at="$(jq -er '.measurement_window.stop_initiated_at' "$evidence")" || return 1
+  # shellcheck disable=SC2034 # Consumed by the sourced evidence renderer.
+  JAVA_MEASUREMENT_JVM_START_EPOCH_MILLIS="$(jq -er \
+    '.process_binding.java_runtime_start_epoch_millis' "$evidence")" || return 1
+  temporary="$(mktemp "$root/.evidence.XXXXXX")" || return 1
+  java_measurement_evidence_json "$root" "$cell" "$started_at" "$stopped_at" \
+    >"$temporary" && mv -T -- "$temporary" "$evidence" || return 1
+  validate_java_measurement_evidence "$evidence" || return 1
+  JAVA_MEASUREMENT_CELL_DIR="${root%/*}"
+  JAVA_MEASUREMENT_PARTIAL="$JAVA_MEASUREMENT_CELL_DIR/.java-measurement.partial"
+  # shellcheck disable=SC2034 # Consumed by the sourced publication writer.
+  JAVA_MEASUREMENT_PARENT_IDENTITY="$(stat --format '%d:%i:%u:%a' -- \
+    "$JAVA_MEASUREMENT_CELL_DIR")" || return 1
+  # shellcheck disable=SC2034 # Consumed by the sourced publication writer.
+  JAVA_MEASUREMENT_ROOT_IDENTITY="$(stat --format '%d:%i:%u:%a' -- "$root")" || return 1
+  # shellcheck disable=SC2034 # Consumed by the sourced publication writer.
+  JAVA_MEASUREMENT_RUNTIME_ARTIFACT_SHA256="$(jq -er \
+    '.runtime_artifacts.attestation_sha256' "$evidence")" || return 1
+  CELL_SLUG="$cell"
+  rm -f -- "$JAVA_MEASUREMENT_CELL_DIR/java-measurement-publication.json"
+  write_java_measurement_publication_receipt "$JAVA_MEASUREMENT_CELL_DIR" || return 1
+  validate_published_java_measurement "$JAVA_MEASUREMENT_CELL_DIR" || return 1
+  clear_active_java_measurement
+  OUTPUT_DIR="$output"
+  # shellcheck disable=SC2034 # Consumed by the sourced summary writer.
+  OUTPUT_READY=true
+  CELLS_MODE=core
+  if write_summary passed >/dev/null 2>&1; then
+    printf 'summary accepted mixed per-cell runtime helper identities\n' >&2
+    return 1
+  fi
+}
+
 test_main_uses_runner_cleanup_and_retains_core_artifacts() {
   local -r fake_root="$TEST_TMP_DIR/fake-root"
   local -r fake_example="$fake_root/examples/apache-java-https"
@@ -6881,6 +7891,23 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
   local -r expected_helper_events="$TEST_TMP_DIR/helper-idle-events.expected"
   local -r docker_socket="$TEST_TMP_DIR/fake-docker.sock"
   local -r source_tree_manifest="$TEST_TMP_DIR/fake-source-tree.manifest"
+  local -r java_measurement_state="$TEST_TMP_DIR/fake-java-measurement-state.txt"
+  local -r bootstrap_jfr_file="$TEST_TMP_DIR/fake-bootstrap.jfr"
+  local -r jfr_file="$TEST_TMP_DIR/fake-measurement.jfr"
+  local -r runtime_helper_jar="$fake_example/java/benchmark/fake-helper.jar"
+  local -r mutation_root="$TEST_TMP_DIR/java-measurement-mutations"
+  local -a java_mutations=(
+    duplicate-top duplicate-nested unexpected-key missing-key epoch-timestamp
+    reversed-timestamps runtime-identity-drift duplicate-runtime-key
+    duplicate-jfr-key negative-nmt-delta raw-jfr-drift raw-jfr-oversized
+    missing-raw-jfr bootstrap-alternate-path measurement-stop-extra-line
+    bootstrap-discard-missing bootstrap-discard-semantics nmt-baseline-old-wording
+    snapshot-semantics-changed runtime-image-substitution
+    runtime-helper-substitution runtime-helper-source-substitution
+    runtime-jfc-substitution runtime-artifact-missing retention-overclaim
+    stop-size-mismatch operations-foreign-file operations-foreign-symlink
+    operations-foreign-directory operations-foreign-special
+  )
   local cell=""
   local boundary=""
   local command_name=""
@@ -6888,9 +7915,15 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
   local revision=""
   local git_tree=""
 
-  mkdir -p -- "$fake_example/scripts" "$fake_bin" "$output_parent" "$fake_example/.runtime"
+  mkdir -p -- "$fake_example/scripts" "$fake_example/java/benchmark" \
+    "$fake_bin" "$output_parent" "$fake_example/.runtime"
   chmod 0755 -- "$fake_example/.runtime"
   install --mode=0755 "$TEST_SCRIPT_DIR/benchmark.sh" "$fake_example/scripts/benchmark.sh"
+  install --mode=0644 "$TEST_SCRIPT_DIR/../java/benchmark/RuntimeSnapshot.java" \
+    "$fake_example/java/benchmark/RuntimeSnapshot.java"
+  install --mode=0644 "$TEST_SCRIPT_DIR/../java/benchmark/obi-benchmark.jfc" \
+    "$fake_example/java/benchmark/obi-benchmark.jfc"
+  printf 'fake deterministic helper jar\n' >"$runtime_helper_jar"
   ln -s -- "$TEST_SOURCE" "$fake_example/run.sh"
   printf 'services: {}\n' >"$fake_example/docker-compose.yml"
   printf 'examples/apache-java-https/.runtime/\n' >"$fake_root/.gitignore"
@@ -6911,6 +7944,8 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
   done
   printf '0 0 0\n' >"$diagnostics"
   printf '0 0 0 0 0 0 0 0 0 0 0\n' >"$bpf_metrics"
+  printf 'pre\n' >"$java_measurement_state"
+  printf 'FLR-fake-bounded-private-recording\n' >"$jfr_file"
   if ! PATH="$fake_bin:$PATH" \
     FAKE_CONTAINER_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
     FAKE_BPF_METRICS_FILE="$bpf_metrics" \
@@ -6920,6 +7955,12 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
     FAKE_DOCKER_ENDPOINT="unix://$docker_socket" \
     FAKE_EVENTS="$events" \
     FAKE_GIT_REVISION="$revision" \
+    FAKE_BOOTSTRAP_JFR_FILE="$bootstrap_jfr_file" \
+    FAKE_JAVA_MEASUREMENT_STATE_FILE="$java_measurement_state" \
+    FAKE_JFR_FILE="$jfr_file" \
+    FAKE_RUNTIME_HELPER_JAR_FILE="$runtime_helper_jar" \
+    FAKE_RUNTIME_HELPER_SOURCE_FILE="$fake_example/java/benchmark/RuntimeSnapshot.java" \
+    FAKE_RUNTIME_JFR_SETTINGS_FILE="$fake_example/java/benchmark/obi-benchmark.jfc" \
     FAKE_PID="$$" \
     FAKE_RESULTS_ROOT="$results_root" \
     FAKE_RUNNER_LOG="$runner_log" \
@@ -6937,6 +7978,7 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
     printf 'hermetic benchmark harness run failed\n' >&2
     return 1
   fi
+  OUTPUT_DIR="$output"
   jq -e '
     .status == "passed" and
     .acceptance_evidence == false and
@@ -6967,6 +8009,17 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
       metric: "kernel_reported_program_execution_count_and_cumulative_run_time_deltas",
       acceptance_evidence: false
     } and
+    (.measurement_scope.jfr_nmt_allocation_native_direct_memory |
+      .status == "available" and
+      .artifact == "cells/*/java-measurement/evidence.json" and
+      .retained_cell_artifacts == 6 and .expected_cell_artifacts == 6 and
+      (.runtime_artifact_attestation_sha256 | test("^[0-9a-f]{64}$")) and
+      .indicators == [
+          "sampled_allocation_weight", "monitor_enter_duration",
+          "thread_park_duration", "nmt_committed_and_reserved",
+          "direct_buffer_pool"
+        ] and
+      .acceptance_evidence == false) and
     (.notes | any(contains("passed summary status means the harness completed successfully")))
   ' "$output/summary.json" >/dev/null || {
     printf 'hermetic run misrepresented harness completion as a completed PoC gate\n' >&2
@@ -7018,10 +8071,55 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
   for cell in uninstrumented bridge-disabled getsockopt-hit unix-hit getsockopt-w3c getsockopt-helper-idle; do
     [[ -f "$output/cells/$cell/resources-measurement-baseline/snapshot.json" &&
       -f "$output/cells/$cell/resources-measurement-end/snapshot.json" &&
-      -f "$output/cells/$cell/bpf-program-runtime.json" ]] || {
+      -f "$output/cells/$cell/bpf-program-runtime.json" &&
+      -f "$output/cells/$cell/java-measurement/evidence.json" &&
+      -f "$output/cells/$cell/java-measurement-publication.json" &&
+      -f "$output/cells/$cell/java-measurement/measurement.jfr" ]] || {
       printf 'hermetic run omitted measurement-boundary artifacts for %s\n' "$cell" >&2
       return 1
     }
+    validate_java_measurement_evidence \
+      "$output/cells/$cell/java-measurement/evidence.json" || return 1
+    validate_published_java_measurement \
+      "$output/cells/$cell" || return 1
+    jq -e '
+      (has("target_pid") | not) and
+      (has("jvm_start_epoch_millis") | not)
+    ' "$output/cells/$cell/java-measurement/operations/08-jfr-summary/output" \
+      >/dev/null || {
+      printf 'JFR summary echoed unrecorded caller identity for %s\n' "$cell" >&2
+      return 1
+    }
+    jq -e '
+      .status == "complete" and .acceptance_evidence == false and
+      .interpretation.acceptance_evidence == false and
+      .interpretation.jfr_retention_may_be_a_bounded_tail_if_the_size_limit_was_reached == true and
+      (.runtime_artifacts.attestation_sha256 | test("^[0-9a-f]{64}$")) and
+      .runtime_artifacts.configured_image_tag ==
+        "obi-apache-java-https-backend-benchmark:local" and
+      .jfr.raw_private_diagnostic_input == true and
+      .jfr.snapshot_semantics ==
+        "single_source_descriptor_bounded_private_copy" and
+      .jfr.retention_scope ==
+        "bounded_tail_may_exclude_earliest_events_if_maximum_size_is_reached" and
+      .jfr.whole_window_retention_attested == false and
+      .jfr.stop_reported_size_reconciled == true and
+      .jfr.allocation_sample == {records: 5, weight_bytes: 500} and
+      .jfr.data_loss == {records: 0, bytes: 0} and
+      .nmt.baseline == {reserved_bytes: 1000000, committed_bytes: 500000} and
+      .nmt.non_negative_delta == {
+        reserved_bytes: 5000, committed_bytes: 2500
+      } and
+      .direct_buffer.signed_delta == {
+        count: 5, memory_used_bytes: 500, total_capacity_bytes: 500
+      }
+    ' "$output/cells/$cell/java-measurement/evidence.json" >/dev/null || return 1
+    if grep -Eqi \
+      'class_name|className|stackTrace|stack_frame|jvmArguments|systemProperties|request_marker|source_path' \
+      "$output/cells/$cell/java-measurement/evidence.json"; then
+      printf 'normalized Java evidence disclosed a prohibited payload field\n' >&2
+      return 1
+    fi
     jq -e '
       .java_diagnostics == {
         status: "not_collected",
@@ -7577,6 +8675,25 @@ test_main_uses_runner_cleanup_and_retains_core_artifacts() {
     printf 'hermetic run did not retrieve one verified public CA per cell\n' >&2
     return 1
   }
+  [[ "$(grep -Fc 'java-runtime benchmark ' "$runner_log")" == 6 ]] || {
+    printf 'core cells did not exclusively select the benchmark JDK runtime\n' >&2
+    return 1
+  }
+  [[ ! -e "$bootstrap_jfr_file" && ! -L "$bootstrap_jfr_file" ]] || {
+    printf 'core cells left the bounded bootstrap JFR behind\n' >&2
+    return 1
+  }
+  mkdir -- "$mutation_root"
+  for boundary in "${java_mutations[@]}"; do
+    assert_java_measurement_mutation_rejected \
+      "$output/cells/getsockopt-hit/java-measurement" \
+      "$mutation_root/$boundary" "$boundary" || return 1
+  done
+  assert_java_direct_buffer_reclamation_is_retained \
+    "$output/cells/getsockopt-hit/java-measurement" \
+    "$mutation_root/direct-reclamation-retained" || return 1
+  assert_java_publication_receipt_mutations_rejected "$output" || return 1
+  assert_mixed_java_runtime_artifact_identity_rejected "$output" || return 1
   ! grep -Fq down "$docker_log" || {
     printf 'hermetic run issued a raw Compose down\n' >&2
     return 1
@@ -7604,17 +8721,26 @@ test_complete_mode_fake_run_publishes_resolvable_bounded_evidence() {
   local -r runtime_log="$TEST_TMP_DIR/fake-native-runtime.log"
   local -r docker_socket="$TEST_TMP_DIR/fake-complete-docker.sock"
   local -r source_tree_manifest="$TEST_TMP_DIR/fake-complete-source-tree.manifest"
+  local -r java_measurement_state="$TEST_TMP_DIR/fake-complete-java-measurement-state.txt"
+  local -r bootstrap_jfr_file="$TEST_TMP_DIR/fake-complete-bootstrap.jfr"
+  local -r jfr_file="$TEST_TMP_DIR/fake-complete-measurement.jfr"
+  local -r runtime_helper_jar="$fake_example/java/benchmark/fake-helper.jar"
   # Exercise publication with a supported capacity that differs from the default fixture.
   local -r pressure_max_entries="${FAKE_PRESSURE_MAP_MAX_ENTRIES_OVERRIDE:-20000}"
   local revision=""
   local git_tree=""
   local command_name=""
 
-  mkdir -p -- "$fake_example/scripts" "$fake_example/java" \
+  mkdir -p -- "$fake_example/scripts" "$fake_example/java/benchmark" \
     "$agent_directory/src/main/c" "$agent_directory/src/test/c" \
     "$fake_bin" "$output_parent" "$fake_example/.runtime"
   chmod 0755 -- "$fake_example/.runtime"
   install --mode=0755 "$TEST_SCRIPT_DIR/benchmark.sh" "$fake_example/scripts/benchmark.sh"
+  install --mode=0644 "$TEST_SCRIPT_DIR/../java/benchmark/RuntimeSnapshot.java" \
+    "$fake_example/java/benchmark/RuntimeSnapshot.java"
+  install --mode=0644 "$TEST_SCRIPT_DIR/../java/benchmark/obi-benchmark.jfc" \
+    "$fake_example/java/benchmark/obi-benchmark.jfc"
+  printf 'fake deterministic helper jar\n' >"$runtime_helper_jar"
   ln -s -- "$TEST_SOURCE" "$fake_example/run.sh"
   printf 'services: {}\n' >"$fake_example/docker-compose.yml"
   printf '%s\n' \
@@ -7686,6 +8812,8 @@ test_complete_mode_fake_run_publishes_resolvable_bounded_evidence() {
   done
   printf '0 0 0\n' >"$diagnostics"
   printf '0 0 0 0 0 0 0 0 0 0 0\n' >"$bpf_metrics"
+  printf 'pre\n' >"$java_measurement_state"
+  printf 'FLR-fake-bounded-private-recording\n' >"$jfr_file"
   if ! PATH="$fake_bin:$PATH" \
     CC="$compiler" \
     MAKEFILES="$TEST_TMP_DIR/nonexistent-hostile.mk" \
@@ -7704,6 +8832,12 @@ test_complete_mode_fake_run_publishes_resolvable_bounded_evidence() {
     FAKE_DOCKER_ENDPOINT="unix://$docker_socket" \
     FAKE_EVENTS="$events" \
     FAKE_GIT_REVISION="$revision" \
+    FAKE_BOOTSTRAP_JFR_FILE="$bootstrap_jfr_file" \
+    FAKE_JAVA_MEASUREMENT_STATE_FILE="$java_measurement_state" \
+    FAKE_JFR_FILE="$jfr_file" \
+    FAKE_RUNTIME_HELPER_JAR_FILE="$runtime_helper_jar" \
+    FAKE_RUNTIME_HELPER_SOURCE_FILE="$fake_example/java/benchmark/RuntimeSnapshot.java" \
+    FAKE_RUNTIME_JFR_SETTINGS_FILE="$fake_example/java/benchmark/obi-benchmark.jfc" \
     FAKE_PRESSURE_MAP_MAX_ENTRIES_OVERRIDE="$pressure_max_entries" \
     FAKE_PID="$$" \
     FAKE_RESULTS_ROOT="$results_root" \
@@ -7727,7 +8861,10 @@ test_complete_mode_fake_run_publishes_resolvable_bounded_evidence() {
     .docker_daemon == {status: "verified_local_unix_socket_endpoint_only", path: "docker-daemon.json"} and
     .application_source == {status: "clean_and_stable", path: "application-source-identity.json"} and
     .measurement_scope.pressure_map_occupancy_and_capacity_rejection ==
-      "bounded_correctness_observed_once"
+      "bounded_correctness_observed_once" and
+    .measurement_scope.jfr_nmt_allocation_native_direct_memory.status == "available" and
+    .measurement_scope.jfr_nmt_allocation_native_direct_memory.retained_cell_artifacts == 6 and
+    .measurement_scope.jfr_nmt_allocation_native_direct_memory.acceptance_evidence == false
   ' "$output/summary.json" >/dev/null || {
     printf 'complete fake run did not publish bounded evidence honestly\n' >&2
     return 1
@@ -7798,6 +8935,15 @@ test_complete_mode_fake_run_publishes_resolvable_bounded_evidence() {
     -f "$output/cells/getsockopt-hit/path-observation.json" &&
     -f "$output/cells/unix-hit/path-observation.json" &&
     ! -e "$agent_directory/INJECTED" ]] || return 1
+  [[ "$(grep -Fc 'java-runtime benchmark ' "$runner_log")" == 6 &&
+    "$(grep -Fc 'java-runtime default ' "$runner_log")" == 4 ]] || {
+    printf 'complete mode did not confine benchmark JVM tooling to core cells\n' >&2
+    return 1
+  }
+  [[ ! -e "$bootstrap_jfr_file" && ! -L "$bootstrap_jfr_file" ]] || {
+    printf 'complete mode left the bounded bootstrap JFR behind\n' >&2
+    return 1
+  }
   ! grep -R -Fq -- 'CFLAGS=-DINJECTED' "$output/native-jni" &&
     ! grep -R -Fq -- 'printf INJECTED' "$output/native-jni" &&
     grep -Fq -- '-DOBI_JNI_TESTING' "$compiler_log" &&
@@ -7815,8 +8961,24 @@ main() {
   TEST_TMP_DIR="$(mktemp -d)"
   prepare_fake_ca
   if [[ "${BENCHMARK_TEST_ONLY:-}" == "core-mode" ]]; then
+    test_java_benchmark_tooling_is_opt_in_and_payload_bounded
+    test_runtime_snapshot_source_and_jfc_are_exact_authorities
+    test_java_tree_traversal_and_publication_identity_fail_closed
+    test_java_publication_substitution_is_quarantined
+    test_java_measurement_failure_classification_is_exact
+    test_java_measurement_partial_cleanup_is_identity_safe
+    test_helper_idle_sustained_rejects_delayed_post_workload_lifecycle
     test_main_uses_runner_cleanup_and_retains_core_artifacts
     printf 'benchmark.sh core-mode test passed\n'
+    return 0
+  fi
+  if [[ "${BENCHMARK_TEST_ONLY:-}" == "benchmark-repairs" ]]; then
+    test_java_benchmark_tooling_is_opt_in_and_payload_bounded
+    test_runtime_snapshot_source_and_jfc_are_exact_authorities
+    test_java_tree_traversal_and_publication_identity_fail_closed
+    test_java_publication_substitution_is_quarantined
+    test_java_measurement_failure_classification_is_exact
+    printf 'benchmark.sh focused repair tests passed\n'
     return 0
   fi
   if [[ "${BENCHMARK_TEST_ONLY:-}" == "complete-mode" ]]; then
@@ -7850,6 +9012,11 @@ main() {
     return 0
   fi
   test_parser_defaults_and_boundaries
+  test_java_benchmark_tooling_is_opt_in_and_payload_bounded
+  test_runtime_snapshot_source_and_jfc_are_exact_authorities
+  test_java_tree_traversal_and_publication_identity_fail_closed
+  test_java_publication_substitution_is_quarantined
+  test_java_measurement_failure_classification_is_exact
   test_java_bridge_program_allowlist_matches_source
   test_lifecycle_tool_paths_must_be_absolute_regular
   test_lifecycle_tool_resolution_rejects_relative_paths
@@ -7898,6 +9065,7 @@ main() {
   test_failed_measurement_clears_reaped_pid
   test_invalid_benchmark_result_is_not_published_or_retained
   test_benchmark_abort_discard_is_exact_and_fail_closed
+  test_java_measurement_partial_cleanup_is_identity_safe
   test_interrupted_measurement_reaps_client_tree
   test_wait_reaps_client_group_after_leader_exit
   test_failed_identity_capture_reaps_client_group

@@ -50,6 +50,14 @@ readonly MAX_BPF_OPERATION_COUNTER=9007199254740991
 readonly MAX_BPF_PROGRAM_METRIC_COUNTER=9007199254740991
 readonly MAX_BPF_PROGRAM_RUNTIME_NANOSECONDS=9007199254740991
 readonly MAX_JAVA_DIAGNOSTICS_SNAPSHOT_BYTES=4096
+readonly MAX_JAVA_RUNTIME_SNAPSHOT_BYTES=4096
+readonly MAX_JAVA_TOOL_OUTPUT_BYTES=1048576
+readonly MAX_JAVA_RUNTIME_ARTIFACT_BYTES=16777216
+readonly MAX_JAVA_TREE_LISTING_BYTES=1048576
+readonly MAX_JAVA_EVIDENCE_FILES=128
+readonly MAX_JFR_BYTES=33554432
+readonly MAX_JFR_RECORDS=600000
+readonly MAX_NMT_LINES=4096
 readonly MAX_BENCHMARK_RESULT_BYTES=100663296
 readonly MAX_OBI_METRICS_SNAPSHOT_BYTES=16777216
 readonly MAX_PROC_CGROUP_BYTES=65536
@@ -71,6 +79,31 @@ readonly RUNNER_CLEANUP_TIMEOUT_SECONDS=300
 readonly POSTLOAD_SENTINEL_TIMEOUT_SECONDS=120
 readonly JNI_BENCHMARK_TIMEOUT_SECONDS=180
 readonly JNI_BENCHMARK_ITERATIONS=10000
+readonly JAVA_TOOL_TIMEOUT_SECONDS=45
+readonly JAVA_JFR_MAX_DURATION_SECONDS=3600
+readonly JAVA_BENCHMARK_IMAGE_TARGET="benchmark-runtime"
+readonly JAVA_DEFAULT_IMAGE_TAG="obi-apache-java-https-backend:local"
+readonly JAVA_BENCHMARK_IMAGE_TAG="obi-apache-java-https-backend-benchmark:local"
+readonly JAVA_BENCHMARK_TOOL_JAR="/otel/obi-benchmark-runtime-snapshot.jar"
+readonly JAVA_BENCHMARK_TOOL_SOURCE="/otel/benchmark-source/RuntimeSnapshot.java"
+readonly JAVA_BENCHMARK_JFR_SETTINGS="/otel/obi-benchmark.jfc"
+readonly JAVA_BENCHMARK_TOOL_SOURCE_CHECKOUT="$EXAMPLE_DIR/java/benchmark/RuntimeSnapshot.java"
+readonly JAVA_BENCHMARK_JFR_SETTINGS_CHECKOUT="$EXAMPLE_DIR/java/benchmark/obi-benchmark.jfc"
+# The helper source is part of the runtime-attestation authority. Its digest is
+# intentionally explicit so descriptor or cap semantics cannot drift silently.
+readonly JAVA_BENCHMARK_TOOL_SOURCE_SHA256="d00f8d0460b51a075708c3005af19b012ff3391cfa8757b2b196d7538ac17dc9"
+# This digest makes the payload-safe JFC settings an exact byte contract. A
+# deliberate settings change must update both the file and this authority.
+readonly JAVA_BENCHMARK_JFR_SETTINGS_SHA256="5c4a13587601f6d07b2b17af779399e4914bef227f003f225217c946fc1f0d9d"
+readonly JAVA_JFR_RETENTION_SCOPE="bounded_tail_may_exclude_earliest_events_if_maximum_size_is_reached"
+readonly JAVA_BOOTSTRAP_JFR_NAME="obi-benchmark-bootstrap"
+readonly JAVA_BOOTSTRAP_JFR_CONTAINER_PATH="/tmp/obi-benchmark-bootstrap.jfr"
+readonly JAVA_MEASUREMENT_JFR_NAME="obi-benchmark-measurement"
+readonly JAVA_MEASUREMENT_JFR_CONTAINER_PATH="/tmp/obi-benchmark-measurement.jfr"
+readonly JAVA_BENCHMARK_TOOL_ENV=(
+  env -i HOME=/tmp LANG=C LC_ALL=C
+  PATH=/opt/java/openjdk/bin:/usr/bin:/bin TZ=UTC
+)
 readonly MAX_PERFORMANCE_REGRESSION_PERCENT=10
 readonly CORE_CELLS=(uninstrumented bridge-disabled getsockopt-hit unix-hit getsockopt-w3c getsockopt-helper-idle)
 readonly BOUNDED_PATH_CELLS=(getsockopt-stale unix-stale unix-timeout getsockopt-pressure)
@@ -128,6 +161,14 @@ BENCHMARK_OUTPUT=""
 BENCHMARK_DURATION_SECONDS=""
 BENCHMARK_CELL_DIR=""
 BENCHMARK_OUTPUT_PARENT_IDENTITY=""
+JAVA_MEASUREMENT_PARTIAL=""
+JAVA_MEASUREMENT_CELL_DIR=""
+JAVA_MEASUREMENT_PARENT_IDENTITY=""
+JAVA_MEASUREMENT_ROOT_IDENTITY=""
+JAVA_MEASUREMENT_JVM_START_EPOCH_MILLIS=""
+JAVA_MEASUREMENT_STARTED_AT=""
+JAVA_MEASUREMENT_STOP_INITIATED_AT=""
+JAVA_MEASUREMENT_RUNTIME_ARTIFACT_SHA256=""
 PS_COMMAND="$(type -P ps 2>/dev/null || true)"
 SLEEP_COMMAND="$(type -P sleep 2>/dev/null || true)"
 HARNESS_STATUS="failed"
@@ -1159,6 +1200,16 @@ configure_compose() {
 
   [[ "$project" =~ ^${PROJECT_NAMESPACE}-[a-z0-9][a-z0-9_-]*$ &&
     ${#project} -le 63 ]] || return 1
+  if [[ "$CELL_BOUNDED_PATH" == "true" ]]; then
+    JAVA_IMAGE_TARGET="runtime"
+    JAVA_BACKEND_IMAGE="$JAVA_DEFAULT_IMAGE_TAG"
+    JAVA_BENCHMARK_TOOL_OPTIONS_SUFFIX=""
+  else
+    JAVA_IMAGE_TARGET="$JAVA_BENCHMARK_IMAGE_TARGET"
+    JAVA_BACKEND_IMAGE="$JAVA_BENCHMARK_IMAGE_TAG"
+    JAVA_BENCHMARK_TOOL_OPTIONS_SUFFIX=" -XX:NativeMemoryTracking=summary -XX:StartFlightRecording=name=${JAVA_BOOTSTRAP_JFR_NAME},settings=${JAVA_BENCHMARK_JFR_SETTINGS},filename=${JAVA_BOOTSTRAP_JFR_CONTAINER_PATH},disk=true,dumponexit=false,duration=${JAVA_JFR_MAX_DURATION_SECONDS}s,maxsize=32m"
+  fi
+  export JAVA_IMAGE_TARGET JAVA_BACKEND_IMAGE JAVA_BENCHMARK_TOOL_OPTIONS_SUFFIX
   COMPOSE=(docker compose --project-name "$project" --file "$COMPOSE_FILE")
 }
 
@@ -1423,6 +1474,21 @@ write_manifest() {
         metric: "kernel_reported_program_execution_count_and_cumulative_run_time_deltas",
         acceptance_evidence: false
       },
+      java_runtime_indicator_evidence: {
+        artifact: "cells/*/java-measurement/evidence.json",
+        private_raw_jfr: "retained_bounded_diagnostic_input",
+        selected_cells: $cells,
+        measurement_window:
+          "post_warmup_baseline_to_stop_initiated_immediately_after_final_load",
+        indicators: [
+          "jfr_sampled_allocation_weight", "jfr_monitor_enter_duration",
+          "jfr_thread_park_duration", "nmt_reserved_and_committed",
+          "direct_buffer_pool"
+        ],
+        normalized_receipt:
+          "low_cardinality_counts_deltas_and_digests_without_payload_fields",
+        acceptance_evidence: false
+      },
       application_source_identity: "application-source-identity.json",
       agent: $agent,
       tls_protocol: $tls,
@@ -1504,15 +1570,15 @@ write_manifest() {
       total_worker_seconds: $total_worker_seconds,
       unavailable_dimensions: {
         jni_lookup_latency_percentiles: $jni_lookup_status,
-        jfr_nmt_allocation_native_direct_memory: "not_collected",
+        jfr_nmt_allocation_native_direct_memory: "bounded_indicators_requested",
         primary_cgroupsockopt_program_cpu: "not_collected",
         bpf_map_insert_failures: (if $complete_requested then "capacity_rejection_only" else "not_collected" end),
         bpf_map_evictions: (if $complete_requested then "not_applicable_non_evicting_hash_pressure" else "not_collected" end),
         bpf_lock_contention: "not_collected",
         application_cpu_rss_fd_threads: "requested_for_bounded_growth_gate",
-        java_allocations: "not_collected",
-        java_native_memory: "not_collected",
-        java_direct_memory: "not_collected"
+        java_allocations: "sampled_indicator_requested_not_exact_count",
+        java_native_memory: "nmt_summary_indicator_requested",
+        java_direct_memory: "direct_buffer_pool_indicator_requested"
       }
     }' >"$OUTPUT_DIR/manifest.json"
 }
@@ -2103,7 +2169,7 @@ normalize_native_jni_benchmark() {
 validate_native_raw_reconciliation() (
   local -r artifact="$1"
   local artifact_directory=""
-  local expected=""
+  local expected_json=""
 
   [[ -f "$artifact" && ! -L "$artifact" ]] || return 1
   artifact_directory="$(cd -- "${artifact%/*}" && pwd -P)" || return 1
@@ -2693,6 +2759,7 @@ capture_service_identity() {
   local -r output="$2"
   local container_id=""
   local inspected_id=""
+  local image_id=""
   local host_pid=""
   local project=""
   local sentinel=""
@@ -2707,17 +2774,18 @@ capture_service_identity() {
 
   container_id="$(compose_service_id "$service")" || return 1
   inspection_before="$(run_bounded "$DOCKER_QUERY_TIMEOUT_SECONDS" docker inspect --format \
-    "{{.Id}} {{.State.Pid}} {{index .Config.Labels \"com.docker.compose.project\"}} {{index .Config.Labels \"$PROJECT_SENTINEL_LABEL\"}}" \
+    "{{.Id}} {{.Image}} {{.State.Pid}} {{index .Config.Labels \"com.docker.compose.project\"}} {{index .Config.Labels \"$PROJECT_SENTINEL_LABEL\"}}" \
     "$container_id")" || return 1
-  read -r inspected_id host_pid project sentinel extra <<<"$inspection_before" || return 1
+  read -r inspected_id image_id host_pid project sentinel extra <<<"$inspection_before" || return 1
   [[ "$inspected_id" =~ ^[0-9a-f]{64}$ && "$inspected_id" == "$container_id"* &&
+    "$image_id" =~ ^sha256:[0-9a-f]{64}$ &&
     "$host_pid" =~ ^[1-9][0-9]*$ &&
     "$project" == "$ACTIVE_PROJECT" && "$sentinel" == "$PROJECT_SENTINEL_VALUE" &&
     -z "$extra" ]] || return 1
   container_id="$inspected_id"
   proc_identity_before="$(local_proc_identity "$host_pid" "$container_id")" || return 1
   inspection_after="$(run_bounded "$DOCKER_QUERY_TIMEOUT_SECONDS" docker inspect --format \
-    "{{.Id}} {{.State.Pid}} {{index .Config.Labels \"com.docker.compose.project\"}} {{index .Config.Labels \"$PROJECT_SENTINEL_LABEL\"}}" \
+    "{{.Id}} {{.Image}} {{.State.Pid}} {{index .Config.Labels \"com.docker.compose.project\"}} {{index .Config.Labels \"$PROJECT_SENTINEL_LABEL\"}}" \
     "$container_id")" || return 1
   proc_identity_after="$(local_proc_identity "$host_pid" "$container_id")" || return 1
   [[ "$inspection_after" == "$inspection_before" &&
@@ -2731,6 +2799,7 @@ capture_service_identity() {
   {
     printf 'service=%s\n' "$service"
     printf 'container_id=%s\n' "$container_id"
+    printf 'image_id=%s\n' "$image_id"
     printf 'host_pid=%s\n' "$host_pid"
     printf 'proc_start_time=%s\n' "$proc_start_time"
     printf 'proc_cgroup_sha256=%s\n' "$proc_cgroup_sha256"
@@ -2755,6 +2824,1835 @@ identity_field() {
   done <"$identity"
   [[ "$matches" == 1 && -n "$value" ]] || return 1
   printf '%s\n' "$value"
+}
+
+validate_benchmark_runtime_source() {
+  local -r source="$1"
+  local digest=""
+
+  [[ -f "$source" && ! -L "$source" ]] || return 1
+  digest="$(sha256_regular_file "$source")" || return 1
+  [[ "$digest" == "$JAVA_BENCHMARK_TOOL_SOURCE_SHA256" ]] || return 1
+  grep -Fq 'new RecordingFile(snapshot.descriptorPath())' "$source" &&
+    grep -Fq 'locateOpenDescriptor' "$source" &&
+    grep -Fq 'FileChannel.open(source, Set.of(StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS))' "$source" &&
+    grep -Fq 'readBoundedDescriptor(sourceDescriptor, sourceDescriptorPath, maximumBytes)' "$source" &&
+    grep -Fq 'streamRaw(System.out)' "$source" &&
+    grep -Fq 'failure.addSuppressed(exception)' "$source" &&
+    grep -Fq 'HARD_MAX_JFR_BYTES = 33_554_432L' "$source" &&
+    grep -Fq 'HARD_MAX_JFR_RECORDS = 600_000L' "$source" &&
+    grep -Fq 'StandardCopyOption.ATOMIC_MOVE' "$source"
+}
+
+validate_benchmark_jfr_settings_source() {
+  local -r source="$1"
+  local digest=""
+
+  [[ -f "$source" && ! -L "$source" ]] || return 1
+  digest="$(sha256_regular_file "$source")" || return 1
+  [[ "$digest" == "$JAVA_BENCHMARK_JFR_SETTINGS_SHA256" ]]
+}
+
+# This is the only boundary classified as infrastructure-unavailable. Once
+# these exact executables and files are present in the exact container image,
+# malformed output or any missing assertion is a measurement-contract failure.
+java_measurement_facilities_available() (
+  local -r cell_dir="$1"
+  local before=""
+  local after=""
+  local container_id=""
+  local path=""
+  local predicate=""
+
+  java_measurement_cell_is_allowed "$cell_dir" || return 1
+  [[ "$CELL_BOUNDED_PATH" == false &&
+    "$JAVA_IMAGE_TARGET" == "$JAVA_BENCHMARK_IMAGE_TARGET" &&
+    "$JAVA_BACKEND_IMAGE" == "$JAVA_BENCHMARK_IMAGE_TAG" ]] || return 1
+  before="$(mktemp "$cell_dir/.java-facility-before.XXXXXX")" || return 1
+  after="$(mktemp "$cell_dir/.java-facility-after.XXXXXX")" || {
+    rm -f -- "$before"
+    return 1
+  }
+  trap 'rm -f -- "$before" "$after"' EXIT
+  capture_service_identity java-backend "$before" || return 1
+  container_id="$(identity_field "$before" container_id)" || return 1
+  while read -r predicate path; do
+    run_bounded "$JAVA_TOOL_TIMEOUT_SECONDS" \
+      docker exec "$container_id" "${JAVA_BENCHMARK_TOOL_ENV[@]}" \
+      /usr/bin/test "$predicate" "$path" >/dev/null || return 1
+  done <<EOF
+-x /opt/java/openjdk/bin/java
+-x /opt/java/openjdk/bin/jcmd
+-x /usr/bin/sha256sum
+-x /usr/bin/stat
+-f $JAVA_BENCHMARK_TOOL_JAR
+-f $JAVA_BENCHMARK_TOOL_SOURCE
+-f $JAVA_BENCHMARK_JFR_SETTINGS
+EOF
+  capture_service_identity java-backend "$after" || return 1
+  cmp -s -- "$before" "$after"
+)
+
+validate_java_runtime_artifacts() {
+  local -r artifact="$1"
+  local -r identity="$2"
+  local expected_image_id=""
+  local checkout_helper_sha256=""
+  local checkout_helper_size=""
+  local checkout_jfc_sha256=""
+  local checkout_jfc_size=""
+  local raw_value_count=""
+
+  [[ -f "$artifact" && ! -L "$artifact" &&
+    -f "$identity" && ! -L "$identity" &&
+    -f "$JAVA_BENCHMARK_TOOL_SOURCE_CHECKOUT" &&
+    ! -L "$JAVA_BENCHMARK_TOOL_SOURCE_CHECKOUT" ]] || return 1
+  validate_benchmark_jfr_settings_source \
+    "$JAVA_BENCHMARK_JFR_SETTINGS_CHECKOUT" || return 1
+  validate_benchmark_runtime_source \
+    "$JAVA_BENCHMARK_TOOL_SOURCE_CHECKOUT" || return 1
+  expected_image_id="$(identity_field "$identity" image_id)" || return 1
+  checkout_helper_sha256="$(sha256_regular_file \
+    "$JAVA_BENCHMARK_TOOL_SOURCE_CHECKOUT")" || return 1
+  checkout_jfc_sha256="$(sha256_regular_file \
+    "$JAVA_BENCHMARK_JFR_SETTINGS_CHECKOUT")" || return 1
+  checkout_helper_size="$(stat --format '%s' -- \
+    "$JAVA_BENCHMARK_TOOL_SOURCE_CHECKOUT")" || return 1
+  checkout_jfc_size="$(stat --format '%s' -- \
+    "$JAVA_BENCHMARK_JFR_SETTINGS_CHECKOUT")" || return 1
+  raw_value_count="$(raw_json_value_count "$artifact")" || return 1
+  [[ "$raw_value_count" == 16 ]] || return 1
+  jq -se \
+    --arg expected_image_id "$expected_image_id" \
+    --arg expected_image_tag "$JAVA_BENCHMARK_IMAGE_TAG" \
+    --arg helper_source_sha256 "$checkout_helper_sha256" \
+    --argjson helper_source_size "$checkout_helper_size" \
+    --arg jfr_settings_sha256 "$checkout_jfc_sha256" \
+    --argjson jfr_settings_size "$checkout_jfc_size" \
+    --arg settings_authority_sha256 "$JAVA_BENCHMARK_JFR_SETTINGS_SHA256" \
+    --arg retention_scope "$JAVA_JFR_RETENTION_SCOPE" \
+    --argjson maximum_artifact_bytes "$MAX_JAVA_RUNTIME_ARTIFACT_BYTES" \
+    --argjson maximum_jfr_bytes "$MAX_JFR_BYTES" \
+    --argjson maximum_duration_seconds "$JAVA_JFR_MAX_DURATION_SECONDS" '
+      def bounded_positive:
+        type == "number" and isfinite and floor == . and . > 0 and
+        . <= $maximum_artifact_bytes;
+      length == 1 and (.[0] |
+        (keys) == [
+          "configured_image_tag", "helper_jar", "helper_source", "image_id",
+          "jfr_settings", "retention", "schema_version"
+        ] and
+        .schema_version == 1 and .image_id == $expected_image_id and
+        .configured_image_tag == $expected_image_tag and
+        (.helper_jar | type == "object" and
+          (keys) == ["sha256", "size_bytes"] and
+          (.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+          (.size_bytes | bounded_positive)) and
+        (.helper_source | type == "object" and
+          (keys) == ["checkout_match", "sha256", "size_bytes"] and
+          .checkout_match == true and .sha256 == $helper_source_sha256 and
+          .size_bytes == $helper_source_size and (.size_bytes | bounded_positive)) and
+        (.jfr_settings | type == "object" and
+          (keys) == [
+            "checkout_match", "settings_authority_sha256", "sha256", "size_bytes"
+          ] and
+          .checkout_match == true and .sha256 == $jfr_settings_sha256 and
+          .sha256 == $settings_authority_sha256 and
+          .settings_authority_sha256 == $settings_authority_sha256 and
+          .size_bytes == $jfr_settings_size and (.size_bytes | bounded_positive)) and
+        (.retention | type == "object" and
+          (keys) == [
+            "maximum_duration_seconds", "maximum_size_bytes", "scope",
+            "whole_window_retention_attested"
+          ] and
+          .maximum_duration_seconds == $maximum_duration_seconds and
+          .maximum_size_bytes == $maximum_jfr_bytes and
+          .scope == $retention_scope and
+          .whole_window_retention_attested == false))
+    ' "$artifact" >/dev/null
+}
+
+capture_java_runtime_artifacts() (
+  local -r root="$1"
+  local -r output="$2"
+  local -r identity="$root/identity.txt"
+  local work=""
+  local before=""
+  local after=""
+  local hashes=""
+  local sizes=""
+  local temporary=""
+  local container_id=""
+  local image_id=""
+  local helper_sha256=""
+  local helper_source_sha256=""
+  local jfr_settings_sha256=""
+  local helper_size=""
+  local helper_source_size=""
+  local jfr_settings_size=""
+  local line=""
+  local path=""
+  local extra=""
+  local -a hash_lines=()
+  local -a size_lines=()
+
+  [[ "$root" == "$JAVA_MEASUREMENT_PARTIAL" && -d "$root" && ! -L "$root" &&
+    "$output" == "$root/"* && ! -e "$output" && ! -L "$output" &&
+    -f "$identity" && ! -L "$identity" ]] || return 1
+  work="$(mktemp -d "$root/.runtime-artifacts.XXXXXX")" || return 1
+  chmod 0700 -- "$work" || return 1
+  before="$work/host-before.txt"
+  after="$work/host-after.txt"
+  hashes="$work/hashes.txt"
+  sizes="$work/sizes.txt"
+  temporary="$work/artifacts.json"
+  trap 'rm -f -- "$before" "$after" "$hashes" "$sizes" "$temporary"; rmdir -- "$work" 2>/dev/null || true' EXIT
+  capture_service_identity java-backend "$before" || return 1
+  cmp -s -- "$identity" "$before" || return 1
+  container_id="$(identity_field "$identity" container_id)" || return 1
+  image_id="$(identity_field "$identity" image_id)" || return 1
+  capture_bounded_private_output "$hashes" "$MAX_JAVA_TOOL_OUTPUT_BYTES" \
+    "$JAVA_TOOL_TIMEOUT_SECONDS" \
+    docker exec "$container_id" "${JAVA_BENCHMARK_TOOL_ENV[@]}" \
+    /usr/bin/sha256sum -- "$JAVA_BENCHMARK_TOOL_JAR" \
+    "$JAVA_BENCHMARK_TOOL_SOURCE" "$JAVA_BENCHMARK_JFR_SETTINGS" || return 1
+  capture_bounded_private_output "$sizes" "$MAX_JAVA_TOOL_OUTPUT_BYTES" \
+    "$JAVA_TOOL_TIMEOUT_SECONDS" \
+    docker exec "$container_id" "${JAVA_BENCHMARK_TOOL_ENV[@]}" \
+    /usr/bin/stat --format=%s -- "$JAVA_BENCHMARK_TOOL_JAR" \
+    "$JAVA_BENCHMARK_TOOL_SOURCE" "$JAVA_BENCHMARK_JFR_SETTINGS" || return 1
+  capture_service_identity java-backend "$after" || return 1
+  cmp -s -- "$identity" "$after" || return 1
+  mapfile -t hash_lines <"$hashes" || return 1
+  mapfile -t size_lines <"$sizes" || return 1
+  [[ "${#hash_lines[@]}" == 3 && "${#size_lines[@]}" == 3 ]] || return 1
+  read -r helper_sha256 path extra <<<"${hash_lines[0]}" || return 1
+  [[ "$helper_sha256" =~ ^[0-9a-f]{64}$ &&
+    "$path" == "$JAVA_BENCHMARK_TOOL_JAR" && -z "$extra" ]] || return 1
+  read -r helper_source_sha256 path extra <<<"${hash_lines[1]}" || return 1
+  [[ "$helper_source_sha256" =~ ^[0-9a-f]{64}$ &&
+    "$path" == "$JAVA_BENCHMARK_TOOL_SOURCE" && -z "$extra" ]] || return 1
+  read -r jfr_settings_sha256 path extra <<<"${hash_lines[2]}" || return 1
+  [[ "$jfr_settings_sha256" =~ ^[0-9a-f]{64}$ &&
+    "$path" == "$JAVA_BENCHMARK_JFR_SETTINGS" && -z "$extra" ]] || return 1
+  read -r helper_size extra <<<"${size_lines[0]}" || return 1
+  [[ "$helper_size" =~ ^[1-9][0-9]*$ && -z "$extra" ]] || return 1
+  read -r helper_source_size extra <<<"${size_lines[1]}" || return 1
+  [[ "$helper_source_size" =~ ^[1-9][0-9]*$ && -z "$extra" ]] || return 1
+  read -r jfr_settings_size extra <<<"${size_lines[2]}" || return 1
+  [[ "$jfr_settings_size" =~ ^[1-9][0-9]*$ && -z "$extra" ]] || return 1
+  jq -n \
+    --arg image_id "$image_id" \
+    --arg configured_image_tag "$JAVA_BENCHMARK_IMAGE_TAG" \
+    --arg helper_sha256 "$helper_sha256" \
+    --argjson helper_size "$helper_size" \
+    --arg helper_source_sha256 "$helper_source_sha256" \
+    --argjson helper_source_size "$helper_source_size" \
+    --arg jfr_settings_sha256 "$jfr_settings_sha256" \
+    --argjson jfr_settings_size "$jfr_settings_size" \
+    --arg settings_authority_sha256 "$JAVA_BENCHMARK_JFR_SETTINGS_SHA256" \
+    --arg retention_scope "$JAVA_JFR_RETENTION_SCOPE" \
+    --argjson maximum_jfr_bytes "$MAX_JFR_BYTES" \
+    --argjson maximum_duration_seconds "$JAVA_JFR_MAX_DURATION_SECONDS" '
+      {
+        schema_version: 1,
+        image_id: $image_id,
+        configured_image_tag: $configured_image_tag,
+        helper_jar: {sha256: $helper_sha256, size_bytes: $helper_size},
+        helper_source: {
+          sha256: $helper_source_sha256,
+          size_bytes: $helper_source_size,
+          checkout_match: true
+        },
+        jfr_settings: {
+          sha256: $jfr_settings_sha256,
+          size_bytes: $jfr_settings_size,
+          checkout_match: true,
+          settings_authority_sha256: $settings_authority_sha256
+        },
+        retention: {
+          maximum_size_bytes: $maximum_jfr_bytes,
+          maximum_duration_seconds: $maximum_duration_seconds,
+          scope: $retention_scope,
+          whole_window_retention_attested: false
+        }
+      }
+    ' >"$temporary" || return 1
+  chmod 0600 -- "$temporary" || return 1
+  validate_java_runtime_artifacts "$temporary" "$identity" || return 1
+  mv -T -- "$temporary" "$output" || return 1
+  rm -f -- "$before" "$after" "$hashes" "$sizes" || return 1
+  rmdir -- "$work"
+)
+
+raw_json_value_count() {
+  local -r artifact="$1"
+
+  [[ -f "$artifact" && ! -L "$artifact" ]] || return 1
+  jq --stream -n '
+    reduce inputs as $event (0;
+      if ($event | length) == 2 then . + 1 else . end)
+  ' "$artifact"
+}
+
+validate_java_runtime_snapshot() {
+  local -r artifact="$1"
+  local -r expected_start_epoch_millis="${2:-}"
+  local raw_value_count=""
+
+  raw_value_count="$(raw_json_value_count "$artifact")" || return 1
+  [[ "$raw_value_count" == 7 ]] || return 1
+  jq -se \
+    --argjson maximum_safe_integer "$MAX_SEED" \
+    --arg expected_start_epoch_millis "$expected_start_epoch_millis" '
+      def safe_positive_integer:
+        type == "number" and isfinite and floor == . and . > 0 and
+        . <= $maximum_safe_integer;
+      def safe_non_negative_integer:
+        type == "number" and isfinite and floor == . and . >= 0 and
+        . <= $maximum_safe_integer;
+      length == 1 and (.[0] |
+        (keys) == [
+          "direct_buffer", "jvm_start_epoch_millis", "runtime_pid",
+          "schema_version", "target_pid"
+        ] and
+        .schema_version == 1 and .target_pid == 1 and .runtime_pid == 1 and
+        (.jvm_start_epoch_millis | safe_positive_integer) and
+        ($expected_start_epoch_millis == "" or
+          (.jvm_start_epoch_millis | tostring) == $expected_start_epoch_millis) and
+        (.direct_buffer | type == "object" and
+          (keys) == ["count", "memory_used_bytes", "total_capacity_bytes"] and
+          (.count | safe_non_negative_integer) and
+          (.memory_used_bytes | safe_non_negative_integer) and
+          (.total_capacity_bytes | safe_non_negative_integer)))
+    ' "$artifact" >/dev/null
+}
+
+capture_bounded_private_output() {
+  local -r output="$1"
+  local -r maximum_bytes="$2"
+  local -r timeout_seconds="$3"
+  shift 3
+  local -r parent="${output%/*}"
+  local temporary=""
+  local captured_bytes=""
+
+  [[ "$output" == /* && "$parent" == /* && -d "$parent" && ! -L "$parent" &&
+    ! -e "$output" && ! -L "$output" &&
+    "$maximum_bytes" =~ ^[1-9][0-9]*$ &&
+    "$timeout_seconds" =~ ^[1-9][0-9]*$ && $# -gt 0 ]] || return 1
+  temporary="$(mktemp "$parent/.${output##*/}.XXXXXX")" || return 1
+  if ! run_bounded "$timeout_seconds" "$@" 2>&1 |
+    head -c "$((maximum_bytes + 1))" >"$temporary"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  captured_bytes="$(stat --format '%s' -- "$temporary")" || {
+    rm -f -- "$temporary"
+    return 1
+  }
+  if [[ ! "$captured_bytes" =~ ^[1-9][0-9]*$ ]] ||
+    ((captured_bytes > maximum_bytes)) ||
+    ! chmod 0600 -- "$temporary" ||
+    ! mv -T -- "$temporary" "$output"; then
+    rm -f -- "$temporary" "$output"
+    return 1
+  fi
+}
+
+capture_bounded_private_streams() {
+  local -r stdout_output="$1"
+  local -r stdout_maximum_bytes="$2"
+  local -r stderr_output="$3"
+  local -r stderr_maximum_bytes="$4"
+  local -r timeout_seconds="$5"
+  shift 5
+  local -r parent="${stdout_output%/*}"
+  local stdout_temporary=""
+  local stderr_temporary=""
+  local stdout_bytes=""
+  local stderr_bytes=""
+  local file_limit_bytes=""
+  local file_limit_blocks=""
+
+  [[ "$stdout_output" == "$parent/"* && "$stderr_output" == "$parent/"* &&
+    "$stdout_output" != "$stderr_output" && -d "$parent" && ! -L "$parent" &&
+    ! -e "$stdout_output" && ! -L "$stdout_output" &&
+    ! -e "$stderr_output" && ! -L "$stderr_output" &&
+    "$stdout_maximum_bytes" =~ ^[1-9][0-9]*$ &&
+    "$stderr_maximum_bytes" =~ ^[1-9][0-9]*$ &&
+    "$timeout_seconds" =~ ^[1-9][0-9]*$ && $# -gt 0 ]] || return 1
+  stdout_temporary="$(mktemp "$parent/.${stdout_output##*/}.XXXXXX")" || return 1
+  stderr_temporary="$(mktemp "$parent/.${stderr_output##*/}.XXXXXX")" || {
+    rm -f -- "$stdout_temporary"
+    return 1
+  }
+  file_limit_bytes="$stdout_maximum_bytes"
+  if ((stderr_maximum_bytes > file_limit_bytes)); then
+    file_limit_bytes="$stderr_maximum_bytes"
+  fi
+  file_limit_blocks="$(((file_limit_bytes + 1023) / 1024 + 1))"
+  if ! (
+    ulimit -f "$file_limit_blocks"
+    run_bounded "$timeout_seconds" "$@" \
+      >"$stdout_temporary" 2>"$stderr_temporary"
+  ); then
+    rm -f -- "$stdout_temporary" "$stderr_temporary"
+    return 1
+  fi
+  stdout_bytes="$(stat --format '%s' -- "$stdout_temporary")" || {
+    rm -f -- "$stdout_temporary" "$stderr_temporary"
+    return 1
+  }
+  stderr_bytes="$(stat --format '%s' -- "$stderr_temporary")" || {
+    rm -f -- "$stdout_temporary" "$stderr_temporary"
+    return 1
+  }
+  if [[ ! "$stdout_bytes" =~ ^[1-9][0-9]*$ ||
+    ! "$stderr_bytes" =~ ^[1-9][0-9]*$ ]] ||
+    ((stdout_bytes > stdout_maximum_bytes || stderr_bytes > stderr_maximum_bytes)) ||
+    ! chmod 0600 -- "$stdout_temporary" "$stderr_temporary" ||
+    ! mv -T -- "$stdout_temporary" "$stdout_output" ||
+    ! mv -T -- "$stderr_temporary" "$stderr_output"; then
+    rm -f -- "$stdout_temporary" "$stderr_temporary" \
+      "$stdout_output" "$stderr_output"
+    return 1
+  fi
+}
+
+java_runtime_identity_matches() {
+  local -r snapshot="$1"
+
+  validate_java_runtime_snapshot \
+    "$snapshot" "$JAVA_MEASUREMENT_JVM_START_EPOCH_MILLIS"
+}
+
+java_measurement_root_identity_matches() {
+  local -r root="$1"
+  local -r phase="$2"
+  local expected_root=""
+  local observed_parent_identity=""
+  local observed_root_identity=""
+
+  java_measurement_cell_is_allowed "$JAVA_MEASUREMENT_CELL_DIR" || return 1
+  case "$phase" in
+    partial)
+      expected_root="$JAVA_MEASUREMENT_PARTIAL"
+      [[ "$root" == "$expected_root" &&
+        ! -e "$JAVA_MEASUREMENT_CELL_DIR/java-measurement" &&
+        ! -L "$JAVA_MEASUREMENT_CELL_DIR/java-measurement" ]] || return 1
+      ;;
+    published)
+      expected_root="$JAVA_MEASUREMENT_CELL_DIR/java-measurement"
+      [[ "$root" == "$expected_root" &&
+        ! -e "$JAVA_MEASUREMENT_PARTIAL" && ! -L "$JAVA_MEASUREMENT_PARTIAL" ]] || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  [[ -d "$JAVA_MEASUREMENT_CELL_DIR" && ! -L "$JAVA_MEASUREMENT_CELL_DIR" &&
+    -d "$root" && ! -L "$root" ]] || return 1
+  observed_parent_identity="$(stat --format '%d:%i:%u:%a' -- \
+    "$JAVA_MEASUREMENT_CELL_DIR")" || return 1
+  observed_root_identity="$(stat --format '%d:%i:%u:%a' -- "$root")" || return 1
+  [[ "$observed_parent_identity" == "$JAVA_MEASUREMENT_PARENT_IDENTITY" &&
+    "$observed_root_identity" == "$JAVA_MEASUREMENT_ROOT_IDENTITY" ]]
+}
+
+capture_stable_java_listing() (
+  local -r root="$1"
+  local -r mode="$2"
+  local -r output="$3"
+  local -r parent="${root%/*}"
+  local first="${output}.first"
+  local second="${output}.second"
+  local root_identity_before=""
+  local root_identity_after=""
+  local parent_identity_before=""
+  local parent_identity_after=""
+  local size=""
+
+  [[ "$root" == /* && "$parent" == /* && -d "$root" && ! -L "$root" &&
+    -d "$parent" && ! -L "$parent" && "$output" == /* &&
+    ! -e "$output" && ! -L "$output" &&
+    ! -e "$first" && ! -L "$first" &&
+    ! -e "$second" && ! -L "$second" ]] || return 1
+  root_identity_before="$(stat --format '%d:%i:%u:%a' -- "$root")" || return 1
+  parent_identity_before="$(stat --format '%d:%i:%u:%a' -- "$parent")" || return 1
+  trap 'rm -f -- "$first" "$second" "$output"' EXIT
+  case "$mode" in
+    all)
+      find -P "$root" -xdev -mindepth 1 -print0 | sort -z >"$first" || return 1
+      find -P "$root" -xdev -mindepth 1 -print0 | sort -z >"$second" || return 1
+      ;;
+    root)
+      find -P "$root" -xdev -mindepth 1 -maxdepth 1 -print0 | sort -z >"$first" || return 1
+      find -P "$root" -xdev -mindepth 1 -maxdepth 1 -print0 | sort -z >"$second" || return 1
+      ;;
+    directories)
+      find -P "$root" -xdev -mindepth 1 -maxdepth 1 -type d -print0 | sort -z >"$first" || return 1
+      find -P "$root" -xdev -mindepth 1 -maxdepth 1 -type d -print0 | sort -z >"$second" || return 1
+      ;;
+    files)
+      find -P "$root" -xdev -mindepth 1 -maxdepth 1 -print0 | sort -z >"$first" || return 1
+      find -P "$root" -xdev -mindepth 1 -maxdepth 1 -print0 | sort -z >"$second" || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  size="$(stat --format '%s' -- "$first")" || return 1
+  [[ "$size" =~ ^[0-9]+$ ]] || return 1
+  ((size <= MAX_JAVA_TREE_LISTING_BYTES)) || return 1
+  cmp -s -- "$first" "$second" || return 1
+  root_identity_after="$(stat --format '%d:%i:%u:%a' -- "$root")" || return 1
+  parent_identity_after="$(stat --format '%d:%i:%u:%a' -- "$parent")" || return 1
+  [[ "$root_identity_after" == "$root_identity_before" &&
+    "$parent_identity_after" == "$parent_identity_before" ]] || return 1
+  mv -T -- "$first" "$output" || return 1
+  rm -f -- "$second"
+  trap - EXIT
+)
+
+# Each target command is enclosed by two JMX runtime reads. Each JMX read is
+# itself enclosed by independently captured host PID/start/cgroup receipts.
+# Thus a successful operation proves that the container process and the Java
+# RuntimeMXBean identity stayed exact before and after both the attach and the
+# target jcmd/tool operation.
+run_java_bound_operation() {
+  local -r root="$1"
+  local -r operation="$2"
+  local -r maximum_output_bytes="$3"
+  local -r mode="$4"
+  shift 4
+  local -r operation_directory="$root/operations/$operation"
+  local -r canonical_identity="$root/identity.txt"
+  local container_id=""
+  local runtime_start=""
+  local -a command=()
+
+  [[ "$root" == "$JAVA_MEASUREMENT_PARTIAL" &&
+    "$operation" =~ ^[0-9]{2}-[a-z][a-z0-9-]*$ &&
+    -d "$root/operations" && ! -L "$root/operations" &&
+    -f "$canonical_identity" && ! -L "$canonical_identity" &&
+    ! -e "$operation_directory" && ! -L "$operation_directory" ]] || return 1
+  java_measurement_root_identity_matches "$root" partial || return 1
+  mkdir --mode=0700 -- "$operation_directory" || return 1
+  capture_service_identity java-backend "$operation_directory/host-before.txt" || return 1
+  cmp -s -- "$canonical_identity" "$operation_directory/host-before.txt" || return 1
+  container_id="$(identity_field "$canonical_identity" container_id)" || return 1
+
+  capture_bounded_private_output \
+    "$operation_directory/runtime-before.json" \
+    "$MAX_JAVA_RUNTIME_SNAPSHOT_BYTES" "$JAVA_TOOL_TIMEOUT_SECONDS" \
+    docker exec "$container_id" "${JAVA_BENCHMARK_TOOL_ENV[@]}" \
+      java --add-modules jdk.attach,jdk.management \
+      -jar "$JAVA_BENCHMARK_TOOL_JAR" runtime-snapshot 1 || return 1
+  capture_service_identity \
+    java-backend "$operation_directory/host-after-runtime-before.txt" || return 1
+  cmp -s -- "$canonical_identity" \
+    "$operation_directory/host-after-runtime-before.txt" || return 1
+  if [[ -z "$JAVA_MEASUREMENT_JVM_START_EPOCH_MILLIS" ]]; then
+    validate_java_runtime_snapshot "$operation_directory/runtime-before.json" || return 1
+    runtime_start="$(jq -er '.jvm_start_epoch_millis' \
+      "$operation_directory/runtime-before.json")" || return 1
+    runtime_start="$(normalize_decimal "$runtime_start" "$MAX_SEED" false)" || return 1
+    JAVA_MEASUREMENT_JVM_START_EPOCH_MILLIS="$runtime_start"
+  else
+    java_runtime_identity_matches "$operation_directory/runtime-before.json" || return 1
+  fi
+
+  case "$mode" in
+    jcmd)
+      (($# > 0)) || return 1
+      command=(docker exec "$container_id" "${JAVA_BENCHMARK_TOOL_ENV[@]}" jcmd 1 "$@")
+      ;;
+    exec)
+      (($# > 0)) || return 1
+      command=(docker exec "$container_id" "$@")
+      ;;
+    jfr)
+      (($# > 0)) || return 1
+      command=(docker exec "$container_id" "$@")
+      ;;
+    runtime)
+      (($# == 0)) || return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  if [[ "$mode" == runtime ]]; then
+    printf 'status=runtime-identity-only\n' >"$operation_directory/output"
+    chmod 0600 -- "$operation_directory/output" || return 1
+  elif [[ "$mode" == jfr ]]; then
+    capture_bounded_private_streams \
+      "$operation_directory/raw-output" "$MAX_JFR_BYTES" \
+      "$operation_directory/output" "$maximum_output_bytes" \
+      "$JAVA_TOOL_TIMEOUT_SECONDS" "${command[@]}" || return 1
+  else
+    capture_bounded_private_output \
+      "$operation_directory/output" "$maximum_output_bytes" \
+      "$JAVA_TOOL_TIMEOUT_SECONDS" "${command[@]}" || return 1
+  fi
+
+  capture_service_identity \
+    java-backend "$operation_directory/host-before-runtime-after.txt" || return 1
+  cmp -s -- "$canonical_identity" \
+    "$operation_directory/host-before-runtime-after.txt" || return 1
+  capture_bounded_private_output \
+    "$operation_directory/runtime-after.json" \
+    "$MAX_JAVA_RUNTIME_SNAPSHOT_BYTES" "$JAVA_TOOL_TIMEOUT_SECONDS" \
+    docker exec "$container_id" "${JAVA_BENCHMARK_TOOL_ENV[@]}" \
+      java --add-modules jdk.attach,jdk.management \
+      -jar "$JAVA_BENCHMARK_TOOL_JAR" runtime-snapshot 1 || return 1
+  capture_service_identity java-backend "$operation_directory/host-after.txt" || return 1
+  cmp -s -- "$canonical_identity" "$operation_directory/host-after.txt" || return 1
+  java_runtime_identity_matches "$operation_directory/runtime-after.json" || return 1
+  java_measurement_root_identity_matches "$root" partial
+}
+
+nmt_summary_totals() {
+  local -r artifact="$1"
+  local line_count=""
+  local total_line=""
+  local reserved=""
+  local committed=""
+
+  [[ -f "$artifact" && ! -L "$artifact" ]] || return 1
+  line_count="$(wc -l <"$artifact")" || return 1
+  [[ "$line_count" =~ ^[1-9][0-9]*$ ]] || return 1
+  ((line_count <= MAX_NMT_LINES)) || return 1
+  [[ "$(grep -c '^Native Memory Tracking:$' "$artifact" || true)" == 1 &&
+    "$(grep -c '^Total:' "$artifact" || true)" == 1 ]] || return 1
+  total_line="$(grep '^Total:' "$artifact")" || return 1
+  [[ "$total_line" =~ ^Total:\ reserved=([0-9]+),\ committed=([0-9]+)$ ]] || return 1
+  reserved="$(normalize_decimal "${BASH_REMATCH[1]}" "$MAX_SEED" false)" || return 1
+  committed="$(normalize_decimal "${BASH_REMATCH[2]}" "$MAX_SEED" false)" || return 1
+  printf '%s %s\n' "$reserved" "$committed"
+}
+
+nmt_summary_diff_totals() {
+  local -r artifact="$1"
+  local line_count=""
+  local total_line=""
+  local reserved=""
+  local reserved_delta="0"
+  local committed=""
+  local committed_delta="0"
+
+  [[ -f "$artifact" && ! -L "$artifact" ]] || return 1
+  line_count="$(wc -l <"$artifact")" || return 1
+  [[ "$line_count" =~ ^[1-9][0-9]*$ ]] || return 1
+  ((line_count <= MAX_NMT_LINES)) || return 1
+  [[ "$(grep -c '^Native Memory Tracking:$' "$artifact" || true)" == 1 &&
+    "$(grep -c '^Total:' "$artifact" || true)" == 1 ]] || return 1
+  total_line="$(grep '^Total:' "$artifact")" || return 1
+  [[ "$total_line" =~ ^Total:\ reserved=([0-9]+)(\ \+([0-9]+))?,\ committed=([0-9]+)(\ \+([0-9]+))?$ ]] || return 1
+  reserved="$(normalize_decimal "${BASH_REMATCH[1]}" "$MAX_SEED" false)" || return 1
+  if [[ -n "${BASH_REMATCH[3]:-}" ]]; then
+    reserved_delta="$(normalize_decimal "${BASH_REMATCH[3]}" "$MAX_SEED" true)" || return 1
+  fi
+  committed="$(normalize_decimal "${BASH_REMATCH[4]}" "$MAX_SEED" false)" || return 1
+  if [[ -n "${BASH_REMATCH[6]:-}" ]]; then
+    committed_delta="$(normalize_decimal "${BASH_REMATCH[6]}" "$MAX_SEED" true)" || return 1
+  fi
+  ((reserved >= reserved_delta && committed >= committed_delta)) || return 1
+  printf '%s %s %s %s\n' \
+    "$reserved" "$committed" "$reserved_delta" "$committed_delta"
+}
+
+validate_jfr_summary() {
+  local -r artifact="$1"
+  local -r expected_size_bytes="$2"
+  local -r expected_sha256="$3"
+  local raw_value_count=""
+
+  raw_value_count="$(raw_json_value_count "$artifact")" || return 1
+  [[ "$raw_value_count" == 13 && "$expected_sha256" =~ ^[0-9a-f]{64}$ ]] || return 1
+  jq -se \
+    --argjson maximum_safe_integer "$MAX_SEED" \
+    --argjson maximum_records "$MAX_JFR_RECORDS" \
+    --argjson expected_size_bytes "$expected_size_bytes" \
+    --arg expected_sha256 "$expected_sha256" '
+      def safe_non_negative_integer:
+        type == "number" and isfinite and floor == . and . >= 0 and
+        . <= $maximum_safe_integer;
+      def exact_pair:
+        type == "object" and (keys) == ["records", "weight_bytes"];
+      def exact_duration_pair:
+        type == "object" and (keys) == ["duration_nanos", "records"];
+      length == 1 and (.[0] |
+        (keys) == [
+          "allocation_sample", "data_loss", "file_size_bytes",
+          "java_monitor_enter", "raw_sha256", "schema_version",
+          "snapshot_semantics", "thread_park", "total_records"
+        ] and
+        .schema_version == 1 and
+        .snapshot_semantics == "single_source_descriptor_bounded_private_copy" and
+        .file_size_bytes == $expected_size_bytes and
+        .raw_sha256 == $expected_sha256 and
+        (.file_size_bytes | safe_non_negative_integer and . > 0) and
+        (.total_records | safe_non_negative_integer and . <= $maximum_records) and
+        (.allocation_sample | exact_pair and
+          (.records | safe_non_negative_integer) and
+          (.weight_bytes | safe_non_negative_integer) and
+          ((.records == 0 and .weight_bytes == 0) or
+            (.records > 0 and .weight_bytes > 0))) and
+        (.java_monitor_enter | exact_duration_pair and
+          (.records | safe_non_negative_integer) and
+          (.duration_nanos | safe_non_negative_integer) and
+          ((.records == 0 and .duration_nanos == 0) or
+            (.records > 0 and .duration_nanos > 0))) and
+        (.thread_park | exact_duration_pair and
+          (.records | safe_non_negative_integer) and
+          (.duration_nanos | safe_non_negative_integer) and
+          ((.records == 0 and .duration_nanos == 0) or
+            (.records > 0 and .duration_nanos > 0))) and
+        (.data_loss | type == "object" and (keys) == ["bytes", "records"] and
+          .records == 0 and .bytes == 0) and
+        .total_records == (
+          .allocation_sample.records + .java_monitor_enter.records +
+          .thread_park.records + .data_loss.records))
+    ' "$artifact" >/dev/null
+}
+
+jfr_formatted_size_bytes() {
+  local -r size_bytes="$1"
+
+  [[ "$size_bytes" =~ ^[1-9][0-9]*$ ]] || return 1
+  ((size_bytes <= MAX_JFR_BYTES)) || return 1
+  if ((size_bytes == 1)); then
+    printf '1 byte\n'
+  elif ((size_bytes < 1024)); then
+    printf '%s bytes\n' "$size_bytes"
+  elif ((size_bytes < 1024 * 1024)); then
+    awk -v bytes="$size_bytes" 'BEGIN { printf "%.1f kB\n", bytes / 1024 }'
+  else
+    awk -v bytes="$size_bytes" 'BEGIN { printf "%.1f MB\n", bytes / 1048576 }'
+  fi
+}
+
+validate_jfr_command_output() {
+  local -r artifact="$1"
+  local -r action="$2"
+  local -r recording_name="$3"
+  local -r recording_path="$4"
+  local -r expected_size_bytes="${5:-}"
+  local stop_regex=""
+  local expected_formatted_size=""
+  local -a lines=()
+
+  [[ -f "$artifact" && ! -L "$artifact" &&
+    "$recording_name" =~ ^[a-z][a-z0-9-]{0,63}$ &&
+    "$recording_path" =~ ^/tmp/[a-z][a-z0-9.-]{0,127}\.jfr$ ]] || return 1
+  mapfile -t lines <"$artifact" || return 1
+  [[ "${#lines[@]}" == 4 && "${lines[0]}" == '1:' &&
+    -z "${lines[2]}" && "${lines[3]}" == "$recording_path" ]] || return 1
+  case "$action" in
+    start)
+      [[ "${lines[1]}" =~ ^Started\ recording\ [1-9][0-9]{0,8}\.\ The\ result\ will\ be\ written\ to:$ ]]
+      ;;
+    stop)
+      if [[ -n "$expected_size_bytes" ]]; then
+        expected_formatted_size="$(jfr_formatted_size_bytes \
+          "$expected_size_bytes")" || return 1
+        [[ "${lines[1]}" == \
+          "Stopped recording \"${recording_name}\", ${expected_formatted_size} written to:" ]]
+      else
+        stop_regex="^Stopped recording \"${recording_name}\", ((1 byte)|([1-9][0-9]{0,8} bytes)|([1-9][0-9]{0,7}\\.[0-9] (kB|MB))) written to:$"
+        [[ "${lines[1]}" =~ $stop_regex ]]
+      fi
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_bootstrap_jfr_discard() {
+  local -r artifact="$1"
+  local raw_value_count=""
+
+  raw_value_count="$(raw_json_value_count "$artifact")" || return 1
+  [[ "$raw_value_count" == 5 ]] || return 1
+  jq -se --argjson maximum_size_bytes "$MAX_JFR_BYTES" '
+    length == 1 and (.[0] |
+      (keys) == [
+        "discard_semantics", "schema_version", "sha256", "size_bytes", "status"
+      ] and
+      .schema_version == 1 and .status == "discarded" and
+      .discard_semantics == "atomic_move_then_descriptor_bounded_delete" and
+      (.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+      (.size_bytes | type == "number" and isfinite and floor == . and
+        . > 0 and . <= $maximum_size_bytes))
+  ' "$artifact" >/dev/null
+}
+
+validate_nmt_baseline_output() {
+  local -r artifact="$1"
+
+  [[ -f "$artifact" && ! -L "$artifact" &&
+    "$(wc -l <"$artifact")" == 2 &&
+    "$(sed -n '1p' "$artifact")" == '1:' &&
+    "$(sed -n '2p' "$artifact")" == 'Baseline taken' ]]
+}
+
+validate_runtime_identity_only_output() {
+  local -r artifact="$1"
+
+  [[ -f "$artifact" && ! -L "$artifact" &&
+    "$(wc -l <"$artifact")" == 1 &&
+    "$(sed -n '1p' "$artifact")" == 'status=runtime-identity-only' ]]
+}
+
+canonical_utc_rfc3339_nano() {
+  local timestamp=""
+  local base=""
+  local fraction=""
+
+  timestamp="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)" || return 1
+  [[ "$timestamp" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})\.([0-9]{9})Z$ ]] || return 1
+  base="${BASH_REMATCH[1]}"
+  fraction="${BASH_REMATCH[2]}"
+  while [[ -n "$fraction" && "${fraction: -1}" == 0 ]]; do
+    fraction="${fraction::-1}"
+  done
+  if [[ -n "$fraction" ]]; then
+    printf '%s.%sZ\n' "$base" "$fraction"
+  else
+    printf '%sZ\n' "$base"
+  fi
+}
+
+java_measurement_evidence_json() {
+  local -r root="$1"
+  local -r cell="$2"
+  local -r started_at="$3"
+  local -r stop_initiated_at="$4"
+  local -r identity="$root/identity.txt"
+  local -r jfr="$root/measurement.jfr"
+  local -r jfr_summary="$root/operations/08-jfr-summary/output"
+  local -r baseline_diff="$root/operations/04-nmt-baseline-confirmation/output"
+  local -r baseline_runtime="$root/operations/05-runtime-baseline/runtime-after.json"
+  local -r postload_summary="$root/operations/10-nmt-postload-summary/output"
+  local -r postload_diff="$root/operations/11-nmt-postload-diff/output"
+  local -r postload_runtime="$root/operations/12-runtime-postload/runtime-after.json"
+  local -r runtime_artifacts="$root/runtime-artifacts.json"
+  local host_pid=""
+  local proc_start_time=""
+  local proc_cgroup_sha256=""
+  local proc_cgroup_binding=""
+  local identity_sha256=""
+  local jfr_sha256=""
+  local jfr_size=""
+  local baseline_current_reserved=""
+  local baseline_current_committed=""
+  local baseline_reserved_delta=""
+  local baseline_committed_delta=""
+  local baseline_reserved=""
+  local baseline_committed=""
+  local postload_summary_reserved=""
+  local postload_summary_committed=""
+  local postload_reserved=""
+  local postload_committed=""
+  local postload_reserved_delta=""
+  local postload_committed_delta=""
+  local reconstructed_reserved=""
+  local reconstructed_committed=""
+  local baseline_direct_count=""
+  local baseline_direct_used=""
+  local baseline_direct_capacity=""
+  local postload_direct_count=""
+  local postload_direct_used=""
+  local postload_direct_capacity=""
+  local jfr_json=""
+  local runtime_artifacts_json=""
+  local runtime_artifacts_sha256=""
+
+  [[ "$cell" =~ ^[a-z][a-z0-9-]*$ && -d "$root" && ! -L "$root" &&
+    -f "$identity" && ! -L "$identity" && -f "$jfr" && ! -L "$jfr" ]] || return 1
+  validate_java_runtime_artifacts "$runtime_artifacts" "$identity" || return 1
+  runtime_artifacts_json="$(jq -c . "$runtime_artifacts")" || return 1
+  runtime_artifacts_sha256="$(sha256_regular_file "$runtime_artifacts")" || return 1
+  host_pid="$(identity_field "$identity" host_pid)" || return 1
+  proc_start_time="$(identity_field "$identity" proc_start_time)" || return 1
+  proc_cgroup_sha256="$(identity_field "$identity" proc_cgroup_sha256)" || return 1
+  proc_cgroup_binding="$(identity_field "$identity" proc_cgroup_container_binding)" || return 1
+  [[ "$host_pid" =~ ^[1-9][0-9]*$ && "$proc_start_time" =~ ^[1-9][0-9]*$ &&
+    "$proc_cgroup_sha256" =~ ^[0-9a-f]{64}$ &&
+    "$proc_cgroup_binding" == "$PROC_CGROUP_CONTAINER_BINDING" ]] || return 1
+  identity_sha256="$(sha256_regular_file "$identity")" || return 1
+  jfr_sha256="$(sha256_regular_file "$jfr")" || return 1
+  jfr_size="$(stat --format '%s' -- "$jfr")" || return 1
+  [[ "$jfr_size" =~ ^[1-9][0-9]*$ ]] || return 1
+  ((jfr_size <= MAX_JFR_BYTES)) || return 1
+  validate_jfr_summary \
+    "$jfr_summary" "$jfr_size" "$jfr_sha256" || return 1
+  jfr_json="$(jq -c . "$jfr_summary")" || return 1
+
+  read -r baseline_current_reserved baseline_current_committed \
+    baseline_reserved_delta baseline_committed_delta < <(
+      nmt_summary_diff_totals "$baseline_diff"
+    ) || return 1
+  baseline_reserved="$((baseline_current_reserved - baseline_reserved_delta))"
+  baseline_committed="$((baseline_current_committed - baseline_committed_delta))"
+  ((baseline_reserved > 0 && baseline_committed > 0)) || return 1
+  read -r postload_summary_reserved postload_summary_committed < <(
+    nmt_summary_totals "$postload_summary"
+  ) || return 1
+  read -r postload_reserved postload_committed postload_reserved_delta \
+    postload_committed_delta < <(nmt_summary_diff_totals "$postload_diff") || return 1
+  reconstructed_reserved="$((postload_reserved - postload_reserved_delta))"
+  reconstructed_committed="$((postload_committed - postload_committed_delta))"
+  [[ "$reconstructed_reserved" == "$baseline_reserved" &&
+    "$reconstructed_committed" == "$baseline_committed" ]] || return 1
+
+  validate_java_runtime_snapshot \
+    "$baseline_runtime" "$JAVA_MEASUREMENT_JVM_START_EPOCH_MILLIS" || return 1
+  validate_java_runtime_snapshot \
+    "$postload_runtime" "$JAVA_MEASUREMENT_JVM_START_EPOCH_MILLIS" || return 1
+  read -r baseline_direct_count baseline_direct_used baseline_direct_capacity < <(
+    jq -er '.direct_buffer | [.count, .memory_used_bytes, .total_capacity_bytes] | @tsv' \
+      "$baseline_runtime"
+  ) || return 1
+  read -r postload_direct_count postload_direct_used postload_direct_capacity < <(
+    jq -er '.direct_buffer | [.count, .memory_used_bytes, .total_capacity_bytes] | @tsv' \
+      "$postload_runtime"
+  ) || return 1
+  jq -n \
+    --arg cell "$cell" \
+    --arg started_at "$started_at" \
+    --arg stop_initiated_at "$stop_initiated_at" \
+    --argjson host_pid "$host_pid" \
+    --argjson proc_start_time "$proc_start_time" \
+    --arg proc_cgroup_sha256 "$proc_cgroup_sha256" \
+    --arg proc_cgroup_binding "$proc_cgroup_binding" \
+    --arg identity_sha256 "$identity_sha256" \
+    --argjson jvm_start_epoch_millis "$JAVA_MEASUREMENT_JVM_START_EPOCH_MILLIS" \
+    --arg jfr_sha256 "$jfr_sha256" \
+    --argjson jfr_size "$jfr_size" \
+    --argjson jfr "$jfr_json" \
+    --argjson baseline_reserved "$baseline_reserved" \
+    --argjson baseline_committed "$baseline_committed" \
+    --argjson postload_summary_reserved "$postload_summary_reserved" \
+    --argjson postload_summary_committed "$postload_summary_committed" \
+    --argjson postload_reserved "$postload_reserved" \
+    --argjson postload_committed "$postload_committed" \
+    --argjson postload_reserved_delta "$postload_reserved_delta" \
+    --argjson postload_committed_delta "$postload_committed_delta" \
+    --arg baseline_diff_sha256 "$(sha256_regular_file "$baseline_diff")" \
+    --arg postload_summary_sha256 "$(sha256_regular_file "$postload_summary")" \
+    --arg postload_diff_sha256 "$(sha256_regular_file "$postload_diff")" \
+    --argjson baseline_direct_count "$baseline_direct_count" \
+    --argjson baseline_direct_used "$baseline_direct_used" \
+    --argjson baseline_direct_capacity "$baseline_direct_capacity" \
+    --argjson postload_direct_count "$postload_direct_count" \
+    --argjson postload_direct_used "$postload_direct_used" \
+    --argjson postload_direct_capacity "$postload_direct_capacity" \
+    --argjson maximum_jfr_bytes "$MAX_JFR_BYTES" \
+    --argjson maximum_jfr_records "$MAX_JFR_RECORDS" \
+    --argjson maximum_jfr_duration_seconds "$JAVA_JFR_MAX_DURATION_SECONDS" \
+    --arg retention_scope "$JAVA_JFR_RETENTION_SCOPE" \
+    --arg runtime_artifacts_sha256 "$runtime_artifacts_sha256" \
+    --argjson runtime_artifacts "$runtime_artifacts_json" '
+      {
+        schema_version: 1,
+        kind: "bounded-java-runtime-indicators",
+        status: "complete",
+        acceptance_evidence: false,
+        cell: $cell,
+        measurement_window: {
+          started_at: $started_at,
+          stop_initiated_at: $stop_initiated_at,
+          start_boundary: "post_warmup_before_first_measurement_admission",
+          stop_boundary: "initiated_immediately_after_final_measurement_client"
+        },
+        process_binding: {
+          service: "java-backend",
+          container_pid: 1,
+          host_pid: $host_pid,
+          proc_start_time: $proc_start_time,
+          proc_cgroup_sha256: $proc_cgroup_sha256,
+          proc_cgroup_container_binding: $proc_cgroup_binding,
+          java_runtime_start_epoch_millis: $jvm_start_epoch_millis,
+          canonical_identity_sha256: $identity_sha256
+        },
+        runtime_artifacts: ($runtime_artifacts + {
+          attestation_sha256: $runtime_artifacts_sha256
+        }),
+        jfr: {
+          status: "available",
+          raw_private_diagnostic_input: true,
+          raw_sha256: $jfr_sha256,
+          raw_size_bytes: $jfr_size,
+          maximum_size_bytes: $maximum_jfr_bytes,
+          maximum_duration_seconds: $maximum_jfr_duration_seconds,
+          snapshot_semantics: $jfr.snapshot_semantics,
+          retention_scope: $retention_scope,
+          whole_window_retention_attested: false,
+          stop_reported_size_reconciled: true,
+          total_records: $jfr.total_records,
+          maximum_records: $maximum_jfr_records,
+          allocation_sample: $jfr.allocation_sample,
+          java_monitor_enter: $jfr.java_monitor_enter,
+          thread_park: $jfr.thread_park,
+          data_loss: $jfr.data_loss
+        },
+        nmt: {
+          status: "available",
+          tracking_level: "summary",
+          baseline: {
+            reserved_bytes: $baseline_reserved,
+            committed_bytes: $baseline_committed
+          },
+          post_load_summary_snapshot: {
+            reserved_bytes: $postload_summary_reserved,
+            committed_bytes: $postload_summary_committed
+          },
+          post_load_diff_snapshot: {
+            reserved_bytes: $postload_reserved,
+            committed_bytes: $postload_committed
+          },
+          non_negative_delta: {
+            reserved_bytes: $postload_reserved_delta,
+            committed_bytes: $postload_committed_delta
+          },
+          baseline_confirmation_sha256: $baseline_diff_sha256,
+          post_load_summary_sha256: $postload_summary_sha256,
+          post_load_diff_sha256: $postload_diff_sha256
+        },
+        direct_buffer: {
+          status: "available",
+          baseline: {
+            count: $baseline_direct_count,
+            memory_used_bytes: $baseline_direct_used,
+            total_capacity_bytes: $baseline_direct_capacity
+          },
+          post_load: {
+            count: $postload_direct_count,
+            memory_used_bytes: $postload_direct_used,
+            total_capacity_bytes: $postload_direct_capacity
+          },
+          signed_delta: {
+            count: ($postload_direct_count - $baseline_direct_count),
+            memory_used_bytes: ($postload_direct_used - $baseline_direct_used),
+            total_capacity_bytes: ($postload_direct_capacity - $baseline_direct_capacity)
+          }
+        },
+        interpretation: {
+          allocation_sample_weight_is_not_an_exact_allocation_count: true,
+          nmt_committed_is_a_jvm_native_tracking_indicator_not_process_rss: true,
+          direct_buffer_pool_is_not_all_native_or_off_heap_memory: true,
+          jfr_retention_may_be_a_bounded_tail_if_the_size_limit_was_reached: true,
+          acceptance_evidence: false
+        }
+      }
+    '
+}
+
+java_measurement_operation_names() {
+  printf '%s\n' \
+    01-bootstrap-stop \
+    02-bootstrap-discard \
+    03-nmt-baseline \
+    04-nmt-baseline-confirmation \
+    05-runtime-baseline \
+    06-jfr-start \
+    07-jfr-stop \
+    08-jfr-summary \
+    10-nmt-postload-summary \
+    11-nmt-postload-diff \
+    12-runtime-postload
+}
+
+validate_java_measurement_tree() (
+  local -r root="$1"
+  local -r parent="${root%/*}"
+  local current_user_id=""
+  local operation=""
+  local entry=""
+  local entry_count=0
+  local bootstrap_size=""
+  local measurement_size=""
+  local work=""
+  local all_listing=""
+  local root_listing=""
+  local operations_listing=""
+  local operation_listing=""
+  local -a root_entries=()
+  local -a operation_entries=()
+  local -a expected_operations=(
+    01-bootstrap-stop
+    02-bootstrap-discard
+    03-nmt-baseline
+    04-nmt-baseline-confirmation
+    05-runtime-baseline
+    06-jfr-start
+    07-jfr-stop
+    08-jfr-summary
+    10-nmt-postload-summary
+    11-nmt-postload-diff
+    12-runtime-postload
+  )
+  local -a java_tree_observed_files=()
+  local -a java_tree_expected_files=(
+    host-after-runtime-before.txt
+    host-after.txt
+    host-before-runtime-after.txt
+    host-before.txt
+    output
+    runtime-after.json
+    runtime-before.json
+  )
+
+  current_user_id="$(id -u)" || return 1
+  is_private_owned_directory "$root" "$current_user_id" || return 1
+  is_private_owned_directory "$root/operations" "$current_user_id" || return 1
+  [[ -d "$parent" && ! -L "$parent" ]] || return 1
+  work="$(mktemp -d "$parent/.java-tree-validation.XXXXXX")" || return 1
+  chmod 0700 -- "$work" || return 1
+  all_listing="$work/all.list"
+  root_listing="$work/root.list"
+  operations_listing="$work/operations.list"
+  operation_listing="$work/operation.list"
+  trap 'rm -f -- "$all_listing" "$root_listing" "$operations_listing" "$operation_listing"; rmdir -- "$work" 2>/dev/null || true' EXIT
+  capture_stable_java_listing "$root" all "$all_listing" || return 1
+  while IFS= read -r -d '' entry; do
+    ((entry_count += 1))
+    ((entry_count <= MAX_JAVA_EVIDENCE_FILES)) || return 1
+    [[ ( -f "$entry" && ! -L "$entry" ) || ( -d "$entry" && ! -L "$entry" ) ]] || return 1
+  done <"$all_listing"
+  capture_stable_java_listing "$root" root "$root_listing" || return 1
+  root_entries=()
+  while IFS= read -r -d '' entry; do
+    root_entries+=("${entry##*/}")
+  done <"$root_listing"
+  [[ "${root_entries[*]}" == \
+    'evidence.json identity.txt measurement.jfr operations runtime-artifacts.json' ]] || return 1
+  capture_stable_java_listing "$root/operations" root \
+    "$operations_listing" || return 1
+  operation_entries=()
+  while IFS= read -r -d '' entry; do
+    [[ -d "$entry" && ! -L "$entry" ]] || return 1
+    operation_entries+=("${entry##*/}")
+  done <"$operations_listing"
+  [[ "${operation_entries[*]}" == "${expected_operations[*]}" ]] || return 1
+
+  while IFS= read -r operation; do
+    [[ -d "$root/operations/$operation" &&
+      ! -L "$root/operations/$operation" ]] || return 1
+    java_tree_observed_files=()
+    rm -f -- "$operation_listing" || return 1
+    capture_stable_java_listing "$root/operations/$operation" files \
+      "$operation_listing" || return 1
+    while IFS= read -r -d '' entry; do
+      [[ -f "$entry" && ! -L "$entry" ]] || return 1
+      is_private_owned_regular_file "$entry" "$current_user_id" || return 1
+      java_tree_observed_files+=("${entry##*/}")
+    done <"$operation_listing"
+    [[ "${java_tree_observed_files[*]}" == \
+      "${java_tree_expected_files[*]}" ]] || return 1
+    cmp -s -- "$root/identity.txt" \
+      "$root/operations/$operation/host-before.txt" || return 1
+    cmp -s -- "$root/identity.txt" \
+      "$root/operations/$operation/host-after-runtime-before.txt" || return 1
+    cmp -s -- "$root/identity.txt" \
+      "$root/operations/$operation/host-before-runtime-after.txt" || return 1
+    cmp -s -- "$root/identity.txt" \
+      "$root/operations/$operation/host-after.txt" || return 1
+    validate_java_runtime_snapshot \
+      "$root/operations/$operation/runtime-before.json" \
+      "$JAVA_MEASUREMENT_JVM_START_EPOCH_MILLIS" || return 1
+    validate_java_runtime_snapshot \
+      "$root/operations/$operation/runtime-after.json" \
+      "$JAVA_MEASUREMENT_JVM_START_EPOCH_MILLIS" || return 1
+  done < <(java_measurement_operation_names)
+  bootstrap_size="$(jq -ser \
+    'if length == 1 then .[0].size_bytes else empty end' \
+    "$root/operations/02-bootstrap-discard/output")" || return 1
+  bootstrap_size="$(normalize_decimal "$bootstrap_size" "$MAX_JFR_BYTES" false)" || return 1
+  validate_jfr_command_output \
+    "$root/operations/01-bootstrap-stop/output" stop \
+    "$JAVA_BOOTSTRAP_JFR_NAME" "$JAVA_BOOTSTRAP_JFR_CONTAINER_PATH" \
+    "$bootstrap_size" || return 1
+  validate_bootstrap_jfr_discard \
+    "$root/operations/02-bootstrap-discard/output" || return 1
+  validate_nmt_baseline_output \
+    "$root/operations/03-nmt-baseline/output" || return 1
+  validate_runtime_identity_only_output \
+    "$root/operations/05-runtime-baseline/output" || return 1
+  validate_jfr_command_output \
+    "$root/operations/06-jfr-start/output" start \
+    "$JAVA_MEASUREMENT_JFR_NAME" "$JAVA_MEASUREMENT_JFR_CONTAINER_PATH" || return 1
+  measurement_size="$(stat --format '%s' -- "$root/measurement.jfr")" || return 1
+  measurement_size="$(normalize_decimal "$measurement_size" "$MAX_JFR_BYTES" false)" || return 1
+  validate_jfr_command_output \
+    "$root/operations/07-jfr-stop/output" stop \
+    "$JAVA_MEASUREMENT_JFR_NAME" "$JAVA_MEASUREMENT_JFR_CONTAINER_PATH" \
+    "$measurement_size" || return 1
+  validate_runtime_identity_only_output \
+    "$root/operations/12-runtime-postload/output" || return 1
+  [[ -f "$root/identity.txt" && ! -L "$root/identity.txt" &&
+    -f "$root/runtime-artifacts.json" && ! -L "$root/runtime-artifacts.json" &&
+    -f "$root/measurement.jfr" && ! -L "$root/measurement.jfr" &&
+    -f "$root/evidence.json" && ! -L "$root/evidence.json" ]] || return 1
+  validate_java_runtime_artifacts "$root/runtime-artifacts.json" \
+    "$root/identity.txt" &&
+    is_private_owned_regular_file "$root/identity.txt" "$current_user_id" &&
+    is_private_owned_regular_file "$root/runtime-artifacts.json" "$current_user_id" &&
+    is_private_owned_regular_file "$root/measurement.jfr" "$current_user_id" &&
+    is_private_owned_regular_file "$root/evidence.json" "$current_user_id"
+)
+
+# Hash a canonical, bounded roster of every published Java evidence path and
+# every regular file's content. The receipt remains outside this root, so the
+# manifest has no self-reference. Stable before/after listings and per-file
+# identities make traversal or content drift fail closed.
+java_measurement_tree_manifest_sha256() (
+  local -r root="$1"
+  local -r parent="${root%/*}"
+  local work=""
+  local listing_before=""
+  local listing_after=""
+  local manifest=""
+  local entry=""
+  local relative=""
+  local kind=""
+  local identity_before=""
+  local identity_after=""
+  local digest=""
+  local root_identity_before=""
+  local root_identity_after=""
+  local parent_identity_before=""
+  local parent_identity_after=""
+  local entry_count=0
+  local manifest_size=""
+
+  [[ "$root" == /* && -d "$root" && ! -L "$root" &&
+    "$parent" == /* && -d "$parent" && ! -L "$parent" ]] || return 1
+  root_identity_before="$(stat --format '%d:%i:%u:%a' -- "$root")" || return 1
+  parent_identity_before="$(stat --format '%d:%i:%u:%a' -- "$parent")" || return 1
+  work="$(mktemp -d "$parent/.java-tree-manifest.XXXXXX")" || return 1
+  chmod 0700 -- "$work" || return 1
+  listing_before="$work/before.list"
+  listing_after="$work/after.list"
+  manifest="$work/tree.manifest"
+  trap 'rm -f -- "$listing_before" "$listing_after" "$manifest"; rmdir -- "$work" 2>/dev/null || true' EXIT
+  capture_stable_java_listing "$root" all "$listing_before" || return 1
+  : >"$manifest" || return 1
+  chmod 0600 -- "$manifest" || return 1
+  while IFS= read -r -d '' entry; do
+    ((entry_count += 1))
+    ((entry_count <= MAX_JAVA_EVIDENCE_FILES)) || return 1
+    [[ "$entry" == "$root/"* ]] || return 1
+    relative="${entry#"$root/"}"
+    is_safe_git_tree_path "$relative" || return 1
+    identity_before="$(stat --format '%d:%i:%u:%a:%s' -- "$entry")" || return 1
+    if [[ -d "$entry" && ! -L "$entry" ]]; then
+      kind='directory'
+      digest='-'
+    elif [[ -f "$entry" && ! -L "$entry" ]]; then
+      kind='file'
+    else
+      return 1
+    fi
+    if [[ "$kind" == file ]]; then
+      digest="$(sha256_regular_file "$entry")" || return 1
+    fi
+    identity_after="$(stat --format '%d:%i:%u:%a:%s' -- "$entry")" || return 1
+    [[ "$identity_after" == "$identity_before" ]] || return 1
+    printf '%s\0%s\0%s\0%s\0' \
+      "$kind" "$relative" "$identity_before" "$digest" >>"$manifest" || return 1
+  done <"$listing_before"
+  manifest_size="$(stat --format '%s' -- "$manifest")" || return 1
+  [[ "$manifest_size" =~ ^[1-9][0-9]*$ ]] || return 1
+  ((manifest_size <= MAX_JAVA_TREE_LISTING_BYTES)) || return 1
+  capture_stable_java_listing "$root" all "$listing_after" || return 1
+  cmp -s -- "$listing_before" "$listing_after" || return 1
+  root_identity_after="$(stat --format '%d:%i:%u:%a' -- "$root")" || return 1
+  parent_identity_after="$(stat --format '%d:%i:%u:%a' -- "$parent")" || return 1
+  [[ "$root_identity_after" == "$root_identity_before" &&
+    "$parent_identity_after" == "$parent_identity_before" ]] || return 1
+  sha256_regular_file "$manifest"
+)
+
+validate_java_measurement_evidence() {
+  local -r artifact="$1"
+  local -r root="${artifact%/*}"
+  local cell=""
+  local started_at=""
+  local stop_initiated_at=""
+  local expected_json=""
+  local expected_raw_value_count=""
+  local observed_raw_value_count=""
+
+  [[ "$artifact" == "$root/evidence.json" && -f "$artifact" && ! -L "$artifact" ]] || return 1
+  cell="$(jq -ser 'if length == 1 then .[0].cell else empty end' "$artifact")" || return 1
+  started_at="$(jq -ser \
+    'if length == 1 then .[0].measurement_window.started_at else empty end' \
+    "$artifact")" || return 1
+  stop_initiated_at="$(jq -ser \
+    'if length == 1 then .[0].measurement_window.stop_initiated_at else empty end' \
+    "$artifact")" || return 1
+  JAVA_MEASUREMENT_JVM_START_EPOCH_MILLIS="$(jq -ser '
+    if length == 1 then
+      .[0].process_binding.java_runtime_start_epoch_millis | tostring
+    else empty end
+  ' "$artifact")" || return 1
+  JAVA_MEASUREMENT_JVM_START_EPOCH_MILLIS="$(normalize_decimal \
+    "$JAVA_MEASUREMENT_JVM_START_EPOCH_MILLIS" "$MAX_SEED" false)" || return 1
+  validate_java_measurement_tree "$root" || return 1
+  jq -se '
+    def timestamp_parts:
+      capture("^(?<base>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\\.(?<fraction>[0-9]{0,8}[1-9]))?Z$") as $parts |
+      ($parts.base + "Z" | fromdateiso8601) as $seconds |
+      select($seconds > 0) |
+      select(($seconds | todateiso8601) == ($parts.base + "Z")) |
+      [$seconds, (((($parts.fraction // "") + "000000000")[0:9]) | tonumber)];
+    length == 1 and (.[0] |
+      (.measurement_window.started_at | timestamp_parts) as $started |
+      (.measurement_window.stop_initiated_at | timestamp_parts) as $stopped |
+      $started <= $stopped)
+  ' "$artifact" >/dev/null || return 1
+  expected_json="$(java_measurement_evidence_json \
+    "$root" "$cell" "$started_at" "$stop_initiated_at")" || return 1
+  expected_raw_value_count="$(jq --stream -n '
+    reduce inputs as $event (0;
+      if ($event | length) == 2 then . + 1 else . end)
+  ' <<<"$expected_json")" || return 1
+  observed_raw_value_count="$(raw_json_value_count "$artifact")" || return 1
+  [[ "$expected_raw_value_count" =~ ^[1-9][0-9]*$ &&
+    "$observed_raw_value_count" == "$expected_raw_value_count" ]] || return 1
+  jq -se --argjson expected "$expected_json" \
+    'length == 1 and .[0] == $expected' "$artifact" >/dev/null
+}
+
+validate_published_java_measurement() (
+  local -r cell_dir="$1"
+  local -r root="$cell_dir/java-measurement"
+  local -r artifact="$root/evidence.json"
+  local -r receipt="$cell_dir/java-measurement-publication.json"
+  local cell=""
+  local current_user_id=""
+  local parent_identity_before=""
+  local parent_identity_after=""
+  local root_identity_before=""
+  local root_identity_after=""
+  local evidence_sha256=""
+  local runtime_artifact_sha256=""
+  local tree_manifest_sha256=""
+  local tree_manifest_sha256_after=""
+  local raw_value_count=""
+  local receipt_size=""
+
+  java_measurement_cell_is_allowed "$cell_dir" || return 1
+  cell="${cell_dir##*/}"
+  [[ -d "$root" && ! -L "$root" &&
+    -f "$receipt" && ! -L "$receipt" ]] || return 1
+  current_user_id="$(id -u)" || return 1
+  is_private_owned_regular_file "$receipt" "$current_user_id" || return 1
+  receipt_size="$(stat --format '%s' -- "$receipt")" || return 1
+  [[ "$receipt_size" =~ ^[1-9][0-9]*$ ]] || return 1
+  ((receipt_size <= MAX_JAVA_TOOL_OUTPUT_BYTES)) || return 1
+  parent_identity_before="$(stat --format '%d:%i:%u:%a' -- "$cell_dir")" || return 1
+  root_identity_before="$(stat --format '%d:%i:%u:%a' -- "$root")" || return 1
+  validate_java_measurement_evidence "$artifact" || return 1
+  evidence_sha256="$(sha256_regular_file "$artifact")" || return 1
+  runtime_artifact_sha256="$(jq -ser '
+    if length == 1 then .[0].runtime_artifacts.attestation_sha256 else empty end
+  ' "$artifact")" || return 1
+  tree_manifest_sha256="$(java_measurement_tree_manifest_sha256 "$root")" || return 1
+  [[ "$evidence_sha256" =~ ^[0-9a-f]{64}$ &&
+    "$runtime_artifact_sha256" =~ ^[0-9a-f]{64}$ &&
+    "$tree_manifest_sha256" =~ ^[0-9a-f]{64}$ ]] || return 1
+  raw_value_count="$(raw_json_value_count "$receipt")" || return 1
+  [[ "$raw_value_count" == 10 ]] || return 1
+  jq -se \
+    --arg cell "$cell" \
+    --arg parent_identity "$parent_identity_before" \
+    --arg root_identity "$root_identity_before" \
+    --arg evidence_sha256 "$evidence_sha256" \
+    --arg runtime_artifact_sha256 "$runtime_artifact_sha256" \
+    --arg tree_manifest_sha256 "$tree_manifest_sha256" '
+      length == 1 and (.[0] |
+        (keys) == [
+          "acceptance_evidence", "cell", "evidence_sha256", "kind",
+          "parent_identity", "root_identity",
+          "runtime_artifact_attestation_sha256", "schema_version", "status",
+          "tree_manifest_sha256"
+        ] and
+        .schema_version == 2 and
+        .kind == "bounded-java-runtime-indicators-publication" and
+        .status == "sealed" and .acceptance_evidence == false and
+        .cell == $cell and .parent_identity == $parent_identity and
+        .root_identity == $root_identity and
+        .evidence_sha256 == $evidence_sha256 and
+        .runtime_artifact_attestation_sha256 == $runtime_artifact_sha256 and
+        .tree_manifest_sha256 == $tree_manifest_sha256)
+    ' "$receipt" >/dev/null || return 1
+  tree_manifest_sha256_after="$(java_measurement_tree_manifest_sha256 "$root")" || return 1
+  parent_identity_after="$(stat --format '%d:%i:%u:%a' -- "$cell_dir")" || return 1
+  root_identity_after="$(stat --format '%d:%i:%u:%a' -- "$root")" || return 1
+  [[ "$parent_identity_after" == "$parent_identity_before" &&
+    "$root_identity_after" == "$root_identity_before" &&
+    "$tree_manifest_sha256_after" == "$tree_manifest_sha256" ]]
+)
+
+write_java_measurement_publication_receipt() {
+  local -r cell_dir="$1"
+  local -r root="$cell_dir/java-measurement"
+  local -r artifact="$root/evidence.json"
+  local -r receipt="$cell_dir/java-measurement-publication.json"
+  local evidence_sha256=""
+  local runtime_artifact_sha256=""
+  local tree_manifest_sha256=""
+  local tree_manifest_sha256_after=""
+  local temporary=""
+
+  [[ "$cell_dir" == "$JAVA_MEASUREMENT_CELL_DIR" &&
+    -d "$root" && ! -L "$root" &&
+    ! -e "$receipt" && ! -L "$receipt" ]] || return 1
+  java_measurement_root_identity_matches "$root" published || return 1
+  validate_java_measurement_evidence "$artifact" || return 1
+  evidence_sha256="$(sha256_regular_file "$artifact")" || return 1
+  runtime_artifact_sha256="$(jq -ser '
+    if length == 1 then .[0].runtime_artifacts.attestation_sha256 else empty end
+  ' "$artifact")" || return 1
+  tree_manifest_sha256="$(java_measurement_tree_manifest_sha256 "$root")" || return 1
+  [[ "$evidence_sha256" =~ ^[0-9a-f]{64}$ &&
+    "$runtime_artifact_sha256" == "$JAVA_MEASUREMENT_RUNTIME_ARTIFACT_SHA256" &&
+    "$tree_manifest_sha256" =~ ^[0-9a-f]{64}$ ]] || return 1
+  temporary="$(mktemp "$cell_dir/.java-measurement-publication.json.XXXXXX")" || return 1
+  if ! jq -n \
+    --arg cell "$CELL_SLUG" \
+    --arg parent_identity "$JAVA_MEASUREMENT_PARENT_IDENTITY" \
+    --arg root_identity "$JAVA_MEASUREMENT_ROOT_IDENTITY" \
+    --arg evidence_sha256 "$evidence_sha256" \
+    --arg runtime_artifact_sha256 "$runtime_artifact_sha256" \
+    --arg tree_manifest_sha256 "$tree_manifest_sha256" '
+      {
+        schema_version: 2,
+        kind: "bounded-java-runtime-indicators-publication",
+        status: "sealed",
+        acceptance_evidence: false,
+        cell: $cell,
+        parent_identity: $parent_identity,
+        root_identity: $root_identity,
+        evidence_sha256: $evidence_sha256,
+        runtime_artifact_attestation_sha256: $runtime_artifact_sha256,
+        tree_manifest_sha256: $tree_manifest_sha256
+      }
+    ' >"$temporary" || ! chmod 0600 -- "$temporary" ||
+    ! java_measurement_root_identity_matches "$root" published; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  tree_manifest_sha256_after="$(java_measurement_tree_manifest_sha256 "$root")" || {
+    rm -f -- "$temporary"
+    return 1
+  }
+  if [[ "$tree_manifest_sha256_after" != "$tree_manifest_sha256" ]] ||
+    ! mv -T -- "$temporary" "$receipt" ||
+    ! java_measurement_root_identity_matches "$root" published ||
+    ! validate_published_java_measurement "$cell_dir"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+}
+
+publish_java_measurement_tree() {
+  local -r partial="$1"
+  local -r final="$2"
+
+  [[ "$partial" == "$JAVA_MEASUREMENT_PARTIAL" &&
+    "$final" == "$JAVA_MEASUREMENT_CELL_DIR/java-measurement" &&
+    ! -e "$final" && ! -L "$final" ]] || return 1
+  java_measurement_root_identity_matches "$partial" partial || return 1
+  mv -T -- "$partial" "$final" || return 1
+  java_measurement_root_identity_matches "$final" published
+}
+
+quarantine_failed_java_measurement_publication() (
+  local -r cell_dir="$1"
+  local -r final="$cell_dir/java-measurement"
+  local -r receipt="$cell_dir/java-measurement-publication.json"
+  local -r rejected="$cell_dir/.java-measurement.rejected"
+  local -r rejected_receipt="$cell_dir/.java-measurement-publication.rejected.json"
+  local observed_parent_identity=""
+
+  java_measurement_cell_is_allowed "$cell_dir" || return 1
+  observed_parent_identity="$(stat --format '%d:%i:%u:%a' -- "$cell_dir")" || return 1
+  [[ "$observed_parent_identity" == "$JAVA_MEASUREMENT_PARENT_IDENTITY" ]] || return 1
+  if [[ -e "$final" || -L "$final" ]]; then
+    [[ ! -e "$rejected" && ! -L "$rejected" ]] || return 1
+    mv -T --no-clobber -- "$final" "$rejected" || return 1
+    [[ ! -e "$final" && ! -L "$final" &&
+      ( -e "$rejected" || -L "$rejected" ) ]] || return 1
+  fi
+  if [[ -e "$receipt" || -L "$receipt" ]]; then
+    [[ ! -e "$rejected_receipt" && ! -L "$rejected_receipt" ]] || return 1
+    mv -T --no-clobber -- "$receipt" "$rejected_receipt" || return 1
+    [[ ! -e "$receipt" && ! -L "$receipt" &&
+      ( -e "$rejected_receipt" || -L "$rejected_receipt" ) ]] || return 1
+  fi
+  [[ ! -e "$final" && ! -L "$final" &&
+    ! -e "$receipt" && ! -L "$receipt" ]]
+)
+
+java_measurement_cell_is_allowed() {
+  local -r cell_dir="$1"
+  local cell=""
+  local allowed=""
+
+  [[ "$OUTPUT_DIR" == /* && "$cell_dir" == "$OUTPUT_DIR/cells/"* &&
+    "$cell_dir" != *$'\n'* && "$cell_dir" != *$'\r'* &&
+    "$cell_dir" != *'//' && "$cell_dir" != *'/./'* &&
+    "$cell_dir" != *'/../'* && "$cell_dir" != */. && "$cell_dir" != */.. ]] || return 1
+  cell="${cell_dir#"$OUTPUT_DIR/cells/"}"
+  [[ "$cell" != */* ]] || return 1
+  for allowed in "${CORE_CELLS[@]}"; do
+    [[ "$cell" == "$allowed" ]] && return 0
+  done
+  return 1
+}
+
+clear_active_java_measurement() {
+  JAVA_MEASUREMENT_PARTIAL=""
+  JAVA_MEASUREMENT_CELL_DIR=""
+  JAVA_MEASUREMENT_PARENT_IDENTITY=""
+  JAVA_MEASUREMENT_ROOT_IDENTITY=""
+  JAVA_MEASUREMENT_JVM_START_EPOCH_MILLIS=""
+  JAVA_MEASUREMENT_STARTED_AT=""
+  JAVA_MEASUREMENT_STOP_INITIATED_AT=""
+  JAVA_MEASUREMENT_RUNTIME_ARTIFACT_SHA256=""
+}
+
+discard_java_measurement_partial() (
+  local -r partial="$1"
+  local -r cell_dir="$2"
+  local -r expected_parent_identity="$3"
+  local -r expected_root_identity="$4"
+  local observed_parent_identity=""
+  local observed_root_identity=""
+  local entry=""
+  local entry_count=0
+  local work=""
+  local listing=""
+
+  java_measurement_cell_is_allowed "$cell_dir" || return 1
+  [[ "$partial" == "$cell_dir/.java-measurement.partial" &&
+    "$expected_parent_identity" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-7]{3,4}$ &&
+    "$expected_root_identity" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-7]{3,4}$ &&
+    ! -e "$cell_dir/java-measurement" && ! -L "$cell_dir/java-measurement" ]] || return 1
+  observed_parent_identity="$(stat --format '%d:%i:%u:%a' -- "$cell_dir")" || return 1
+  [[ "$observed_parent_identity" == "$expected_parent_identity" ]] || return 1
+  if [[ ! -e "$partial" && ! -L "$partial" ]]; then
+    return 0
+  fi
+  [[ -d "$partial" && ! -L "$partial" ]] || return 1
+  observed_root_identity="$(stat --format '%d:%i:%u:%a' -- "$partial")" || return 1
+  [[ "$observed_root_identity" == "$expected_root_identity" ]] || return 1
+  work="$(mktemp -d "$cell_dir/.java-partial-discard.XXXXXX")" || return 1
+  chmod 0700 -- "$work" || return 1
+  listing="$work/entries.list"
+  trap 'rm -f -- "$listing"; rmdir -- "$work" 2>/dev/null || true' EXIT
+  capture_stable_java_listing "$partial" all "$listing" || return 1
+  while IFS= read -r -d '' entry; do
+    ((entry_count += 1))
+    ((entry_count <= MAX_JAVA_EVIDENCE_FILES)) || return 1
+    [[ ( -f "$entry" && ! -L "$entry" ) || ( -d "$entry" && ! -L "$entry" ) ||
+      -L "$entry" ]] || return 1
+  done <"$listing"
+  observed_parent_identity="$(stat --format '%d:%i:%u:%a' -- "$cell_dir")" || return 1
+  observed_root_identity="$(stat --format '%d:%i:%u:%a' -- "$partial")" || return 1
+  [[ "$observed_parent_identity" == "$expected_parent_identity" &&
+    "$observed_root_identity" == "$expected_root_identity" ]] || return 1
+  find -P "$partial" -xdev -mindepth 1 \( -type f -o -type l \) -delete || return 1
+  observed_root_identity="$(stat --format '%d:%i:%u:%a' -- "$partial")" || return 1
+  [[ "$observed_root_identity" == "$expected_root_identity" ]] || return 1
+  find -P "$partial" -xdev -mindepth 1 -depth -type d -empty -delete || return 1
+  observed_parent_identity="$(stat --format '%d:%i:%u:%a' -- "$cell_dir")" || return 1
+  observed_root_identity="$(stat --format '%d:%i:%u:%a' -- "$partial")" || return 1
+  [[ "$observed_parent_identity" == "$expected_parent_identity" &&
+    "$observed_root_identity" == "$expected_root_identity" ]] || return 1
+  rmdir -- "$partial" || return 1
+  [[ ! -e "$partial" && ! -L "$partial" &&
+    ! -e "$cell_dir/java-measurement" && ! -L "$cell_dir/java-measurement" ]]
+)
+
+discard_active_java_measurement() {
+  local -r partial="$JAVA_MEASUREMENT_PARTIAL"
+  local -r cell_dir="$JAVA_MEASUREMENT_CELL_DIR"
+  local -r parent_identity="$JAVA_MEASUREMENT_PARENT_IDENTITY"
+  local -r root_identity="$JAVA_MEASUREMENT_ROOT_IDENTITY"
+  local discard_status=0
+
+  if [[ -n "$partial" || -n "$cell_dir" || -n "$parent_identity" ||
+    -n "$root_identity" ]]; then
+    discard_java_measurement_partial \
+      "$partial" "$cell_dir" "$parent_identity" "$root_identity" || discard_status=1
+  fi
+  clear_active_java_measurement
+  return "$discard_status"
+}
+
+write_java_measurement_status() {
+  local -r cell_dir="$1"
+  local -r stage="$2"
+  local -r classification="$3"
+  local -r output="$cell_dir/java-measurement-status.json"
+  local temporary=""
+  local status=""
+
+  java_measurement_cell_is_allowed "$cell_dir" || return 1
+  case "$stage" in
+    post_warmup_preflight|post_warmup_baseline|post_load_stop|post_load_collection) ;;
+    *) return 1 ;;
+  esac
+  case "$classification" in
+    infrastructure_unavailable) status="unavailable" ;;
+    measurement_contract_failed) status="failed" ;;
+    *) return 1 ;;
+  esac
+  [[ ! -e "$output" && ! -L "$output" ]] || return 1
+  temporary="$(mktemp "$cell_dir/.java-measurement-status.json.XXXXXX")" || return 1
+  if ! jq -n --arg cell "$CELL_SLUG" --arg stage "$stage" \
+    --arg status "$status" --arg classification "$classification" '
+    {
+      schema_version: 1,
+      kind: "bounded-java-runtime-indicators",
+      status: $status,
+      cell: $cell,
+      stage: $stage,
+      classification: $classification,
+      acceptance_evidence: false
+    }
+  ' >"$temporary" || ! chmod 0600 -- "$temporary" ||
+    ! mv -T -- "$temporary" "$output"; then
+    rm -f -- "$temporary" "$output"
+    return 1
+  fi
+}
+
+begin_java_measurement_with_classification() {
+  local -r cell_dir="$1"
+
+  if ! java_measurement_facilities_available "$cell_dir"; then
+    write_java_measurement_status \
+      "$cell_dir" post_warmup_preflight infrastructure_unavailable || true
+    return 1
+  fi
+  if ! begin_java_measurement "$cell_dir"; then
+    write_java_measurement_status \
+      "$cell_dir" post_warmup_baseline measurement_contract_failed || true
+    return 1
+  fi
+}
+
+stop_java_measurement_with_classification() {
+  local -r cell_dir="$1"
+
+  if ! stop_java_measurement "$cell_dir"; then
+    write_java_measurement_status \
+      "$cell_dir" post_load_stop measurement_contract_failed || true
+    return 1
+  fi
+}
+
+finish_java_measurement_with_classification() {
+  local -r cell_dir="$1"
+
+  if ! finish_java_measurement "$cell_dir"; then
+    quarantine_failed_java_measurement_publication "$cell_dir" || true
+    write_java_measurement_status \
+      "$cell_dir" post_load_collection measurement_contract_failed || true
+    return 1
+  fi
+}
+
+begin_java_measurement() {
+  local -r cell_dir="$1"
+  local -r partial="$cell_dir/.java-measurement.partial"
+  local -r final="$cell_dir/java-measurement"
+  local -r expected_suffix=" -XX:NativeMemoryTracking=summary -XX:StartFlightRecording=name=${JAVA_BOOTSTRAP_JFR_NAME},settings=${JAVA_BENCHMARK_JFR_SETTINGS},filename=${JAVA_BOOTSTRAP_JFR_CONTAINER_PATH},disk=true,dumponexit=false,duration=${JAVA_JFR_MAX_DURATION_SECONDS}s,maxsize=32m"
+  local output=""
+  local parent_identity=""
+  local parent_identity_after=""
+  local root_identity=""
+  local bootstrap_size=""
+
+  java_measurement_cell_is_allowed "$cell_dir" || return 1
+  [[ "$CELL_BOUNDED_PATH" == false && "$JAVA_IMAGE_TARGET" == "$JAVA_BENCHMARK_IMAGE_TARGET" &&
+    "$JAVA_BACKEND_IMAGE" == "$JAVA_BENCHMARK_IMAGE_TAG" &&
+    "$JAVA_BENCHMARK_TOOL_OPTIONS_SUFFIX" == "$expected_suffix" &&
+    -z "$JAVA_MEASUREMENT_PARTIAL" &&
+    ! -e "$partial" && ! -L "$partial" &&
+    ! -e "$final" && ! -L "$final" ]] || return 1
+  validate_benchmark_jfr_settings_source \
+    "$JAVA_BENCHMARK_JFR_SETTINGS_CHECKOUT" || return 1
+  parent_identity="$(stat --format '%d:%i:%u:%a' -- "$cell_dir")" || return 1
+  mkdir --mode=0700 -- "$partial" "$partial/operations" || return 1
+  root_identity="$(stat --format '%d:%i:%u:%a' -- "$partial")" || return 1
+  parent_identity_after="$(stat --format '%d:%i:%u:%a' -- "$cell_dir")" || return 1
+  [[ "$parent_identity_after" == "$parent_identity" ]] || return 1
+  JAVA_MEASUREMENT_CELL_DIR="$cell_dir"
+  JAVA_MEASUREMENT_PARTIAL="$partial"
+  JAVA_MEASUREMENT_PARENT_IDENTITY="$parent_identity"
+  JAVA_MEASUREMENT_ROOT_IDENTITY="$root_identity"
+  JAVA_MEASUREMENT_JVM_START_EPOCH_MILLIS=""
+  JAVA_MEASUREMENT_STARTED_AT=""
+  JAVA_MEASUREMENT_STOP_INITIATED_AT=""
+  JAVA_MEASUREMENT_RUNTIME_ARTIFACT_SHA256=""
+  java_measurement_root_identity_matches "$partial" partial || return 1
+  capture_service_identity java-backend "$partial/identity.txt" || return 1
+  chmod 0600 -- "$partial/identity.txt" || return 1
+  capture_java_runtime_artifacts \
+    "$partial" "$partial/runtime-artifacts.json" || return 1
+  JAVA_MEASUREMENT_RUNTIME_ARTIFACT_SHA256="$(sha256_regular_file \
+    "$partial/runtime-artifacts.json")" || return 1
+  java_measurement_root_identity_matches "$partial" partial || return 1
+
+  run_java_bound_operation "$partial" 01-bootstrap-stop \
+    "$MAX_JAVA_TOOL_OUTPUT_BYTES" jcmd \
+    JFR.stop "name=$JAVA_BOOTSTRAP_JFR_NAME" || return 1
+  output="$partial/operations/01-bootstrap-stop/output"
+  validate_jfr_command_output "$output" stop \
+    "$JAVA_BOOTSTRAP_JFR_NAME" "$JAVA_BOOTSTRAP_JFR_CONTAINER_PATH" || return 1
+
+  run_java_bound_operation "$partial" 02-bootstrap-discard \
+    "$MAX_JAVA_TOOL_OUTPUT_BYTES" exec \
+    "${JAVA_BENCHMARK_TOOL_ENV[@]}" \
+      java --add-modules jdk.attach,jdk.management,jdk.jfr \
+      -jar "$JAVA_BENCHMARK_TOOL_JAR" \
+      discard-bootstrap-jfr "$MAX_JFR_BYTES" || return 1
+  validate_bootstrap_jfr_discard \
+    "$partial/operations/02-bootstrap-discard/output" || return 1
+  bootstrap_size="$(jq -ser \
+    'if length == 1 then .[0].size_bytes else empty end' \
+    "$partial/operations/02-bootstrap-discard/output")" || return 1
+  bootstrap_size="$(normalize_decimal "$bootstrap_size" "$MAX_JFR_BYTES" false)" || return 1
+  validate_jfr_command_output "$output" stop \
+    "$JAVA_BOOTSTRAP_JFR_NAME" "$JAVA_BOOTSTRAP_JFR_CONTAINER_PATH" \
+    "$bootstrap_size" || return 1
+
+  run_java_bound_operation "$partial" 03-nmt-baseline \
+    "$MAX_JAVA_TOOL_OUTPUT_BYTES" jcmd VM.native_memory baseline || return 1
+  output="$partial/operations/03-nmt-baseline/output"
+  validate_nmt_baseline_output "$output" || return 1
+
+  run_java_bound_operation "$partial" 04-nmt-baseline-confirmation \
+    "$MAX_JAVA_TOOL_OUTPUT_BYTES" jcmd \
+    VM.native_memory summary.diff scale=1 || return 1
+  nmt_summary_diff_totals \
+    "$partial/operations/04-nmt-baseline-confirmation/output" >/dev/null || return 1
+
+  run_java_bound_operation "$partial" 05-runtime-baseline \
+    "$MAX_JAVA_TOOL_OUTPUT_BYTES" runtime || return 1
+
+  run_java_bound_operation "$partial" 06-jfr-start \
+    "$MAX_JAVA_TOOL_OUTPUT_BYTES" jcmd \
+    JFR.start "name=$JAVA_MEASUREMENT_JFR_NAME" \
+    "settings=$JAVA_BENCHMARK_JFR_SETTINGS" \
+    "filename=$JAVA_MEASUREMENT_JFR_CONTAINER_PATH" disk=true dumponexit=false \
+    "duration=${JAVA_JFR_MAX_DURATION_SECONDS}s" \
+    maxsize=32m || return 1
+  output="$partial/operations/06-jfr-start/output"
+  validate_jfr_command_output "$output" start \
+    "$JAVA_MEASUREMENT_JFR_NAME" "$JAVA_MEASUREMENT_JFR_CONTAINER_PATH" || return 1
+  JAVA_MEASUREMENT_STARTED_AT="$(canonical_utc_rfc3339_nano)" || return 1
+  java_measurement_root_identity_matches "$partial" partial
+}
+
+finish_java_measurement() {
+  local -r cell_dir="$1"
+  local -r partial="$JAVA_MEASUREMENT_PARTIAL"
+  local -r final="$cell_dir/java-measurement"
+  local output=""
+  local jfr_size=""
+  local jfr_sha256=""
+  local temporary=""
+  local runtime_artifacts_after="$partial/runtime-artifacts-after.json"
+
+  [[ "$cell_dir" == "$JAVA_MEASUREMENT_CELL_DIR" &&
+    "$partial" == "$cell_dir/.java-measurement.partial" &&
+    -d "$partial" && ! -L "$partial" &&
+    -n "$JAVA_MEASUREMENT_JVM_START_EPOCH_MILLIS" &&
+    -n "$JAVA_MEASUREMENT_STARTED_AT" &&
+    -n "$JAVA_MEASUREMENT_STOP_INITIATED_AT" &&
+    ! -e "$final" && ! -L "$final" ]] || return 1
+  java_measurement_root_identity_matches "$partial" partial || return 1
+  capture_java_runtime_artifacts "$partial" "$runtime_artifacts_after" || return 1
+  cmp -s -- "$partial/runtime-artifacts.json" "$runtime_artifacts_after" || return 1
+  [[ "$(sha256_regular_file "$runtime_artifacts_after")" == \
+    "$JAVA_MEASUREMENT_RUNTIME_ARTIFACT_SHA256" ]] || return 1
+  rm -f -- "$runtime_artifacts_after" || return 1
+  java_measurement_root_identity_matches "$partial" partial || return 1
+
+  run_java_bound_operation "$partial" 08-jfr-summary \
+    "$MAX_JAVA_TOOL_OUTPUT_BYTES" jfr \
+    "${JAVA_BENCHMARK_TOOL_ENV[@]}" \
+      java --add-modules jdk.attach,jdk.management,jdk.jfr \
+      -jar "$JAVA_BENCHMARK_TOOL_JAR" \
+      jfr-snapshot "$JAVA_MEASUREMENT_JFR_CONTAINER_PATH" \
+      "$MAX_JFR_BYTES" "$MAX_JFR_RECORDS" || return 1
+  mv -T -- "$partial/operations/08-jfr-summary/raw-output" \
+    "$partial/measurement.jfr" || return 1
+  jfr_size="$(stat --format '%s' -- "$partial/measurement.jfr")" || return 1
+  [[ "$jfr_size" =~ ^[1-9][0-9]*$ ]] || return 1
+  ((jfr_size <= MAX_JFR_BYTES)) || return 1
+  jfr_sha256="$(sha256_regular_file "$partial/measurement.jfr")" || return 1
+  validate_jfr_summary \
+    "$partial/operations/08-jfr-summary/output" "$jfr_size" "$jfr_sha256" || return 1
+  validate_jfr_command_output \
+    "$partial/operations/07-jfr-stop/output" stop \
+    "$JAVA_MEASUREMENT_JFR_NAME" "$JAVA_MEASUREMENT_JFR_CONTAINER_PATH" \
+    "$jfr_size" || return 1
+
+  run_java_bound_operation "$partial" 10-nmt-postload-summary \
+    "$MAX_JAVA_TOOL_OUTPUT_BYTES" jcmd VM.native_memory summary scale=1 || return 1
+  nmt_summary_totals \
+    "$partial/operations/10-nmt-postload-summary/output" >/dev/null || return 1
+  run_java_bound_operation "$partial" 11-nmt-postload-diff \
+    "$MAX_JAVA_TOOL_OUTPUT_BYTES" jcmd VM.native_memory summary.diff scale=1 || return 1
+  nmt_summary_diff_totals \
+    "$partial/operations/11-nmt-postload-diff/output" >/dev/null || return 1
+  run_java_bound_operation "$partial" 12-runtime-postload \
+    "$MAX_JAVA_TOOL_OUTPUT_BYTES" runtime || return 1
+
+  temporary="$(mktemp "$partial/.evidence.json.XXXXXX")" || return 1
+  if ! java_measurement_evidence_json \
+    "$partial" "$CELL_SLUG" "$JAVA_MEASUREMENT_STARTED_AT" \
+    "$JAVA_MEASUREMENT_STOP_INITIATED_AT" \
+    >"$temporary" || ! chmod 0600 -- "$temporary" ||
+    ! mv -T -- "$temporary" "$partial/evidence.json"; then
+    rm -f -- "$temporary" "$partial/evidence.json"
+    return 1
+  fi
+  validate_java_measurement_evidence "$partial/evidence.json" || return 1
+  java_measurement_root_identity_matches "$partial" partial || return 1
+  publish_java_measurement_tree "$partial" "$final" || return 1
+  validate_java_measurement_evidence "$final/evidence.json" || return 1
+  java_measurement_root_identity_matches "$final" published || return 1
+  write_java_measurement_publication_receipt "$cell_dir" || return 1
+  validate_published_java_measurement "$cell_dir" || return 1
+  clear_active_java_measurement
+}
+
+stop_java_measurement() {
+  local -r cell_dir="$1"
+  local -r partial="$JAVA_MEASUREMENT_PARTIAL"
+  local output=""
+
+  [[ "$cell_dir" == "$JAVA_MEASUREMENT_CELL_DIR" &&
+    "$partial" == "$cell_dir/.java-measurement.partial" &&
+    -d "$partial" && ! -L "$partial" &&
+    -n "$JAVA_MEASUREMENT_STARTED_AT" &&
+    -z "$JAVA_MEASUREMENT_STOP_INITIATED_AT" ]] || return 1
+  java_measurement_root_identity_matches "$partial" partial || return 1
+  JAVA_MEASUREMENT_STOP_INITIATED_AT="$(canonical_utc_rfc3339_nano)" || return 1
+  run_java_bound_operation "$partial" 07-jfr-stop \
+    "$MAX_JAVA_TOOL_OUTPUT_BYTES" jcmd \
+    JFR.stop "name=$JAVA_MEASUREMENT_JFR_NAME" || return 1
+  output="$partial/operations/07-jfr-stop/output"
+  validate_jfr_command_output "$output" stop \
+    "$JAVA_MEASUREMENT_JFR_NAME" "$JAVA_MEASUREMENT_JFR_CONTAINER_PATH" || return 1
+  java_measurement_root_identity_matches "$partial" partial
 }
 
 capture_proc_snapshot_from_root() {
@@ -5941,7 +7839,8 @@ validate_poc_gate_shape() {
                 })
               end))) and
         .unmeasured_dimensions == {
-          jfr_nmt_allocation_native_direct_memory: "not_collected",
+          jfr_nmt_allocation_native_direct_memory:
+            "bounded_indicators_retained_not_evaluated_as_acceptance_gate",
           primary_cgroupsockopt_program_cpu: "not_collected",
           bpf_lock_contention: "not_collected"
         } and
@@ -6122,7 +8021,8 @@ poc_gate_summary_json() {
         },
         resources: $resources,
         unmeasured_dimensions: {
-          jfr_nmt_allocation_native_direct_memory: "not_collected",
+          jfr_nmt_allocation_native_direct_memory:
+            "bounded_indicators_retained_not_evaluated_as_acceptance_gate",
           primary_cgroupsockopt_program_cpu: "not_collected",
           bpf_lock_contention: "not_collected"
         }
@@ -8644,7 +10544,8 @@ cleanup_active_project() {
   ACTIVE_PROJECT=""
   ACTIVE_CELL_DIR=""
   COMPOSE=()
-  unset BENCHMARK_CA_SOURCE
+  unset BENCHMARK_CA_SOURCE JAVA_IMAGE_TARGET JAVA_BACKEND_IMAGE \
+    JAVA_BENCHMARK_TOOL_OPTIONS_SUFFIX
 }
 
 write_cell_status() {
@@ -8745,6 +10646,7 @@ run_helper_idle_sustained() {
   successful_requests="$((successful_requests + request_count))"
   capture_resource_snapshot \
     "$cell_dir/resources-measurement-baseline" measurement_baseline not_collected
+  begin_java_measurement_with_classification "$cell_dir" || return 1
   for ((repetition = 1; repetition <= REPETITIONS; repetition++)); do
     log_info "measuring $CELL_SLUG repetition $repetition/$REPETITIONS"
     run_helper_idle_measurement_rep "$cell_dir" "$repetition"
@@ -8754,8 +10656,10 @@ run_helper_idle_sustained() {
     ((successful_requests <= MAX_JAVA_DIAGNOSTIC_COUNTER - request_count)) || return 1
     successful_requests="$((successful_requests + request_count))"
   done
+  stop_java_measurement_with_classification "$cell_dir" || return 1
   capture_resource_snapshot \
     "$cell_dir/resources-measurement-end" measurement_end not_collected
+  finish_java_measurement_with_classification "$cell_dir" || return 1
   # Take a fresh observation after every workload client has exited. Waiting for
   # two subsequent Java bridge stats-map report passes prevents a pass that occurred during the
   # workload from being used as its completion boundary.
@@ -8822,6 +10726,7 @@ run_cell() {
     fi
     capture_resource_snapshot \
       "$cell_dir/resources-measurement-baseline" measurement_baseline not_collected
+    begin_java_measurement_with_classification "$cell_dir" || return 1
 
     for ((repetition = 1; repetition <= REPETITIONS; repetition++)); do
       log_info "measuring $CELL_SLUG repetition $repetition/$REPETITIONS"
@@ -8831,8 +10736,10 @@ run_cell() {
         record_w3c_workload_successes "$cell_dir/measurements/$repetition_label.json"
       fi
     done
+    stop_java_measurement_with_classification "$cell_dir" || return 1
     capture_resource_snapshot \
       "$cell_dir/resources-measurement-end" measurement_end not_collected
+    finish_java_measurement_with_classification "$cell_dir" || return 1
     if [[ "$CELL_SUSTAINED_W3C" == "true" ]]; then
       capture_java_diagnostics "$cell_dir/sustained-w3c/java-diagnostics-after.txt"
       validate_java_diagnostics_counter_deltas \
@@ -8904,6 +10811,13 @@ write_summary() {
   local bpf_program_counters_status="not_available"
   local bpf_program_artifact=""
   local bpf_program_artifact_count=0
+  local java_runtime_indicators_json=""
+  local java_runtime_indicators_status="not_available"
+  local java_runtime_artifact=""
+  local java_runtime_artifact_count=0
+  local java_runtime_artifact_sha256=""
+  local java_runtime_reference_sha256=""
+  local java_runtime_artifact_identity_mismatch=false
   local variance_json=""
   local summary_temporary=""
   local manifest_temporary=""
@@ -8995,6 +10909,54 @@ write_summary() {
       ((bpf_program_artifact_count += 1))
     fi
   done
+  for cell in "${CORE_CELLS[@]}"; do
+    java_runtime_artifact="$OUTPUT_DIR/cells/$cell/java-measurement/evidence.json"
+    if validate_published_java_measurement "$OUTPUT_DIR/cells/$cell" &&
+      [[ "$(jq -er '.cell' "$java_runtime_artifact")" == "$cell" ]]; then
+      java_runtime_artifact_sha256="$(jq -er \
+        '.runtime_artifacts.attestation_sha256' \
+        "$java_runtime_artifact")" || return 1
+      [[ "$java_runtime_artifact_sha256" =~ ^[0-9a-f]{64}$ ]] || return 1
+      if [[ -z "$java_runtime_reference_sha256" ]]; then
+        java_runtime_reference_sha256="$java_runtime_artifact_sha256"
+      elif [[ "$java_runtime_artifact_sha256" != \
+        "$java_runtime_reference_sha256" ]]; then
+        java_runtime_artifact_identity_mismatch=true
+      fi
+      ((java_runtime_artifact_count += 1))
+    fi
+  done
+  if [[ "$java_runtime_artifact_identity_mismatch" == true ]]; then
+    java_runtime_indicators_status="identity_mismatch"
+    java_runtime_reference_sha256=""
+  elif ((java_runtime_artifact_count == ${#CORE_CELLS[@]})); then
+    java_runtime_indicators_status="available"
+  elif ((java_runtime_artifact_count > 0)); then
+    java_runtime_indicators_status="partially_available"
+  fi
+  [[ "$status" != "passed" ||
+    ( "$java_runtime_artifact_count" == "${#CORE_CELLS[@]}" &&
+      "$java_runtime_artifact_identity_mismatch" == false ) ]] || return 1
+  java_runtime_indicators_json="$(jq -cn \
+    --arg status "$java_runtime_indicators_status" \
+    --arg runtime_artifact_attestation_sha256 "$java_runtime_reference_sha256" \
+    --argjson retained_cell_artifacts "$java_runtime_artifact_count" \
+    --argjson expected_cell_artifacts "${#CORE_CELLS[@]}" '{
+      status: $status,
+      artifact: "cells/*/java-measurement/evidence.json",
+      runtime_artifact_attestation_sha256: (
+        if $runtime_artifact_attestation_sha256 == "" then null
+        else $runtime_artifact_attestation_sha256 end
+      ),
+      retained_cell_artifacts: $retained_cell_artifacts,
+      expected_cell_artifacts: $expected_cell_artifacts,
+      indicators: [
+        "sampled_allocation_weight", "monitor_enter_duration",
+        "thread_park_duration", "nmt_committed_and_reserved",
+        "direct_buffer_pool"
+      ],
+      acceptance_evidence: false
+    }')" || return 1
   if ((bpf_program_artifact_count == ${#CORE_CELLS[@]})); then
     bpf_program_counters_status="available"
   elif ((bpf_program_artifact_count > 0)); then
@@ -9043,6 +11005,7 @@ write_summary() {
     --argjson poc_gates "$poc_gates_json" \
     --argjson poc_resources "$poc_resources_json" \
     --argjson bpf_program_counters "$bpf_program_counters_json" \
+    --argjson java_runtime_indicators "$java_runtime_indicators_json" \
     '{
       status: $status,
       acceptance_evidence: false,
@@ -9063,7 +11026,7 @@ write_summary() {
           java_bridge_map: $poc_resources.map_dimension
         },
         application_cpu_rss: "requested_point_samples_not_evaluated_as_a_growth_gate",
-        jfr_nmt_allocation_native_direct_memory: "not_collected",
+        jfr_nmt_allocation_native_direct_memory: $java_runtime_indicators,
         exact_owned_cgroupsockopt_program_counters: $bpf_program_counters,
         primary_cgroupsockopt_program_cpu: "not_collected",
         bpf_lock_contention: "not_collected",
@@ -9085,7 +11048,11 @@ write_summary() {
         "docker-daemon.json proves only that the selected endpoint was a stable existing non-symlink Unix socket; it does not prove where the daemon process runs.",
         "Each available process sample separately binds the exact inspected container ID to bounded local procfs cgroup, PID-start-time, and cgroup-digest evidence.",
         "A passed summary status means the harness completed successfully; poc-gates.json remains partial and is not issue-acceptance evidence.",
-        "Process and container samples do not establish JFR/NMT allocations, native/direct memory, primary-program CPU utilization, or lock contention."
+        "JFR sampled-allocation weights, monitor/park events, NMT summary totals/deltas, and the direct-buffer pool are bounded indicators; they are not exact full allocation counts, all native/off-heap memory, production SLO evidence, or issue-acceptance evidence.",
+        "The size-bounded JFR may retain only a bounded tail if its 32 MiB limit is reached; whole-window event retention is explicitly not attested.",
+        "Every available Java runtime indicator cell is bound to one exact benchmark image, helper JAR/source, and JFR settings attestation shared across the six-cell aggregate.",
+        "The retained raw JFR is private bounded diagnostic input; normalized receipts expose only low-cardinality counts, deltas, and digests and never class names, stack frames, JVM arguments, system properties, request markers, or source paths.",
+        "Primary-program CPU utilization and BPF lock contention remain uncollected."
       ]
     }' >"$summary_temporary"; then
     rm -f -- "$summary_temporary" "$manifest_temporary" || return 1
@@ -9206,6 +11173,7 @@ on_exit() {
   trap - EXIT INT TERM
   set +e
   abort_active_benchmark || final_status=1
+  discard_active_java_measurement || final_status=1
   if [[ -n "$ACTIVE_PROJECT" ]]; then
     write_cell_status "$ACTIVE_CELL_DIR" failed "interrupted_or_failed_before_cleanup" || true
     if ! cleanup_active_project; then

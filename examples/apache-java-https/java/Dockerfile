@@ -17,8 +17,14 @@ COPY java/pom.xml ./pom.xml
 RUN --mount=type=cache,target=/root/.m2 mvn --batch-mode --no-transfer-progress dependency:resolve
 COPY java/src/ ./src/
 RUN --mount=type=cache,target=/root/.m2 mvn --batch-mode --no-transfer-progress package
+COPY java/benchmark/RuntimeSnapshot.java ./benchmark/RuntimeSnapshot.java
+RUN javac --release 21 --add-modules jdk.attach,jdk.management,jdk.jfr \
+      -d /build/benchmark-classes benchmark/RuntimeSnapshot.java && \
+    jar --create --file /build/obi-benchmark-runtime-snapshot.jar \
+      --main-class io.opentelemetry.obi.examples.benchmark.RuntimeSnapshot \
+      -C /build/benchmark-classes .
 
-FROM eclipse-temurin:21.0.10_7-jre@sha256:34a58218d838035428163eb35abb629944c5906d1bedcfef8bc8864cce11dfe5
+FROM eclipse-temurin:21.0.10_7-jre@sha256:34a58218d838035428163eb35abb629944c5906d1bedcfef8bc8864cce11dfe5 AS runtime-base
 
 WORKDIR /app
 COPY --from=builder /build/target/apache-java-https-backend.jar /app/backend.jar
@@ -29,3 +35,25 @@ COPY --from=fault-builder /build/pid-reuse-supervisor /otel/pid-reuse-supervisor
 RUN install -d -m 0700 /run/obi-demo/fault
 
 ENTRYPOINT ["java", "-jar", "/app/backend.jar"]
+
+# The benchmark harness selects this target explicitly. The ordinary Compose
+# model and direct Dockerfile build both continue to end at the JRE-only
+# `runtime` target below.
+FROM eclipse-temurin:21.0.10_7-jdk@sha256:e58e492628c1428ceb838afc1a1b8762673d5eaa09296f560c363daea0fdcf3b AS benchmark-runtime
+
+WORKDIR /app
+COPY --from=builder /build/target/apache-java-https-backend.jar /app/backend.jar
+COPY .runtime/artifacts/official-javaagent.jar /otel/official-javaagent.jar
+COPY .runtime/artifacts/obi-otel-extension.jar /otel/obi-otel-extension.jar
+COPY --from=fault-builder /build/libobi-java-remote-parent-fault.so /otel/libobi-java-remote-parent-fault.so
+COPY --from=fault-builder /build/pid-reuse-supervisor /otel/pid-reuse-supervisor
+COPY --from=builder /build/obi-benchmark-runtime-snapshot.jar /otel/obi-benchmark-runtime-snapshot.jar
+COPY java/benchmark/RuntimeSnapshot.java /otel/benchmark-source/RuntimeSnapshot.java
+COPY java/benchmark/obi-benchmark.jfc /otel/obi-benchmark.jfc
+RUN chmod 0444 /otel/obi-benchmark-runtime-snapshot.jar \
+      /otel/benchmark-source/RuntimeSnapshot.java /otel/obi-benchmark.jfc && \
+    install -d -m 0700 /run/obi-demo/fault
+
+ENTRYPOINT ["java", "-jar", "/app/backend.jar"]
+
+FROM runtime-base AS runtime

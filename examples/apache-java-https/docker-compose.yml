@@ -34,7 +34,8 @@ services:
     build:
       context: .
       dockerfile: java/Dockerfile
-    image: obi-apache-java-https-backend:local
+      target: ${JAVA_IMAGE_TARGET:-runtime}
+    image: ${JAVA_BACKEND_IMAGE:-obi-apache-java-https-backend:local}
     network_mode: host
     environment:
       HTTPS_PORT: "18443"
@@ -45,7 +46,7 @@ services:
       TLS_KEYSTORE_PASSWORD: changeit
       TLS_PROTOCOL: ${BACKEND_TLS_PROTOCOL:-TLSv1.3}
       TLS_RECEIVE_BOUNDARY_FIXTURE_ENABLED: "1"
-      JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS_VALUE--javaagent:/otel/official-javaagent.jar}
+      JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS_VALUE--javaagent:/otel/official-javaagent.jar}${JAVA_BENCHMARK_TOOL_OPTIONS_SUFFIX:-}
       OTEL_JAVAAGENT_EXTENSIONS: ${OTEL_JAVAAGENT_EXTENSIONS_VALUE-/otel/obi-otel-extension.jar}
       OTEL_PROPAGATORS: ${OTEL_PROPAGATORS_VALUE:-obi,tracecontext,baggage}
       OTEL_OBI_REMOTE_PARENT_ENABLED: ${EXTENSION_ENABLED:-true}

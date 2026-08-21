@@ -1,0 +1,90 @@
+{
+  "schema": "compatibility-campaign-plan-v1",
+  "matrix_revision": "apache-java-https-compatibility-v3",
+  "expected_cell_count": 45,
+  "baseline": {
+    "kernel": "upstream-6.12",
+    "deployment": "container-process",
+    "cgroup_topology": "unified-v2",
+    "architecture": "amd64",
+    "jvm_feature": 21,
+    "agent_distribution": "otel",
+    "agent_version": "2.28.1",
+    "tls": "TLSv1.3",
+    "transport": "getsockopt"
+  },
+  "excluded_dimensions": [
+    {
+      "dimension": "rhel-8-4.18-backport",
+      "status": "untested",
+      "reason": "direct-execution-required-no-version-inference"
+    },
+    {
+      "dimension": "http2-backend",
+      "status": "unsupported",
+      "reason": "request-safe-http2-not-proven"
+    },
+    {
+      "dimension": "auto-transport",
+      "status": "out-of-scope",
+      "reason": "issue-36-control-not-issue-38-transport-dimension"
+    }
+  ],
+  "cells": [
+    {"id":"k-rhel96-host-v2-getsockopt","slice":"kernel-topology-deployment","kernel":"rhel-9.6-5.14","deployment":"host-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"getsockopt","profile":"compatibility-smoke","provider":"preprovisioned-host-application-v1"},
+    {"id":"k-rhel96-host-v2-unix","slice":"kernel-topology-deployment","kernel":"rhel-9.6-5.14","deployment":"host-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"unix","profile":"compatibility-smoke","provider":"preprovisioned-host-application-v1"},
+    {"id":"k-rhel96-container-v2-getsockopt","slice":"kernel-topology-deployment","kernel":"rhel-9.6-5.14","deployment":"container-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"getsockopt","profile":"compatibility-smoke","provider":"runsh-java21-container-v1"},
+    {"id":"k-rhel96-container-v2-unix","slice":"kernel-topology-deployment","kernel":"rhel-9.6-5.14","deployment":"container-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"unix","profile":"compatibility-smoke","provider":"runsh-java21-container-v1"},
+
+    {"id":"k-upstream510-host-v2-getsockopt","slice":"kernel-topology-deployment","kernel":"upstream-5.10","deployment":"host-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"getsockopt","profile":"compatibility-smoke","provider":"preprovisioned-host-application-v1"},
+    {"id":"k-upstream510-host-v2-unix","slice":"kernel-topology-deployment","kernel":"upstream-5.10","deployment":"host-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"unix","profile":"compatibility-smoke","provider":"preprovisioned-host-application-v1"},
+    {"id":"k-upstream510-container-v2-getsockopt","slice":"kernel-topology-deployment","kernel":"upstream-5.10","deployment":"container-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"getsockopt","profile":"compatibility-smoke","provider":"runsh-java21-container-v1"},
+    {"id":"k-upstream510-container-v2-unix","slice":"kernel-topology-deployment","kernel":"upstream-5.10","deployment":"container-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"unix","profile":"compatibility-smoke","provider":"runsh-java21-container-v1"},
+
+    {"id":"k-upstream515-host-v2-getsockopt","slice":"kernel-topology-deployment","kernel":"upstream-5.15","deployment":"host-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"getsockopt","profile":"compatibility-smoke","provider":"preprovisioned-host-application-v1"},
+    {"id":"k-upstream515-host-v2-unix","slice":"kernel-topology-deployment","kernel":"upstream-5.15","deployment":"host-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"unix","profile":"compatibility-smoke","provider":"preprovisioned-host-application-v1"},
+    {"id":"k-upstream515-container-v2-getsockopt","slice":"kernel-topology-deployment","kernel":"upstream-5.15","deployment":"container-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"getsockopt","profile":"compatibility-smoke","provider":"runsh-java21-container-v1"},
+    {"id":"k-upstream515-container-v2-unix","slice":"kernel-topology-deployment","kernel":"upstream-5.15","deployment":"container-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"unix","profile":"compatibility-smoke","provider":"runsh-java21-container-v1"},
+
+    {"id":"k-upstream61-host-v2-getsockopt","slice":"kernel-topology-deployment","kernel":"upstream-6.1","deployment":"host-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"getsockopt","profile":"compatibility-smoke","provider":"preprovisioned-host-application-v1"},
+    {"id":"k-upstream61-host-v2-unix","slice":"kernel-topology-deployment","kernel":"upstream-6.1","deployment":"host-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"unix","profile":"compatibility-smoke","provider":"preprovisioned-host-application-v1"},
+    {"id":"k-upstream61-container-v2-getsockopt","slice":"kernel-topology-deployment","kernel":"upstream-6.1","deployment":"container-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"getsockopt","profile":"compatibility-smoke","provider":"runsh-java21-container-v1"},
+    {"id":"k-upstream61-container-v2-unix","slice":"kernel-topology-deployment","kernel":"upstream-6.1","deployment":"container-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"unix","profile":"compatibility-smoke","provider":"runsh-java21-container-v1"},
+
+    {"id":"k-upstream66-host-v2-getsockopt","slice":"kernel-topology-deployment","kernel":"upstream-6.6","deployment":"host-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"getsockopt","profile":"compatibility-smoke","provider":"preprovisioned-host-application-v1"},
+    {"id":"k-upstream66-host-v2-unix","slice":"kernel-topology-deployment","kernel":"upstream-6.6","deployment":"host-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"unix","profile":"compatibility-smoke","provider":"preprovisioned-host-application-v1"},
+    {"id":"k-upstream66-container-v2-getsockopt","slice":"kernel-topology-deployment","kernel":"upstream-6.6","deployment":"container-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"getsockopt","profile":"compatibility-smoke","provider":"runsh-java21-container-v1"},
+    {"id":"k-upstream66-container-v2-unix","slice":"kernel-topology-deployment","kernel":"upstream-6.6","deployment":"container-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"unix","profile":"compatibility-smoke","provider":"runsh-java21-container-v1"},
+
+    {"id":"k-upstream612-host-v2-getsockopt","slice":"kernel-topology-deployment","kernel":"upstream-6.12","deployment":"host-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"getsockopt","profile":"compatibility-smoke","provider":"preprovisioned-host-application-v1"},
+    {"id":"k-upstream612-host-v2-unix","slice":"kernel-topology-deployment","kernel":"upstream-6.12","deployment":"host-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"unix","profile":"compatibility-smoke","provider":"preprovisioned-host-application-v1"},
+    {"id":"k-upstream612-container-v2-getsockopt","slice":"kernel-topology-deployment","kernel":"upstream-6.12","deployment":"container-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"getsockopt","profile":"compatibility-smoke","provider":"runsh-java21-container-v1"},
+    {"id":"k-upstream612-container-v2-unix","slice":"kernel-topology-deployment","kernel":"upstream-6.12","deployment":"container-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"unix","profile":"compatibility-smoke","provider":"runsh-java21-container-v1"},
+
+    {"id":"k-supported-host-hybrid-getsockopt","slice":"kernel-topology-deployment","kernel":"supported-runtime-probed","deployment":"host-process","cgroup_topology":"hybrid-v1-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"getsockopt","profile":"compatibility-smoke","provider":"preprovisioned-host-application-v1"},
+    {"id":"k-supported-host-hybrid-unix","slice":"kernel-topology-deployment","kernel":"supported-runtime-probed","deployment":"host-process","cgroup_topology":"hybrid-v1-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"unix","profile":"compatibility-smoke","provider":"preprovisioned-host-application-v1"},
+    {"id":"k-supported-container-hybrid-getsockopt","slice":"kernel-topology-deployment","kernel":"supported-runtime-probed","deployment":"container-process","cgroup_topology":"hybrid-v1-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"getsockopt","profile":"compatibility-smoke","provider":"runsh-java21-container-v1"},
+    {"id":"k-supported-container-hybrid-unix","slice":"kernel-topology-deployment","kernel":"supported-runtime-probed","deployment":"container-process","cgroup_topology":"hybrid-v1-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"unix","profile":"compatibility-smoke","provider":"runsh-java21-container-v1"},
+
+    {"id":"k-supported-host-nested-v2-getsockopt","slice":"kernel-topology-deployment","kernel":"supported-runtime-probed","deployment":"host-process","cgroup_topology":"nested-delegated-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"getsockopt","profile":"compatibility-smoke","provider":"preprovisioned-host-application-v1"},
+    {"id":"k-supported-host-nested-v2-unix","slice":"kernel-topology-deployment","kernel":"supported-runtime-probed","deployment":"host-process","cgroup_topology":"nested-delegated-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"unix","profile":"compatibility-smoke","provider":"preprovisioned-host-application-v1"},
+    {"id":"k-supported-container-nested-v2-getsockopt","slice":"kernel-topology-deployment","kernel":"supported-runtime-probed","deployment":"container-process","cgroup_topology":"nested-delegated-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"getsockopt","profile":"compatibility-smoke","provider":"runsh-java21-container-v1"},
+    {"id":"k-supported-container-nested-v2-unix","slice":"kernel-topology-deployment","kernel":"supported-runtime-probed","deployment":"container-process","cgroup_topology":"nested-delegated-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"unix","profile":"compatibility-smoke","provider":"runsh-java21-container-v1"},
+    {"id":"k-supported-sibling-containers-getsockopt","slice":"kernel-topology-deployment","kernel":"supported-runtime-probed","deployment":"container-process","cgroup_topology":"sibling-containers","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"getsockopt","profile":"compatibility-smoke","provider":"runsh-java21-container-v1"},
+    {"id":"k-supported-sibling-containers-unix","slice":"kernel-topology-deployment","kernel":"supported-runtime-probed","deployment":"container-process","cgroup_topology":"sibling-containers","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"unix","profile":"compatibility-smoke","provider":"runsh-java21-container-v1"},
+
+    {"id":"j-jdk8-otel-getsockopt","slice":"jvm-agent","kernel":"upstream-6.12","deployment":"container-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":8,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"getsockopt","profile":"compatibility-smoke","provider":"preprovisioned-jvm-application-v1"},
+    {"id":"j-jdk8-splunk-getsockopt","slice":"jvm-agent","kernel":"upstream-6.12","deployment":"container-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":8,"agent_distribution":"splunk","agent_version":"2.28.0","tls":"TLSv1.3","transport":"getsockopt","profile":"compatibility-smoke","provider":"preprovisioned-jvm-application-v1"},
+    {"id":"j-jdk11-otel-getsockopt","slice":"jvm-agent","kernel":"upstream-6.12","deployment":"container-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":11,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"getsockopt","profile":"compatibility-smoke","provider":"preprovisioned-jvm-application-v1"},
+    {"id":"j-jdk11-splunk-getsockopt","slice":"jvm-agent","kernel":"upstream-6.12","deployment":"container-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":11,"agent_distribution":"splunk","agent_version":"2.28.0","tls":"TLSv1.3","transport":"getsockopt","profile":"compatibility-smoke","provider":"preprovisioned-jvm-application-v1"},
+    {"id":"j-jdk17-otel-getsockopt","slice":"jvm-agent","kernel":"upstream-6.12","deployment":"container-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":17,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"getsockopt","profile":"compatibility-smoke","provider":"preprovisioned-jvm-application-v1"},
+    {"id":"j-jdk17-splunk-getsockopt","slice":"jvm-agent","kernel":"upstream-6.12","deployment":"container-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":17,"agent_distribution":"splunk","agent_version":"2.28.0","tls":"TLSv1.3","transport":"getsockopt","profile":"compatibility-smoke","provider":"preprovisioned-jvm-application-v1"},
+    {"id":"j-jdk21-splunk-getsockopt","slice":"jvm-agent","kernel":"upstream-6.12","deployment":"container-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"splunk","agent_version":"2.28.0","tls":"TLSv1.3","transport":"getsockopt","profile":"compatibility-smoke","provider":"runsh-java21-container-v1"},
+
+    {"id":"a-arm64-jdk21-otel-getsockopt","slice":"architecture","kernel":"upstream-6.12","deployment":"container-process","cgroup_topology":"unified-v2","architecture":"arm64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"getsockopt","profile":"compatibility-smoke","provider":"runsh-java21-container-v1"},
+    {"id":"a-arm64-jdk21-otel-unix","slice":"architecture","kernel":"upstream-6.12","deployment":"container-process","cgroup_topology":"unified-v2","architecture":"arm64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.3","transport":"unix","profile":"compatibility-smoke","provider":"runsh-java21-container-v1"},
+
+    {"id":"t-tls12-jdk21-otel-getsockopt","slice":"tls","kernel":"upstream-6.12","deployment":"container-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.2","transport":"getsockopt","profile":"compatibility-smoke","provider":"runsh-java21-container-v1"},
+    {"id":"t-tls12-jdk21-otel-unix","slice":"tls","kernel":"upstream-6.12","deployment":"container-process","cgroup_topology":"unified-v2","architecture":"amd64","jvm_feature":21,"agent_distribution":"otel","agent_version":"2.28.1","tls":"TLSv1.2","transport":"unix","profile":"compatibility-smoke","provider":"runsh-java21-container-v1"}
+  ]
+}

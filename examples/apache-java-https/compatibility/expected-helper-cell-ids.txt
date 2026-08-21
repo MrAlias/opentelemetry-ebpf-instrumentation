@@ -1,0 +1,7 @@
+h-jdk8-amd64-otel-getsockopt
+h-jdk11-amd64-otel-getsockopt
+h-jdk17-amd64-otel-getsockopt
+h-jdk21-amd64-otel-getsockopt
+h-jdk21-amd64-otel-unix
+h-jdk21-amd64-otel-auto
+h-jdk21-arm64-otel-getsockopt

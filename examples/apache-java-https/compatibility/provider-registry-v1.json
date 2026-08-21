@@ -1,0 +1,25 @@
+{
+  "schema": "compatibility-provider-registry-v1",
+  "providers": {
+    "preprovisioned-host-application-v1": {
+      "kind": "external",
+      "launcher": "providers/preprovisioned-host-application-v1.sh",
+      "approved_drivers": []
+    },
+    "preprovisioned-jvm-application-v1": {
+      "kind": "external",
+      "launcher": "providers/preprovisioned-jvm-application-v1.sh",
+      "approved_drivers": []
+    },
+    "preprovisioned-lifecycle-application-v1": {
+      "kind": "external",
+      "launcher": "providers/preprovisioned-lifecycle-application-v1.sh",
+      "approved_drivers": []
+    },
+    "runsh-java21-container-v1": {
+      "kind": "local",
+      "launcher": "providers/runsh-java21-container-v1.sh",
+      "approved_drivers": []
+    }
+  }
+}

@@ -9,8 +9,8 @@ to directly observed cells. The [final result](FINAL-RESULT.md) reconciles the
 parent tracker's definition of done against that same retained evidence
 boundary.
 
-Matrix revision: `apache-java-https-compatibility-v2`.
-<!-- obi-compatibility-matrix-revision: apache-java-https-compatibility-v2 -->
+Matrix revision: `apache-java-https-compatibility-v3`.
+<!-- obi-compatibility-matrix-revision: apache-java-https-compatibility-v3 -->
 
 ## Request and context sequence
 
@@ -85,6 +85,29 @@ fail.
 Checked-in result matrices mark only linked retained evidence as passed; every
 other cell remains **untested**. The presence of this example does not claim
 that an unlinked cell passed.
+
+The V3 compatibility and helper-lifecycle campaigns are source-built but have
+no current executions. Keep their private result roots outside the checkout so
+source cleanliness remains observable:
+
+```bash
+CAMPAIGN_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/obi-compatibility.XXXXXX")"
+chmod 700 "$CAMPAIGN_ROOT"
+mkdir -m 700 "$CAMPAIGN_ROOT/cells"
+
+./examples/apache-java-https/compatibility/create-source-authority.sh \
+  --output "$CAMPAIGN_ROOT/source-authority.json"
+
+./examples/apache-java-https/compatibility/run-cell.sh \
+  --campaign compatibility \
+  --cell k-upstream612-container-v2-getsockopt \
+  --source-authority "$CAMPAIGN_ROOT/source-authority.json" \
+  --output "$CAMPAIGN_ROOT/cells/k-upstream612-container-v2-getsockopt"
+```
+
+Retain nonzero cell results: 1 is `fail`, 69 is infrastructure `untested`, and
+78 is product `unsupported`. Run every frozen ID before invoking the exact-ID
+collector documented in [COMPATIBILITY.md](COMPATIBILITY.md).
 
 ## What the assertion proves
 

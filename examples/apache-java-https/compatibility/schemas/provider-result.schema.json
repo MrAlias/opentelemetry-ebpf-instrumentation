@@ -1,0 +1,195 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:obi:apache-java-https:compatibility-provider-result-v1",
+  "title": "Apache Java HTTPS compatibility provider result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "campaign",
+    "campaign_revision",
+    "plan_sha256",
+    "cell_id",
+    "provider",
+    "provider_exit_status",
+    "status",
+    "reason",
+    "attempted",
+    "infrastructure_failure",
+    "requested",
+    "provider_registry_sha256",
+    "external_driver",
+    "command",
+    "source",
+    "runtime",
+    "artifacts",
+    "assertions",
+    "evidence_index",
+    "raw_evidence"
+  ],
+  "properties": {
+    "schema": {"const": "compatibility-provider-result-v1"},
+    "campaign": {"enum": ["compatibility", "helper-lifecycle"]},
+    "campaign_revision": {"type": "string", "minLength": 1, "maxLength": 96},
+    "plan_sha256": {"$ref": "#/$defs/sha256"},
+    "cell_id": {"$ref": "#/$defs/token"},
+    "provider": {"$ref": "#/$defs/token"},
+    "provider_exit_status": {"type": "integer", "minimum": 0, "maximum": 255},
+    "status": {"enum": ["pass", "fail", "unsupported", "untested"]},
+    "reason": {"$ref": "#/$defs/token"},
+    "attempted": {"type": "boolean"},
+    "infrastructure_failure": {"type": "boolean"},
+    "requested": {"$ref": "#/$defs/requested"},
+    "provider_registry_sha256": {"$ref": "#/$defs/sha256"},
+    "external_driver": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "sha256", "snapshot"],
+          "properties": {
+            "id": {"$ref": "#/$defs/token"},
+            "sha256": {"$ref": "#/$defs/sha256"},
+            "snapshot": {"const": "external-driver.snapshot"}
+          }
+        }
+      ]
+    },
+    "command": {"$ref": "#/$defs/command"},
+    "source": {"type": "object"},
+    "runtime": {"type": ["object", "null"]},
+    "artifacts": {"type": ["object", "null"]},
+    "assertions": {"type": ["object", "null"]},
+    "evidence_index": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "array",
+          "maxItems": 512,
+          "items": {"$ref": "#/$defs/evidence_index_entry"}
+        }
+      ]
+    },
+    "raw_evidence": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["directory", "manifest", "manifest_sha256"],
+          "properties": {
+            "directory": {"type": "string", "minLength": 1},
+            "manifest": {"type": "string", "minLength": 1},
+            "manifest_sha256": {"$ref": "#/$defs/sha256"}
+          }
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "untested"}}},
+      "then": {
+        "properties": {
+          "infrastructure_failure": {"const": true},
+          "runtime": {"type": "null"},
+          "artifacts": {"type": "null"},
+          "assertions": {"type": "null"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"status": {"enum": ["pass", "fail", "unsupported"]}}},
+      "then": {
+        "properties": {
+          "attempted": {"const": true},
+          "infrastructure_failure": {"const": false}
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "token": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,95}$"
+    },
+    "evidence_index_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field", "path", "sha256"],
+      "properties": {
+        "field": {
+          "type": "string",
+          "pattern": "^(runtime|artifacts|assertions)([.][A-Za-z0-9_-]+)+$"
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}(/[A-Za-z0-9][A-Za-z0-9._-]{0,127})*$"
+        },
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "requested": {
+      "type": "object",
+      "required": [
+        "id",
+        "kernel",
+        "deployment",
+        "cgroup_topology",
+        "architecture",
+        "jvm_feature",
+        "agent_distribution",
+        "agent_version",
+        "tls",
+        "transport",
+        "provider"
+      ],
+      "properties": {
+        "id": {"$ref": "#/$defs/token"},
+        "slice": {"type": "string"},
+        "kernel": {"type": "string"},
+        "deployment": {"enum": ["host-process", "container-process"]},
+        "cgroup_topology": {
+          "enum": [
+            "unified-v2",
+            "hybrid-v1-v2",
+            "nested-delegated-v2",
+            "sibling-containers"
+          ]
+        },
+        "architecture": {"enum": ["amd64", "arm64"]},
+        "jvm_feature": {"enum": [8, 11, 17, 21]},
+        "agent_distribution": {"enum": ["otel", "splunk"]},
+        "agent_version": {"type": "string"},
+        "tls": {"enum": ["TLSv1.2", "TLSv1.3"]},
+        "transport": {"enum": ["getsockopt", "unix", "auto"]},
+        "profile": {"type": "string"},
+        "provider": {"$ref": "#/$defs/token"}
+      }
+    },
+    "command": {
+      "type": "object",
+      "required": ["executed", "argv", "adapter_sha256", "exit_status"],
+      "properties": {
+        "executed": {"type": "boolean"},
+        "argv": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string"}
+        },
+        "adapter_sha256": {"$ref": "#/$defs/sha256"},
+        "executable_sha256": {"$ref": "#/$defs/sha256"},
+        "exit_status": {
+          "oneOf": [
+            {"type": "integer", "minimum": 0, "maximum": 255},
+            {"type": "null"}
+          ]
+        }
+      }
+    }
+  }
+}

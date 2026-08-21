@@ -1,7 +1,13 @@
 # Compatibility evidence matrix
 
-Matrix revision: `apache-java-https-compatibility-v2`.
-<!-- obi-compatibility-matrix-revision: apache-java-https-compatibility-v2 -->
+Matrix revision: `apache-java-https-compatibility-v3`.
+<!-- obi-compatibility-matrix-revision: apache-java-https-compatibility-v3 -->
+
+V3 is a source-complete campaign definition, not an execution claim. All 45
+required V3 cells and all seven helper-lifecycle cells remain **pending** until
+their exact providers run and the resulting records are sealed. Existing
+linked bundles below are historical evidence for their recorded revisions;
+they do not populate, pass, or close a V3 cell.
 
 Cells without a linked run artifact remain **untested**. Kernel or distribution
 version inference is not evidence. Runtime feature detection must name the
@@ -10,14 +16,79 @@ bridge-readiness log proves availability, not Java selection. This snapshot is
 retained as `java-selected-transport-configuration.txt` and is required for new
 evidence produced after the V2 diagnostics contract was introduced. Older
 linked bundles remain historical results for their recorded revisions, but do
-not establish V2 selection at the current revision. `auto` cannot stand in for
-forced primary and fallback tests.
+not establish V3 selection at the current revision. `auto` cannot stand in for
+forced primary and fallback tests and is outside the exact 45-cell V3
+aggregate.
 
 Each result must be one of `pass`, `fail`, `unsupported`, or `untested` and
 include revision, kernel, architecture, cgroup mode, JVM, agent, Apache,
 OpenSSL, TLS, transport, command, and artifact link.
 
-## Kernel, deployment mode, cgroup, and transport
+## V3 campaign source and pending status
+
+The executable source is in [`compatibility/`](compatibility/README.md). The
+45-cell plan is [`campaign-v3.json`](compatibility/campaign-v3.json), with an
+independent frozen ID roster in
+[`expected-v3-cell-ids.txt`](compatibility/expected-v3-cell-ids.txt). The
+collector rejects anything other than these exact, unique IDs.
+
+| V3 factorized slice | Exact cell count | Source status |
+| --- | ---: | --- |
+| Kernel, topology, and deployment: 17 rows × two forced transports | 34 | pending / no V3 executions retained |
+| JVM 8/11/17/21 × two pinned agents on fixed `amd64` primary, excluding the baseline already counted above | 7 | pending / no V3 executions retained |
+| Native `arm64`, Java 21, OpenTelemetry, both forced transports | 2 | pending / no V3 executions retained |
+| TLS 1.2 baseline, both forced transports | 2 | pending / no V3 executions retained |
+| **Exact V3 aggregate** | **45** | **pending / aggregate not materialized** |
+
+RHEL 8 / 4.18 is not one of the 45 cells. It remains explicitly `untested`
+and requires direct execution on the documented backport; a RHEL or kernel
+version string is never substituted for feature evidence. Backend HTTP/2
+remains a documented product `unsupported` exclusion. Neither exclusion may
+be synthesized into a campaign cell.
+
+Issue #23's application/helper coverage is separately frozen in
+[`helper-lifecycle-v1.json`](compatibility/helper-lifecycle-v1.json) and
+[`expected-helper-cell-ids.txt`](compatibility/expected-helper-cell-ids.txt).
+Its seven cells are all pending. They do not change the 45-ID V3 count. A pass
+requires blocking `SSLSocket`, `SSLEngine`/`SocketChannel`, Netty
+`SslHandler`, normal extraction and fallback, platform/executor/cross-thread
+behavior, Java 21 virtual threads where applicable, early/late helper attach,
+absence/restart/version-mismatch/load-order controls, duplicate/stale and
+cross-request isolation, and every repeated FD/thread/direct-buffer/
+classloader/request/task/thread-local/same-process resource gate.
+The unavailable-bridge control also requires byte-identical normal and
+fallback application results, a separately retained passing normal-agent
+extraction proof, and bounded diagnostics (at most 64 entries and 65,536
+bytes); missing, changed, or unbounded evidence cannot pass.
+
+The runner distinguishes infrastructure `untested` from product
+`unsupported` and assertion `fail`. Missing providers remain untested. A
+checksum-verified provider that runs but omits or malforms required assertions
+fails its cell. Raw evidence remains private; the public aggregate contains
+only sealed identities, assertions, digests, and safe relative evidence-index
+bindings—never raw bytes, absolute paths, command arguments, or secrets. Every
+public runtime/artifact/assertion digest must resolve through that index to one
+unique regular raw file and exact manifest entry. No status from an `auto`,
+component-test, historical, neighboring-kernel, or neighboring-architecture
+execution is projected into V3.
+
+The checked-in external-provider registry is intentionally empty. Until a
+reviewed host/JVM/lifecycle driver identity is added, those cells can only be
+recorded as explicit infrastructure `untested`; an arbitrary self-matching
+path and digest cannot authorize execution. A registry-approved driver that is
+actually invoked retains its exact ID and digest even when it returns
+infrastructure `untested`; only a pre-execution unavailable or unapproved
+boundary has no driver identity. The local Java 21 adapter separately needs
+exact kernel-provenance and topology-attestation files for every execution. It
+cross-binds the attested process-cgroup digest to live and retained `/proc`
+bytes, and semantically validates successful `bpftool`, Compose project/
+container/image, Java runtime, host topology, and Apache/OpenSSL evidence before
+publishing an authoritative runtime identity. Its current production evidence
+can prove supported forced selection, but cannot prove the campaign's
+unsupported control, so it fails closed instead of synthesizing `unsupported`.
+All matrix and helper statuses in this document remain pending.
+
+## Kernel, deployment mode, cgroup, and transport inventory
 
 For each named environment, host-process and container-process cells are
 distinct. Use Java 21, one named official agent, `amd64`, and one fixed stack.
@@ -25,7 +96,7 @@ A container-process result does not establish the equivalent host-process
 cell. Sibling-container topology has only a container-process cell. Record the
 exact TLS version for each forced transport result.
 
-| Environment | Deployment mode | Cgroup topology | `getsockopt` | `unix` | `auto` |
+| Environment | Deployment mode | Cgroup topology | `getsockopt` | `unix` | `auto` (#23 only) |
 | --- | --- | --- | --- | --- | --- |
 | RHEL 9 / kernel 5.14 | host process | unified v2 | untested | untested | untested |
 | RHEL 9 / kernel 5.14 | container process | unified v2 | untested | untested | untested |
@@ -95,7 +166,7 @@ recovery scenario, and exits nonzero after its trap restores the base stack; it
 is `unsupported` for this gate, not a pass and not permission to label forced
 Unix fallback as tested.
 
-## Architecture
+## Historical architecture evidence (not V3 status)
 
 Each observed row uses one observed Linux kernel, unified cgroup v2, Java 21,
 and the named agent. A row records one forced transport/TLS pair; it does not
@@ -110,7 +181,7 @@ establish the other transport or TLS version.
 | `amd64` | OpenTelemetry 2.28.1 | 1.3 | untested | pass | [Unix/TLS 1.3](evidence/otel-unix-tls13-6c4a2505/README.md) |
 | `arm64` | untested | untested | untested | untested | not recorded |
 
-## JVM and official agent
+## Historical JVM and official-agent evidence (not V3 status)
 
 Use one fixed supported kernel/architecture and record the TLS/transport pair
 in the linked evidence. The Compose backend is pinned to Java 21; Java 8, 11,
@@ -168,7 +239,7 @@ issue #38. The privileged Compose matrix therefore remains:
 Additional agent releases must be selected deliberately, pinned by checksum,
 and added as new rows. “Latest” is not a matrix cell.
 
-## Apache, OpenSSL, and TLS
+## Historical Apache, OpenSSL, and TLS evidence (not V3 status)
 
 | Apache / OpenSSL | `getsockopt`/TLS 1.2 | Unix/TLS 1.2 | `getsockopt`/TLS 1.3 | Unix/TLS 1.3 | Backend HTTP |
 | --- | --- | --- | --- | --- | --- |
@@ -189,38 +260,54 @@ before changing that status.
 ## Cell procedure
 
 ```bash
-./examples/apache-java-https/run.sh \
-  --transport getsockopt \
-  --agent otel \
-  --tls TLSv1.3
+CAMPAIGN_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/obi-compatibility.XXXXXX")"
+chmod 700 "$CAMPAIGN_ROOT"
+mkdir -m 700 "$CAMPAIGN_ROOT/cells"
 
-./examples/apache-java-https/run.sh \
-  --transport unix \
-  --agent otel \
-  --tls TLSv1.3
+./examples/apache-java-https/compatibility/create-source-authority.sh \
+  --output "$CAMPAIGN_ROOT/source-authority.json"
 
-./examples/apache-java-https/run.sh \
-  --transport getsockopt \
-  --agent otel \
-  --tls TLSv1.2
+./examples/apache-java-https/compatibility/run-cell.sh \
+  --campaign compatibility \
+  --cell k-upstream612-container-v2-getsockopt \
+  --source-authority "$CAMPAIGN_ROOT/source-authority.json" \
+  --output "$CAMPAIGN_ROOT/cells/k-upstream612-container-v2-getsockopt"
 
-./examples/apache-java-https/run.sh \
-  --transport unix \
-  --agent otel \
-  --tls TLSv1.2
-
-./examples/apache-java-https/run.sh \
-  --transport getsockopt \
-  --scenario security
+# Run and retain one cell directory for every frozen ID before collecting.
+./examples/apache-java-https/compatibility/collect.sh \
+  --campaign compatibility \
+  --input-root "$CAMPAIGN_ROOT/cells" \
+  --source-authority "$CAMPAIGN_ROOT/source-authority.json" \
+  --output "$CAMPAIGN_ROOT/public-aggregate-v3"
 ```
 
-Attach the result directories, `bpftool feature probe` output, cgroup mount
-layout, `uname -a`, container image IDs, and any reason-coded miss/drop
-counters. A pass requires zero wrong parents. Under live map pressure, an
-explicit Java root is permitted only when the transport-aware bridge pipeline
-conserves the full request count, retains the actual upstream and retrieval
-failure reasons, and reconciles with the aggregate Java diagnostics. Other
-tests may report a miss only when their expected outcome permits it.
+The authority generator and both output boundaries reject paths inside the
+checkout. The generator requires a clean source tree and freezes the commit,
+Git tree, source-tree manifest, tracked patch, and patch identity before any
+cell runs. Preserve the mode-0700 campaign root; only the aggregate subdirectory
+is public-safe.
+
+The plan chooses a real adapter for every cell. The local Java 21 container
+adapter invokes the production harness with `--scenario all --repeat 1
+--seed 1`; it is not a targeted smoke alias. Other cells use checksum-pinned
+preprovisioned host, JVM, or lifecycle drivers with an exact argv contract.
+If their platform or driver is absent, the cell is retained as infrastructure
+`untested`, never silently skipped. See the campaign README for the driver
+contract, kernel/topology attestations, status rules, private/public boundary,
+and focused mutation tests.
+
+Transport attempt order is exact rather than set-like. A forced result attempts
+only its requested transport. An `auto` pass selecting `getsockopt` records only
+that primary attempt; an `auto` pass selecting Unix records `getsockopt` then
+`unix`; and authoritative `auto` unsupported records both attempts and no
+selection. Resource-gate baselines and finals are nonnegative snapshots; only
+their recomputed delta may be signed.
+
+A pass requires zero wrong parents. Under live map pressure, an explicit Java
+root is permitted only when the transport-aware bridge pipeline conserves the
+full request count, retains the actual upstream and retrieval failure reasons,
+and reconciles with the aggregate Java diagnostics. Other tests may report a
+miss only when their expected outcome permits it.
 
 The narrowest directly demonstrated configurations are the exact Linux
 7.0.0-1009-aws, unified-cgroup-v2, `amd64`, Temurin 21, Apache 2.4.68, and

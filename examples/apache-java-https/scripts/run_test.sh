@@ -36292,8 +36292,39 @@ assert_compatibility_matrix_reference() {
   ' "$document"
 }
 
+assert_compatibility_campaign_entrypoint_contract() {
+  local -r harness="${1:-$TEST_SCRIPT_DIR/run_test.sh}"
+  local -r campaign="$TEST_SCRIPT_DIR/../compatibility/tests/campaign_test.sh"
+  local -r matrix="$TEST_SCRIPT_DIR/../COMPATIBILITY.md"
+  local -r readme="$TEST_SCRIPT_DIR/../README.md"
+
+  [[ -f "$campaign" && ! -L "$campaign" && -x "$campaign" ]] || return 1
+  [[ "$(grep -Fxc \
+    '  "$TEST_SCRIPT_DIR/../compatibility/tests/campaign_test.sh"' \
+    "$harness")" == 1 ]] || return 1
+  grep -Fq 'mktemp -d "${TMPDIR:-/tmp}/obi-compatibility.' "$matrix" || return 1
+  grep -Fq 'create-source-authority.sh' "$matrix" || return 1
+  grep -Fq -- '--source-authority "$CAMPAIGN_ROOT/source-authority.json"' \
+    "$matrix" || return 1
+  grep -Fq 'mktemp -d "${TMPDIR:-/tmp}/obi-compatibility.' "$readme" || return 1
+}
+
+test_compatibility_campaign_entrypoint_is_mutation_sensitive() {
+  local -r harness="$TEST_SCRIPT_DIR/run_test.sh"
+  local -r mutated="$TEST_TMP_DIR/run-test-without-compatibility-campaign.sh"
+
+  assert_compatibility_campaign_entrypoint_contract "$harness" || return 1
+  sed '\#^  "$TEST_SCRIPT_DIR/../compatibility/tests/campaign_test.sh"$#d' \
+    "$harness" >"$mutated"
+  if assert_compatibility_campaign_entrypoint_contract "$mutated"; then
+    printf 'canonical harness accepted a missing compatibility campaign test\n' >&2
+    return 1
+  fi
+}
+
 test_compatibility_matrix_lists_deployment_modes() {
   local -r matrix="$TEST_SCRIPT_DIR/../COMPATIBILITY.md"
+  local -r plan="$TEST_SCRIPT_DIR/../compatibility/campaign-v3.json"
   local -r readme="$TEST_SCRIPT_DIR/../README.md"
   local -r final_result="$TEST_SCRIPT_DIR/../FINAL-RESULT.md"
   local -r invalid_matrix="$TEST_TMP_DIR/compatibility-matrix-revision-invalid.md"
@@ -36328,6 +36359,8 @@ test_compatibility_matrix_lists_deployment_modes() {
   )
 
   matrix_revision="$(compatibility_matrix_revision "$matrix")" || return 1
+  [[ "$matrix_revision" == apache-java-https-compatibility-v3 ]] || return 1
+  [[ "$(jq -er '.matrix_revision' "$plan")" == "$matrix_revision" ]] || return 1
   for document in "$readme" "$final_result"; do
     assert_compatibility_matrix_reference "$document" "$matrix_revision" || return 1
   done
@@ -36368,7 +36401,7 @@ test_compatibility_matrix_lists_deployment_modes() {
     return 1
   fi
   grep -Fqx \
-    '| Environment | Deployment mode | Cgroup topology | `getsockopt` | `unix` | `auto` |' \
+    '| Environment | Deployment mode | Cgroup topology | `getsockopt` | `unix` | `auto` (#23 only) |' \
     "$matrix" || return 1
   for row in "${expected_rows[@]}"; do
     grep -Fqx "$row" "$matrix" || return 1
@@ -42586,7 +42619,9 @@ main() {
   test_markdown_workflow_preserves_literal_nonempty_targets
   test_markdown_workflow_uses_exact_event_ranges
   test_runbook_build_and_control_contract_is_mutation_sensitive
+  test_compatibility_campaign_entrypoint_is_mutation_sensitive
   test_compatibility_matrix_lists_deployment_modes
+  "$TEST_SCRIPT_DIR/../compatibility/tests/campaign_test.sh"
   test_demo_uses_only_explicit_tcp_context
   test_obi_image_build_regenerates_bpf_hermetically
   test_demo_obi_lifecycle_timeouts_are_explicit

@@ -14,14 +14,19 @@ performance cell fail regardless of latency.
 ## Predeclared PoC gates
 
 - zero wrong parents and zero duplicate Java server spans;
-- no monotonic file-descriptor, thread, native-memory, or map growth after the
-  workload and one idle recovery interval;
+- operator-predeclared positive absolute ceilings for full-container-cgroup
+  FD count, task count, and RSS bytes at every required boundary, plus
+  operator-predeclared non-negative recovery-over-before allowances at each of
+  two consecutive 30-second idle confirmations;
 - privileged Go transport-harness `getsockopt` miss and hit p99 below 1 ms;
 - privileged Go transport-harness Unix miss and hit p99 below 50 ms;
 - Unix timeout p50 at or above its 50 ms absolute deadline and p99 at or
   below 100 ms;
 - steady-state application throughput and p99 latency regression no worse than
   10% against the same official-agent baseline;
+- OBI, Java-backend, and combined cgroup-v2 CPU use per successful request no
+  worse than 10% against `bridge-disabled` for each comparable application
+  cell;
 - population coefficient of variation no greater than 10% for both
   per-repetition throughput and per-repetition p99 in every core application
   cell; and
@@ -38,8 +43,12 @@ regression for the comparable instrumented cells against `bridge-disabled`;
 at most 10% population CV for throughput and repetition p99 in all six core
 cells; the sampled-JFR allocation-weight allowance above for
 `getsockopt-hit`, `unix-hit`, and `getsockopt-w3c` against `bridge-disabled`;
-and bounded process FD/thread growth from the before and idle-recovery samples.
-Unavailable required process samples fail that process dimension closed, and
+and bounded full-cgroup process-tree FD/task/RSS use across the before,
+post-warmup baseline, all five scheduled repetition midpoints, measurement end,
+after-load, and both idle-recovery samples. It also evaluates exact cgroup-v2
+OBI, Java, and combined CPU deltas per successful request from dedicated
+pre/post measurement boundaries. Unavailable required process-tree or CPU
+samples fail those dimensions closed, and
 unavailable descriptive map samples prevent successful harness completion.
 
 The file does not claim a complete PoC result. Although the exported
@@ -63,8 +72,10 @@ the direct-buffer-pool delta described below. They are diagnostic indicators,
 not exact allocation or all-native-memory counts. `poc-gates.json` evaluates
 the sampled allocation *weight* per successful request only as an exploratory
 regression indicator. A pass never converts it into exact allocation evidence,
-and the size-bounded recording may retain only a bounded tail. Primary cgroup-sockopt
-program CPU utilization and BPF lock contention remain uncollected. A `passed`
+and the size-bounded recording may retain only a bounded tail. NMT and direct
+buffer values remain fixed diagnostic indicators and are not evaluated as
+resource acceptance gates. Primary cgroup-sockopt program CPU utilization and
+BPF lock contention remain uncollected. A `passed`
 `summary.json` status
 means only that the requested harness execution completed; it is neither a
 passing PoC gate nor issue-acceptance evidence.
@@ -330,7 +341,7 @@ dedicated harness for the comparable core cells.
 The default `--cells core` run produces the sustained application benchmark.
 Schema-v2 `variance.json` retains each cell's exactly five repetitions, median,
 observed range, and population variability fields for throughput and
-per-repetition p99. Schema-v2 `poc-gates.json` applies the predeclared
+per-repetition p99. Schema-v3 `poc-gates.json` applies the predeclared
 zero-failure, 10% regression, 10% population-CV, and exploratory sampled-JFR
 allocation-weight thresholds to the supported core dimensions, while
 preserving the partial resource result described above.
@@ -522,9 +533,16 @@ deterministic syscall/socket fixtures. Before building, the harness asks
 pins the compiler's canonical executable path, and records its SHA-256,
 version, flags, requested build command, and expanded Make command. Those
 compiler-version, dry-run, build, and native-fixture commands run with an empty
-inherited environment plus only `PATH=/usr/bin:/bin` and `LC_ALL=C`; dynamic
-loader variables are absent before `env -i` starts because Bash `exec -c`
-launches it with an empty environment. GNU Make control variables
+inherited environment plus only `PATH=/usr/bin:/bin` and `LC_ALL=C`. Native
+tools are resolved through fixed system paths by a POSIX special-builtin
+`exec -c` bootstrap and returned only through a shell assignment after
+validation, so functions named `printf`, `command`, `builtin`, `type`,
+`readlink`, `env`, or even slash-bearing executable paths cannot redirect or
+rewrite resolution. Dynamic
+loader variables are absent before `env -i` starts because Bash is first put
+in POSIX mode, where the special builtin `exec` takes precedence over imported
+or same-shell functions named `exec`, and `exec -c` launches the broker with an
+empty environment. GNU Make control variables
 and compiler/linker search-path variables from the caller therefore cannot
 change the recorded or executed build. The harness verifies the four relevant
 tracked source/build inputs are clean before and after the build, copies those
@@ -599,7 +617,7 @@ the exact recorded client session, then discards only an allowlisted
 parent identity is unchanged; outside/malformed paths and directories fail
 closed, and a final symlink is unlinked without following its target.
 
-The schema-v3 manifest preserves its `w3c_headers: false` baseline for existing
+The schema-v4 manifest preserves its `w3c_headers: false` baseline for existing
 consumers. Its authoritative per-cell traffic record is
 `workload.w3c_headers_by_cell`: only `getsockopt-w3c` is `true`; the four
 other Apache comparison controls and the direct-Java helper-idle control are
@@ -629,12 +647,14 @@ fence for kernel program execution/run-time counters. Normal before/after/idle
 resource snapshots, the preflight, and the post-load sentinel remain outside
 this window.
 
-Each helper-idle repetition still retains an unsynchronized in-load resource
-point sample for OBI and Java CPU/RSS/thread/FD/container comparison. Its
-`snapshot.json` explicitly marks Java diagnostics `not_collected`; the sample
-retains process, container, and OBI-metrics artifacts but deliberately omits
-only the `/obi-diagnostics` request, because that server-instrumented request
-would contaminate exact `t_missing` accounting.
+Each helper-idle repetition retains one scheduled in-load cgroup snapshot at
+integer `floor(duration_seconds/2)` seconds after confirmed client launch,
+while the bound client process is still live. Its receipt explicitly marks
+Java diagnostics, OBI metrics, Docker inspect, and container stats
+`not_collected`; only the FD-anchored OBI and Java cgroup-v2 process-tree
+artifacts are retained. In particular, omitting the `/obi-diagnostics` request
+prevents that server-instrumented request from contaminating exact `t_missing`
+accounting.
 
 For `N` successful direct-Java requests, the raw Java `t_missing` delta is
 exactly `N + 1`: the final diagnostics request is itself server-instrumented and
@@ -661,13 +681,25 @@ or incomplete roster fails closed instead of becoming zero resource use:
 
 ```bash
 benchmark_parent="$(mktemp -d)"
+: "${PROCESS_TREE_FD_ABSOLUTE_MAX:?set the predeclared positive FD ceiling}"
+: "${PROCESS_TREE_TASK_ABSOLUTE_MAX:?set the predeclared positive task ceiling}"
+: "${PROCESS_TREE_RSS_BYTES_ABSOLUTE_MAX:?set the predeclared positive RSS-byte ceiling}"
+: "${PROCESS_TREE_FD_RECOVERY_DELTA_MAX:?set the predeclared non-negative FD recovery allowance}"
+: "${PROCESS_TREE_TASK_RECOVERY_DELTA_MAX:?set the predeclared non-negative task recovery allowance}"
+: "${PROCESS_TREE_RSS_BYTES_RECOVERY_DELTA_MAX:?set the predeclared non-negative RSS recovery allowance}"
 ./examples/apache-java-https/scripts/benchmark.sh \
   --output "$benchmark_parent/core-$(date -u +%Y%m%dT%H%M%SZ)" \
   --warmup-seconds 30 \
   --duration-seconds 60 \
   --concurrency 16 \
   --repetitions 5 \
-  --seed 20260721
+  --seed 20260721 \
+  --process-tree-fd-absolute-max "$PROCESS_TREE_FD_ABSOLUTE_MAX" \
+  --process-tree-task-absolute-max "$PROCESS_TREE_TASK_ABSOLUTE_MAX" \
+  --process-tree-rss-bytes-absolute-max "$PROCESS_TREE_RSS_BYTES_ABSOLUTE_MAX" \
+  --process-tree-fd-recovery-delta-max "$PROCESS_TREE_FD_RECOVERY_DELTA_MAX" \
+  --process-tree-task-recovery-delta-max "$PROCESS_TREE_TASK_RECOVERY_DELTA_MAX" \
+  --process-tree-rss-bytes-recovery-delta-max "$PROCESS_TREE_RSS_BYTES_RECOVERY_DELTA_MAX"
 ```
 
 The output path must be an absolute, fresh child of an existing current-user,
@@ -681,13 +713,23 @@ ownership-checked cleanup path.
 
 `--seed` accepts only `0` through `9007199254740991`, the largest integer that
 remains exact when the retained JSON is evaluated by `jq`.
+Each of the six process-tree caps is mandatory and may appear only once. The
+three absolute caps must be positive; the three recovery allowances may be
+zero. All six are canonical decimal integers no greater than
+`9007199254740991`. The harness does not supply policy defaults or infer caps
+from the observations. Before any cell runs, schema-v4
+`manifest.in-progress.json` freezes the exact values and shell-escaped
+invocation; terminal `manifest.json` is a distinct publish-once leaf created
+only during finalization.
 
 Before any Compose execution, the harness rejects `DOCKER_HOST`, resolves the
 active Docker context and its Docker endpoint, and requires an absolute local
 `unix:///...` endpoint whose path is an existing non-symlink Unix socket.
 `docker-daemon.json` retains that context, endpoint, socket path, device, and
-inode, and successful summary publication re-resolves all of them. A TCP, SSH,
-missing, symlinked, changed, or otherwise non-socket endpoint is not accepted.
+inode. Those values are verified before container execution; terminal summary
+publication holds and rechecks the exact retained evidence bytes instead of
+introducing a new unrecorded Docker query into the publication transaction. A
+TCP, SSH, missing, symlinked, changed, or otherwise non-socket endpoint is not accepted.
 This proves only the selected local filesystem socket endpoint; a Unix socket
 can proxy a remote daemon, so it does not prove Docker daemon process locality,
 host identity, or immutable hardware/kernel settings. `host-environment.txt`
@@ -695,21 +737,35 @@ remains the descriptive host record.
 
 Run it on a Linux host with Docker Compose v2 plus the GNU/procps/util-linux
 tools it validates at startup, including `timeout`, `setsid`, `ps`, and `sleep`.
+The JSON authority path also requires Perl with core `Fcntl`, `Digest::SHA`,
+`JSON::PP`, `Errno`, and `POSIX`, and Linux `openat`, `getdents64`, `renameat2`,
+`linkat`, and `unlinkat` syscall metadata. Terminal JSON publication additionally
+requires an inherited `RLIMIT_NOFILE` of at least 1024 and an output filesystem
+that supports anonymous `O_TMPFILE` inodes and `linkat(AT_EMPTY_PATH)`. Before
+reporting itself ready, the trusted helper links an unnamed probe inode through
+the held output-directory descriptor, verifies the linked inode, unlinks it,
+and proves the private probe name is absent. Midpoint directory publication runs the trusted
+absolute Perl interpreter in a taint-enabled empty environment, so inherited
+Perl module paths/options and shell command functions cannot alter its syscall
+or digest implementation.
 
 Each cell retains the runner's preflight provenance, warmup and repetition
 JSON, post-load sentinel, host environment, Docker stats and inspect records,
 `/proc` memory/fd/thread snapshots, OBI metrics when applicable, and requested
-Java diagnostics. The helper-idle midpoint is the documented exception: it
-omits Java diagnostics and records that explicit reason in `snapshot.json`.
-In addition to the unsynchronized midpoint samples, every cell retains a
-`resources-measurement-baseline` snapshot after warmup and before the first
-measurement repetition, plus a `resources-measurement-end` snapshot initiated
-immediately after the final repetition. Java diagnostics are intentionally
-excluded from these two snapshots so they cannot extend or mutate the sustained
-client counter window.
+Java diagnostics. Every scheduled midpoint is instead a cgroup-only
+transaction: it performs no Docker inspect/stats query, OBI scrape, or Java
+diagnostic request, and its receipt records all four as `not_collected` with an
+explicit reason. Dedicated `cpu-measurement-baseline` and
+`cpu-measurement-end` directories, captured immediately before and after the
+five-repetition workload, are the authoritative cgroup CPU and process-tree
+FD/task/RSS boundaries. The later `program-metrics-baseline` and
+`program-metrics-end` snapshots are diagnostic-only OBI/program-counter
+boundaries; they intentionally do not collect process-tree cgroup evidence and
+cannot replace either authoritative CPU boundary.
 
-For the three cells whose selected transport is `getsockopt`, each measurement
-boundary also retains an exact-owned program collection fence. The required
+For the three cells whose selected transport is `getsockopt`, each
+program-metrics diagnostic boundary also retains an exact-owned program
+collection fence. The required
 roster is the bridge `setsockopt` program, router, direct take/discard handlers,
 task take/discard handlers, and health handler—exactly seven distinct
 `CGroupSockopt` programs. The exporter increments
@@ -752,8 +808,60 @@ token boundaries. The explicit cgroup/container binding is retained in every
 available identity, snapshot, and process observation. The before and
 idle-recovery process-growth gate requires that entire identity and binding to
 match, preventing an unrelated process or a reused numeric PID from completing
-the gate. For OBI, each metrics scrape is additionally bracketed by ownership
-receipts. Each receipt independently enumerates the exact `/fd` and `/fdinfo`
+the legacy PID-1 gate.
+
+The acceptance resource gate uses the separate `*-cgroup-v2.json` artifacts.
+Production roots are fixed at `/proc` and `/sys/fs/cgroup`; redirected roots
+exist only as a hermetic test seam. Each available artifact proves the mount's
+`cgroup2fs` statfs type through independently opened root and leaf directory
+FDs, requires root-to-leaf device continuity, exactly one `0::/path`, and the
+full container ID at non-hex boundaries. The canonical component-by-component
+hierarchy digest, root and leaf device/inode identities, cgroup path, and a
+`domain` leaf with both `nr_descendants` and `nr_dying_descendants` equal to
+zero must remain unchanged after collection, closing path, hierarchy, and
+descendant ABA substitutions. It then performs two bounded passes over the
+complete sorted `cgroup.procs` roster. Every PID is bound to its start time and
+cgroup digest;
+each pass independently requires bounded, unique numeric FD and task filename
+rosters, `/proc/<pid>/status` must contain exactly one `VmRSS` and `Threads`,
+and task-directory count must equal `Threads`. The PID/start/cgroup roster must
+match across passes, while resource values may change. Per-pass totals cover
+every stable PID, and the conservative envelope retains min/max process, FD,
+task, thread, RSS, and cgroup CPU values.
+Missing, duplicated, oversized, changing, reset, or partial inputs produce a
+bounded unavailable artifact rather than a zero.
+When a retained cgroup snapshot source is missing or malformed, projection uses
+that exact unavailable form and the resource dimension remains
+`not_evaluated`. The recovery schedule has no unavailable schema: malformed
+captured schedule contents are not evaluated, while a missing schedule is an
+artifact-construction failure rather than an invented sample.
+
+Dedicated `cpu-measurement-baseline` and `cpu-measurement-end` directories
+bound cumulative cgroup-v2 `usage_usec`, `user_usec`, and `system_usec` for OBI
+and Java. The parser accepts the kernel's independent microsecond rounding only
+when `user_usec + system_usec <= usage_usec <= user_usec + system_usec + 1`.
+The workload delta is end-pass minimum minus baseline-pass maximum, so capture
+overhead outside the interval cannot improve the candidate. For
+`getsockopt-hit`, `unix-hit`, and `getsockopt-w3c`, schema-v3 `poc-gates.json`
+compares OBI, Java-backend, and their checked exact sum per sealed successful
+request against `bridge-disabled`. The 10% equality uses unsigned decimal
+cross multiplication rather than floating-point division. `uninstrumented` has
+no OBI/agent baseline and helper-idle uses a different direct-Java workload, so
+both are explicitly excluded. These application-container counters do not
+collect or proxy primary BPF-program CPU.
+
+Absolute FD/task/RSS ceilings apply to each envelope maximum at
+`resources-before`, `cpu-measurement-baseline`, each `rep-01` through
+`rep-05` scheduled midpoint, `cpu-measurement-end`,
+`resources-after-load`, and both recovery snapshots. Recovery deltas subtract
+the `resources-before` envelope minimum from each recovery envelope maximum;
+both independently must fit the predeclared allowance.
+`recovery-schedule.json` binds the only two recovery samples to serial
+30-second idle intervals. Both wall and monotonic clocks must measure each
+sleep within the bounded 30-to-32-second window; rollback, a no-op/short sleep,
+reordering, overlap, or an intervening workload fails closed. For OBI, each
+metrics scrape is additionally bracketed by ownership receipts. Each receipt
+independently enumerates the exact `/fd` and `/fdinfo`
 filename rosters twice, requires both complete FD-to-`map_id`/`prog_id`
 readings to be byte-identical, and binds the resulting descriptor-numbered
 roster to the same container ID, host PID, PID start time, and cgroup digest as
@@ -773,7 +881,28 @@ content digests. The harness independently regenerates the exact `git-tree-v2`
 mode/blob/path manifest from the recorded Git tree and requires every retained
 runner manifest to match it byte-for-byte. The live checkout is rechecked for
 revision/index/worktree/untracked-file drift both when this artifact is created
-and before a successful summary is published.
+and before a successful summary is published. Terminal publication performs
+that second check inside the native source transaction with an authenticated
+Git executable, empty stdin, bounded combined output, a clean fixed config
+environment, replacement objects disabled, optional locks disabled, hooks and
+external diff disabled, and forced `trustctime`, default `checkStat`, file-mode,
+and symlink semantics. It authenticates the recorded commit and every tree
+object by recomputing their Git SHA-1 object IDs, requires the flattened tree to
+equal the NUL-safe stage OID/mode/path roster, and rejects gitlinks. It then
+hashes every tracked regular file and symlink directly through an
+`O_NOFOLLOW` descriptor using the Git blob framing and requires its mode, path,
+and blob ID to equal that authenticated tree. Two complete raw passes must have
+identical HEAD/tree, local-config, stage, index-flag, tracked-content, and
+filesystem-roster transcripts. Local config enabling
+`extensions.worktreeConfig` is rejected case-insensitively, so a separate
+worktree config cannot introduce filter, include, or core overrides outside
+that transcript. The fixed checkout bounds are 16 MiB of Git
+output, 16,384 tracked/filesystem entries, 96 MiB per tracked leaf, and 256 MiB
+of aggregate tracked bytes. Ignored contents are not source inputs, but the
+exact ignored names and node types observed at admission are retained in the
+full non-`.git` namespace roster; a new ignored or nonignored path, a type
+change, or ignore-roster drift fails the terminal check. This preserves the
+declared ignored-file behavior without allowing ignored namespace growth.
 A clean preflight runs from a sealed source snapshot that is removed when the
 runner exits with its scoped stack still active. Before starting any sustained
 client, the harness therefore reads only the public CA certificate from the
@@ -784,14 +913,152 @@ matches its SHA-256 certificate fingerprint to the preflight's retained
 `certificates.json`. The read-only public certificate resides in the private
 per-cell artifact directory and is the only file mounted into the
 least-privileged benchmark client; no private key or PKCS#12 keystore is copied.
-A snapshot labelled `unsynchronized_midpoint` is a point sample while the load
-command is still running; it is not proof that traffic was live throughout the
-sample. The manifest includes a shell-escaped invocation for reproduction. On a
+A snapshot labelled `scheduled_repetition_midpoint` begins at integer
+`floor(duration_seconds/2)` seconds after the bound client launch and is
+accepted only if that exact process identity is live both before and after
+collection. The private transaction binds cell, repetition, duration, result
+path, benchmark PID/start identity, parent and publication directory
+device/inode/owner/group/mode, and measured wall/monotonic launch, sleep, and
+capture timestamps. The validator retains an exact sorted four- or six-leaf
+publication roster with each held file's device/inode metadata, byte cap, exact
+size, and SHA-256. One isolated helper opens the creation-bound parent and
+partial directory with `O_DIRECTORY|O_NOFOLLOW`, enumerates the bounded roster
+with `getdents64`, and opens every leaf relative to that descriptor without
+following symlinks. It rechecks the exact regular owner-only leaf identities
+and digests, calls `renameat2(RENAME_NOREPLACE)`, then requires the final name
+to resolve to that same directory inode and rechecks every final leaf through
+held descriptors. The helper's successful return is the sole midpoint
+publication linearization point; there is no Bash pathname validation-to-rename
+window. Failure or EXIT removes only the exact non-symlink allowlisted files
+from the still-bound partial directory and refuses a replacement parent,
+directory, or child. A concurrently created foreign final name is never
+replaced or removed, while cleanup may still remove the exact producer-owned
+partial. An unavailable midpoint receipt is likewise rendered and validated as
+one held canonical byte image, cleans only that authenticated partial, and then
+uses `O_TMPFILE` plus `linkat(AT_EMPTY_PATH)` against the creation-bound parent
+to publish to an absent `.json` name. A foreign regular file, symlink, or
+directory appearing in that final gap makes publication fail and remains
+untouched. Every midpoint omits Java
+diagnostics, Docker queries, and OBI metrics, so it contributes zero in-window
+OBI scrapes and cannot inject application work into the CPU/JFR window. Early
+exit retains a bounded unavailable receipt, and any unavailable one of the
+required five midpoint snapshots makes the process-tree gate not evaluated.
+This proves liveness at the two collection checks, not continuous traffic
+throughout collection. Manifest, boundary, midpoint, recovery, and PoC JSON are
+read once from one `O_RDONLY|O_NOFOLLOW` descriptor into an exact
+length-framed, NUL-free, byte-capped held image. Duplicate-path counting, typed
+validation, cross-file projections, and gate arithmetic consume that held byte
+image rather than reopening the lexical source, and exactly one top-level JSON
+document is required. `poc-gates.json` also binds the exact schema-v4 manifest
+gate declaration by digest. The manifest includes a shell-escaped invocation
+for reproduction. On a
 successful full harness run, `variance.json` records every requested completed
 sustained-client repetition separately for each core cell; it preserves the
 ordinal source paths rather than combining cells, warmups, sentinels, midpoint
 samples, or individual requests. `summary.json` links that artifact only when
 it is available.
+
+Terminal JSON publication is one descriptor-held, publish-once transaction.
+The harness first pins the private output and repository root directories, then
+feeds every source decision used by the terminal PoC, manifest, or summary to
+one trusted helper over an anonymous length-framed channel. An `S` record binds
+one regular leaf's descriptor identity, byte cap, exact size, and SHA-256; a
+`D` record binds an exact bounded directory selection; a `T` record replaces a
+fully checked Java measurement tree with an independently rederived 93-entry
+authority; a distinct `G` record binds the clean application checkout's root
+identity, revision, Git tree, exact retained `git-tree-v2` manifest SHA-256,
+authenticated commit/tree topology and expected blob IDs, raw worktree blob
+hashes, local-config, NUL-safe stage/index-flag rosters, and exact ignored/full
+namespace rosters. It does not claim to authenticate the physical loose or
+packed storage of blob objects in the Git object database;
+and an `N` record binds an absent, nonregular, empty, or oversized
+optional leaf. For an absent leaf, `N` also binds the exact first missing path
+component and every existing descriptor-walked prefix, so creating, removing,
+or swapping an intermediate directory invalidates the frozen authority. The
+fixed limits are 640 retained leaves, 128 directories,
+eight trees, one checkout, 128 negative states, 128 directory selectors, 4096 records, a
+4-MiB serialized roster, and 896 simultaneously held source descriptors.
+Each of the six Java trees compacts 81 regular-file descriptors into one held
+tree descriptor while preserving the exact 81-file/12-directory manifest. The
+single `G` checkout authority is cross-bound to every retained runner
+`source-tree.manifest`, `application-source-identity.json`, and the terminal
+summary by that exact manifest SHA-256.
+
+The recorded coprocess PID is the native Perl authority itself, not an
+intermediate Bash wrapper: the coprocess performs the same POSIX-special
+`exec -c` transition into the authenticated environment and Perl executable.
+Its bounded signal handlers kill and synchronously reap an active authenticated
+Git child before the Perl authority exits, so TERM, ALRM, malformed protocol,
+and missing acknowledgement paths cannot leave a Git child or protocol pipe
+owned by an untracked wrapper. HUP, INT, TERM, ALRM, and QUIT are masked before
+the helper installs its handlers, then that exact set is explicitly unblocked
+before the session deadline or any source read. This normalizes an inherited
+blocked handled signal while preserving every unrelated inherited mask bit.
+HUP, INT, TERM, ALRM, and QUIT are also masked before each Git fork; the child
+restores the normalized prior mask immediately before `exec`, while the parent
+records the child PID before restoring it. The same
+set remains masked only for each `waitpid(WNOHANG)` result and clearing that
+PID. A still-live or stopped child is polled again after a bounded 10-ms
+interval with ALRM deliverable, so the session deadline can always kill and
+synchronously reap it. This closes the pre-registration, post-wait stale-PID,
+and stopped-after-EOF liveness windows.
+
+Both terminal PoC regenerations consume the already-held in-progress manifest
+value; they never select a lexical manifest again. If a PoC byte image was
+created earlier, every terminal regeneration must succeed against the current
+recorded sources and equal that exact held image. A mismatch is fatal for both
+passed and failed completion and links no terminal leaf. Only a failed run that
+genuinely had no earlier PoC value may publish the honest no-PoC form, deriving
+its cell roster from recorded current status leaves and retaining an exact
+`not_available` PoC receipt with null application-resource projections. Passed
+completion always requires the full held PoC.
+
+`FREEZE` closes source admission, coherently reopens and rechecks the complete
+source authority through pinned descriptors, and returns one canonical roster.
+That exact roster is embedded in `summary.json` and cross-linked by
+`source_authority_receipt` count, directory count, size, and SHA-256. After
+`FREEZE`, candidate construction and validation use only held values; no live
+source path is reopened. The same trusted helper validates the exact canonical
+PoC, terminal-manifest, and summary candidate bytes and their cross-bindings,
+creates private anonymous `O_TMPFILE` candidates, rechecks the frozen source
+roster, and enters a bounded commit lease. It links `poc-gates.json` when
+present, then `manifest.json`, reopens and verifies those published inodes (or
+rechecks PoC absence), and verifies the held summary candidate and output root.
+The helper then emits one exact anonymous-channel `M:LINKED` record and requires
+the immediate exact `M:CONTINUE` acknowledgement under the same commit deadline.
+Only after that acknowledgement does it run one final complete source-authority
+sweep; the immediately following operation links `summary.json` as the final
+filesystem syscall before the helper immediately exits. A missing or malformed
+acknowledgement cannot publish the completion marker and leaves earlier exact
+links untouched for diagnosis. Thus `summary.json` is the sole completion
+marker; there is deliberately no fallible post-marker validation or cleanup.
+
+The output directory is owner-private and requires a sole terminal writer. The
+transaction provides atomic name visibility, not crash durability: it does not
+claim an `fsync` barrier, and a failure after an earlier link but before the
+summary marker may leave truthful partial residue. Such residue is preserved,
+never retried, replaced, or cleaned through an ambiguous pathname. A foreign
+precreated leaf, absent-target race, signal, timeout, or later-link failure
+therefore fails closed without clobbering an unknown inode. The held
+parent-directory descriptor pins device, inode, mode, owner, and group across
+every link, and each linked result must be the same inode as its anonymous
+candidate. This is a stronger absent-name primitive than a named `O_EXCL`
+candidate: no candidate pathname exists. `summary.json` has a closed
+`artifact_receipts` roster for terminal manifest and PoC. The PoC receipt is
+always the exact object `{status,path,size_bytes,sha256}`: `available` binds the
+fixed relative path, exact byte size, and SHA-256, while an early failed run may
+use `not_available` with three null value fields only when no `poc-gates.json`
+leaf exists. That unavailable receipt also requires the summary's PoC link and
+all four application-resource gate projections to be exactly
+`not_available`/null; it cannot accompany inferred partial PoC data. A passed
+completion requires the full available PoC receipt.
+Later consumers validate the published summary, manifest, PoC, embedded source
+authority, and exact receipts as the completed point-in-time snapshot; they do
+not reopen mutable workload sources forever. Arbitrary same-UID mutation after
+a successful return cannot be prevented for ordinary retained files without
+filesystem verity or stronger privilege, but a fresh terminal-receipt check
+detects changed published bytes. Such post-return mutation is outside the
+point-in-time publication guarantee.
 
 For every retained per-repetition value, `variance.json` reports the observed
 minimum, numeric median, and maximum. The fixed five-value median is the middle

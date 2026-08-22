@@ -65,7 +65,7 @@ silently to Unix.
 | malformed/zero trace or span ID | discarded; Java request remains healthy | pass | pass | [retained primary zero-ID controls and recovery](evidence/otel-getsockopt-tls13-e8db066a/README.md#retained-proof) and [Unix zero-ID fault graphs](evidence/otel-unix-tls12-bd1c9327/README.md#retained-proof) |
 | stale entry past TTL | miss; never a parent | pass | pass | [retained primary `1ns` TTL, W3C precedence, and recovery](evidence/otel-getsockopt-tls13-e8db066a/scenario-primary-w3c-stale.json) and [retained Unix `1ns` stale rejection, W3C precedence, and recovery](evidence/otel-unix-tls13-6c4a2505/unix-w3c-stale.json) |
 | explicit stale-generation mismatch | miss; never a parent; valid W3C still wins | untested | untested | restart and TTL-stale controls do not inject a mismatched generation |
-| live handoff-map capacity rejection | the non-evicting map rejects excess admission without evicting any admitted ticket; exact hits, explicit roots, and actual upstream/retrieval reason counts reconcile by transport; zero wrong or unresolved parents; exact-key cleanup and steady-baseline recovery | untested | untested | the retained summaries cover the superseded LRU-eviction design; a fresh HASH-capacity run is required |
+| live handoff-map capacity rejection | pressure contract 2 fills the non-evicting `HASH` exactly, rejects one extra key with kernel `E2BIG`, preserves the exact ordered-content digest through traffic, and keeps the extra absent; one deterministic W3C parent, at least one explicit root, `H+R+W=N`, bridge/Java conservation, zero wrong or unresolved parents, exact-key cleanup, and steady-baseline recovery are all required | untested | untested | the retained summaries cover the superseded LRU-eviction design; a fresh HASH-capacity and `pressure-traffic-barrier-v2` run is required |
 | OBI absent at JVM start, followed by late attach | Java root span and healthy response while absent; exact-parent recovery after attach | pass | pass | [primary](evidence/otel-getsockopt-tls13-e8db066a/scenario-fail-open-obi-absent.json) and [Unix](evidence/otel-unix-tls12-bd1c9327/scenario-fail-open-obi-absent.json) bounded startup-absence graphs plus their late-attach recovery scenarios |
 | OBI permanently absent for the JVM lifetime | ordinary Java-agent behavior remains healthy for the full process lifetime | untested | untested | retained late-attach sequences do not establish permanent process-lifetime absence |
 | OBI stop/restart during traffic | no wrong parent while absent; recovery only if claimed | pass | pass | [primary](evidence/otel-getsockopt-tls13-e8db066a/scenario-restart-fault.json) and [Unix](evidence/otel-unix-tls12-bd1c9327/scenario-restart-fault.json) restart traffic; this row does not claim a primary descriptor survived into a new OBI generation |
@@ -138,17 +138,22 @@ transport and remains untouched.
   for map selection and cleanup authorization. Require an empty baseline,
   exactly `max_entries` tagged `OPEN` values, one extra key rejected specifically
   by the kernel's `E2BIG` capacity result, and a deterministic ordered key/value
-  SHA-256. Start the marked scenario behind a
-  private ready barrier, publish its release only after the fill proof, then
+  SHA-256. Start the marked scenario behind the private
+  `pressure-traffic-barrier-v2`, make request zero carry one deterministic valid
+  W3C parent, publish the release only after the fill proof, then
   scan all entries after traffic and require the same digest, exact full count,
   and still-absent extra key. Independently require positive bounded
   `handoff_admission/overload` and zero `handoff_admission/ambiguous`; do not add
   this auxiliary signal to upstream or retrieval conservation. Remove only the
   deterministic synthetic keys, verify every one plus the rejected key is
   absent, then retain two consecutive at-or-below-baseline samples within a
-  bounded TTL-aware recovery deadline. Classify every nonzero Java parent as an
-  exact hit and only a true Java root as an explicit root, then reconcile those
-  outcomes with the actual bridge upstream/retrieval reasons and Java counts.
+  bounded TTL-aware recovery deadline. Classify the remaining requests as exact
+  OBI hits or true Java roots and require `H+R+W=N`, `W=1`, `R>=1`, and zero
+  wrong or unresolved parents. For bridge valid retrievals `V`, attributable
+  failures `F`, and W3C-masked valid candidates `M`, require
+  `H<=V<=H+W`, `R<=F<=R+W`, `V+F=N`, `M=V-H`, and `M+F-R=W`. Java diagnostics
+  must bind `take_valid=take_sampled=V`, `take_unsampled=0`,
+  `discard_standard=M`, `attributable_absence=F`, and one diagnostic self-miss.
   Promote canonical cleanup evidence only after that recovery gate passes.
   Retain the scenario's exact running and successful terminal Docker
   inspections as one canonical owner-only `0600` raw artifact. Require its
@@ -156,7 +161,9 @@ transport and remains untouched.
   transition, and bind its exact filename, SHA-256, and byte size in both the
   barrier and scenario status. Evidence never records that inspection, its
   container identifiers, the incarnation capability, or the private barrier
-  session in the normalized observation or public claim projection.
+  session in the normalized observation or seven-file public claims-v2
+  projection. The private raw-v3 source contract and barrier are authenticated
+  before projection; the public bundle carries bounded derived claims only.
 - Restart only the `obi` service and preserve old descriptors long enough to
   test stale endpoint behavior.
 - Run `fd-port-reuse` to reuse one client ephemeral port across reconnects,
@@ -202,9 +209,9 @@ or credential topology; do not mark it pass.
   key is absent. The retained real JVM identity still binds map selection and
   cleanup authority. The separate private scenario-container inspection is
   mode `0600`, single-link, canonical, size-bounded, and descriptor-bound to the
-  barrier and scenario status; projected lookup summaries and public claims
-  must not disclose its name, session, control-mount leaf, or container/image
-  identity.
+  contract-v2 barrier and scenario status; projected lookup summaries and
+  public claims-v2 must not disclose its name, session, control-mount leaf, or
+  container/image identity.
 - The Unix fault responder is an acceptance-only, single-request-at-a-time
   service with named stale/malformed, timeout, disconnect, overload,
   truncation, envelope, version, and zero-ID modes. It uses strict request ABI

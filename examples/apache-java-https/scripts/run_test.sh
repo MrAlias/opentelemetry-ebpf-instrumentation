@@ -9788,6 +9788,8 @@ test_pressure_barrier_binds_container_inspection_descriptor() {
     local -r barrier="$directory/map-pressure-pressure-barrier-status.json"
     local descriptor=""
     local container_descriptor=""
+    local mutated="$directory/scenario-pressure-status-mutated.json"
+    local mutation=""
     local -i admission_maximum=0
 
     pressure_test_prepare_scenario_inspection_state \
@@ -9808,7 +9810,19 @@ test_pressure_barrier_binds_container_inspection_descriptor() {
     chmod 0644 -- \
       "$RESULT_DIR/map-pressure-pressure-fill.json" \
       "$RESULT_DIR/map-pressure-pressure-verify.json"
-    printf '{"request_count":2}\n' >"$result"
+    cat >"$result" <<'EOF'
+{
+  "request_count": 2,
+  "pressure_correlation": {
+    "request_count": 2,
+    "exact_hit_count": 0,
+    "explicit_root_count": 1,
+    "w3c_parent_count": 1,
+    "wrong_parent_count": 0,
+    "unresolved_count": 0
+  }
+}
+EOF
     admission_maximum="$(pressure_admission_max_events 2)"
     jq -cS -n \
       --argjson inspections "$descriptor" \
@@ -9817,17 +9831,31 @@ test_pressure_barrier_binds_container_inspection_descriptor() {
           pressure_correlation: {
             barrier_reference: "map-pressure-pressure-barrier-status.json",
             bridge: {
+              attributable_failure_count: 1,
               handoff_admission_outcome_counts: {
                 ambiguous: 0,
                 maximum: $admission_maximum,
                 overload: 1
-              }
+              },
+              retrieval_valid_count: 1,
+              transport: "getsockopt",
+              w3c_masked_valid_count: 1
             },
             container_inspections: $inspections,
+            java_reconciliation_target: {
+              attributable_absence_count: 1,
+              diagnostic_self_miss_count: 1,
+              discard_standard_count: 1,
+              take_sampled_count: 1,
+              take_unsampled_count: 0,
+              take_valid_count: 1
+            },
             trace: {
-              exact_hit_count: 1,
+              exact_hit_count: 0,
               explicit_root_count: 1,
+              request_count: 2,
               unresolved_count: 0,
+              w3c_parent_count: 1,
               wrong_parent_count: 0
             }
           },
@@ -9852,6 +9880,32 @@ test_pressure_barrier_binds_container_inspection_descriptor() {
     PRESSURE_TOKEN_BASE=700
     PRESSURE_VERIFY_STATUS=passed
     PRESSURE_BARRIER_RUNTIME_STATUS=retained
+    SELECTED_TRANSPORT=getsockopt
+
+    pressure_w3c_status_crosslinks_are_exact \
+      "$scenario_status" pressure getsockopt 2 "$descriptor" "$deadline"
+    for mutation in \
+      '.pressure_correlation.barrier_reference = "wrong"' \
+      '.pressure_correlation.container_inspections = {}' \
+      '.pressure_correlation.trace.w3c_parent_count = 0' \
+      '.pressure_correlation.trace.explicit_root_count = 0' \
+      '.pressure_correlation.trace.request_count = 3' \
+      '.pressure_correlation.trace.extra = 0' \
+      'del(.pressure_correlation.trace.w3c_parent_count)' \
+      '.pressure_correlation.bridge.retrieval_valid_count = 2' \
+      '.pressure_correlation.bridge.attributable_failure_count = 2' \
+      '.pressure_correlation.bridge.w3c_masked_valid_count = 0' \
+      '.pressure_correlation.java_reconciliation_target.take_sampled_count = 0' \
+      '.pressure_correlation.java_reconciliation_target.discard_standard_count = 0'; do
+      jq "$mutation" "$scenario_status" >"$mutated"
+      if pressure_w3c_status_crosslinks_are_exact \
+        "$mutated" pressure getsockopt 2 "$descriptor" "$deadline" \
+        >/dev/null 2>&1; then
+        printf 'pressure v2 status accepted broken crosslink: %s\n' \
+          "$mutation" >&2
+        return 1
+      fi
+    done
 
     finalize_pressure_barrier_status pressure "$result" "$scenario_status"
     [[ "$PRESSURE_BARRIER_RUNTIME_STATUS" == finalized &&
@@ -9860,14 +9914,29 @@ test_pressure_barrier_binds_container_inspection_descriptor() {
     jq -e \
       --argjson descriptor "$descriptor" \
       --argjson container "$container_descriptor" '
-        .schema == "pressure-traffic-barrier-v1" and
+        .schema == "pressure-traffic-barrier-v2" and
         .status == "passed" and
         .container_inspections == $descriptor and
         .container == $container and
         .container_inspections.reference ==
           "map-pressure-pressure-container-inspections.json" and
         (.container_inspections.sha256 | test("^[0-9a-f]{64}$")) and
-        .container_inspections.size_bytes >= 1
+        .container_inspections.size_bytes >= 1 and
+        .traffic.request_count == 2 and
+        .traffic.exact_hit_count == 0 and
+        .traffic.explicit_root_count == 1 and
+        .traffic.w3c_parent_count == 1 and
+        .traffic.retrieval_valid_count == 1 and
+        .traffic.attributable_failure_count == 1 and
+        .traffic.w3c_masked_valid_count == 1 and
+        .traffic.java_reconciliation_target == {
+          attributable_absence_count:1,
+          diagnostic_self_miss_count:1,
+          discard_standard_count:1,
+          take_sampled_count:1,
+          take_unsampled_count:0,
+          take_valid_count:1
+        }
       ' "$barrier" >/dev/null
     pressure_transaction_state_is_empty
     pressure_test_teardown_runtime "$deadline"
@@ -12785,6 +12854,8 @@ test_bridge_take_count_includes_cancelled_request() {
 
 test_pressure_scenario_counts_are_unique_and_bounded() {
   local result=""
+  local request_count_mutated=""
+  local w3c_mutated=""
   local -r deadline="$((SECONDS + 60))"
 
   pressure_test_reset_lifecycle_state
@@ -12794,18 +12865,25 @@ test_pressure_scenario_counts_are_unique_and_bounded() {
 
   cat >"$result" <<'EOF'
 {
+  "request_count": 128,
   "pressure_correlation": {
-    "exact_hit_count": 127,
+    "request_count": 128,
+    "exact_hit_count": 126,
     "explicit_root_count": 1,
+    "w3c_parent_count": 1,
     "wrong_parent_count": 0,
     "unresolved_count": 0
   }
 }
 EOF
   [[ "$(pressure_scenario_count \
-      "$result" exact_hit_count 128 "$deadline")" == "127" &&
+      "$result" request_count 128 "$deadline")" == "128" &&
+    "$(pressure_scenario_count \
+      "$result" exact_hit_count 128 "$deadline")" == "126" &&
     "$(pressure_scenario_count \
       "$result" explicit_root_count 128 "$deadline")" == "1" &&
+    "$(pressure_scenario_count \
+      "$result" w3c_parent_count 128 "$deadline")" == "1" &&
     "$(pressure_scenario_count \
       "$result" wrong_parent_count 128 "$deadline")" == "0" &&
     "$(pressure_scenario_count \
@@ -12813,6 +12891,51 @@ EOF
     printf 'pressure scenario result counts were not parsed exactly\n' >&2
     return 1
   }
+  request_count_mutated="$RESULT_DIR/pressure-scenario-request-count-mutated.json"
+  sed '/^    "request_count":/d' "$result" >"$request_count_mutated"
+  if pressure_scenario_count \
+    "$request_count_mutated" request_count 128 "$deadline" \
+    >/dev/null 2>&1; then
+    printf 'pressure scenario result accepted a missing correlation request count\n' >&2
+    return 1
+  fi
+  sed 's/^    "request_count": 128/    "request_count": 127/' \
+    "$result" >"$request_count_mutated"
+  if pressure_scenario_count \
+    "$request_count_mutated" request_count 128 "$deadline" \
+    >/dev/null 2>&1; then
+    printf 'pressure scenario result accepted unequal request counts\n' >&2
+    return 1
+  fi
+  sed '/^    "request_count":/a\    "request_count": 128,' \
+    "$result" >"$request_count_mutated"
+  if pressure_scenario_count \
+    "$request_count_mutated" request_count 128 "$deadline" \
+    >/dev/null 2>&1; then
+    printf 'pressure scenario result accepted a duplicate correlation request count\n' >&2
+    return 1
+  fi
+  w3c_mutated="$RESULT_DIR/pressure-scenario-w3c-mutated.json"
+  sed '/"w3c_parent_count":/d' "$result" >"$w3c_mutated"
+  if pressure_scenario_count \
+    "$w3c_mutated" w3c_parent_count 128 "$deadline" >/dev/null 2>&1; then
+    printf 'pressure scenario result accepted a missing W3C count\n' >&2
+    return 1
+  fi
+  sed 's/"w3c_parent_count": 1/"w3c_parent_count": "1"/' \
+    "$result" >"$w3c_mutated"
+  if pressure_scenario_count \
+    "$w3c_mutated" w3c_parent_count 128 "$deadline" >/dev/null 2>&1; then
+    printf 'pressure scenario result accepted a nonnumeric W3C count\n' >&2
+    return 1
+  fi
+  { sed '/"w3c_parent_count":/a\    "w3c_parent_count": 1,' "$result"; } \
+    >"$w3c_mutated"
+  if pressure_scenario_count \
+    "$w3c_mutated" w3c_parent_count 128 "$deadline" >/dev/null 2>&1; then
+    printf 'pressure scenario result accepted a duplicate W3C count\n' >&2
+    return 1
+  fi
   if pressure_scenario_count \
     "$result" absent_count 128 "$deadline" >/dev/null 2>&1; then
     printf 'pressure scenario result accepted a missing count\n' >&2
@@ -13704,6 +13827,208 @@ EOF
   if pressure_bridge_reconciliation \
     "$unix_delta" unix 1 1 2 >/dev/null 2>&1; then
     printf 'pressure bridge accepted BPF handoffs for Unix retrieval\n' >&2
+    return 1
+  fi
+}
+
+write_pressure_w3c_bridge_delta_fixture() {
+  local -r output="$1"
+  local -r transport="$2"
+  local -r valid="$3"
+  local -r failures="$4"
+  local -r handoffs="$5"
+  local -r admission_overload="${6:-1}"
+
+  [[ ( "$transport" == getsockopt || "$transport" == unix ) &&
+    "$valid" =~ ^(0|[1-9][0-9]*)$ &&
+    "$failures" =~ ^(0|[1-9][0-9]*)$ &&
+    "$handoffs" =~ ^(0|[1-9][0-9]*)$ &&
+    "$admission_overload" =~ ^[1-9][0-9]*$ ]] || return 1
+  {
+    printf 'obi_java_remote_parent_operations_total{operation="inject",status="valid",transport="tcp"} before=0 after=%d delta=%d\n' \
+      "$valid" "$valid"
+    printf 'obi_java_remote_parent_operations_total{operation="inject",status="overload",transport="tcp"} before=0 after=%d delta=%d\n' \
+      "$failures" "$failures"
+    printf 'obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} before=0 after=%d delta=%d\n' \
+      "$valid" "$valid"
+    printf 'obi_java_remote_parent_operations_total{operation="stage",status="valid",transport="tcp"} before=0 after=%d delta=%d\n' \
+      "$valid" "$valid"
+    printf 'obi_java_remote_parent_operations_total{operation="take",status="valid",transport="%s"} before=0 after=%d delta=%d\n' \
+      "$transport" "$valid" "$valid"
+    if [[ "$transport" == unix ]]; then
+      printf 'obi_java_remote_parent_operations_total{operation="take",status="already_consumed",transport="unix"} before=0 after=%d delta=%d\n' \
+        "$failures" "$failures"
+    fi
+    if ((handoffs > 0)); then
+      printf 'obi_java_remote_parent_operations_total{operation="handoff",status="valid",transport="tcp"} before=0 after=%d delta=%d\n' \
+        "$handoffs" "$handoffs"
+    fi
+    printf 'obi_java_remote_parent_operations_total{operation="handoff_admission",status="overload",transport="tcp"} before=0 after=%d delta=%d\n' \
+      "$admission_overload" "$admission_overload"
+    printf '%s\n' \
+      'obi_java_remote_parent_operations_total{operation="handoff_admission",status="ambiguous",transport="tcp"} before=0 after=0 delta=0'
+  } >"$output"
+}
+
+test_pressure_w3c_bridge_reconciliation_is_algebraically_exact() {
+  local -r delta="$TEST_TMP_DIR/pressure-w3c-bridge.delta"
+  local -r mutated="$TEST_TMP_DIR/pressure-w3c-bridge-mutated.delta"
+  local transport=""
+  local masked=""
+  local valid=""
+  local failures=""
+  local handoffs=""
+  local reconciliation=""
+
+  for transport in getsockopt unix; do
+    for masked in 0 1; do
+      valid="$((2 + masked))"
+      failures="$((2 - masked))"
+      handoffs=0
+      [[ "$transport" == unix ]] || handoffs="$valid"
+      write_pressure_w3c_bridge_delta_fixture \
+        "$delta" "$transport" "$valid" "$failures" "$handoffs"
+      reconciliation="$(pressure_w3c_bridge_reconciliation \
+        "$delta" "$transport" 2 1 1 4)" || {
+        printf 'W3C pressure bridge rejected transport=%s masked=%s\n' \
+          "$transport" "$masked" >&2
+        return 1
+      }
+      jq -e \
+        --arg transport "$transport" \
+        --argjson valid "$valid" \
+        --argjson failures "$failures" \
+        --argjson masked "$masked" \
+        --argjson handoffs "$handoffs" '
+          .transport == $transport and
+          .retrieval_valid_count == $valid and
+          .attributable_failure_count == $failures and
+          .w3c_masked_valid_count == $masked and
+          .auxiliary_outcome_counts.handoff == $handoffs and
+          .handoff_admission_outcome_counts == {
+            overload:1,ambiguous:0,maximum:36
+          }
+        ' <<<"$reconciliation" >/dev/null || return 1
+    done
+  done
+
+  # The positional benchmark-cycle wrapper and its v1 JSON shape are
+  # unchanged: the same metrics are exact V=3/R=1/N=4 evidence when W=0.
+  write_pressure_w3c_bridge_delta_fixture \
+    "$delta" getsockopt 3 1 3
+  reconciliation="$(pressure_bridge_reconciliation \
+    "$delta" getsockopt 3 1 4)" || {
+    printf 'legacy benchmark pressure wrapper rejected its v1 shape\n' >&2
+    return 1
+  }
+  jq -e '
+    .retrieval_valid_count == 3 and
+    .upstream_failure_count == 1 and .retrieval_failure_count == 0 and
+    (has("attributable_failure_count") | not) and
+    (has("w3c_masked_valid_count") | not)
+  ' <<<"$reconciliation" >/dev/null || {
+    printf 'legacy benchmark pressure wrapper changed its JSON contract\n' >&2
+    return 1
+  }
+
+  # Wrapper bounds and H+R+W=N are rejected before metric evidence can be
+  # accepted.
+  if pressure_w3c_bridge_reconciliation \
+      "$delta" bogus 2 1 1 4 >/dev/null 2>&1 ||
+    pressure_w3c_bridge_reconciliation \
+      "$delta" getsockopt x 1 1 4 >/dev/null 2>&1 ||
+    pressure_w3c_bridge_reconciliation \
+      "$delta" getsockopt 2 0 1 3 >/dev/null 2>&1 ||
+    pressure_w3c_bridge_reconciliation \
+      "$delta" getsockopt 2 1 0 3 >/dev/null 2>&1 ||
+    pressure_w3c_bridge_reconciliation \
+      "$delta" getsockopt 2 1 2 5 >/dev/null 2>&1 ||
+    pressure_w3c_bridge_reconciliation \
+      "$delta" getsockopt 2 1 1 5 >/dev/null 2>&1 ||
+    pressure_w3c_bridge_reconciliation \
+      "$delta" getsockopt 2 1 1 4 36 extra >/dev/null 2>&1; then
+    printf 'W3C pressure bridge accepted invalid bounds or H+R+W algebra\n' >&2
+    return 1
+  fi
+
+  # V below H/F above R+W and V above H+W/F below R are both rejected.
+  write_pressure_w3c_bridge_delta_fixture "$mutated" getsockopt 2 3 0
+  if pressure_w3c_bridge_reconciliation \
+    "$mutated" getsockopt 3 1 1 5 >/dev/null 2>&1; then
+    printf 'W3C pressure bridge accepted V<H or F>R+W\n' >&2
+    return 1
+  fi
+  write_pressure_w3c_bridge_delta_fixture "$mutated" getsockopt 4 1 0
+  if pressure_w3c_bridge_reconciliation \
+    "$mutated" getsockopt 2 2 1 5 >/dev/null 2>&1; then
+    printf 'W3C pressure bridge accepted V>H+W or F<R\n' >&2
+    return 1
+  fi
+
+  # V+F=N and D+(F-R)=W are mandatory, and a handoff remains bounded by V.
+  write_pressure_w3c_bridge_delta_fixture "$mutated" getsockopt 3 2 0
+  if pressure_w3c_bridge_reconciliation \
+    "$mutated" getsockopt 2 1 1 4 >/dev/null 2>&1; then
+    printf 'W3C pressure bridge accepted V+F!=N\n' >&2
+    return 1
+  fi
+  write_pressure_w3c_bridge_delta_fixture "$mutated" getsockopt 3 1 4
+  if pressure_w3c_bridge_reconciliation \
+    "$mutated" getsockopt 2 1 1 4 >/dev/null 2>&1; then
+    printf 'W3C pressure bridge accepted handoff>V\n' >&2
+    return 1
+  fi
+
+  # Admission pressure is independent evidence.  A larger positive BPF
+  # overload count cannot manufacture a W3C masked-valid outcome.
+  write_pressure_w3c_bridge_delta_fixture "$mutated" getsockopt 2 2 0 5
+  reconciliation="$(pressure_w3c_bridge_reconciliation \
+    "$mutated" getsockopt 2 1 1 4)" || return $?
+  jq -e '
+    .handoff_admission_outcome_counts.overload == 5 and
+    .w3c_masked_valid_count == 0 and .attributable_failure_count == 2
+  ' <<<"$reconciliation" >/dev/null
+}
+
+test_pressure_w3c_java_targets_are_exact() {
+  local -r before="$TEST_TMP_DIR/pressure-w3c-java-before.txt"
+  local -r after="$TEST_TMP_DIR/pressure-w3c-java-after.txt"
+  local -r delta="$TEST_TMP_DIR/pressure-w3c-java.delta"
+
+  write_diagnostics_fixture "$before" 0 0 0 0 0 0
+
+  # getsockopt: the attributable failures may be split between missing and
+  # the existing at-most-one already-consumed outcome.
+  write_diagnostics_fixture "$after" 3 0 0 3 0 1
+  sed -i 's/,t_missing=0/,t_missing=1/' "$after"
+  sed -i 's/,t_already_consumed=0/,t_already_consumed=1/' "$after"
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  assert_java_diagnostics_delta "$delta" 3 0 0 2 3 0 1 || return $?
+
+  write_diagnostics_fixture "$after" 2 0 0 2 0 0
+  sed -i 's/,t_missing=0/,t_missing=3/' "$after"
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  assert_java_diagnostics_delta "$delta" 2 0 0 3 2 0 0 || return $?
+
+  # Unix has the exact self-probe miss plus F already-consumed takes.
+  write_diagnostics_fixture "$after" 3 0 0 3 0 1 already_consumed 1
+  sed -i 's/,t_missing=0/,t_missing=1/' "$after"
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  assert_pressure_unix_already_consumed_diagnostics_delta \
+    "$delta" 3 1 3 0 1 1 || return $?
+
+  write_diagnostics_fixture "$after" 2 0 0 2 0 0 already_consumed 2
+  sed -i 's/,t_missing=0/,t_missing=1/' "$after"
+  write_java_diagnostics_delta "$before" "$after" "$delta"
+  assert_pressure_unix_already_consumed_diagnostics_delta \
+    "$delta" 2 1 2 0 0 2 || return $?
+
+  sed -i \
+    's/d_overload before=0 after=0 delta=0/d_overload before=0 after=1 delta=1/' \
+    "$delta"
+  if assert_pressure_unix_already_consumed_diagnostics_delta \
+    "$delta" 2 1 2 0 0 2 >/dev/null 2>&1; then
+    printf 'W3C pressure diagnostics attributed BPF admission overload to d_overload\n' >&2
     return 1
   fi
 }
@@ -18894,8 +19219,9 @@ test_pressure_scenario_reconciles_roots_with_bridge_and_java_counts() {
   "status": "passed",
   "request_count": 10,
   "pressure_correlation": {
-    "exact_hit_count": 7,
+    "exact_hit_count": 6,
     "explicit_root_count": 3,
+    "w3c_parent_count": 1,
     "wrong_parent_count": 0,
     "unresolved_count": 0
   }
@@ -18927,12 +19253,14 @@ EOF
     write_metrics_delta() {
       : >"$3"
     }
-    pressure_bridge_reconciliation() {
-      printf 'bridge:%s:%s:%s:%s\n' "$2" "$3" "$4" "$5" >>"$call_log"
-      [[ "$2" == "getsockopt" && "$3" == "7" && "$4" == "3" && "$5" == "10" ]] || \
+    pressure_w3c_bridge_reconciliation() {
+      printf 'bridge:%s:%s:%s:%s:%s\n' \
+        "$2" "$3" "$4" "$5" "$6" >>"$call_log"
+      [[ "$2" == "getsockopt" && "$3" == "6" && "$4" == "3" && \
+        "$5" == "1" && "$6" == "10" ]] || \
         return 1
       printf '%s\n' \
-        '{"transport":"getsockopt","retrieval_valid_count":7,"upstream_failure_count":3,"retrieval_failure_count":0,"upstream_failure_reason_counts":{"missing":0,"stale":0,"ambiguous":0,"malformed":0,"overload":3,"segmented":0},"retrieval_failure_reason_counts":{"missing":0,"stale":0,"unsupported":0,"malformed":0,"version_mismatch":0,"ambiguous":0,"unauthorized":0,"already_consumed":0,"timeout":0,"overload":0,"transport_error":0,"disabled":0}}'
+        '{"transport":"getsockopt","retrieval_valid_count":7,"attributable_failure_count":3,"w3c_masked_valid_count":1,"upstream_failure_count":3,"retrieval_failure_count":0,"upstream_failure_reason_counts":{"missing":0,"stale":0,"ambiguous":0,"malformed":0,"overload":3,"segmented":0},"retrieval_failure_reason_counts":{"missing":0,"stale":0,"unsupported":0,"malformed":0,"version_mismatch":0,"ambiguous":0,"unauthorized":0,"already_consumed":0,"timeout":0,"overload":0,"transport_error":0,"disabled":0}}'
     }
     write_java_diagnostics_delta() {
       : >"$3"
@@ -18941,12 +19269,12 @@ EOF
       printf 'java:%s:%s:%s:%s:%s:%s:%s\n' \
         "$2" "$3" "$4" "$5" "$6" "$7" "$8" >>"$call_log"
       [[ "$2" == "7" && "$3" == "0" && "$4" == "0" && "$5" == "4" &&
-        "$6" == "7" && "$7" == "0" && "$8" == "0" ]]
+        "$6" == "7" && "$7" == "0" && "$8" == "1" ]]
     }
 
     run_scenario pressure >/dev/null
     [[ "$PRESSURE_ACTIVE" == "false" ]]
-    [[ "$(<"$call_log")" == $'wait:0:0\nwait:7:7\nbridge:getsockopt:7:3:10\njava:7:0:0:4:7:0:0' ]]
+    [[ "$(<"$call_log")" == $'wait:0:0\nwait:6:6\nbridge:getsockopt:6:3:1:10\njava:7:0:0:4:7:0:1' ]]
   ) || {
     printf 'pressure scenario did not reconcile explicit roots across evidence layers\n' >&2
     return 1
@@ -18954,6 +19282,10 @@ EOF
   grep -Fq '"retrieval_valid_count":7' \
     "$result_dir/scenario-pressure-status.json" || return 1
   grep -Fq '"attributable_absence_count":3' \
+    "$result_dir/scenario-pressure-status.json" || return 1
+  grep -Fq '"w3c_parent_count":1' \
+    "$result_dir/scenario-pressure-status.json" || return 1
+  grep -Fq '"discard_standard_count":1' \
     "$result_dir/scenario-pressure-status.json" || return 1
 }
 
@@ -19006,8 +19338,9 @@ test_pressure_unix_scenario_uses_strict_already_consumed_reconciliation() {
   "status": "passed",
   "request_count": 128,
   "pressure_correlation": {
-    "exact_hit_count": 126,
+    "exact_hit_count": 125,
     "explicit_root_count": 2,
+    "w3c_parent_count": 1,
     "wrong_parent_count": 0,
     "unresolved_count": 0
   }
@@ -19035,15 +19368,17 @@ EOF
     obi_metric_pair_evidence_json_from_reference() { printf '{}\n'; }
     wait_for_bridge_metrics_quiescent() { :; }
     write_metrics_delta() { : >"$3"; }
-    pressure_bridge_reconciliation() {
-      printf '%s\n' '{"transport":"unix","retrieval_valid_count":126,"upstream_failure_count":2,"retrieval_failure_count":2,"upstream_failure_reason_counts":{"missing":0,"stale":0,"ambiguous":0,"malformed":0,"overload":2,"segmented":0},"retrieval_failure_reason_counts":{"missing":0,"stale":0,"unsupported":0,"malformed":0,"version_mismatch":0,"ambiguous":0,"unauthorized":0,"already_consumed":2,"timeout":0,"overload":0,"transport_error":0,"disabled":0}}'
+    pressure_w3c_bridge_reconciliation() {
+      [[ "$2" == unix && "$3" == 125 && "$4" == 2 &&
+        "$5" == 1 && "$6" == 128 ]] || return 1
+      printf '%s\n' '{"transport":"unix","retrieval_valid_count":125,"attributable_failure_count":3,"w3c_masked_valid_count":0,"upstream_failure_count":2,"retrieval_failure_count":3,"upstream_failure_reason_counts":{"missing":0,"stale":0,"ambiguous":0,"malformed":0,"overload":2,"segmented":0},"retrieval_failure_reason_counts":{"missing":0,"stale":0,"unsupported":0,"malformed":0,"version_mismatch":0,"ambiguous":0,"unauthorized":0,"already_consumed":3,"timeout":0,"overload":0,"transport_error":0,"disabled":0}}'
     }
     write_java_diagnostics_delta() { : >"$3"; }
     assert_pressure_unix_already_consumed_diagnostics_delta() {
       printf 'strict:%s:%s:%s:%s:%s:%s\n' \
         "$2" "$3" "$4" "$5" "$6" "$7" >>"$call_log"
-      [[ "$2" == "126" && "$3" == "1" && "$4" == "126" && \
-        "$5" == "0" && "$6" == "0" && "$7" == "2" ]]
+      [[ "$2" == "125" && "$3" == "1" && "$4" == "125" && \
+        "$5" == "0" && "$6" == "0" && "$7" == "3" ]]
     }
     assert_java_diagnostics_delta() {
       printf 'generic\n' >>"$call_log"
@@ -19056,7 +19391,7 @@ EOF
     printf 'Unix pressure scenario did not use strict already-consumed reconciliation\n' >&2
     return 1
   }
-  grep -Fqx 'strict:126:1:126:0:0:2' "$call_log"
+  grep -Fqx 'strict:125:1:125:0:0:3' "$call_log"
   if grep -Fqx 'generic' "$call_log"; then
     printf 'Unix pressure scenario used generic diagnostics instead of strict reconciliation\n' >&2
     return 1
@@ -19111,8 +19446,9 @@ test_pressure_failure_retains_wrong_parent_counts_and_cleans_up() {
   "status": "failed",
   "request_count": 10,
   "pressure_correlation": {
-    "exact_hit_count": 7,
+    "exact_hit_count": 6,
     "explicit_root_count": 2,
+    "w3c_parent_count": 1,
     "wrong_parent_count": 1,
     "unresolved_count": 0
   }
@@ -19144,9 +19480,9 @@ EOF
     write_metrics_delta() { : >"$3"; }
     record_obi_metric_pair() { printf 'metric-pair.json\n'; }
     obi_metric_pair_evidence_json_from_reference() { printf '{}\n'; }
-    pressure_bridge_reconciliation() {
+    pressure_w3c_bridge_reconciliation() {
       printf '%s\n' \
-        '{"transport":"getsockopt","retrieval_valid_count":8,"upstream_failure_count":2,"retrieval_failure_count":0}'
+        '{"transport":"getsockopt","retrieval_valid_count":7,"attributable_failure_count":3,"w3c_masked_valid_count":1,"upstream_failure_count":3,"retrieval_failure_count":0}'
     }
     write_java_diagnostics_delta() { : >"$3"; }
     assert_java_diagnostics_delta() { :; }
@@ -36235,6 +36571,530 @@ test_runbook_build_and_control_contract_is_mutation_sensitive() {
   fi
 }
 
+assert_pressure_v2_documentation_contract() {
+  local -r readme="${1:-$TEST_SCRIPT_DIR/../README.md}"
+  local -r security="${2:-$TEST_SCRIPT_DIR/../SECURITY.md}"
+  local -r benchmark_doc="${3:-$TEST_SCRIPT_DIR/../BENCHMARK.md}"
+  local -r compatibility="${4:-$TEST_SCRIPT_DIR/../COMPATIBILITY.md}"
+  local -r evidence_readme="${5:-$TEST_SCRIPT_DIR/../evidence/README.md}"
+  local -r runner="${6:-$TEST_SCRIPT_DIR/../run.sh}"
+  local -r scenario="${7:-$TEST_SCRIPT_DIR/../tracecheck/cmd/scenario/main.go}"
+  local -r benchmark_consumer="${8:-$TEST_SCRIPT_DIR/benchmark.sh}"
+  local -r projector="${9:-$TEST_SCRIPT_DIR/project-retained-acceptance-evidence.sh}"
+  local -r verifier="${10:-$TEST_SCRIPT_DIR/verify-retained-evidence.sh}"
+  local -r campaign="${11:-$TEST_SCRIPT_DIR/run-retained-acceptance-campaign.sh}"
+  local -r importer="${12:-$TEST_SCRIPT_DIR/import-retained-ci-evidence.sh}"
+  local -r map_pressure="${13:-$TEST_SCRIPT_DIR/../tracecheck/cmd/mappressure/main.go}"
+  local path=""
+
+  for path in \
+    "$readme" \
+    "$security" \
+    "$benchmark_doc" \
+    "$compatibility" \
+    "$evidence_readme" \
+    "$runner" \
+    "$scenario" \
+    "$benchmark_consumer" \
+    "$projector" \
+    "$verifier" \
+    "$campaign" \
+    "$importer" \
+    "$map_pressure"; do
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+  done
+
+  command grep -Fq -- '`H+R+W=N`' "$readme" || return 1
+  command grep -Fq -- '`W=1`, `R>=1`' "$readme" || return 1
+  command grep -Fq -- '`V+F=N`' "$readme" || return 1
+  command grep -Fq -- '`H<=V<=H+W`' "$readme" || return 1
+  command grep -Fq -- '`R<=F<=R+W`' "$readme" || return 1
+  command grep -Fq -- '`M=V-H`' "$readme" || return 1
+  command grep -Fq -- '`M+F-R=W`' "$readme" || return 1
+  command grep -Fq -- '`pressure-traffic-barrier-v2`' "$readme" || return 1
+  command grep -Fq -- 'obi-bounded-acceptance-claims-v2' "$readme" || return 1
+  command grep -Fq -- 'obi-retained-ci-claim-index-v2' "$readme" || return 1
+  command grep -Fq -- 'mktemp -d /tmp/obi-retained-import.XXXXXX' \
+    "$readme" || return 1
+  command awk '
+    $0 == "  output=\"$import_parent/retained-claims-${head_sha:0:12}-${evidence_id:0:12}\"" {
+      assignments += 1
+    }
+    END { exit !(assignments == 1) }
+  ' "$readme" || return 1
+  command grep -Fq -- 'unzip -p "$acceptance_zip" derivation-receipt.json' \
+    "$readme" || return 1
+  command grep -Fq -- 'unzip -p "$fault_zip" derivation-receipt.json' \
+    "$readme" || return 1
+  command grep -Fq -- 'caller-owned mode `0700`' "$readme" || return 1
+  command grep -Fq -- '${DOWNLOAD_DIR:?set DOWNLOAD_DIR' "$readme" || return 1
+  command grep -Fq -- '[[ "$download_dir" != "$repo_root" &&' \
+    "$readme" || return 1
+  command grep -Fq -- '"$download_dir" != "$repo_root/"*' \
+    "$readme" || return 1
+  command grep -Fq -- '[[ -f "$input" && ! -L "$input" ]]' \
+    "$readme" || return 1
+  command grep -Fq -- 'chmod 0600 --' "$readme" || return 1
+  command grep -Fq -- 'chmod 0700 -- "$import_parent"' "$readme" || return 1
+  command grep -Fq -- 'hidden `.retained-ci-import.*` entry' "$readme" || return 1
+  command grep -Fq -- 'fail-closed residue discoverable' "$readme" || return 1
+  command awk '
+    $0 == "  \"$repo_root/examples/apache-java-https/scripts/import-retained-ci-evidence.sh\" \\" {
+      calls += 1
+      if (getline <= 0 ||
+          $0 != "    claims-v2 \"$run_json\" \"$artifacts_json\" \\") {
+        invalid = 1
+      }
+      if (getline <= 0 ||
+          $0 != "    \"$acceptance_zip\" \"$fault_zip\" \"$output\"") {
+        invalid = 1
+      }
+    }
+    END { exit !(calls == 1 && !invalid) }
+  ' "$readme" || return 1
+  command grep -Fq -- 'filled to all 10,000 entries' "$readme" || return 1
+  command grep -Fq -- '`E2BIG`' "$readme" || return 1
+  command awk '
+    index($0, "acceptance/acceptance-claims.json#/issue_36") {
+      acceptance = NR
+    }
+    index($0, "fault-security/fault-security-matrix.json#/coverage/issue_36") {
+      fault = NR
+    }
+    END { exit !(acceptance > 0 && fault > acceptance) }
+  ' "$readme" || return 1
+
+  command awk '
+    /^\| live handoff-map capacity rejection \|/ {
+      rows += 1
+      if (index($0, "| untested | untested |") > 0 &&
+          index($0, "pressure-traffic-barrier-v2") > 0 &&
+          index($0, "H+R+W=N") > 0) {
+        valid += 1
+      }
+    }
+    END { exit !(rows == 1 && valid == 1) }
+  ' "$security" || return 1
+
+  command grep -Fq -- 'source contract 2' "$benchmark_doc" || return 1
+  command grep -Fq -- '`pressure-traffic-barrier-v2`' "$benchmark_doc" || return 1
+  command grep -Fq -- '`H+R+W=N`, `W=1`, `R>=1`' "$benchmark_doc" || return 1
+  command grep -Fq -- '`M+F-R=W`' "$benchmark_doc" || return 1
+  command grep -Fq -- "kernel's" "$benchmark_doc" || return 1
+  command grep -Fq -- '`E2BIG`' "$benchmark_doc" || return 1
+
+  command grep -Fq -- '`pressure-traffic-barrier-v2`' "$compatibility" || return 1
+  command grep -Fq -- '`H+R+W=N`' "$compatibility" || return 1
+  command grep -Fq -- 'all 10,000 entries' "$compatibility" || return 1
+  command grep -Fq -- 'kernel `E2BIG`' "$compatibility" || return 1
+  command grep -Fq -- 'do not promote any pending matrix cell' \
+    "$compatibility" || return 1
+
+  command grep -Fq -- 'pressure source contract 2' "$evidence_readme" || return 1
+  command grep -Fq -- '`pressure-traffic-barrier-v2`' "$evidence_readme" || return 1
+  command grep -Fq -- 'Claims-v1 remains a legacy compatibility shape' \
+    "$evidence_readme" || return 1
+  command grep -Fq -- '`H+R+W=N`' "$evidence_readme" || return 1
+
+  command grep -Fq -- 'PRESSURE_TRAFFIC_CONTRACT_VERSION=2' "$runner" || return 1
+  command grep -Fq -- '--arg schema pressure-traffic-barrier-v2' "$runner" || return 1
+  command grep -Fq -- 'capacity_rejected_entries: 1' "$runner" || return 1
+  command grep -Fq -- 'content_sha256' "$runner" || return 1
+
+  command grep -Fq -- 'pressureW3CCase' "$scenario" || return 1
+  command grep -Fq -- 'summary.RequestCount != requestCount' "$scenario" || return 1
+  command grep -Fq -- 'summary.W3CParentCount != 1' "$scenario" || return 1
+  command grep -Fq -- \
+    'summary.ExactHitCount+summary.ExplicitRootCount+summary.W3CParentCount != summary.RequestCount' \
+    "$scenario" || return 1
+
+  command grep -Fq -- 'info.Type == ebpf.Hash' "$map_pressure" || return 1
+  command grep -Fq -- 'errors.Is(err, syscall.E2BIG)' "$map_pressure" || return 1
+  command grep -Fq -- 'if isCapacityRejection(err) {' \
+    "$map_pressure" || return 1
+  command awk '
+    /_, _ = digest.Write\(key\)/ { key = NR }
+    /_, _ = digest.Write\(value\[:\]\)/ { value = NR }
+    END { exit !(key > 0 && value == key + 1) }
+  ' "$map_pressure" || return 1
+  command awk '
+    /^func verifySyntheticEntries\(/ { inside = 1 }
+    inside && /err := lookup\(syntheticKey\(identity, tokenBase, entryCount\),/ {
+      lookup += 1
+    }
+    inside && /if err == nil \{/ { present += 1 }
+    inside && /capacity-plus-one synthetic entry became present/ { reject += 1 }
+    inside && /!errors.Is\(err, ebpf.ErrKeyNotExist\)/ { absent += 1 }
+    /^func openProcessMap\(/ { inside = 0 }
+    END { exit !(lookup == 1 && present == 1 && reject == 1 && absent == 1) }
+  ' "$map_pressure" || return 1
+
+  command grep -Fq -- '.schema == "pressure-traffic-barrier-v2"' \
+    "$benchmark_consumer" || return 1
+  command grep -Fq -- 'pressure_contract_version: 2' \
+    "$benchmark_consumer" || return 1
+  command grep -Fq -- '.w3c_parent_count == 1' "$benchmark_consumer" || return 1
+  command grep -Fq -- '.w3c_masked_valid_count +' \
+    "$benchmark_consumer" || return 1
+
+  command grep -Fq -- 'PRESSURE_TRAFFIC_CONTRACT_VERSION=2' \
+    "$projector" || return 1
+  command grep -Fq -- 'pressure-traffic-barrier-v2' "$projector" || return 1
+  command grep -Fq -- 'obi-bounded-acceptance-claims-v2' "$projector" || return 1
+  command grep -Fq -- 'conservation: "H+R+W=N"' "$projector" || return 1
+
+  command grep -Fq -- 'The legacy topology label names the H/R subpopulation.' \
+    "$verifier" || return 1
+  command grep -Fq -- 'pressure-exact-or-explicit-root' "$verifier" || return 1
+  command grep -Fq -- \
+    '2511f18ed4961eea9f979a6fd8bad9ee973ce768adecaebcf0dea31b9aaa8e7d' \
+    "$verifier" || return 1
+
+  command grep -Fq -- 'projector_execute "$projector" --claims-v2' \
+    "$campaign" || return 1
+
+  command grep -Fq -- \
+    '2511f18ed4961eea9f979a6fd8bad9ee973ce768adecaebcf0dea31b9aaa8e7d' \
+    "$importer" || return 1
+  command grep -Fq -- \
+    '6f8dabcca0235c585c40c85ffeb978c139eef1a51ba56c40506f61ded58bc027' \
+    "$importer" || return 1
+  command grep -Fq -- 'obi-retained-ci-claim-index-v2' "$importer" || return 1
+  command grep -Fq -- 'artifact_seed="$(printf ' "$importer" || return 1
+  command grep -Fq -- '"$HEAD_SHA" "$RUN_ID" "$RUN_ATTEMPT"' \
+    "$importer" || return 1
+  command grep -Fq -- \
+    '"$acceptance_receipt" "$fault_receipt" | sha256sum)"' \
+    "$importer" || return 1
+  command grep -Fq -- \
+    '"retained-claims-${HEAD_SHA:0:12}-${EVIDENCE_ID:0:12}"' \
+    "$importer" || return 1
+  command grep -Fq -- 'CANDIDATE_CLEANUP_ALLOWED=0' "$importer" || return 1
+  command awk '
+    index($0, "acceptance/acceptance-claims.json#/issue_36") {
+      acceptance = NR
+    }
+    index($0, "fault-security/fault-security-matrix.json#/coverage/issue_36") {
+      fault = NR
+    }
+    END { exit !(acceptance > 0 && fault > acceptance) }
+  ' "$importer"
+}
+
+test_pressure_v2_documentation_contract_is_mutation_sensitive() {
+  local -a paths=(
+    "$TEST_SCRIPT_DIR/../README.md"
+    "$TEST_SCRIPT_DIR/../SECURITY.md"
+    "$TEST_SCRIPT_DIR/../BENCHMARK.md"
+    "$TEST_SCRIPT_DIR/../COMPATIBILITY.md"
+    "$TEST_SCRIPT_DIR/../evidence/README.md"
+    "$TEST_SCRIPT_DIR/../run.sh"
+    "$TEST_SCRIPT_DIR/../tracecheck/cmd/scenario/main.go"
+    "$TEST_SCRIPT_DIR/benchmark.sh"
+    "$TEST_SCRIPT_DIR/project-retained-acceptance-evidence.sh"
+    "$TEST_SCRIPT_DIR/verify-retained-evidence.sh"
+    "$TEST_SCRIPT_DIR/run-retained-acceptance-campaign.sh"
+    "$TEST_SCRIPT_DIR/import-retained-ci-evidence.sh"
+    "$TEST_SCRIPT_DIR/../tracecheck/cmd/mappressure/main.go"
+  )
+  local -r mutation_root="$TEST_TMP_DIR/pressure-v2-documentation"
+  local original=""
+  local mutated=""
+
+  mkdir -m 0700 -- "$mutation_root"
+  assert_pressure_v2_documentation_contract "${paths[@]}" || {
+    printf 'pressure-v2 documentation is not source-bound to the active contract\n' >&2
+    return 1
+  }
+
+  original="${paths[0]}"
+  mutated="$mutation_root/README.md"
+  command sed 's/H+R+W=N/H+R=N/g' "$original" >"$mutated"
+  paths[0]="$mutated"
+  if assert_pressure_v2_documentation_contract "${paths[@]}"; then
+    printf 'pressure-v2 documentation accepted stale parent conservation\n' >&2
+    return 1
+  fi
+  paths[0]="$original"
+
+  mutated="$mutation_root/README-stale-valid-bound.md"
+  command sed 's/H<=V<=H+W/H<=V<=H/g' "$original" >"$mutated"
+  paths[0]="$mutated"
+  if assert_pressure_v2_documentation_contract "${paths[@]}"; then
+    printf 'pressure-v2 documentation accepted a stale valid-retrieval bound\n' >&2
+    return 1
+  fi
+  paths[0]="$original"
+
+  mutated="$mutation_root/README-stale-failure-bound.md"
+  command sed 's/R<=F<=R+W/R<=F<=R/g' "$original" >"$mutated"
+  paths[0]="$mutated"
+  if assert_pressure_v2_documentation_contract "${paths[@]}"; then
+    printf 'pressure-v2 documentation accepted a stale failure bound\n' >&2
+    return 1
+  fi
+  paths[0]="$original"
+
+  mutated="$mutation_root/README-stale-vf-conservation.md"
+  command sed 's/V+F=N/V+F=N+1/g' "$original" >"$mutated"
+  paths[0]="$mutated"
+  if assert_pressure_v2_documentation_contract "${paths[@]}"; then
+    printf 'pressure-v2 documentation accepted stale bridge conservation\n' >&2
+    return 1
+  fi
+  paths[0]="$original"
+
+  mutated="$mutation_root/README-stale-mask-conservation.md"
+  command sed 's/M+F-R=W/M+F-R=0/g' "$original" >"$mutated"
+  paths[0]="$mutated"
+  if assert_pressure_v2_documentation_contract "${paths[@]}"; then
+    printf 'pressure-v2 documentation accepted stale W3C mask conservation\n' >&2
+    return 1
+  fi
+  paths[0]="$original"
+
+  mutated="$mutation_root/README-stale-import-output.md"
+  command sed \
+    's|retained-claims-${head_sha:0:12}-${evidence_id:0:12}|noncanonical-output|g' \
+    "$original" >"$mutated"
+  paths[0]="$mutated"
+  if assert_pressure_v2_documentation_contract "${paths[@]}"; then
+    printf 'pressure-v2 documentation accepted a noncanonical importer output\n' >&2
+    return 1
+  fi
+  paths[0]="$original"
+
+  mutated="$mutation_root/README-prefixed-import-output.md"
+  command sed \
+    's|output="$import_parent/retained-claims-|output="$import_parent/prefix-retained-claims-|' \
+    "$original" >"$mutated"
+  paths[0]="$mutated"
+  if assert_pressure_v2_documentation_contract "${paths[@]}"; then
+    printf 'pressure-v2 documentation accepted a prefixed importer output\n' >&2
+    return 1
+  fi
+  paths[0]="$original"
+
+  mutated="$mutation_root/README-relative-importer.md"
+  command sed \
+    's|"$repo_root/examples/apache-java-https/scripts/import-retained-ci-evidence.sh"|./examples/apache-java-https/scripts/import-retained-ci-evidence.sh|g' \
+    "$original" >"$mutated"
+  paths[0]="$mutated"
+  if assert_pressure_v2_documentation_contract "${paths[@]}"; then
+    printf 'pressure-v2 documentation accepted a relative importer invocation\n' >&2
+    return 1
+  fi
+  paths[0]="$original"
+
+  mutated="$mutation_root/README-relative-import-inputs.md"
+  command sed \
+    -e 's/claims-v2 "$run_json" "$artifacts_json"/claims-v2 RUN.json ARTIFACTS.json/' \
+    -e 's/"$acceptance_zip" "$fault_zip" "$output"/ACCEPTANCE.zip FAULT.zip "$output"/' \
+    "$original" >"$mutated"
+  paths[0]="$mutated"
+  if assert_pressure_v2_documentation_contract "${paths[@]}"; then
+    printf 'pressure-v2 documentation accepted relative importer inputs\n' >&2
+    return 1
+  fi
+  paths[0]="$original"
+
+  mutated="$mutation_root/README-extra-import-input.md"
+  command sed \
+    's/claims-v2 "$run_json" "$artifacts_json"/claims-v2 "$run_json" "$artifacts_json" "$download_dir\/EXTRA"/' \
+    "$original" >"$mutated"
+  paths[0]="$mutated"
+  if assert_pressure_v2_documentation_contract "${paths[@]}"; then
+    printf 'pressure-v2 documentation accepted an extra importer input\n' >&2
+    return 1
+  fi
+  paths[0]="$original"
+
+  mutated="$mutation_root/README-download-equals-root.md"
+  command sed \
+    's/\[\[ "$download_dir" != "$repo_root" &&/[[ -n "$download_dir" \&\&/' \
+    "$original" >"$mutated"
+  paths[0]="$mutated"
+  if assert_pressure_v2_documentation_contract "${paths[@]}"; then
+    printf 'pressure-v2 documentation accepted DOWNLOAD_DIR equal to repo_root\n' >&2
+    return 1
+  fi
+  paths[0]="$original"
+
+  mutated="$mutation_root/README-in-checkout-downloads.md"
+  command sed '/"$download_dir" != "$repo_root\/"\*/d' \
+    "$original" >"$mutated"
+  paths[0]="$mutated"
+  if assert_pressure_v2_documentation_contract "${paths[@]}"; then
+    printf 'pressure-v2 documentation accepted an in-checkout download directory\n' >&2
+    return 1
+  fi
+  paths[0]="$original"
+
+  original="${paths[1]}"
+  mutated="$mutation_root/SECURITY.md"
+  command sed \
+    '/^| live handoff-map capacity rejection |/s/| untested | untested |/| pass | pass |/' \
+    "$original" >"$mutated"
+  paths[1]="$mutated"
+  if assert_pressure_v2_documentation_contract "${paths[@]}"; then
+    printf 'pressure-v2 documentation promoted an unproved matrix row\n' >&2
+    return 1
+  fi
+  paths[1]="$original"
+
+  original="${paths[2]}"
+  mutated="$mutation_root/BENCHMARK.md"
+  command sed 's/pressure-traffic-barrier-v2/pressure-traffic-barrier-v1/g' \
+    "$original" >"$mutated"
+  paths[2]="$mutated"
+  if assert_pressure_v2_documentation_contract "${paths[@]}"; then
+    printf 'pressure-v2 documentation accepted the legacy barrier\n' >&2
+    return 1
+  fi
+  paths[2]="$original"
+
+  original="${paths[5]}"
+  mutated="$mutation_root/run.sh"
+  command sed 's/PRESSURE_TRAFFIC_CONTRACT_VERSION=2/PRESSURE_TRAFFIC_CONTRACT_VERSION=1/g' \
+    "$original" >"$mutated"
+  paths[5]="$mutated"
+  if assert_pressure_v2_documentation_contract "${paths[@]}"; then
+    printf 'pressure-v2 documentation accepted a legacy runner source contract\n' >&2
+    return 1
+  fi
+  paths[5]="$original"
+
+  original="${paths[6]}"
+  mutated="$mutation_root/scenario-main.go"
+  command sed 's/summary.W3CParentCount != 1/summary.W3CParentCount != 0/g' \
+    "$original" >"$mutated"
+  paths[6]="$mutated"
+  if assert_pressure_v2_documentation_contract "${paths[@]}"; then
+    printf 'pressure-v2 documentation accepted a zero-W3C scenario\n' >&2
+    return 1
+  fi
+  paths[6]="$original"
+
+  original="${paths[7]}"
+  mutated="$mutation_root/benchmark.sh"
+  command sed 's/pressure_contract_version: 2/pressure_contract_version: 1/g' \
+    "$original" >"$mutated"
+  paths[7]="$mutated"
+  if assert_pressure_v2_documentation_contract "${paths[@]}"; then
+    printf 'pressure-v2 documentation accepted a legacy benchmark projection\n' >&2
+    return 1
+  fi
+  paths[7]="$original"
+
+  original="${paths[8]}"
+  mutated="$mutation_root/projector.sh"
+  command sed 's/obi-bounded-acceptance-claims-v2/obi-bounded-acceptance-claims-v1/g' \
+    "$original" >"$mutated"
+  paths[8]="$mutated"
+  if assert_pressure_v2_documentation_contract "${paths[@]}"; then
+    printf 'pressure-v2 documentation accepted a legacy public claim schema\n' >&2
+    return 1
+  fi
+  paths[8]="$original"
+
+  original="${paths[9]}"
+  mutated="$mutation_root/verifier.sh"
+  command sed 's/H\/R subpopulation/stale topology population/g' \
+    "$original" >"$mutated"
+  paths[9]="$mutated"
+  if assert_pressure_v2_documentation_contract "${paths[@]}"; then
+    printf 'pressure-v2 documentation accepted an unexplained topology label\n' >&2
+    return 1
+  fi
+  paths[9]="$original"
+
+  original="${paths[10]}"
+  mutated="$mutation_root/campaign.sh"
+  command sed 's/--claims-v2/--claims-v1/g' "$original" >"$mutated"
+  paths[10]="$mutated"
+  if assert_pressure_v2_documentation_contract "${paths[@]}"; then
+    printf 'pressure-v2 documentation accepted a legacy campaign selector\n' >&2
+    return 1
+  fi
+  paths[10]="$original"
+
+  original="${paths[11]}"
+  mutated="$mutation_root/importer.sh"
+  command sed \
+    's|acceptance/acceptance-claims.json#/issue_36|acceptance/acceptance-claims.json#/stale_issue_36|g' \
+    "$original" >"$mutated"
+  paths[11]="$mutated"
+  if assert_pressure_v2_documentation_contract "${paths[@]}"; then
+    printf 'pressure-v2 documentation accepted a stale importer pointer\n' >&2
+    return 1
+  fi
+  paths[11]="$original"
+
+  mutated="$mutation_root/importer-unsafe-postseal-cleanup.sh"
+  command sed 's/CANDIDATE_CLEANUP_ALLOWED=0/CANDIDATE_CLEANUP_ALLOWED=1/' \
+    "$original" >"$mutated"
+  paths[11]="$mutated"
+  if assert_pressure_v2_documentation_contract "${paths[@]}"; then
+    printf 'pressure-v2 documentation accepted unsafe post-seal cleanup\n' >&2
+    return 1
+  fi
+  paths[11]="$original"
+
+  original="${paths[12]}"
+  mutated="$mutation_root/mappressure-main.go"
+  command sed 's/info.Type == ebpf.Hash/info.Type == ebpf.LRUHash/g' \
+    "$original" >"$mutated"
+  paths[12]="$mutated"
+  if assert_pressure_v2_documentation_contract "${paths[@]}"; then
+    printf 'pressure-v2 documentation accepted an evicting pressure map\n' >&2
+    return 1
+  fi
+
+  mutated="$mutation_root/mappressure-disconnected-capacity.go"
+  command sed 's/if isCapacityRejection(err) {/if false {/' \
+    "$original" >"$mutated"
+  paths[12]="$mutated"
+  if assert_pressure_v2_documentation_contract "${paths[@]}"; then
+    printf 'pressure-v2 documentation accepted disconnected E2BIG handling\n' >&2
+    return 1
+  fi
+
+  mutated="$mutation_root/mappressure-reversed-digest.go"
+  command awk '
+    /_, _ = digest.Write\(key\)/ {
+      key_line = $0
+      if (getline <= 0 || $0 !~ /_, _ = digest.Write\(value\[:\]\)/) exit 2
+      print $0
+      print key_line
+      swapped += 1
+      next
+    }
+    { print }
+    END { if (swapped != 1) exit 2 }
+  ' "$original" >"$mutated"
+  paths[12]="$mutated"
+  if assert_pressure_v2_documentation_contract "${paths[@]}"; then
+    printf 'pressure-v2 documentation accepted reversed pressure digest order\n' >&2
+    return 1
+  fi
+
+  mutated="$mutation_root/mappressure-capacity-plus-one-present.go"
+  command awk '
+    /^func verifySyntheticEntries\(/ { inside = 1 }
+    inside && /if err == nil \{/ && changed == 0 {
+      sub(/if err == nil/, "if err != nil")
+      changed += 1
+    }
+    { print }
+    END { if (changed != 1) exit 2 }
+  ' "$original" >"$mutated"
+  paths[12]="$mutated"
+  if assert_pressure_v2_documentation_contract "${paths[@]}"; then
+    printf 'pressure-v2 documentation accepted a present capacity-plus-one key\n' >&2
+    return 1
+  fi
+}
+
 compatibility_matrix_revision() {
   local -r matrix="$1"
 
@@ -47627,6 +48487,16 @@ test_pressure_runtime_lifecycle_fresh_sourced_group() {
     test_pressure_scenario_counts_are_unique_and_bounded
 }
 
+test_pressure_w3c_runner_fresh_sourced_group() {
+  pressure_test_run_fresh_sourced_group pressure-w3c-runner \
+    test_pressure_w3c_bridge_reconciliation_is_algebraically_exact \
+    test_pressure_w3c_java_targets_are_exact \
+    test_pressure_scenario_reconciles_roots_with_bridge_and_java_counts \
+    test_pressure_unix_scenario_uses_strict_already_consumed_reconciliation \
+    test_pressure_failure_retains_wrong_parent_counts_and_cleans_up \
+    test_pressure_empty_result_fails_closed_and_cleans_up
+}
+
 test_pressure_map_one_shot_fresh_sourced_group() {
   pressure_test_run_fresh_sourced_group map-one-shot \
     test_map_pressure_partial_fill_is_cleanup_owned \
@@ -47814,6 +48684,7 @@ main() {
   test_bridge_inject_attempt_total_is_reason_agnostic
   test_pressure_transaction_authority_fresh_sourced_group
   test_pressure_runtime_lifecycle_fresh_sourced_group
+  test_pressure_w3c_runner_fresh_sourced_group
   test_pressure_map_one_shot_fresh_sourced_group
   test_benchmark_pressure_cycles_fresh_sourced_group
   test_bridge_take_count_includes_cancelled_request
@@ -47876,10 +48747,6 @@ main() {
   test_final_java_diagnostics_skip_active_fault_bridge
   test_helper_unavailable_scenario_injects_without_staging_or_retrieval
   test_scenario_fences_metrics_around_diagnostics
-  test_pressure_scenario_reconciles_roots_with_bridge_and_java_counts
-  test_pressure_unix_scenario_uses_strict_already_consumed_reconciliation
-  test_pressure_failure_retains_wrong_parent_counts_and_cleans_up
-  test_pressure_empty_result_fails_closed_and_cleans_up
   test_scenario_controls_matching_fixture_lifecycle
   test_scenario_supports_metrics_only_security_evidence
   test_security_controls_select_metrics_only_evidence
@@ -48002,6 +48869,7 @@ main() {
   test_markdown_workflow_preserves_literal_nonempty_targets
   test_markdown_workflow_uses_exact_event_ranges
   test_runbook_build_and_control_contract_is_mutation_sensitive
+  test_pressure_v2_documentation_contract_is_mutation_sensitive
   test_compatibility_campaign_entrypoint_is_mutation_sensitive
   test_compatibility_matrix_lists_deployment_modes
   "$TEST_SCRIPT_DIR/../compatibility/tests/campaign_test.sh"

@@ -503,10 +503,13 @@ duplicated, stale, or unsealed Java evidence makes this exploratory dimension
 getsockopt and Unix hit paths, getsockopt and Unix stale paths, Unix timeout,
 and getsockopt pressure. These artifacts use
 `bounded_correctness_observed_once`; they intentionally contain no application
-throughput or p50/p95/p99 claim. The pressure observation retains exact-parent
-and root counts, bounded capacity rejection, exact post-traffic content
-preservation for the non-evicting hash map, cleanup, and two canonical recovery
-Prometheus samples. The runner privately retains an owner-only canonical
+throughput or p50/p95/p99 claim. The pressure observation uses source contract 2
+and `pressure-traffic-barrier-v2`: request zero retains one deterministic W3C
+parent, the remaining requests are exact OBI hits or explicit roots, and it
+requires `H+R+W=N`, `W=1`, `R>=1`, and zero wrong or unresolved parents. It
+also retains the bridge/Java `V/F/M` reconciliation, bounded capacity rejection,
+exact post-traffic content preservation for the non-evicting `HASH`, cleanup,
+and two canonical recovery Prometheus samples. The runner privately retains an owner-only canonical
 container inspection covering the running and terminal scenario lifecycle.
 Validation checks its exact identity/image/command/labels/mount/runtime/state
 shape and binds its SHA-256 and byte size through both the barrier and scenario
@@ -514,8 +517,8 @@ status. That private artifact and its identifiers are deliberately absent from
 `path-observation.json` and `lookup-paths.json`. Validation also parses the
 read-only preparation record, empty
 baseline, exact full fill, an extra key rejected only by the kernel's `E2BIG`
-capacity result, ordered key/value SHA-256,
-ready/fill/release barrier, post-traffic verification, admission counters,
+capacity result, ordered key/value SHA-256, the barrier-v2 ready/fill/release
+transaction, post-traffic verification, admission counters,
 cleanup, canonical recovered sample, and recovery-attempt log. It requires one
 stable map ID/type/capacity; PID `0` and namespace `0` for the impossible
 synthetic key space; the same full-map digest before and after traffic; positive
@@ -1125,12 +1128,13 @@ uninstrumented, W3C/no-state, miss, timeout, async-handoff, redispatch,
 virtual-thread, Netty, and restart controls. The pressure helper discovers the
 live non-evicting handoff-claim `HASH` map and records the exact map and JVM
 cleanup identity before mutation. A private scenario process first publishes a
-ready record. The helper then arms cleanup and fills the impossible PID-zero,
-namespace-zero synthetic key space with exactly `max_entries` tagged `OPEN`
-tickets. It requires an empty baseline, one extra key rejected specifically by
-the kernel's `E2BIG` capacity result, exact lookup of every admitted key, and an
-ordered key/value SHA-256 before atomically publishing
-the scenario release. Values use fresh monotonic observations tied to the one
+ready record under `pressure-traffic-barrier-v2`. Request zero carries one
+deterministic valid W3C parent. The helper then arms cleanup and fills the
+impossible PID-zero, namespace-zero synthetic key space with exactly
+`max_entries` tagged `OPEN` tickets. It requires an empty baseline, one extra
+key rejected specifically by the kernel's `E2BIG` capacity result, exact lookup
+of every admitted key, and an ordered key/value SHA-256 before atomically
+publishing the scenario release. Values use fresh monotonic observations tied to the one
 unambiguous live JVM incarnation, while the impossible key identity keeps the
 production sweeper from reclaiming the controlled entries or real traffic from
 colliding with them. After all 128 marked handoff requests finish, a second scan
@@ -1149,14 +1153,17 @@ canonical owner-only `0600` raw artifact; the barrier and scenario status each
 bind its filename, SHA-256, and byte size. The inspection includes the private
 barrier session, container/image identity, command, labels, control-mount leaf,
 runtime flags, and lifecycle timestamps. Neither it nor those private values is
-published in normalized lookup observations or the seven-file bounded claims.
-The incarnation capability is likewise never published.
-Pressure results report exact hits and explicit Java roots separately: every
-nonzero parent must identify the exact Apache client, exact hits plus roots must
-equal the request count, and wrong-parent and unresolved counts must be zero.
-Stable bridge deltas retain upstream and retrieval failures by reason. A
-transport-aware conservation check reconciles those aggregate bridge outcomes
-and the Java diagnostic counts with the trace outcomes.
+published in normalized lookup observations or the active seven-file claims-v2
+projection. The incarnation capability is likewise never published.
+Pressure results report exact hits, explicit Java roots, and the one W3C parent
+separately. Exact hits must identify their intended Apache client; the W3C span
+must identify its supplied trace and parent; and `H+R+W=N`, `W=1`, `R>=1`, with
+wrong-parent and unresolved counts both zero. Stable bridge deltas retain valid
+retrievals `V`, attributable failures `F`, and W3C-masked valid candidates `M`
+by reason. Validation requires `H<=V<=H+W`, `R<=F<=R+W`, `V+F=N`, `M=V-H`, and
+`M+F-R=W`; Java diagnostics bind the same counts through valid/sample/discard
+and absence fields. The admission-overload signal remains auxiliary to those
+conservation equations.
 For a production-style sustained benchmark, keep the stack with `--keep` and
 add a fixed-duration external load generator; do not compare that result
 directly with the bounded runner.

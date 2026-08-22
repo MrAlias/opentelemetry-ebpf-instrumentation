@@ -42,12 +42,18 @@ RUNBOOK_SNAPSHOT=""
 ACCEPTANCE_PRIVATE_STAT=""
 ASSERTION_PRIVATE_STAT=""
 RUNBOOK_PRIVATE_SHA256=""
+CLAIMS_VERSION=1
+CLAIMS_VERIFIER_MODE="--claims-v1"
+ISSUE_36_PROJECTION=""
+RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION=""
 
 usage() {
   printf '%s\n' \
-    "Usage: $SCRIPT_NAME ABS_ACCEPTANCE_ALL ABS_ASSERTION_FAILURE ABS_RUNBOOK_RECEIPT ABS_NONEXISTENT_OUTPUT" \
+    "Usage: $SCRIPT_NAME [--claims-v1|--claims-v2] ABS_ACCEPTANCE_ALL ABS_ASSERTION_FAILURE ABS_RUNBOOK_RECEIPT ABS_NONEXISTENT_OUTPUT" \
     "" \
     "Validate two private v3 runs and publish one closed seven-file bounded-claim summary." \
+    "The default and --claims-v1 preserve the legacy claim contract." \
+    "--claims-v2 additionally requires authenticated pressure contract v2 evidence." \
     "All inputs and the output must be absolute paths. The output must not exist."
 }
 
@@ -768,6 +774,45 @@ sanitize_projector_git_environment() {
   export GIT_NO_REPLACE_OBJECTS=1
 }
 
+# Select the pressure contract only from the producer blob at the authenticated
+# raw source revision. A data file cannot opt an older run into claims v2.
+recorded_pressure_traffic_contract_version() {
+  local -r revision="$1"
+  local -r producer_path='examples/apache-java-https/run.sh'
+  local repository=""
+  local producer=""
+  local producer_size=""
+  local assignment_count=""
+  local v1_marker_count=""
+  local v2_marker_count=""
+
+  is_sha1 "$revision" || return 1
+  repository="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)" || return 1
+  repository="$(cd -- "$repository" && pwd -P)" || return 1
+  producer_size="$(git -C "$repository" cat-file -s \
+    "$revision:$producer_path")" || return 1
+  [[ "$producer_size" =~ ^[1-9][0-9]*$ ]] || return 1
+  ((producer_size <= 4194304)) || return 1
+  producer="$(mktemp "$WORK_DIRECTORY/recorded-pressure-run.XXXXXX")" ||
+    return 1
+  git -C "$repository" cat-file blob \
+    "$revision:$producer_path" >"$producer" || return 1
+  [[ -f "$producer" && ! -L "$producer" &&
+    "$(stat -Lc '%s' -- "$producer")" == "$producer_size" ]] || return 1
+  assignment_count="$(grep -Ec \
+    '^PRESSURE_TRAFFIC_CONTRACT_VERSION=' "$producer" || true)"
+  v1_marker_count="$(grep -Fxc \
+    'PRESSURE_TRAFFIC_CONTRACT_VERSION=1' "$producer" || true)"
+  v2_marker_count="$(grep -Fxc \
+    'PRESSURE_TRAFFIC_CONTRACT_VERSION=2' "$producer" || true)"
+  case "$assignment_count:$v1_marker_count:$v2_marker_count" in
+    0:0:0) printf '0\n' ;;
+    1:1:0) printf '1\n' ;;
+    1:0:1) printf '2\n' ;;
+    *) return 1 ;;
+  esac
+}
+
 validate_otel_agent_source_contract() {
   local -r repository="$1"
   local -r head="$2"
@@ -1223,8 +1268,9 @@ publish_verified_candidate() {
     retain_invalid_publication "the moved candidate identity or sealed mode changed"
     return 1
   fi
-  if ! "$VERIFIER" --claims-v1 "$OUTPUT_DIRECTORY" >/dev/null; then
-    retain_invalid_publication "post-move claims-v1 verification failed"
+  if ! "$VERIFIER" "$CLAIMS_VERIFIER_MODE" "$OUTPUT_DIRECTORY" >/dev/null; then
+    retain_invalid_publication \
+      "post-move ${CLAIMS_VERIFIER_MODE#--} verification failed"
     return 1
   fi
   if ! (CDPATH='' cd / && bash "$OUTPUT_DIRECTORY/verify.sh" >/dev/null); then
@@ -1623,6 +1669,158 @@ validate_private_claim_inputs() {
   done
 }
 
+validate_private_issue_36_inputs() {
+  local -r prepare="$ACCEPTANCE_SNAPSHOT/map-pressure-pressure-prepare.json"
+  local -r fill="$ACCEPTANCE_SNAPSHOT/map-pressure-pressure-fill.json"
+  local -r verify="$ACCEPTANCE_SNAPSHOT/map-pressure-pressure-verify.json"
+  local -r result="$ACCEPTANCE_SNAPSHOT/scenario-pressure.json"
+  local -r status="$ACCEPTANCE_SNAPSHOT/scenario-pressure-status.json"
+  local -r barrier="$ACCEPTANCE_SNAPSHOT/map-pressure-pressure-barrier-status.json"
+  local fill_sha256=""
+  local verify_sha256=""
+  local result_sha256=""
+  local status_sha256=""
+  local path=""
+
+  [[ "$CLAIMS_VERSION" == 2 &&
+    "$RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION" == 2 ]] || return 1
+  for path in "$prepare" "$fill" "$verify" "$result" "$status" "$barrier"; do
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+  done
+  fill_sha256="$(sha256sum <"$fill")" || return 1
+  verify_sha256="$(sha256sum <"$verify")" || return 1
+  result_sha256="$(sha256sum <"$result")" || return 1
+  status_sha256="$(sha256sum <"$status")" || return 1
+  fill_sha256="${fill_sha256%% *}"
+  verify_sha256="${verify_sha256%% *}"
+  result_sha256="${result_sha256%% *}"
+  status_sha256="${status_sha256%% *}"
+  is_sha256 "$fill_sha256" && is_sha256 "$verify_sha256" &&
+    is_sha256 "$result_sha256" && is_sha256 "$status_sha256" || return 1
+
+  ISSUE_36_PROJECTION="$WORK_DIRECTORY/issue-36-projection.json"
+  jq -cS -e -s \
+    --arg fill_sha256 "$fill_sha256" \
+    --arg verify_sha256 "$verify_sha256" \
+    --arg result_sha256 "$result_sha256" \
+    --arg status_sha256 "$status_sha256" '
+    if length != 6 then error("six issue #36 inputs required") else
+    .[0] as $prepare | .[1] as $fill | .[2] as $verify |
+    .[3] as $result | .[4] as $status | .[5] as $barrier |
+    if (($prepare.status == "passed" and .[0].mode == "prepare" and
+      $prepare.map_name == "java_remote_parent_handoff_claims" and
+      $prepare.kernel_name == "java_remote_par" and
+      $prepare.map_type == "Hash" and $prepare.max_entries == 10000 and
+      $prepare.synthetic_pid == 0 and $prepare.synthetic_namespace == 0 and
+      $prepare.touched == 0) and
+    ($fill.status == "passed" and $fill.mode == "fill" and
+      $fill.map_id == $prepare.map_id and $fill.map_type == "Hash" and
+      $fill.max_entries == 10000 and $fill.touched == 10000 and
+      $fill.verified_present_entries == 10000 and
+      $fill.verified_absent_entries == 1 and
+      $fill.capacity_rejected_entries == 1 and
+      ($fill.content_sha256 | type == "string" and
+        test("^[0-9a-f]{64}$"))) and
+    ($verify.status == "passed" and $verify.mode == "verify" and
+      $verify.map_id == $prepare.map_id and $verify.map_type == "Hash" and
+      $verify.max_entries == 10000 and
+      $verify.verified_present_entries == 10000 and
+      $verify.verified_absent_entries == 1 and
+      $verify.content_sha256 == $fill.content_sha256) and
+    ($result.status == "passed" and $result.scenario == "pressure" and
+      $result.request_count == 128 and
+      ($result.pressure_correlation | keys) == [
+        "exact_hit_count", "explicit_root_count", "request_count",
+        "unresolved_count", "w3c_parent_count", "wrong_parent_count"] and
+      $result.pressure_correlation.request_count == 128 and
+      ($result.pressure_correlation.exact_hit_count | type == "number" and
+        floor == . and . >= 0 and . <= 127) and
+      ($result.pressure_correlation.explicit_root_count | type == "number" and
+        floor == . and . >= 1 and . <= 127) and
+      $result.pressure_correlation.w3c_parent_count == 1 and
+      $result.pressure_correlation.wrong_parent_count == 0 and
+      $result.pressure_correlation.unresolved_count == 0 and
+      ($result.pressure_correlation.exact_hit_count +
+        $result.pressure_correlation.explicit_root_count +
+        $result.pressure_correlation.w3c_parent_count) == 128) and
+    ($status.status == "passed" and $status.scenario == "pressure" and
+      $status.exit_status == 0 and $status.metric_status == 0 and
+      $status.result == "scenario-pressure.json" and
+      $status.pressure_correlation.barrier_reference ==
+        "map-pressure-pressure-barrier-status.json" and
+      $status.pressure_correlation.trace == $result.pressure_correlation) and
+    ($barrier.schema == "pressure-traffic-barrier-v2" and
+      $barrier.status == "passed" and
+      $barrier.scenario_label == "pressure" and
+      $barrier.sequence == ["scenario_ready", "capacity_fill_verified",
+        "release_published", "scenario_reaped",
+        "post_traffic_content_verified"] and
+      $barrier.fill.reference == "map-pressure-pressure-fill.json" and
+      $barrier.fill.sha256 == $fill_sha256 and
+      $barrier.fill.map_id == ($prepare.map_id | tostring) and
+      $barrier.fill.max_entries == 10000 and
+      $barrier.fill.touched == 10000 and
+      $barrier.fill.verified_present_entries == 10000 and
+      $barrier.fill.verified_absent_entries == 1 and
+      $barrier.fill.capacity_rejected_entries == 1 and
+      $barrier.fill.content_sha256 == $fill.content_sha256 and
+      $barrier.verification.reference ==
+        "map-pressure-pressure-verify.json" and
+      $barrier.verification.sha256 == $verify_sha256 and
+      $barrier.verification.map_id == ($prepare.map_id | tostring) and
+      $barrier.verification.verified_present_entries == 10000 and
+      $barrier.verification.verified_absent_entries == 1 and
+      $barrier.verification.content_sha256 == $verify.content_sha256 and
+      $barrier.verification.content_sha256 ==
+        $barrier.fill.content_sha256 and
+      $barrier.traffic.result_reference == "scenario-pressure.json" and
+      $barrier.traffic.result_sha256 == $result_sha256 and
+      $barrier.traffic.status_reference ==
+        "scenario-pressure-status.json" and
+      $barrier.traffic.status_sha256 == $status_sha256 and
+      $barrier.traffic.request_count == 128 and
+      $barrier.traffic.exact_hit_count ==
+        $result.pressure_correlation.exact_hit_count and
+      $barrier.traffic.explicit_root_count ==
+        $result.pressure_correlation.explicit_root_count and
+      $barrier.traffic.w3c_parent_count == 1 and
+      $barrier.traffic.wrong_parent_count == 0 and
+      $barrier.traffic.unresolved_count == 0))
+    then {
+      status: "passed",
+      pressure_contract: {
+        version: 2,
+        barrier_schema: "pressure-traffic-barrier-v2",
+        traffic_barrier_cross_binding_verified: true
+      },
+      traffic: {
+        request_count: 128,
+        exact_parent_count: $result.pressure_correlation.exact_hit_count,
+        explicit_local_root_count:
+          $result.pressure_correlation.explicit_root_count,
+        w3c_parent_count: 1,
+        wrong_parent_count: 0,
+        unresolved_count: 0,
+        conservation: "H+R+W=N"
+      },
+      full_hash_pressure: {
+        map_type: "non-evicting HASH",
+        capacity: 10000,
+        filled_entries: 10000,
+        capacity_rejected_entries: 1,
+        capacity_rejection_errno: "E2BIG",
+        fill_content_sha256: $fill.content_sha256,
+        post_traffic_content_sha256: $verify.content_sha256,
+        content_digest_equal: true
+      }
+    } else error("raw-v2 issue #36 projection contract failed") end
+    end
+  ' "$prepare" "$fill" "$verify" "$result" "$status" "$barrier" \
+    >"$ISSUE_36_PROJECTION" || return 1
+  [[ -s "$ISSUE_36_PROJECTION" &&
+    -z "$(tail -c 1 -- "$ISSUE_36_PROJECTION")" ]]
+}
+
 write_claim_authority_summary() {
   local revision=""
   local tree=""
@@ -1863,6 +2061,31 @@ write_acceptance_claim_summary() {
   rm -f -- "$CANDIDATE_DIRECTORY/resource-recovery-summary.json"
 }
 
+write_acceptance_claim_summary_v2() {
+  local -r claims="$CANDIDATE_DIRECTORY/acceptance-claims.json"
+  local transformed=""
+
+  [[ "$CLAIMS_VERSION" == 2 && -f "$ISSUE_36_PROJECTION" &&
+    ! -L "$ISSUE_36_PROJECTION" ]] || return 1
+  write_acceptance_claim_summary || return 1
+  transformed="$(mktemp "$WORK_DIRECTORY/acceptance-claims-v2.XXXXXX")" ||
+    return 1
+  jq -cS -e --slurpfile issue_36 "$ISSUE_36_PROJECTION" '
+    if ($issue_36 | length) != 1 then
+      error("one issue #36 projection required")
+    else
+      .schema = "obi-bounded-acceptance-claims-v2" |
+      .issue_34.scenarios[9].w3c_parent_count =
+        $issue_36[0].traffic.w3c_parent_count |
+      .issue_34.scenarios[9].conservation =
+        $issue_36[0].traffic.conservation |
+      .issue_36 = $issue_36[0]
+    end
+  ' "$claims" >"$transformed" || return 1
+  mv -fT -- "$transformed" "$claims" || return 1
+  chmod 0644 -- "$claims"
+}
+
 write_derivation_receipt() {
   local authority_sha256=""
   local claims_sha256=""
@@ -1883,6 +2106,46 @@ write_derivation_receipt() {
     --arg bundle_name "$OUTPUT_NAME" '{
       schema: "obi-bounded-claim-derivation-v1",
       derivation_contract: "private-raw-v3-to-bounded-claims-v1",
+      bundle_name: $bundle_name,
+      evidence_id: $evidence_id,
+      authority: {reference: "authority-summary.json", sha256: $authority_sha256},
+      claims: {reference: "acceptance-claims.json", sha256: $claims_sha256},
+      private_validation_profile: {
+        exact_complete_producer_roster_validated: true,
+        fixed_invocations_without_keep_validated: true,
+        raw_snapshots_same_device_and_capped: true,
+        required_eleven_stress_pair_ownership_validated: true,
+        raw_semantics_validated_before_projection: true,
+        raw_semantics_recomputable_from_public_bundle: false
+      },
+      public_file_order: [
+        "README.md", "SANITIZATION.md", "acceptance-claims.json",
+        "authority-summary.json", "derivation-receipt.json", "verify.sh",
+        "SHA256SUMS"
+      ]
+    }' | write_file derivation-receipt.json
+}
+
+write_derivation_receipt_v2() {
+  local authority_sha256=""
+  local claims_sha256=""
+  local evidence_id=""
+
+  authority_sha256="$(sha256sum \
+    <"$CANDIDATE_DIRECTORY/authority-summary.json")" || return 1
+  authority_sha256="${authority_sha256%% *}"
+  claims_sha256="$(sha256sum \
+    <"$CANDIDATE_DIRECTORY/acceptance-claims.json")" || return 1
+  claims_sha256="${claims_sha256%% *}"
+  evidence_id="$(printf '%s\n' 'obi-bounded-claims-evidence-v2' \
+    "$OUTPUT_NAME" "$authority_sha256" "$claims_sha256" | sha256sum)" ||
+    return 1
+  evidence_id="${evidence_id%% *}"
+  jq -cS -n --arg authority_sha256 "$authority_sha256" \
+    --arg claims_sha256 "$claims_sha256" --arg evidence_id "$evidence_id" \
+    --arg bundle_name "$OUTPUT_NAME" '{
+      schema: "obi-bounded-claim-derivation-v1",
+      derivation_contract: "private-raw-v3-to-bounded-claims-v2",
       bundle_name: $bundle_name,
       evidence_id: $evidence_id,
       authority: {reference: "authority-summary.json", sha256: $authority_sha256},
@@ -2662,11 +2925,167 @@ printf 'bounded claim bundle internally consistent (not authenticated): %s\n' \
 CLAIM_VERIFY_SCRIPT
 }
 
+write_portable_claim_verifier_v2() {
+  local -r verifier="$CANDIDATE_DIRECTORY/verify.sh"
+  local v2_pressure_validation=""
+  local v2_validation=""
+  local transformed=""
+
+  [[ "$CLAIMS_VERSION" == 2 ]] || return 1
+  write_portable_claim_verifier || return 1
+  v2_pressure_validation="$(mktemp \
+    "$WORK_DIRECTORY/claims-v2-pressure-validation.XXXXXX")" || return 1
+  v2_validation="$(mktemp \
+    "$WORK_DIRECTORY/claims-v2-validation.XXXXXX")" || return 1
+  transformed="$(mktemp \
+    "$WORK_DIRECTORY/claims-v2-portable-verifier.XXXXXX")" || return 1
+  cat >"$v2_pressure_validation" <<'CLAIMS_V2_PRESSURE_VALIDATION'
+    (.scenarios[9] as $pressure |
+      ($pressure.exact_parent_count | integer_between(0;127)) and
+      ($pressure.explicit_local_root_count | integer_between(1;127)) and
+      $pressure.w3c_parent_count == 1 and
+      $pressure.conservation == "H+R+W=N" and
+      ($pressure.exact_parent_count +
+        $pressure.explicit_local_root_count +
+        $pressure.w3c_parent_count) == 128 and
+      $pressure == (scenario("pressure";128;
+        $pressure.exact_parent_count; $pressure.explicit_local_root_count;
+        "pressure-exact-or-explicit-root") +
+        {conservation:"H+R+W=N",w3c_parent_count:1})) and
+CLAIMS_V2_PRESSURE_VALIDATION
+  cat >"$v2_validation" <<'CLAIMS_V2_VALIDATION'
+
+jq -e '
+  def sha256: type == "string" and test("^[0-9a-f]{64}$");
+  keys == ["issue_32", "issue_34", "issue_36", "schema", "status"] and
+  .schema == "obi-bounded-acceptance-claims-v2" and .status == "passed" and
+  (.issue_34.scenarios[9] as $pressure |
+    ($pressure | keys) == ["bounded_duration_verified", "conservation",
+      "duration_cap_nanos", "exact_parent_count",
+      "explicit_local_root_count", "name", "request_count",
+      "required_metric_pair_and_java_capture_verified", "topology_contract",
+      "w3c_parent_count", "zero_unresolved_parent", "zero_wrong_parent"] and
+    $pressure.name == "pressure" and $pressure.request_count == 128 and
+    $pressure.w3c_parent_count == 1 and
+    $pressure.conservation == "H+R+W=N" and
+    ($pressure.exact_parent_count + $pressure.explicit_local_root_count +
+      $pressure.w3c_parent_count) == 128) and
+  (.issue_36 |
+    keys == ["full_hash_pressure", "pressure_contract", "status", "traffic"] and
+    .status == "passed" and
+    .pressure_contract == {barrier_schema:"pressure-traffic-barrier-v2",
+      traffic_barrier_cross_binding_verified:true, version:2} and
+    (.traffic |
+      keys == ["conservation", "exact_parent_count",
+        "explicit_local_root_count", "request_count", "unresolved_count",
+        "w3c_parent_count", "wrong_parent_count"] and
+      .request_count == 128 and
+      (.exact_parent_count | type == "number" and floor == . and
+        . >= 0 and . <= 127) and
+      (.explicit_local_root_count | type == "number" and floor == . and
+        . >= 1 and . <= 127) and
+      .w3c_parent_count == 1 and .wrong_parent_count == 0 and
+      .unresolved_count == 0 and .conservation == "H+R+W=N" and
+      (.exact_parent_count + .explicit_local_root_count +
+        .w3c_parent_count) == 128) and
+    (.full_hash_pressure |
+      keys == ["capacity", "capacity_rejected_entries",
+        "capacity_rejection_errno", "content_digest_equal",
+        "fill_content_sha256", "filled_entries", "map_type",
+        "post_traffic_content_sha256"] and
+      .map_type == "non-evicting HASH" and .capacity == 10000 and
+      .filled_entries == 10000 and .capacity_rejected_entries == 1 and
+      .capacity_rejection_errno == "E2BIG" and
+      (.fill_content_sha256 | sha256) and
+      (.post_traffic_content_sha256 | sha256) and
+      .post_traffic_content_sha256 == .fill_content_sha256 and
+      .content_digest_equal == true)) and
+  .issue_36.traffic.exact_parent_count ==
+    .issue_34.scenarios[9].exact_parent_count and
+  .issue_36.traffic.explicit_local_root_count ==
+    .issue_34.scenarios[9].explicit_local_root_count and
+  .issue_36.traffic.w3c_parent_count ==
+    .issue_34.scenarios[9].w3c_parent_count
+' "$bundle_directory/acceptance-claims.json" >/dev/null ||
+  fail 'acceptance-claims.json violates its closed claims-v2 schema'
+CLAIMS_V2_VALIDATION
+
+  awk -v v2_pressure_validation="$v2_pressure_validation" \
+    -v v2_validation="$v2_validation" '
+    function emit(path, line) {
+      while ((getline line < path) > 0) print line
+      close(path)
+    }
+    {
+      line = $0
+      if (skipping_pressure == 1) {
+        if (line == "        \"pressure-exact-or-explicit-root\")) and") {
+          skipping_pressure=0
+        }
+        next
+      }
+      if (line == "    (.scenarios[9] as $pressure |") {
+        emit(v2_pressure_validation)
+        pressure_replacements++
+        skipping_pressure=1
+        next
+      }
+      if (line == "  keys == [\"issue_32\", \"issue_34\", \"schema\", \"status\"] and") {
+        line = "  keys == [\"issue_32\", \"issue_34\", \"issue_36\", \"schema\", \"status\"] and"
+        root_key_replacements++
+      }
+      if (line == "  .schema == \"obi-bounded-acceptance-claims-v1\" and .status == \"passed\" and") {
+        line = "  .schema == \"obi-bounded-acceptance-claims-v2\" and .status == \"passed\" and"
+        schema_replacements++
+      }
+      if (index(line, "obi-bounded-claims-evidence-v1") != 0) {
+        sub("obi-bounded-claims-evidence-v1",
+          "obi-bounded-claims-evidence-v2", line)
+        evidence_domains++
+      }
+      if (index(line, "private-raw-v3-to-bounded-claims-v1") != 0) {
+        sub("private-raw-v3-to-bounded-claims-v1",
+          "private-raw-v3-to-bounded-claims-v2", line)
+        derivation_contracts++
+      }
+      print line
+      if (line == "  fail \047acceptance-claims.json violates its closed schema\047") {
+        emit(v2_validation)
+        validation_insertions++
+      }
+    }
+    END {
+      if (skipping_pressure != 0 || pressure_replacements != 1 ||
+          root_key_replacements != 1 || schema_replacements != 1 ||
+          evidence_domains != 1 || derivation_contracts != 1 ||
+          validation_insertions != 1) exit 1
+    }
+  ' "$verifier" >"$transformed" || return 1
+  chmod 0644 -- "$transformed" || return 1
+  mv -fT -- "$transformed" "$verifier" || return 1
+  chmod 0644 -- "$verifier" || return 1
+  rm -f -- "$v2_pressure_validation" "$v2_validation"
+}
+
 main() {
+  local acceptance_revision=""
+
   if [[ $# == 1 && ( "$1" == -h || "$1" == --help ) ]]; then
     usage
     return 0
   fi
+  case "${1:-}" in
+    --claims-v1)
+      CLAIMS_VERSION=1
+      CLAIMS_VERIFIER_MODE="--claims-v1"
+      shift
+      ;;
+    --claims-v2)
+      CLAIMS_VERSION=2
+      CLAIMS_VERIFIER_MODE="--claims-v2"
+      shift
+      ;;
+  esac
   [[ $# == 4 ]] || {
     usage >&2
     return 2
@@ -2709,8 +3128,26 @@ main() {
     die "assertion-failure raw-v3 input did not verify"
   assert_raw_runs_share_authority ||
     die "the two raw runs do not share one pinned source and runtime authority"
+  acceptance_revision="$(key_value \
+    "$ACCEPTANCE_SNAPSHOT/environment.txt" revision)" ||
+    die "could not read the authenticated acceptance source revision"
+  RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION="$(
+    recorded_pressure_traffic_contract_version "$acceptance_revision"
+  )" || die "authenticated pressure contract version is missing or ambiguous"
+  if [[ "$CLAIMS_VERSION" == 1 &&
+    ! "$RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION" =~ ^(0|1)$ ]]; then
+    die "claims-v1 requires authenticated raw pressure contract v0 or v1 evidence"
+  fi
+  if [[ "$CLAIMS_VERSION" == 2 &&
+    "$RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION" != 2 ]]; then
+    die "claims-v2 requires authenticated raw pressure contract v2 and barrier v2 evidence"
+  fi
   validate_private_claim_inputs ||
     die "private raw runs do not satisfy the bounded claim profile"
+  if [[ "$CLAIMS_VERSION" == 2 ]]; then
+    validate_private_issue_36_inputs ||
+      die "claims-v2 requires authenticated raw pressure contract v2 and barrier v2 evidence"
+  fi
   assert_private_input_authority_unchanged ||
     die "private inputs changed during semantic verification"
 
@@ -2720,18 +3157,28 @@ main() {
   CANDIDATE_IDENTITY="$(stat -Lc '%d:%i:%u' -- "$CANDIDATE_DIRECTORY")" ||
     die "could not pin publication candidate identity"
   write_claim_authority_summary || die "could not derive public authority"
-  write_acceptance_claim_summary || die "could not derive acceptance claims"
-  write_derivation_receipt || die "could not bind the derivation receipt"
+  if [[ "$CLAIMS_VERSION" == 2 ]]; then
+    write_acceptance_claim_summary_v2 || die "could not derive claims-v2 acceptance claims"
+    write_derivation_receipt_v2 || die "could not bind the claims-v2 derivation receipt"
+  else
+    write_acceptance_claim_summary || die "could not derive acceptance claims"
+    write_derivation_receipt || die "could not bind the derivation receipt"
+  fi
   write_claim_summary_notes || die "could not write bounded-claim notes"
-  write_portable_claim_verifier || die "could not write portable verifier"
+  if [[ "$CLAIMS_VERSION" == 2 ]]; then
+    write_portable_claim_verifier_v2 ||
+      die "could not write claims-v2 portable verifier"
+  else
+    write_portable_claim_verifier || die "could not write portable verifier"
+  fi
   write_checksum_manifest || die "could not seal the checksum closure"
   assert_private_input_authority_unchanged ||
     die "private inputs changed during bounded-claim derivation"
   validate_public_candidate_budget ||
     die "public candidate exceeds its exact file or byte cap"
   seal_public_candidate || die "could not make the candidate immutable"
-  "$VERIFIER" --claims-v1 "$CANDIDATE_DIRECTORY" >/dev/null ||
-    die "bounded-claim candidate did not pass claims-v1 verification"
+  "$VERIFIER" "$CLAIMS_VERIFIER_MODE" "$CANDIDATE_DIRECTORY" >/dev/null ||
+    die "bounded-claim candidate did not pass ${CLAIMS_VERIFIER_MODE#--} verification"
   (CDPATH='' cd / && bash "$CANDIDATE_DIRECTORY/verify.sh" >/dev/null) ||
     die "bounded-claim candidate did not pass portable verification"
   publish_verified_candidate || return 1

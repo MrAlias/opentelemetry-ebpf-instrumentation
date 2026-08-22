@@ -28,11 +28,41 @@ readonly OBI_METRIC_BOUNDARY_REFERENCED_MAX_BYTES=536870912
 readonly OBI_METRIC_BOUNDARY_FREEZE_MAX_BYTES=160
 readonly BUNDLE_ARCHIVE_MAX_BYTES=603979776
 readonly BUNDLE_ARCHIVE_MAX_FILES=32768
+readonly GIT_GRAPH_MAX_FILES=10000
+readonly GIT_GRAPH_MAX_TREES=4000
+readonly GIT_GRAPH_MAX_PATH_BYTES=2097152
+readonly GIT_GRAPH_MAX_PATH_LENGTH=4096
+readonly GIT_GRAPH_MAX_COMPONENT_LENGTH=255
+readonly GIT_GRAPH_MAX_PATH_DEPTH=64
+readonly GIT_GRAPH_MAX_COMMIT_BYTES=1048576
+readonly GIT_GRAPH_MAX_TREE_BYTES=1048576
+readonly GIT_GRAPH_MAX_TREE_TOTAL_BYTES=4194304
+readonly GIT_GRAPH_QUERY_TIMEOUT_SECONDS=30
+readonly GIT_GRAPH_TOTAL_TIMEOUT_SECONDS=120
+readonly -a GIT_AUTHORITY_OPTIONS=(
+  --no-replace-objects
+  -c core.fsmonitor=false
+  -c core.hooksPath=/dev/null
+  -c core.ignoreStat=false
+  -c core.trustctime=true
+  -c core.checkStat=default
+  -c core.untrackedCache=false
+  -c core.preloadIndex=false
+  -c core.fileMode=true
+  -c core.symlinks=true
+  -c core.ignoreCase=false
+  -c index.skipHash=false
+  -c index.threads=1
+)
 readonly RAW_V3_ARCHIVE_MAX_BYTES=603979776
 readonly RAW_V3_ARCHIVE_MAX_FILES=32768
 readonly CLAIM_V1_ARCHIVE_MAX_BYTES=188416
 readonly CLAIM_V1_ARCHIVE_MAX_FILES=7
 readonly CLAIM_VERIFY_SH_SHA256='376907ef806b4fdbdc971dde6d4a6f968476c64b237900d80a80dcd8d83e6f8b'
+readonly CLAIM_V2_ARCHIVE_MAX_BYTES=188416
+readonly CLAIM_V2_ARCHIVE_MAX_FILES=7
+readonly HELD_SOURCE_MAX_BYTES=1048576
+readonly CLAIM_V2_VERIFY_SH_SHA256='2511f18ed4961eea9f979a6fd8bad9ee973ce768adecaebcf0dea31b9aaa8e7d'
 readonly FAULT_SECURITY_MATRIX_V1_ARCHIVE_MAX_BYTES=262144
 readonly FAULT_SECURITY_MATRIX_V1_ARCHIVE_MAX_FILES=6
 # Updated with the exact portable verifier bytes emitted by the matrix
@@ -65,6 +95,11 @@ VERIFICATION_MODE="tracked"
 RAW_V3_KIND=""
 RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION=""
 EXTERNAL_SOURCE_DIRECTORY=""
+INTERNAL_HELD_SOURCE=false
+HELD_SOURCE_SCRIPT_DIR=""
+HELD_SOURCE_REPO_ROOT=""
+HELD_SOURCE_EXPECTED_HEAD=""
+HELD_SOURCE_EXPECTED_SHA256=""
 OBI_METRIC_BOUNDARY_INDEX_PAYLOAD=""
 OBI_METRIC_BOUNDARY_INDEX_SHA256=""
 declare -A VERIFIED_REFERENCE_SHA256=()
@@ -90,6 +125,7 @@ usage() {
     "       $SCRIPT_NAME --raw-v3 pid-reuse-unix ABSOLUTE_RESULT_DIRECTORY" \
     "       $SCRIPT_NAME --raw-v3 assertion-failure ABSOLUTE_RESULT_DIRECTORY" \
     "       $SCRIPT_NAME --claims-v1 ABSOLUTE_BUNDLE_DIRECTORY" \
+    "       $SCRIPT_NAME --claims-v2 ABSOLUTE_BUNDLE_DIRECTORY" \
     "       $SCRIPT_NAME --fault-security-matrix-v1 ABSOLUTE_BUNDLE_DIRECTORY" \
     "" \
     "Verify one sanitized retained acceptance-evidence bundle in this Git checkout." \
@@ -99,7 +135,7 @@ usage() {
     "--current-code also rejects changes after that revision except retained evidence" \
     "publication and Markdown documentation in the repository's documentation locations." \
     "The raw-v3 modes validate private producer output without publishing it." \
-    "The claims-v1 mode validates one closed bounded-claim summary." \
+    "The claims-v1 and claims-v2 modes validate closed bounded-claim summaries." \
     "The fault-security-matrix-v1 mode validates its separate six-file summary."
 }
 
@@ -107,6 +143,553 @@ die() {
   printf '%s: %s\n' "$SCRIPT_NAME" "$*" >&2
   exit 1
 }
+
+# Reexec the running Bash through its retained executable descriptor before an
+# absolute, empty-environment command. POSIX mode makes `exec` a special
+# builtin before same-shell or imported functions, while the randomized
+# descriptor spelling cannot equal a predeclared slash-name function.
+trusted_clean_exec() (
+  POSIXLY_CORRECT=1
+  [[ -o posix ]] && {
+    trap - EXIT HUP INT TERM ERR DEBUG RETURN QUIT ALRM
+    unset -n OBI_TRUSTED_BOOTSTRAP_FD OBI_TRUSTED_BOOTSTRAP_PATH \
+      OBI_TRUSTED_BOOTSTRAP_INDEX OBI_TRUSTED_BOOTSTRAP_PID 2>/dev/null ||
+      return 1
+    unset -v OBI_TRUSTED_BOOTSTRAP_FD OBI_TRUSTED_BOOTSTRAP_PATH \
+      OBI_TRUSTED_BOOTSTRAP_INDEX OBI_TRUSTED_BOOTSTRAP_PID 2>/dev/null ||
+      return 1
+    OBI_TRUSTED_BOOTSTRAP_FD=""
+    OBI_TRUSTED_BOOTSTRAP_PATH=/proc
+    OBI_TRUSTED_BOOTSTRAP_INDEX=0
+    OBI_TRUSTED_BOOTSTRAP_PID="$BASHPID"
+    [[ -z "$OBI_TRUSTED_BOOTSTRAP_FD" &&
+      "$OBI_TRUSTED_BOOTSTRAP_PATH" == /proc &&
+      "$OBI_TRUSTED_BOOTSTRAP_INDEX" == 0 &&
+      "$OBI_TRUSTED_BOOTSTRAP_PID" == "$BASHPID" ]] || return 1
+    (($# > 0)) || return 1
+    {
+    for ((OBI_TRUSTED_BOOTSTRAP_INDEX = 0;
+      OBI_TRUSTED_BOOTSTRAP_INDEX < 96;
+      OBI_TRUSTED_BOOTSTRAP_INDEX++)); do
+      if ((RANDOM & 1)); then
+        OBI_TRUSTED_BOOTSTRAP_PATH+=/.
+      else
+        OBI_TRUSTED_BOOTSTRAP_PATH+=//
+      fi
+    done
+    OBI_TRUSTED_BOOTSTRAP_PATH+="/$OBI_TRUSTED_BOOTSTRAP_PID/fd/$OBI_TRUSTED_BOOTSTRAP_FD"
+    [[ "$OBI_TRUSTED_BOOTSTRAP_FD" =~ ^[1-9][0-9]*$ &&
+      "$OBI_TRUSTED_BOOTSTRAP_PATH" == /* &&
+      -e "/proc/$OBI_TRUSTED_BOOTSTRAP_PID/fd/$OBI_TRUSTED_BOOTSTRAP_FD" &&
+      "/proc/$OBI_TRUSTED_BOOTSTRAP_PID/exe" -ef \
+        "/proc/$OBI_TRUSTED_BOOTSTRAP_PID/fd/$OBI_TRUSTED_BOOTSTRAP_FD" ]] ||
+      return 1
+    exec -c "$OBI_TRUSTED_BOOTSTRAP_PATH" --noprofile --norc --posix -c '
+      expected_pid=$1
+      bootstrap_fd=$2
+      shift 2
+      [[ -o posix && "$BASHPID" == "$expected_pid" &&
+        "$bootstrap_fd" =~ ^[1-9][0-9]*$ &&
+        /proc/self/exe -ef "/proc/self/fd/$bootstrap_fd" ]] || exit 1
+      exec {bootstrap_fd}<&-
+      exec -c "$@"
+    ' retained-git-clean-bootstrap "$OBI_TRUSTED_BOOTSTRAP_PID" \
+      "$OBI_TRUSTED_BOOTSTRAP_FD" "$@"
+    } {OBI_TRUSTED_BOOTSTRAP_FD}<"/proc/$OBI_TRUSTED_BOOTSTRAP_PID/exe"
+  }
+)
+
+# Internal held-source authority is resolved by a fixed Git executable with
+# caller state removed. Nine outer calls at six seconds plus the graph's
+# 120-second deadline bound hidden startup to 174 seconds. Normal public modes
+# keep their existing PATH and dependency contract.
+trusted_internal_literal_git() (
+  trusted_clean_exec /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C LANG=C \
+    GIT_NO_REPLACE_OBJECTS=1 GIT_NO_LAZY_FETCH=1 GIT_OPTIONAL_LOCKS=0 \
+    /usr/bin/timeout --foreground --kill-after=1s 5s \
+    /usr/bin/git "${GIT_AUTHORITY_OPTIONS[@]}" \
+      -c core.attributesFile=/dev/null -c core.bare=false \
+      -c extensions.worktreeConfig=false "$@"
+)
+
+assert_clean_local_git_config() {
+  local -r repository_root="$1"
+
+  trusted_internal_literal_git -C "$repository_root" \
+    config --local --no-includes \
+    --null --list |
+    trusted_clean_exec /usr/bin/python3 -I -c '
+import re
+import sys
+
+maximum = 1048576
+data = sys.stdin.buffer.read(maximum + 1)
+if len(data) > maximum or (data and not data.endswith(b"\0")):
+    raise ValueError("local Git config exceeds its authority bound")
+records = data[:-1].split(b"\0") if data else []
+for record in records:
+    key, separator, value = record.partition(b"\n")
+    if not separator or not key:
+        raise ValueError("local Git config record is malformed")
+    folded = key.lower()
+    if (folded.startswith((b"include.", b"includeif.", b"filter.")) or
+            folded in (
+                b"core.fsmonitor",
+                b"core.attributesfile",
+                b"core.worktree",
+                b"core.usereplacerefs",
+                b"extensions.worktreeconfig",
+                b"extensions.partialclone",
+            ) or
+            re.fullmatch(
+                rb"remote\..+\.(promisor|partialclonefilter)", folded
+            ) or
+            (folded == b"core.bare" and value.lower() != b"false")):
+        raise ValueError("local Git config changes source authority")
+' "$repository_root"
+}
+
+assert_internal_source_git_policy() {
+  local -r repository_root="$1"
+  local replacement_refs=""
+  local shallow_state=""
+
+  assert_clean_local_git_config "$repository_root" || return 1
+  replacement_refs="$(trusted_internal_literal_git -C "$repository_root" \
+    for-each-ref --count=1 --format='%(refname)' refs/replace/)" || return 1
+  [[ -z "$replacement_refs" || ${#replacement_refs} -le 4096 ]] || return 1
+  [[ -z "$replacement_refs" ]] || return 1
+  shallow_state="$(trusted_internal_literal_git -C "$repository_root" rev-parse \
+    --is-shallow-repository)" || return 1
+  [[ "$shallow_state" == false ]]
+}
+
+authenticate_held_source_git_graph() (
+  local -r repository_root="$1"
+  local -r revision="$2"
+  local -r relative_path="$3"
+  local -r held_path="$4"
+  local -r expected_sha256="$5"
+  local -r maximum_blob_bytes="$6"
+  local -r expected_uid="$7"
+  local -r held_pid="$8"
+  local -r held_fd="$9"
+
+  trusted_clean_exec /usr/bin/python3 -I - "$repository_root" "$revision" \
+    "$relative_path" "$held_path" "$expected_sha256" \
+    "$maximum_blob_bytes" "$expected_uid" "$held_pid" "$held_fd" \
+    "$GIT_GRAPH_MAX_FILES" "$GIT_GRAPH_MAX_TREES" \
+    "$GIT_GRAPH_MAX_PATH_BYTES" \
+    "$GIT_GRAPH_MAX_PATH_LENGTH" "$GIT_GRAPH_MAX_COMPONENT_LENGTH" \
+    "$GIT_GRAPH_MAX_PATH_DEPTH" "$GIT_GRAPH_MAX_COMMIT_BYTES" \
+    "$GIT_GRAPH_MAX_TREE_BYTES" "$GIT_GRAPH_MAX_TREE_TOTAL_BYTES" \
+    "$GIT_GRAPH_QUERY_TIMEOUT_SECONDS" "$GIT_GRAPH_TOTAL_TIMEOUT_SECONDS" \
+    "${GIT_AUTHORITY_OPTIONS[@]}" <<'PY'
+import functools
+import fcntl
+import hashlib
+import os
+import re
+import select
+import stat
+import subprocess
+import sys
+import time
+
+(
+    repository_root,
+    revision,
+    relative_path_text,
+    held_path,
+    expected_sha256,
+    maximum_blob_text,
+    expected_uid_text,
+    held_pid_text,
+    held_fd_text,
+    maximum_files_text,
+    maximum_trees_text,
+    maximum_path_bytes_text,
+    maximum_path_length_text,
+    maximum_component_length_text,
+    maximum_path_depth_text,
+    maximum_commit_text,
+    maximum_tree_text,
+    maximum_tree_total_text,
+    query_timeout_text,
+    total_timeout_text,
+    *git_options,
+) = sys.argv[1:]
+maximum_blob = int(maximum_blob_text)
+expected_uid = int(expected_uid_text)
+maximum_files = int(maximum_files_text)
+maximum_trees = int(maximum_trees_text)
+maximum_path_bytes = int(maximum_path_bytes_text)
+maximum_path_length = int(maximum_path_length_text)
+maximum_component_length = int(maximum_component_length_text)
+maximum_path_depth = int(maximum_path_depth_text)
+maximum_commit = int(maximum_commit_text)
+maximum_tree = int(maximum_tree_text)
+maximum_tree_total = int(maximum_tree_total_text)
+query_timeout = int(query_timeout_text)
+total_timeout = int(total_timeout_text)
+deadline = time.monotonic() + total_timeout
+git_environment = {
+    "PATH": "/usr/bin:/bin",
+    "LC_ALL": "C",
+    "LANG": "C",
+    "GIT_NO_REPLACE_OBJECTS": "1",
+    "GIT_NO_LAZY_FETCH": "1",
+    "GIT_OPTIONAL_LOCKS": "0",
+}
+
+
+def check_deadline():
+    if time.monotonic() >= deadline:
+        raise TimeoutError("authenticated Git object graph timed out")
+
+
+def validate_path(path):
+    components = path.split(b"/")
+    if (not path or path.startswith(b"/") or
+            len(path) > maximum_path_length or
+            len(components) > maximum_path_depth or any(
+                component in (b"", b".", b"..") or
+                len(component) > maximum_component_length
+                for component in components)):
+        raise ValueError("Git object graph path is unsafe")
+
+
+def object_digest(object_type, content):
+    digest = hashlib.sha1()
+    digest.update(object_type)
+    digest.update(b" ")
+    digest.update(str(len(content)).encode("ascii"))
+    digest.update(b"\0")
+    digest.update(content)
+    return digest.hexdigest().encode("ascii")
+
+
+class BatchReader:
+    def __init__(self):
+        check_deadline()
+        self.process = subprocess.Popen(
+            [
+                "/usr/bin/git",
+                *git_options,
+                "-c", "core.attributesFile=/dev/null",
+                "-c", "core.bare=false",
+                "-c", "extensions.worktreeConfig=false",
+                "-C",
+                repository_root,
+                f"--work-tree={repository_root}",
+                "cat-file",
+                "--batch",
+            ],
+            env=git_environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+        )
+        self.input_descriptor = self.process.stdin.fileno()
+        self.output_descriptor = self.process.stdout.fileno()
+        os.set_blocking(self.input_descriptor, False)
+        os.set_blocking(self.output_descriptor, False)
+        self.buffer = bytearray()
+        self.query_deadline = deadline
+
+    def _remaining(self):
+        remaining = min(self.query_deadline, deadline) - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Git object batch query timed out")
+        return remaining
+
+    def _write_all(self, value):
+        offset = 0
+        while offset < len(value):
+            check_deadline()
+            _, writable, _ = select.select(
+                [], [self.input_descriptor], [], self._remaining()
+            )
+            if not writable:
+                raise TimeoutError("Git object batch query timed out")
+            written = os.write(self.input_descriptor, value[offset:])
+            if written <= 0:
+                raise RuntimeError("Git object batch input closed")
+            offset += written
+
+    def _fill(self, maximum_read):
+        check_deadline()
+        readable, _, _ = select.select(
+            [self.output_descriptor], [], [], self._remaining()
+        )
+        if not readable:
+            raise TimeoutError("Git object batch query timed out")
+        chunk = os.read(self.output_descriptor, maximum_read)
+        if not chunk:
+            raise RuntimeError("Git object batch output closed")
+        self.buffer.extend(chunk)
+
+    def _read_line(self, maximum_length):
+        while b"\n" not in self.buffer:
+            remaining = maximum_length + 1 - len(self.buffer)
+            if remaining <= 0:
+                raise ValueError("Git object batch header exceeded its bound")
+            self._fill(min(remaining, 4096))
+        boundary = self.buffer.index(b"\n")
+        if boundary > maximum_length:
+            raise ValueError("Git object batch header exceeded its bound")
+        result = bytes(self.buffer[:boundary])
+        del self.buffer[:boundary + 1]
+        return result
+
+    def _read_exact(self, size):
+        while len(self.buffer) < size:
+            self._fill(min(size - len(self.buffer), 65536))
+        result = bytes(self.buffer[:size])
+        del self.buffer[:size]
+        return result
+
+    def read_object(self, object_id, expected_type, maximum_size):
+        if not re.fullmatch(b"[0-9a-f]{40}", object_id):
+            raise ValueError("Git object identifier is malformed")
+        self.query_deadline = min(time.monotonic() + query_timeout, deadline)
+        self._write_all(object_id + b"\n")
+        fields = self._read_line(256).split(b" ")
+        if (len(fields) != 3 or fields[0] != object_id or
+                fields[1] != expected_type or
+                not re.fullmatch(b"0|[1-9][0-9]*", fields[2])):
+            raise ValueError("Git object batch header is invalid")
+        size = int(fields[2])
+        if size > maximum_size:
+            raise ValueError("Git object exceeds its byte bound")
+        content = self._read_exact(size)
+        if self._read_exact(1) != b"\n":
+            raise ValueError("Git object batch record is unterminated")
+        if object_digest(expected_type, content) != object_id:
+            raise ValueError("Git object bytes do not match their identifier")
+        return content
+
+    def close(self, succeeded):
+        try:
+            if succeeded:
+                if self.buffer:
+                    raise ValueError("Git object batch left surplus protocol bytes")
+                self.process.stdin.close()
+                self.query_deadline = min(
+                    time.monotonic() + query_timeout, deadline
+                )
+                readable, _, _ = select.select(
+                    [self.output_descriptor], [], [], self._remaining()
+                )
+                if not readable or os.read(self.output_descriptor, 1):
+                    raise ValueError("Git object batch did not end at clean EOF")
+                remaining = max(
+                    0.001,
+                    min(deadline, time.monotonic() + query_timeout) -
+                    time.monotonic(),
+                )
+                if self.process.wait(timeout=remaining) != 0:
+                    raise RuntimeError("Git object batch process failed")
+        finally:
+            if self.process.poll() is None:
+                self.process.kill()
+                self.process.wait()
+            if not self.process.stdin.closed:
+                self.process.stdin.close()
+            self.process.stdout.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exception_type, _exception, _traceback):
+        self.close(exception_type is None)
+
+
+def parse_commit_tree(content):
+    header_end = content.find(b"\n\n")
+    if header_end < 0:
+        raise ValueError("Git commit object has no header boundary")
+    lines = content[:header_end].split(b"\n")
+    if (not lines or not re.fullmatch(b"tree [0-9a-f]{40}", lines[0]) or
+            sum(line.startswith(b"tree ") for line in lines) != 1):
+        raise ValueError("Git commit object has no unique root tree")
+    return lines[0][5:]
+
+
+def parse_tree(content):
+    entries = []
+    names = set()
+    offset = 0
+    while offset < len(content):
+        mode_end = content.find(b" ", offset)
+        name_end = content.find(b"\0", mode_end + 1)
+        if mode_end <= offset or name_end <= mode_end + 1:
+            raise ValueError("Git tree object entry is malformed")
+        mode = content[offset:mode_end]
+        name = content[mode_end + 1:name_end]
+        object_end = name_end + 21
+        if object_end > len(content):
+            raise ValueError("Git tree object identifier is truncated")
+        object_id = content[name_end + 1:object_end].hex().encode("ascii")
+        if (mode not in (b"40000", b"100644", b"100755", b"120000") or
+                not name or name in (b".", b"..") or b"/" in name or
+                len(name) > maximum_component_length or name in names):
+            raise ValueError("Git tree object entry is unsafe or unsupported")
+        names.add(name)
+        entries.append((mode, name, object_id))
+        offset = object_end
+    if not entries:
+        raise ValueError("Git tree object is empty")
+
+    def compare(left, right):
+        left_name = left[1]
+        right_name = right[1]
+        shared = min(len(left_name), len(right_name))
+        if left_name[:shared] != right_name[:shared]:
+            return -1 if left_name[:shared] < right_name[:shared] else 1
+        left_tail = ord("/") if left[0] == b"40000" else 0
+        right_tail = ord("/") if right[0] == b"40000" else 0
+        if len(left_name) > shared:
+            left_tail = left_name[shared]
+        if len(right_name) > shared:
+            right_tail = right_name[shared]
+        return (left_tail > right_tail) - (left_tail < right_tail)
+
+    if entries != sorted(entries, key=functools.cmp_to_key(compare)):
+        raise ValueError("Git tree object entries are not canonically ordered")
+    return entries
+
+
+def authenticate_graph():
+    revision_bytes = revision.encode("ascii")
+    cache = {}
+    leaves = {}
+    path_bytes = 0
+    tree_visits = 0
+    tree_bytes = 0
+    with BatchReader() as batch:
+        root_tree = parse_commit_tree(
+            batch.read_object(revision_bytes, b"commit", maximum_commit)
+        )
+
+        def read_tree(object_id):
+            nonlocal tree_bytes
+            if object_id not in cache:
+                if len(cache) >= maximum_trees:
+                    raise ValueError("Git object graph exceeds its tree-count bound")
+                raw_tree = batch.read_object(object_id, b"tree", maximum_tree)
+                tree_bytes += len(raw_tree)
+                if tree_bytes > maximum_tree_total:
+                    raise ValueError("Git object graph exceeds its tree-byte bound")
+                cache[object_id] = parse_tree(raw_tree)
+            return cache[object_id]
+
+        def walk(prefix, object_id, depth):
+            nonlocal path_bytes, tree_visits
+            check_deadline()
+            tree_visits += 1
+            if tree_visits > maximum_trees or depth > maximum_path_depth:
+                raise ValueError("Git object graph exceeds its traversal bound")
+            for mode, name, child_id in read_tree(object_id):
+                path = name if not prefix else prefix + b"/" + name
+                validate_path(path)
+                if mode == b"40000":
+                    walk(path, child_id, depth + 1)
+                    continue
+                if path in leaves:
+                    raise ValueError("Git object graph duplicates a leaf path")
+                path_bytes += len(path)
+                if path_bytes > maximum_path_bytes:
+                    raise ValueError("Git object graph exceeds its path-byte bound")
+                leaves[path] = (mode, child_id)
+                if len(leaves) > maximum_files:
+                    raise ValueError("Git object graph exceeds its leaf-count bound")
+
+        walk(b"", root_tree, 1)
+    if not leaves:
+        raise ValueError("Git object graph has no leaves")
+    return leaves
+
+
+repository_root_bytes = os.fsencode(repository_root)
+relative_path = os.fsencode(relative_path_text)
+expected_held_path = f"/proc/{held_pid_text}/fd/{held_fd_text}"
+if (sys.platform != "linux" or not os.path.isabs(repository_root) or
+        os.path.realpath(repository_root) != repository_root or
+        b"\n" in repository_root_bytes or
+        not re.fullmatch(r"[0-9a-f]{40}", revision) or
+        not 1 <= maximum_blob <= 1048576 or
+        not re.fullmatch(r"[1-9][0-9]*", held_pid_text) or
+        not re.fullmatch(r"[0-9]+", held_fd_text) or
+        held_path != expected_held_path or
+        not 1 <= maximum_files <= 10000 or
+        not 1 <= maximum_trees <= 4000 or
+        not 1 <= maximum_path_bytes <= 2097152 or
+        not 1 <= maximum_path_length <= 4096 or
+        not 1 <= maximum_component_length <= 255 or
+        not 1 <= maximum_path_depth <= 64 or
+        not 1 <= maximum_commit <= 1048576 or
+        not 1 <= maximum_tree <= 1048576 or
+        not maximum_tree <= maximum_tree_total <= 4194304 or
+        not 1 <= query_timeout <= 30 or not 1 <= total_timeout <= 120):
+    raise ValueError("authenticated Git graph arguments are invalid")
+validate_path(relative_path)
+
+leaves = authenticate_graph()
+entry = leaves.get(relative_path)
+if entry is None:
+    raise ValueError("authenticated held-source path is absent")
+mode, object_id = entry
+if (mode != b"100755" or not os.path.isabs(held_path) or
+        not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)):
+    raise ValueError("held Git source arguments are invalid")
+if (os.stat(f"/proc/{held_pid_text}").st_uid != expected_uid or
+        os.readlink(held_path) !=
+        "/memfd:obi-retained-source-verifier (deleted)"):
+    raise ValueError("held Git source process or descriptor is invalid")
+descriptor = os.open(held_path, os.O_RDONLY | os.O_CLOEXEC)
+try:
+    before = os.fstat(descriptor)
+    if (not stat.S_ISREG(before.st_mode) or before.st_size < 1 or
+            before.st_size > maximum_blob or before.st_uid != expected_uid or
+            stat.S_IMODE(before.st_mode) != 0o500 or before.st_nlink != 0):
+        raise ValueError("held Git source size is invalid")
+    required_seals = (
+        fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK |
+        fcntl.F_SEAL_SEAL
+    )
+    if fcntl.fcntl(descriptor, fcntl.F_GET_SEALS) & required_seals != required_seals:
+        raise ValueError("held Git source memfd lacks immutable seals")
+    content = bytearray()
+    offset = 0
+    while len(content) <= maximum_blob:
+        check_deadline()
+        block = os.pread(
+            descriptor,
+            min(65536, maximum_blob + 1 - len(content)),
+            offset,
+        )
+        if not block:
+            break
+        content.extend(block)
+        offset += len(block)
+    after = os.fstat(descriptor)
+finally:
+    os.close(descriptor)
+if (len(content) != before.st_size or
+        (before.st_dev, before.st_ino, before.st_size,
+         before.st_uid, before.st_mode, before.st_nlink,
+         before.st_ctime_ns, before.st_mtime_ns) !=
+        (after.st_dev, after.st_ino, after.st_size,
+         after.st_uid, after.st_mode, after.st_nlink,
+         after.st_ctime_ns, after.st_mtime_ns) or
+        object_digest(b"blob", content) != object_id or
+        hashlib.sha256(content).hexdigest() != expected_sha256):
+    raise ValueError("held Git source bytes differ from authenticated tree")
+sys.stdout.write(f"{mode.decode()} {object_id.decode()}\n")
+PY
+)
 
 sanitize_git_environment() {
   local git_variable=""
@@ -447,6 +1030,20 @@ check_dependencies() {
   if (( ${#missing[@]} > 0 )); then
     die "missing required commands: ${missing[*]}"
   fi
+  if [[ "$INTERNAL_HELD_SOURCE" == true ]]; then
+    [[ -f /usr/bin/bash && -x /usr/bin/bash &&
+      -f /usr/bin/env && -x /usr/bin/env &&
+      -f /usr/bin/git && -x /usr/bin/git &&
+      -f /usr/bin/python3 && -x /usr/bin/python3 &&
+      -f /usr/bin/timeout && -x /usr/bin/timeout &&
+      "$(stat -Lc '%u:%a' -- /usr/bin/bash)" == 0:* &&
+      "$(stat -Lc '%u:%a' -- /usr/bin/env)" == 0:* &&
+      "$(stat -Lc '%u:%a' -- /usr/bin/git)" == 0:* &&
+      "$(stat -Lc '%u:%a' -- /usr/bin/python3)" == 0:* &&
+      "$(stat -Lc '%u:%a' -- /usr/bin/timeout)" == 0:* ]] || {
+      die "trusted absolute Bash, env, Git, Python, or timeout runtime is unavailable"
+    }
+  fi
 }
 
 is_sha1() {
@@ -455,6 +1052,22 @@ is_sha1() {
 
 is_sha256() {
   [[ "$1" =~ ^[0-9a-f]{64}$ ]]
+}
+
+configure_internal_held_source() {
+  local -r script_directory="$1"
+  local -r repository_root="$2"
+  local -r expected_head="$3"
+  local -r expected_sha256="$4"
+
+  [[ "$script_directory" == /* && "$repository_root" == /* &&
+    "$expected_head" =~ ^[0-9a-f]{40}$ &&
+    "$expected_sha256" =~ ^[0-9a-f]{64}$ ]] || return 1
+  INTERNAL_HELD_SOURCE=true
+  HELD_SOURCE_SCRIPT_DIR="$script_directory"
+  HELD_SOURCE_REPO_ROOT="$repository_root"
+  HELD_SOURCE_EXPECTED_HEAD="$expected_head"
+  HELD_SOURCE_EXPECTED_SHA256="$expected_sha256"
 }
 
 raw_v3_kind_transport() {
@@ -612,9 +1225,115 @@ resolve_trusted_repository() {
   TRUSTED_REPO_ROOT="$(cd -- "$trusted_repo_root" && pwd -P)" || {
     die "could not resolve the verifier Git checkout"
   }
-  TRUSTED_HEAD="$(git -C "$TRUSTED_REPO_ROOT" rev-parse --verify --quiet 'HEAD^{commit}')" || {
+  TRUSTED_HEAD="$(git -C "$TRUSTED_REPO_ROOT" rev-parse --verify --quiet \
+    'HEAD^{commit}')" || {
     die "the verifier Git checkout does not have a HEAD commit"
   }
+}
+
+resolve_internal_held_source_authority() {
+  local -r verifier_relative_path='examples/apache-java-https/scripts/verify-retained-evidence.sh'
+  local -r held_source_path="${BASH_SOURCE[0]}"
+  local held_pid=''
+  local held_fd=''
+  local script_directory_physical=''
+  local repository_root_physical=''
+  local derived_repository_root=''
+  local git_repository_root=''
+  local observed_head=''
+  local held_receipt=''
+  local held_mode=''
+  local held_object_id=''
+  local held_extra=''
+  local final_head=''
+
+  [[ "$held_source_path" =~ ^/proc/([1-9][0-9]*)/fd/([0-9]+)$ ]] || {
+    die "internal held-source mode requires a process-held descriptor"
+  }
+  held_pid="${BASH_REMATCH[1]}"
+  held_fd="${BASH_REMATCH[2]}"
+  [[ "$held_pid" == "$BASHPID" && -d "/proc/$held_pid" ]] || {
+    die "internal held-source process identity is invalid"
+  }
+  [[ -d "$HELD_SOURCE_SCRIPT_DIR" && ! -L "$HELD_SOURCE_SCRIPT_DIR" ]] || {
+    die "internal held-source script directory is unsafe"
+  }
+  script_directory_physical="$(cd -- "$HELD_SOURCE_SCRIPT_DIR" && pwd -P)" || {
+    die "could not resolve the internal held-source script directory"
+  }
+  [[ "$script_directory_physical" == "$HELD_SOURCE_SCRIPT_DIR" ]] || {
+    die "internal held-source script directory must be physical"
+  }
+  [[ -d "$HELD_SOURCE_REPO_ROOT" && ! -L "$HELD_SOURCE_REPO_ROOT" ]] || {
+    die "internal held-source repository root is unsafe"
+  }
+  repository_root_physical="$(cd -- "$HELD_SOURCE_REPO_ROOT" && pwd -P)" || {
+    die "could not resolve the internal held-source repository root"
+  }
+  [[ "$repository_root_physical" == "$HELD_SOURCE_REPO_ROOT" ]] || {
+    die "internal held-source repository root must be physical"
+  }
+  derived_repository_root="$(cd -- "$HELD_SOURCE_SCRIPT_DIR/../../.." && pwd -P)" || {
+    die "could not derive the internal held-source repository root"
+  }
+  [[ "$derived_repository_root" == "$HELD_SOURCE_REPO_ROOT" &&
+    "$HELD_SOURCE_SCRIPT_DIR" == \
+      "$HELD_SOURCE_REPO_ROOT/examples/apache-java-https/scripts" ]] || {
+    die "internal held-source script directory is outside the exact repository location"
+  }
+  git_repository_root="$(trusted_internal_literal_git -C "$HELD_SOURCE_REPO_ROOT" \
+    rev-parse --show-toplevel)" || {
+    die "internal held-source root is not a Git checkout"
+  }
+  git_repository_root="$(cd -- "$git_repository_root" && pwd -P)" || {
+    die "could not resolve the internal held-source Git root"
+  }
+  [[ "$git_repository_root" == "$HELD_SOURCE_REPO_ROOT" ]] || {
+    die "internal held-source Git root does not match the physical trust root"
+  }
+  assert_internal_source_git_policy "$HELD_SOURCE_REPO_ROOT" || {
+    die "internal held-source checkout has replacement refs or replacement config"
+  }
+  observed_head="$(trusted_internal_literal_git -C "$HELD_SOURCE_REPO_ROOT" rev-parse \
+    --verify --quiet 'HEAD^{commit}')" || {
+    die "internal held-source checkout does not have an exact HEAD"
+  }
+  [[ "$observed_head" == "$HELD_SOURCE_EXPECTED_HEAD" ]] || {
+    die "internal held-source HEAD does not match the importing authority"
+  }
+  held_receipt="$(authenticate_held_source_git_graph "$HELD_SOURCE_REPO_ROOT" \
+    "$observed_head" "$verifier_relative_path" "$held_source_path" \
+    "$HELD_SOURCE_EXPECTED_SHA256" "$HELD_SOURCE_MAX_BYTES" "$EUID" \
+    "$held_pid" "$held_fd")" || {
+    die "internal held-source verifier bytes do not match exact HEAD"
+  }
+  read -r held_mode held_object_id held_extra <<<"$held_receipt"
+  [[ -z "$held_extra" && "$held_mode" == 100755 ]] || {
+    die "internal held-source verifier graph receipt is malformed"
+  }
+  is_sha1 "$held_object_id" || {
+    die "internal held-source verifier graph receipt is invalid"
+  }
+  assert_internal_source_git_policy "$HELD_SOURCE_REPO_ROOT" || {
+    die "internal held-source replacement authority changed"
+  }
+  final_head="$(trusted_internal_literal_git -C "$HELD_SOURCE_REPO_ROOT" rev-parse \
+    --verify --quiet 'HEAD^{commit}')" || {
+    die "internal held-source HEAD changed after object authentication"
+  }
+  [[ "$final_head" == "$observed_head" &&
+    "$final_head" == "$HELD_SOURCE_EXPECTED_HEAD" ]] || {
+    die "internal held-source HEAD identity changed"
+  }
+  exec {held_fd}<&- || {
+    die "could not close the authenticated held-source descriptor"
+  }
+  [[ ! -e "/proc/$BASHPID/fd/$held_fd" ]] || {
+    die "authenticated held-source descriptor remained open"
+  }
+
+  TRUSTED_REPO_ROOT="$HELD_SOURCE_REPO_ROOT"
+  TRUSTED_HEAD="$observed_head"
 }
 
 validate_tracked_bundle_archive_budget() {
@@ -703,7 +1422,8 @@ snapshot_bundle() {
   }
   BUNDLE_SNAPSHOT_ROOT="$snapshot_parent"
   assert_bundle_snapshot_root_has_mode 700
-  if ! git -C "$REPO_ROOT" archive --format=tar "$TRUSTED_HEAD" -- "$relative_path" |
+  if ! git -C "$REPO_ROOT" archive --format=tar \
+    "$TRUSTED_HEAD" -- "$relative_path" |
     (
       cd -- "$snapshot_parent" || exit 1
       exec tar -xf -
@@ -754,7 +1474,8 @@ validate_external_bundle_budget() {
   else
     [[ "$owner" == "$EUID" ]] || return 1
   fi
-  if [[ "$VERIFICATION_MODE" == claims-v1 ]]; then
+  if [[ "$VERIFICATION_MODE" == claims-v1 ||
+    "$VERIFICATION_MODE" == claims-v2 ]]; then
     case "$mode" in
       555)
         effective_file_mode=444
@@ -962,7 +1683,8 @@ snapshot_external_bundle() {
     die "could not create the private external-evidence archive"
   }
   BUNDLE_SNAPSHOT_ROOT="$snapshot_parent"
-  if [[ "$VERIFICATION_MODE" == claims-v1 ]]; then
+  if [[ "$VERIFICATION_MODE" == claims-v1 ||
+    "$VERIFICATION_MODE" == claims-v2 ]]; then
     BUNDLE_DIR="$snapshot_parent/$BUNDLE_NAME"
   else
     BUNDLE_DIR="$snapshot_parent/bundle"
@@ -1006,16 +1728,19 @@ verify_bundle_worktree_matches_pinned_head() {
   local -r relative_path="$1"
   local extra_paths=""
 
-  if ! git -C "$REPO_ROOT" diff --quiet "$TRUSTED_HEAD" -- "$relative_path"; then
+  if ! git -C "$REPO_ROOT" diff --quiet \
+    "$TRUSTED_HEAD" -- "$relative_path"; then
     die "bundle working-tree content differs from the captured HEAD commit"
   fi
-  extra_paths="$(git -C "$REPO_ROOT" ls-files --others --exclude-standard -- "$relative_path")" || {
+  extra_paths="$(git -C "$REPO_ROOT" ls-files \
+    --others --exclude-standard -- "$relative_path")" || {
     die "could not inspect untracked bundle files"
   }
   [[ -z "$extra_paths" ]] || {
     die "bundle contains untracked or ignored working-tree files"
   }
-  extra_paths="$(git -C "$REPO_ROOT" ls-files --others --ignored --exclude-standard -- "$relative_path")" || {
+  extra_paths="$(git -C "$REPO_ROOT" ls-files \
+    --others --ignored --exclude-standard -- "$relative_path")" || {
     die "could not inspect ignored bundle files"
   }
   [[ -z "$extra_paths" ]] || {
@@ -1305,9 +2030,11 @@ write_source_tree_manifest_for_revision() {
   local object_id=""
   local executable=""
 
-  git -C "$REPO_ROOT" cat-file -e "${revision}^{commit}" || return 1
+  git -C "$REPO_ROOT" cat-file -e \
+    "${revision}^{commit}" || return 1
   entries="$TMP_DIR/source-tree-entries"
-  git -C "$REPO_ROOT" ls-tree -r -z --full-tree "$revision" >"$entries" || return 1
+  git -C "$REPO_ROOT" ls-tree -r -z --full-tree \
+    "$revision" >"$entries" || return 1
   while IFS= read -r -d '' entry; do
     metadata="${entry%%$'\t'*}"
     path="${entry#*$'\t'}"
@@ -2025,7 +2752,7 @@ validate_obi_metric_pair() {
         jq -e 'all(.series[]; .operation != "handoff_admission")' \
           "$pair" >/dev/null || return 1
         ;;
-      1)
+      1|2)
         jq -e '
           . as $pair |
           [.series[] | select(.operation == "handoff_admission")] as $rows |
@@ -3342,7 +4069,8 @@ recorded_pressure_traffic_contract_version() {
   local producer="$TMP_DIR/recorded-pressure-run-producer"
   local producer_size=""
   local assignment_count=""
-  local marker_count=""
+  local v1_marker_count=""
+  local v2_marker_count=""
 
   is_sha1 "$revision" || return 1
   producer_size="$(git -C "$REPO_ROOT" cat-file -s \
@@ -3355,11 +4083,14 @@ recorded_pressure_traffic_contract_version() {
     "$(stat -Lc '%s' -- "$producer")" == "$producer_size" ]] || return 1
   assignment_count="$(grep -Ec \
     '^PRESSURE_TRAFFIC_CONTRACT_VERSION=' "$producer" || true)"
-  marker_count="$(grep -Fxc \
+  v1_marker_count="$(grep -Fxc \
     'PRESSURE_TRAFFIC_CONTRACT_VERSION=1' "$producer" || true)"
-  case "$assignment_count:$marker_count" in
-    0:0) printf '0\n' ;;
-    1:1) printf '1\n' ;;
+  v2_marker_count="$(grep -Fxc \
+    'PRESSURE_TRAFFIC_CONTRACT_VERSION=2' "$producer" || true)"
+  case "$assignment_count:$v1_marker_count:$v2_marker_count" in
+    0:0:0) printf '0\n' ;;
+    1:1:0) printf '1\n' ;;
+    1:0:1) printf '2\n' ;;
     *) return 1 ;;
   esac
 }
@@ -3845,7 +4576,8 @@ validate_raw_scenario_graph() {
       return 1
     return
   fi
-  jq -e --arg scenario "$scenario" '
+  jq -e --arg scenario "$scenario" --argjson contract_version \
+    "${RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION:-0}" '
     def trace_id:
       type == "string" and test("^[0-9a-f]{32}$") and
       . != "00000000000000000000000000000000";
@@ -3896,9 +4628,53 @@ validate_raw_scenario_graph() {
       $descendant.trace_id == $ancestor.trace_id and
       $descendant.service_name == $ancestor.service_name and
       climb($descendant.parent_span_id; []);
-    all(.cases[];
-      . as $case |
-      (.trace.spans + (.trace.related_spans // [])) as $spans |
+    # Match tracecheck spanDescendsFrom for the v2 pressure authority.  Unlike
+    # the legacy helper above, traversal continues beyond the named ancestor
+    # so a self-parent or cycle at/above that ancestor cannot be hidden.
+    def descends_exact($spans; $descendant; $ancestor):
+      def climb($parent_id; $seen; $found_ancestor):
+        if ($parent_id | zero_parent) then $found_ancestor
+        elif ($seen | index($parent_id)) != null then false
+        else
+          [$spans[] | select(.trace_id == $descendant.trace_id and
+            .span_id == $parent_id)] as $parents |
+          if ($parents | length) == 0 then $found_ancestor
+          elif ($parents | length) != 1 then false
+          elif ($found_ancestor | not) and
+              $parents[0].service_name != $ancestor.service_name then false
+          else
+            climb($parents[0].parent_span_id; $seen + [$parent_id];
+              $found_ancestor or $parent_id == $ancestor.span_id)
+          end
+        end;
+      $descendant.trace_id == $ancestor.trace_id and
+      $descendant.service_name == $ancestor.service_name and
+      ([$spans[] | select(.trace_id == $descendant.trace_id and
+        .span_id == $descendant.span_id)] | length) == 1 and
+      ([$spans[] | select(.trace_id == $ancestor.trace_id and
+        .span_id == $ancestor.span_id)] | length) == 1 and
+      climb($descendant.parent_span_id; []; false);
+    def unique_span_identities($spans):
+      ([$spans[] | [.trace_id, .span_id]] | length) ==
+        ([$spans[] | [.trace_id, .span_id]] | unique | length);
+    def acyclic_span_ancestry($spans):
+      def climb($trace; $parent_id; $seen):
+        if ($parent_id | zero_parent) then true
+        elif ($seen | index($parent_id)) != null then false
+        else
+          [$spans[] | select(.trace_id == $trace and
+            .span_id == $parent_id)] as $parents |
+          if ($parents | length) == 0 then true
+          elif ($parents | length) != 1 then false
+          else
+            climb($trace; $parents[0].parent_span_id; $seen + [$parent_id])
+          end
+        end;
+      all($spans[]; . as $span |
+        climb($span.trace_id; $span.parent_span_id; [$span.span_id]));
+    (.cases | to_entries | all(.[];
+      .key as $index | .value as $case |
+      ($case.trace.spans + ($case.trace.related_spans // [])) as $spans |
       ([$spans[] |
         select(.service_name == "apache-proxy" and .kind == "CLIENT" and
           marker(.) == $case.request.marker and
@@ -3909,6 +4685,16 @@ validate_raw_scenario_graph() {
       ([$spans[] |
         select(.service_name == "apache-proxy" and .kind == "SERVER" and
           (marker(.) == null or marker(.) == $case.request.marker))]) as $server |
+      (if $scenario == "pressure" and $contract_version == 2 then
+        all($spans[];
+          (.trace_id | trace_id) and (.span_id | span_id) and
+          ((.parent_span_id | zero_parent) or
+            (.parent_span_id | span_id)) and
+          (.flags | type == "number" and floor == . and . >= 0 and
+            . <= 4294967295)) and
+        unique_span_identities($spans) and
+        acyclic_span_ancestry($spans)
+      else true end) and
       ($client | length) == 1 and ($java | length) == 1 and
       (if $scenario == "pipelining" then ($server | length) <= 1
        else ($server | length) == 1 end) and
@@ -3923,19 +4709,45 @@ validate_raw_scenario_graph() {
           ($java[0].parent_span_id | span_id))
       else ($java[0].parent_span_id | span_id) end) and
       ([$spans[] | select(.trace_id == $java[0].trace_id and
+        .service_name == $java[0].service_name and
         .parent_span_id == $java[0].parent_span_id and
         .span_id != $java[0].span_id)] | length) == 0 and
       (if ($server | length) == 1 then
         marker($server[0]) == $case.request.marker and
         endpoint_exact($server[0]; $case.request.endpoint) and
         ($server[0].trace_id | trace_id) and ($server[0].span_id | span_id) and
-        ($server[0].parent_span_id | zero_parent) and
-        descends($spans; $client[0]; $server[0])
+        (if $scenario == "pressure" and $contract_version == 2 and
+            $index == 0 then
+          $server[0].trace_id == $case.request.w3c_trace_id and
+          $server[0].parent_span_id == $case.request.w3c_parent_span_id and
+          ($server[0].flags % 256) == 1
+        else ($server[0].parent_span_id | zero_parent) end) and
+        (if $scenario == "pressure" and $contract_version == 2 then
+          descends_exact($spans; $client[0]; $server[0])
+        else descends($spans; $client[0]; $server[0]) end)
       else ($client[0].parent_span_id | zero_parent) end) and
       $client[0].span_id != $java[0].span_id and
       ($client[0].flags | type == "number" and floor == . and . >= 0) and
       ($java[0].flags | type == "number" and floor == . and . >= 0) and
-      (if $scenario == "pressure" and
+      (if $scenario == "pressure" and $contract_version == 2 and
+          $index == 0 then
+        $case.request.w3c_case ==
+          "valid-w3c-under-full-hash-pressure" and
+        $case.request.w3c_trace_flags == "01" and
+        $client[0].trace_id == $case.request.w3c_trace_id and
+        $server[0].span_id != $case.request.w3c_parent_span_id and
+        $client[0].span_id != $case.request.w3c_parent_span_id and
+        $java[0].span_id != $case.request.w3c_parent_span_id and
+        $server[0].span_id != $client[0].span_id and
+        $server[0].span_id != $java[0].span_id and
+        $client[0].span_id != $java[0].span_id and
+        ($client[0].flags % 256) == 1 and
+        $java[0].trace_id == $case.request.w3c_trace_id and
+        $java[0].parent_span_id == $case.request.w3c_parent_span_id and
+        (($java[0].flags / 256 | floor) % 2) == 1 and
+        (($java[0].flags / 512 | floor) % 2) == 1 and
+        ($java[0].flags % 256) == 1
+      elif $scenario == "pressure" and
           ($java[0].parent_span_id | zero_parent) then
         (($java[0].flags / 512 | floor) % 2) == 0 and
         $client[0].trace_id != $java[0].trace_id
@@ -3945,7 +4757,7 @@ validate_raw_scenario_graph() {
         (($java[0].flags / 256 | floor) % 2) == 1 and
         (($java[0].flags / 512 | floor) % 2) == 1 and
         ($client[0].flags % 256) == ($java[0].flags % 256)
-      end))
+      end)))
   ' "$BUNDLE_DIR/$result" >/dev/null || {
     printf '%s: raw scenario predicate failed: %s-bridge-topology\n' \
       "$SCRIPT_NAME" "$scenario" >&2
@@ -4438,12 +5250,22 @@ validate_raw_scenario_graph() {
         "${RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION:-0}" '
         def zero_parent:
           . == null or . == "" or . == "0000000000000000";
+        def trace_id:
+          type == "string" and test("^[0-9a-f]{32}$") and
+          . != "00000000000000000000000000000000";
+        def span_id:
+          type == "string" and test("^[0-9a-f]{16}$") and
+          . != "0000000000000000";
         . as $root |
-        [$root.cases[] |
-          [.trace.spans[] | select(
-            .service_name == "java-backend" and .kind == "SERVER")][0] |
-          if (.parent_span_id | zero_parent) then "explicit_root"
-          else "exact" end] as $outcomes |
+        [$root.cases | to_entries[] |
+          .key as $index | .value as $case |
+          [($case.trace.spans + ($case.trace.related_spans // []))[] |
+            select(.service_name == "java-backend" and .kind == "SERVER")]
+            as $java |
+          if ($java | length) != 1 then error("Java cardinality")
+          elif $contract_version == 2 and $index == 0 then "w3c"
+          elif ($java[0].parent_span_id | zero_parent) then "explicit_root"
+          else "exact_hit" end] as $outcomes |
         (.cases | to_entries | all(.[];
           .key as $index | .value as $case |
           $case.request.handoff_hops == (2 + ($index % 7)) and
@@ -4451,7 +5273,30 @@ validate_raw_scenario_graph() {
           $case.response.workload == "servlet-async-executor" and
           $case.response.handoff_hops == ((2 + ($index % 7)) | tostring) and
           $case.response.handoff_fault == "none")) and
-        ([$outcomes[] | select(. == "exact")] | length) ==
+        (if $contract_version == 2 then
+          ($root.pressure_correlation | keys) == [
+            "exact_hit_count", "explicit_root_count", "request_count",
+            "unresolved_count", "w3c_parent_count", "wrong_parent_count"
+          ] and
+          $root.cases[0].request.w3c_case ==
+            "valid-w3c-under-full-hash-pressure" and
+          ($root.cases[0].request.w3c_trace_id | trace_id) and
+          ($root.cases[0].request.w3c_parent_span_id | span_id) and
+          $root.cases[0].request.w3c_trace_flags == "01" and
+          ($root.cases[0] | has("pressure_parent_outcome") | not) and
+          ([range(1; $root.request_count) as $index |
+            $root.cases[$index].request |
+            select(has("w3c_case") or has("w3c_trace_id") or
+              has("w3c_parent_span_id") or has("w3c_trace_flags"))] |
+            length) == 0 and
+          ([range(1; $root.request_count) as $index |
+            $root.cases[$index] |
+            select(.pressure_parent_outcome != $outcomes[$index])] |
+            length) == 0 and
+          $root.pressure_correlation.request_count == $root.request_count and
+          $root.pressure_correlation.w3c_parent_count == 1
+        else true end) and
+        ([$outcomes[] | select(. == "exact_hit")] | length) ==
           .pressure_correlation.exact_hit_count and
         ([$outcomes[] | select(. == "explicit_root")] | length) ==
           .pressure_correlation.explicit_root_count and
@@ -4459,13 +5304,128 @@ validate_raw_scenario_graph() {
           floor == . and . >= 0 and . <= $root.request_count) and
         (.pressure_correlation.explicit_root_count | type == "number" and
           floor == . and
-          . >= (if $contract_version == 1 then 1 else 0 end) and
+          . >= (if $contract_version == 0 then 0 else 1 end) and
           . <= $root.request_count) and
         (.pressure_correlation.exact_hit_count +
-          .pressure_correlation.explicit_root_count) == .request_count and
+          .pressure_correlation.explicit_root_count +
+          (if $contract_version == 2 then
+            .pressure_correlation.w3c_parent_count else 0 end)) ==
+          .request_count and
         .pressure_correlation.wrong_parent_count == 0 and
         .pressure_correlation.unresolved_count == 0
       ' "$BUNDLE_DIR/$result" >/dev/null || return 1
+      if [[ "${RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION:-}" == 2 ]]; then
+        jq -e -s --arg expected_transport "$expected_selected_transport" '
+          def count:
+            type == "number" and floor == . and . >= 0 and . <= 128;
+          def admission_count:
+            type == "number" and floor == . and . >= 0 and . <= 1152;
+          .[0].pressure_correlation as $trace |
+          .[1].pressure_correlation as $status |
+          $trace == $status.trace and
+          ($status | keys) == ["barrier_reference", "bridge",
+            "container_inspections", "java_reconciliation_target", "trace"] and
+          $status.barrier_reference ==
+            "map-pressure-pressure-barrier-status.json" and
+          ($status.container_inspections |
+            keys == ["reference", "sha256", "size_bytes"] and
+            .reference ==
+              "map-pressure-pressure-container-inspections.json" and
+            (.sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+            (.size_bytes | type == "number" and floor == . and . >= 1 and
+              . <= 32768)) and
+          ($trace | keys) == ["exact_hit_count", "explicit_root_count",
+            "request_count", "unresolved_count", "w3c_parent_count",
+            "wrong_parent_count"] and
+          $trace.request_count == 128 and $trace.w3c_parent_count == 1 and
+          $trace.explicit_root_count >= 1 and
+          $trace.wrong_parent_count == 0 and $trace.unresolved_count == 0 and
+          ($trace.exact_hit_count + $trace.explicit_root_count +
+            $trace.w3c_parent_count) == 128 and
+          ($status.bridge as $bridge |
+            ($bridge | keys) == [
+              "attributable_failure_count", "auxiliary_outcome_counts",
+              "handoff_admission_outcome_counts", "phase_outcome_counts",
+              "retrieval_failure_count", "retrieval_failure_reason_counts",
+              "retrieval_valid_count", "transport",
+              "upstream_failure_count", "upstream_failure_reason_counts",
+              "w3c_masked_valid_count"
+            ] and
+            $bridge.transport == $expected_transport and
+            ($bridge.phase_outcome_counts |
+              keys == ["candidate", "inject", "retrieval", "stage"] and
+              all(.[]; count) and .inject == 128 and
+              .inject >= .candidate and .candidate >= .stage and
+              (if $expected_transport == "unix" then .retrieval == 128
+               else .stage >= .retrieval end)) and
+            ($bridge.auxiliary_outcome_counts |
+              keys == ["handoff"] and (.handoff | count) and
+              .handoff <= $bridge.retrieval_valid_count) and
+            ($bridge.handoff_admission_outcome_counts |
+              keys == ["ambiguous", "maximum", "overload"] and
+              (.overload | admission_count) and .overload >= 1 and
+              .ambiguous == 0 and .maximum == 1152) and
+            ($bridge.retrieval_valid_count | count) and
+            ($bridge.attributable_failure_count | count) and
+            ($bridge.w3c_masked_valid_count | count) and
+            ($bridge.upstream_failure_count | count) and
+            ($bridge.retrieval_failure_count | count) and
+            $bridge.retrieval_valid_count >= $trace.exact_hit_count and
+            $bridge.retrieval_valid_count <=
+              ($trace.exact_hit_count + $trace.w3c_parent_count) and
+            $bridge.attributable_failure_count >=
+              $trace.explicit_root_count and
+            $bridge.attributable_failure_count <=
+              ($trace.explicit_root_count + $trace.w3c_parent_count) and
+            ($bridge.retrieval_valid_count +
+              $bridge.attributable_failure_count) == 128 and
+            $bridge.w3c_masked_valid_count ==
+              ($bridge.retrieval_valid_count - $trace.exact_hit_count) and
+            ($bridge.w3c_masked_valid_count +
+              $bridge.attributable_failure_count -
+                $trace.explicit_root_count) == $trace.w3c_parent_count and
+            ($bridge.w3c_masked_valid_count == 0 or
+              $bridge.w3c_masked_valid_count == 1) and
+            ($bridge.upstream_failure_reason_counts |
+              keys == ["ambiguous", "malformed", "missing", "overload",
+                "segmented", "stale"] and all(.[]; count) and
+              ([.[]] | add) == $bridge.upstream_failure_count) and
+            ($bridge.retrieval_failure_reason_counts |
+              keys == ["already_consumed", "ambiguous", "disabled",
+                "malformed", "missing", "overload", "stale", "timeout",
+                "transport_error", "unauthorized", "unsupported",
+                "version_mismatch"] and all(.[]; count) and
+              ([.[]] | add) == $bridge.retrieval_failure_count) and
+            (if $expected_transport == "getsockopt" then
+              ($bridge.upstream_failure_count +
+                $bridge.retrieval_failure_count) ==
+                  $bridge.attributable_failure_count and
+              $bridge.phase_outcome_counts.retrieval ==
+                ($bridge.retrieval_valid_count +
+                  $bridge.retrieval_failure_count) and
+              (128 - $bridge.phase_outcome_counts.retrieval) ==
+                $bridge.upstream_failure_count
+            else
+              $bridge.retrieval_failure_count ==
+                $bridge.attributable_failure_count and
+              $bridge.upstream_failure_count <=
+                $bridge.attributable_failure_count and
+              $bridge.retrieval_failure_reason_counts.already_consumed ==
+                $bridge.attributable_failure_count and
+              all($bridge.retrieval_failure_reason_counts | to_entries[];
+                .key == "already_consumed" or .value == 0)
+            end)) and
+          $status.java_reconciliation_target == {
+            attributable_absence_count:
+              $status.bridge.attributable_failure_count,
+            diagnostic_self_miss_count:1,
+            discard_standard_count:$status.bridge.w3c_masked_valid_count,
+            take_sampled_count:$status.bridge.retrieval_valid_count,
+            take_unsampled_count:0,
+            take_valid_count:$status.bridge.retrieval_valid_count
+          }
+        ' "$BUNDLE_DIR/$result" "$BUNDLE_DIR/$status" >/dev/null || return 1
+      else
       jq -e -s --argjson contract_version \
         "${RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION:-0}" \
         --arg expected_transport "$expected_selected_transport" '
@@ -4536,6 +5496,7 @@ validate_raw_scenario_graph() {
           ($status | keys == ["bridge", "java_reconciliation_target", "trace"])
         end)
       ' "$BUNDLE_DIR/$result" "$BUNDLE_DIR/$status" >/dev/null || return 1
+      fi
       ;;
     handoff)
       jq -e '
@@ -5187,6 +6148,260 @@ raw_pressure_delta_summary() {
   ' "$parsed_delta"
 }
 
+# Reconstruct the v2 pressure bridge authority from the authenticated metric
+# pair.  The one standard-W3C request may either reach Java as a valid bridge
+# take which is discarded, or fail bridge retrieval while W3C still wins.
+raw_pressure_bridge_reconciliation_v2() {
+  local -r relative_path="$1"
+  local -r expected_hits="$2"
+  local -r expected_roots="$3"
+  local -r expected_w3c="$4"
+  local -r expected_requests="$5"
+  local maximum_admission=""
+  local parsed_delta=""
+  local expected_transport=""
+
+  [[ "$expected_hits" =~ ^(0|[1-9][0-9]*)$ &&
+    "$expected_roots" =~ ^[1-9][0-9]*$ && "$expected_w3c" == 1 &&
+    "$expected_requests" =~ ^[1-9][0-9]{0,3}$ ]] || return 1
+  ((expected_requests <= 1000 &&
+    expected_hits + expected_roots + expected_w3c == expected_requests)) ||
+    return 1
+  expected_transport="$(jq -er '.selection.selected_transport' \
+    <<<"$OBI_METRIC_BOUNDARY_INDEX_PAYLOAD")" || return 1
+  [[ "$expected_transport" == getsockopt || "$expected_transport" == unix ]] ||
+    return 1
+  maximum_admission="$(
+    raw_pressure_admission_max_events "$expected_requests"
+  )" || return 1
+  parsed_delta="$(mktemp "$TMP_DIR/raw-pressure-v2-delta.XXXXXX")" || return $?
+  validate_raw_pressure_delta_pair_v1 \
+    "$relative_path" "$expected_requests" "$parsed_delta" || return 1
+
+  LC_ALL=C awk \
+    -v selected="$expected_transport" \
+    -v wanted_hits="$expected_hits" \
+    -v wanted_roots="$expected_roots" \
+    -v wanted_w3c="$expected_w3c" \
+    -v wanted_requests="$expected_requests" \
+    -v max_admission="$maximum_admission" '
+    function upstream_status(status) {
+      return status == "missing" || status == "stale" ||
+        status == "ambiguous" || status == "malformed" ||
+        status == "overload" || status == "segmented"
+    }
+    function retrieval_status(status) {
+      return status == "missing" || status == "stale" ||
+        status == "unsupported" || status == "malformed" ||
+        status == "version_mismatch" || status == "ambiguous" ||
+        status == "unauthorized" || status == "already_consumed" ||
+        status == "timeout" || status == "overload" ||
+        status == "transport_error" || status == "disabled"
+    }
+    {
+      if (NF != 6) { failed = 1; next }
+      transport = $1
+      operation = $2
+      status = $3
+      delta = $6
+      if (operation !~ /^[a-z_]+$/ || status !~ /^[a-z_]+$/ ||
+          transport !~ /^[a-z_]+$/ ||
+          delta !~ /^(0|[1-9][0-9]{0,4})$/ || (delta + 0) > 10000) {
+        failed = 1
+        next
+      }
+      key = transport "|" operation "|" status
+      if (seen[key]++) { failed = 1; next }
+      if (operation == "inject" && transport == "tcp") {
+        inject_total += delta
+        if (status == "valid") inject_valid += delta
+        else if (upstream_status(status)) {
+          inject_fail += delta
+          upstream_reason[status] += delta
+        } else if (delta != 0) failed = 1
+        next
+      }
+      if (operation == "candidate" && transport == "tcp") {
+        candidate_total += delta
+        if (status == "valid") candidate_valid += delta
+        else if (status == "ambiguous" || status == "malformed" ||
+            status == "overload") {
+          candidate_fail += delta
+          upstream_reason[status] += delta
+        } else if (delta != 0) failed = 1
+        next
+      }
+      if (operation == "stage" && transport == "tcp") {
+        stage_total += delta
+        if (status == "valid") stage_valid += delta
+        else if (status == "ambiguous" || status == "malformed" ||
+            status == "overload") {
+          stage_fail += delta
+          upstream_reason[status] += delta
+        } else if (delta != 0) failed = 1
+        next
+      }
+      if (operation == "take") {
+        if (transport != selected) {
+          if (delta != 0) failed = 1
+        } else {
+          retrieval_total += delta
+          if (status == "valid") retrieval_valid += delta
+          else if (retrieval_status(status)) {
+            retrieval_fail += delta
+            retrieval_reason[status] += delta
+          } else if (delta != 0) failed = 1
+        }
+        next
+      }
+      if (operation == "handoff" && transport == "tcp") {
+        if (status == "valid") handoff_valid += delta
+        else if (delta != 0) failed = 1
+        next
+      }
+      if (operation == "handoff_admission") {
+        if (transport != "tcp" ||
+            (status != "overload" && status != "ambiguous")) {
+          failed = 1
+          next
+        }
+        if (status == "overload") {
+          admission_overload_rows++
+          admission_overload += delta
+        } else {
+          admission_ambiguous_rows++
+          admission_ambiguous += delta
+        }
+        next
+      }
+      allowed = operation == "negotiate" && status == "missing" &&
+        transport == selected
+      allowed = allowed || (operation == "cleanup" && status == "valid" &&
+        transport == "tcp")
+      allowed = allowed || (operation == "report" && status == "valid" &&
+        transport == "tcp")
+      if (delta != 0 && !allowed) failed = 1
+    }
+    END {
+      upstream_fail = inject_fail + candidate_fail + stage_fail
+      failures = selected == "getsockopt" ?
+        upstream_fail + retrieval_fail : retrieval_fail
+      masked = retrieval_valid - wanted_hits
+      if (inject_total != wanted_requests || inject_valid != candidate_total ||
+          candidate_valid != stage_total || retrieval_valid < wanted_hits ||
+          retrieval_valid > wanted_hits + wanted_w3c ||
+          failures < wanted_roots || failures > wanted_roots + wanted_w3c ||
+          retrieval_valid + failures != wanted_requests ||
+          masked < 0 || masked > 1 ||
+          masked + failures - wanted_roots != wanted_w3c ||
+          handoff_valid > retrieval_valid ||
+          (selected != "getsockopt" && handoff_valid != 0) ||
+          admission_overload_rows != 1 || admission_ambiguous_rows > 1 ||
+          admission_overload < 1 || admission_overload > max_admission ||
+          admission_ambiguous != 0) failed = 1
+      if (selected == "getsockopt") {
+        if (stage_valid != retrieval_total ||
+            upstream_fail + retrieval_fail != failures) failed = 1
+      } else if (retrieval_total != wanted_requests ||
+          retrieval_fail != failures || upstream_fail > failures ||
+          retrieval_reason["already_consumed"] != failures) failed = 1
+      if (failed) exit 1
+      printf "{\"transport\":\"%s\",", selected
+      printf "\"phase_outcome_counts\":{\"inject\":%d,\"candidate\":%d,\"stage\":%d,\"retrieval\":%d},", inject_total, candidate_total, stage_total, retrieval_total
+      printf "\"auxiliary_outcome_counts\":{\"handoff\":%d},", handoff_valid
+      printf "\"handoff_admission_outcome_counts\":{\"overload\":%d,\"ambiguous\":%d,\"maximum\":%d},", admission_overload, admission_ambiguous, max_admission
+      printf "\"retrieval_valid_count\":%d,\"attributable_failure_count\":%d,\"w3c_masked_valid_count\":%d,", retrieval_valid, failures, masked
+      printf "\"upstream_failure_count\":%d,\"retrieval_failure_count\":%d,", upstream_fail, retrieval_fail
+      printf "\"upstream_failure_reason_counts\":{\"missing\":%d,\"stale\":%d,\"ambiguous\":%d,\"malformed\":%d,\"overload\":%d,\"segmented\":%d},", upstream_reason["missing"], upstream_reason["stale"], upstream_reason["ambiguous"], upstream_reason["malformed"], upstream_reason["overload"], upstream_reason["segmented"]
+      printf "\"retrieval_failure_reason_counts\":{\"missing\":%d,\"stale\":%d,\"unsupported\":%d,\"malformed\":%d,\"version_mismatch\":%d,\"ambiguous\":%d,\"unauthorized\":%d,\"already_consumed\":%d,\"timeout\":%d,\"overload\":%d,\"transport_error\":%d,\"disabled\":%d}}\n", retrieval_reason["missing"], retrieval_reason["stale"], retrieval_reason["unsupported"], retrieval_reason["malformed"], retrieval_reason["version_mismatch"], retrieval_reason["ambiguous"], retrieval_reason["unauthorized"], retrieval_reason["already_consumed"], retrieval_reason["timeout"], retrieval_reason["overload"], retrieval_reason["transport_error"], retrieval_reason["disabled"]
+    }
+  ' "$parsed_delta"
+}
+
+validate_raw_pressure_java_diagnostics_v2() {
+  local -r expected_valid="$1"
+  local -r expected_failures="$2"
+  local -r expected_standard="$3"
+  local -r expected_transport="$4"
+  local -r before_reference='phases/pressure-before/java-diagnostics.txt'
+  local -r after_reference='phases/pressure-after/java-diagnostics.txt'
+  local before_snapshot=""
+  local after_snapshot=""
+  local before_entry=""
+  local after_entry=""
+  local name=""
+  local before_value=""
+  local after_value=""
+  local -i before_decoded=0
+  local -i after_decoded=0
+  local -i delta=0
+  local -i pressure_missing=0
+  local -i pressure_already_consumed=0
+  local -i index=0
+  local -a before_entries=()
+  local -a after_entries=()
+  local -a fixed_failure_counters=(
+    provider_reject provider_ver lookup_missing lookup_version lookup_error
+    record_version invoke_error extract_fields extract_invalid extract_error
+    registration_fail
+  )
+  declare -A deltas=()
+
+  [[ "$expected_valid" =~ ^(0|[1-9][0-9]*)$ &&
+    "$expected_failures" =~ ^(0|[1-9][0-9]*)$ &&
+    "$expected_standard" =~ ^(0|1)$ &&
+    ( "$expected_transport" == getsockopt || "$expected_transport" == unix ) ]] ||
+    return 1
+  validate_java_diagnostics_reference "$before_reference" || return 1
+  validate_java_diagnostics_reference "$after_reference" || return 1
+  IFS= read -r before_snapshot <"$BUNDLE_DIR/$before_reference" || return 1
+  IFS= read -r after_snapshot <"$BUNDLE_DIR/$after_reference" || return 1
+  IFS=',' read -r -a before_entries <<<"$before_snapshot"
+  IFS=',' read -r -a after_entries <<<"$after_snapshot"
+  (( ${#before_entries[@]} == ${#after_entries[@]} )) || return 1
+  for ((index = 0; index < ${#before_entries[@]}; index++)); do
+    before_entry="${before_entries[index]}"
+    after_entry="${after_entries[index]}"
+    name="${before_entry%%=*}"
+    [[ "$name" == "${after_entry%%=*}" ]] || return 1
+    before_value="${before_entry#*=}"
+    after_value="${after_entry#*=}"
+    before_decoded=$((36#$before_value))
+    after_decoded=$((36#$after_value))
+    ((after_decoded >= before_decoded)) || return 1
+    delta=$((after_decoded - before_decoded))
+    deltas["$name"]="$delta"
+    if [[ "$name" == d_* && "$delta" != 0 ]]; then
+      return 1
+    fi
+    if [[ "$name" == t_* ]]; then
+      case "$name" in
+        t_valid|t_missing|t_already_consumed) ;;
+        *) ((delta == 0)) || return 1 ;;
+      esac
+    fi
+  done
+  [[ "${deltas[t_valid]:-}" == "$expected_valid" &&
+    "${deltas[take_sampled]:-}" == "$expected_valid" &&
+    "${deltas[take_unsampled]:-}" == 0 &&
+    "${deltas[discard_standard]:-}" == "$expected_standard" ]] || return 1
+  pressure_missing="${deltas[t_missing]:-}"
+  pressure_already_consumed="${deltas[t_already_consumed]:-}"
+  [[ "$pressure_missing" =~ ^(0|[1-9][0-9]*)$ &&
+    "$pressure_already_consumed" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+  if [[ "$expected_transport" == unix ]]; then
+    ((pressure_missing == 1 &&
+      pressure_already_consumed == expected_failures)) || return 1
+  else
+    ((pressure_missing >= 1 && pressure_already_consumed <= 1 &&
+      pressure_missing - 1 + pressure_already_consumed ==
+        expected_failures)) || return 1
+  fi
+  for name in "${fixed_failure_counters[@]}"; do
+    [[ "${deltas[$name]:-}" == 0 ]] || return 1
+  done
+}
+
 validate_raw_pressure_container_inspections() {
   local -r artifact='map-pressure-pressure-container-inspections.json'
   local -r source_manifest="$TMP_DIR/external-before.manifest"
@@ -5355,8 +6570,13 @@ validate_raw_pressure_barrier() {
   local inspections_size=""
   local exact_hits=""
   local roots=""
+  local w3c_parents=""
   local request_count=""
   local delta_summary=""
+  local bridge_reconciliation=""
+  local retrieval_valid=""
+  local attributable_failures=""
+  local w3c_masked_valid=""
   local inject_total=""
   local candidate_total=""
   local stage_total=""
@@ -5424,9 +6644,36 @@ validate_raw_pressure_barrier() {
   admission_maximum="$(
     raw_pressure_admission_max_events "$request_count"
   )" || return 1
-  delta_summary="$(raw_pressure_delta_summary \
-    "phases/$label-after/obi-metrics.delta" \
-    "$exact_hits" "$roots" "$request_count")" || return 1
+  if [[ "${RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION:-}" == 2 ]]; then
+    w3c_parents="$(jq -er '.pressure_correlation.w3c_parent_count' \
+      "$BUNDLE_DIR/$result")" || return 1
+    [[ "$w3c_parents" == 1 ]] || return 1
+    bridge_reconciliation="$(raw_pressure_bridge_reconciliation_v2 \
+      "phases/$label-after/obi-metrics.delta" \
+      "$exact_hits" "$roots" "$w3c_parents" "$request_count")" || return 1
+    jq -e --argjson bridge "$bridge_reconciliation" \
+      '.pressure_correlation.bridge == $bridge' \
+      "$BUNDLE_DIR/$scenario_status" >/dev/null || return 1
+    retrieval_valid="$(jq -er '.retrieval_valid_count' \
+      <<<"$bridge_reconciliation")" || return 1
+    attributable_failures="$(jq -er '.attributable_failure_count' \
+      <<<"$bridge_reconciliation")" || return 1
+    w3c_masked_valid="$(jq -er '.w3c_masked_valid_count' \
+      <<<"$bridge_reconciliation")" || return 1
+    validate_raw_pressure_java_diagnostics_v2 \
+      "$retrieval_valid" "$attributable_failures" "$w3c_masked_valid" \
+      "$expected_transport" || return 1
+    delta_summary="$(jq -r '[.phase_outcome_counts.inject,
+        .phase_outcome_counts.candidate, .phase_outcome_counts.stage,
+        .phase_outcome_counts.retrieval, .auxiliary_outcome_counts.handoff,
+        .handoff_admission_outcome_counts.overload,
+        .handoff_admission_outcome_counts.maximum] | @tsv' \
+      <<<"$bridge_reconciliation")" || return 1
+  else
+    delta_summary="$(raw_pressure_delta_summary \
+      "phases/$label-after/obi-metrics.delta" \
+      "$exact_hits" "$roots" "$request_count")" || return 1
+  fi
   read -r inject_total candidate_total stage_total retrieval_total \
     handoff_total admission_overload admission_maximum extra \
     <<<"$delta_summary" || return 1
@@ -5442,20 +6689,29 @@ validate_raw_pressure_barrier() {
     --arg verify "$verify" --arg verify_sha256 "$verify_sha256" \
     --arg content_sha256 "$fill_content_sha256" \
     --arg result "$result" --arg result_sha256 "$result_sha256" \
-    --arg scenario_status "$scenario_status" \
+    --arg scenario_status_reference "$scenario_status" \
     --arg status_sha256 "$status_sha256" \
     --arg inspections "$inspections" \
     --arg inspections_sha256 "$inspections_sha256" \
     --argjson inspections_size "$inspections_size" \
     --argjson exact_hits "$exact_hits" --argjson roots "$roots" \
     --argjson request_count "$request_count" \
+    --argjson contract_version \
+      "${RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION:-1}" \
+    --argjson w3c_parents "${w3c_parents:-0}" \
+    --argjson retrieval_valid "${retrieval_valid:-0}" \
+    --argjson attributable_failures "${attributable_failures:-0}" \
+    --argjson w3c_masked_valid "${w3c_masked_valid:-0}" \
     --argjson admission_overload "$admission_overload" \
     --argjson admission_maximum "$admission_maximum" \
-    --slurpfile inspection "$BUNDLE_DIR/$inspections" '
+    --slurpfile inspection "$BUNDLE_DIR/$inspections" \
+    --slurpfile scenario_status_doc "$BUNDLE_DIR/$scenario_status" '
       keys == ["container", "container_inspections", "control", "fill",
         "scenario_label", "schema", "sequence", "session", "status",
         "traffic", "verification"] and
-      .schema == "pressure-traffic-barrier-v1" and .status == "passed" and
+      .schema == (if $contract_version == 2 then
+        "pressure-traffic-barrier-v2" else
+        "pressure-traffic-barrier-v1" end) and .status == "passed" and
       .scenario_label == $label and .session == $session and
       .sequence == ["scenario_ready", "capacity_fill_verified",
         "release_published", "scenario_reaped",
@@ -5504,23 +6760,60 @@ validate_raw_pressure_barrier() {
         .verified_absent_entries == 1 and
         .content_sha256 == $content_sha256) and
       .verification.content_sha256 == .fill.content_sha256 and
-      (.traffic | keys == ["exact_hit_count", "explicit_root_count",
-        "handoff_admission_ambiguous_count",
-        "handoff_admission_maximum_count",
-        "handoff_admission_overload_count",
-        "request_count", "result_reference", "result_sha256",
-        "status_reference", "status_sha256", "unresolved_count",
-        "wrong_parent_count"] and
-        .result_reference == $result and .result_sha256 == $result_sha256 and
-        .status_reference == $scenario_status and
-        .status_sha256 == $status_sha256 and
-        .request_count == $request_count and
-        .exact_hit_count == $exact_hits and .explicit_root_count == $roots and
-        .handoff_admission_overload_count == $admission_overload and
-        .handoff_admission_ambiguous_count == 0 and
-        .handoff_admission_maximum_count == $admission_maximum and
-        .wrong_parent_count == 0 and
-        .unresolved_count == 0)
+      (.traffic as $traffic |
+        $traffic.result_reference == $result and
+        $traffic.result_sha256 == $result_sha256 and
+        $traffic.status_reference == $scenario_status_reference and
+        $traffic.status_sha256 == $status_sha256 and
+        $traffic.request_count == $request_count and
+        $traffic.exact_hit_count == $exact_hits and
+        $traffic.explicit_root_count == $roots and
+        $traffic.handoff_admission_overload_count == $admission_overload and
+        $traffic.handoff_admission_ambiguous_count == 0 and
+        $traffic.handoff_admission_maximum_count == $admission_maximum and
+        $traffic.wrong_parent_count == 0 and
+        $traffic.unresolved_count == 0 and
+        (if $contract_version == 2 then
+          ($traffic | keys) == ["attributable_failure_count",
+            "exact_hit_count", "explicit_root_count",
+            "handoff_admission_ambiguous_count",
+            "handoff_admission_maximum_count",
+            "handoff_admission_overload_count",
+            "java_reconciliation_target", "request_count",
+            "result_reference", "result_sha256", "retrieval_valid_count",
+            "status_reference", "status_sha256", "unresolved_count",
+            "w3c_masked_valid_count", "w3c_parent_count",
+            "wrong_parent_count"] and
+          $traffic.w3c_parent_count == $w3c_parents and
+          $traffic.retrieval_valid_count == $retrieval_valid and
+          $traffic.attributable_failure_count == $attributable_failures and
+          $traffic.w3c_masked_valid_count == $w3c_masked_valid and
+          $traffic.java_reconciliation_target == {
+            attributable_absence_count:$attributable_failures,
+            diagnostic_self_miss_count:1,
+            discard_standard_count:$w3c_masked_valid,
+            take_sampled_count:$retrieval_valid,
+            take_unsampled_count:0,
+            take_valid_count:$retrieval_valid
+          } and
+          $scenario_status_doc[0].pressure_correlation.trace == {
+            exact_hit_count:$exact_hits,
+            explicit_root_count:$roots,
+            request_count:$request_count,
+            unresolved_count:0,
+            w3c_parent_count:$w3c_parents,
+            wrong_parent_count:0
+          } and
+          $scenario_status_doc[0].pressure_correlation.java_reconciliation_target ==
+            $traffic.java_reconciliation_target
+        else
+          ($traffic | keys) == ["exact_hit_count", "explicit_root_count",
+            "handoff_admission_ambiguous_count",
+            "handoff_admission_maximum_count",
+            "handoff_admission_overload_count", "request_count",
+            "result_reference", "result_sha256", "status_reference",
+            "status_sha256", "unresolved_count", "wrong_parent_count"]
+        end))
     ' "$BUNDLE_DIR/$barrier" >/dev/null || return 1
   jq -e --arg barrier "$barrier" \
     --arg inspections "$inspections" \
@@ -5532,6 +6825,9 @@ validate_raw_pressure_barrier() {
     --argjson retrieval "$retrieval_total" \
     --argjson handoff "$handoff_total" \
     --argjson roots "$roots" \
+    --argjson contract_version \
+      "${RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION:-1}" \
+    --argjson bridge "${bridge_reconciliation:-null}" \
     --argjson admission_overload "$admission_overload" \
     --argjson admission_maximum "$admission_maximum" \
     --arg expected_transport "$expected_transport" '
@@ -5555,8 +6851,12 @@ validate_raw_pressure_barrier() {
         overload: $admission_overload, ambiguous: 0,
         maximum: $admission_maximum
       } and
-      (.pressure_correlation.bridge.upstream_failure_count +
-        .pressure_correlation.bridge.retrieval_failure_count) == $roots
+      (if $contract_version == 2 then
+        .pressure_correlation.bridge == $bridge
+      else
+        (.pressure_correlation.bridge.upstream_failure_count +
+          .pressure_correlation.bridge.retrieval_failure_count) == $roots
+      end)
     ' "$BUNDLE_DIR/$scenario_status" >/dev/null
 }
 
@@ -6121,7 +7421,7 @@ validate_raw_pressure_evidence_v1() {
 validate_raw_pressure_evidence() {
   case "${RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION:-}" in
     0) validate_raw_pressure_evidence_v0 ;;
-    1) validate_raw_pressure_evidence_v1 ;;
+    1|2) validate_raw_pressure_evidence_v1 ;;
     *) return 1 ;;
   esac
 }
@@ -6141,7 +7441,7 @@ validate_raw_handoff_admission_contract() {
         \( -name '*.prom' -o -name '*.delta' \) \
         -printf '%P\0' | LC_ALL=C sort -z)
       ;;
-    1)
+    1|2)
       while IFS= read -r -d '' relative_path; do
         is_pressure=false
         if [[ "$relative_path" == phases/pressure-after/obi-metrics.delta ]]; then
@@ -6189,7 +7489,7 @@ validate_raw_stopped_admission_pre_stop_contract() {
 
   case "${RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION:-}" in
     0) return 0 ;;
-    1) ;;
+    1|2) ;;
     *) return 1 ;;
   esac
   for label in late-attach w3c-match extension-controls; do
@@ -6737,7 +8037,7 @@ raw_v3_manifest_add_pressure_cleanup_attempts() {
           *) return 1 ;;
         esac
         ;;
-      1)
+      1|2)
         deletion_reused="$(key_value "$attempt_status" deletion_reused)" || return 1
         recovery_status="$(key_value "$attempt_status" recovery_status)" || return 1
         if [[ "$deletion_reused" == false ]]; then
@@ -7114,7 +8414,7 @@ validate_raw_v3_exact_closure() {
           map-pressure-pressure-traffic-complete.prom \
           >>"$expected_files" || return 1
         ;;
-      1)
+      1|2)
         printf '%s\n' \
           map-pressure-pressure-verify.json \
           map-pressure-pressure-verify.stderr.log \
@@ -7239,7 +8539,7 @@ validate_raw_v3_exact_closure() {
       scenario-security-status.json >>"$expected_statuses" || return 1
 
     for label in w3c-match late-attach extension-controls; do
-      if [[ "${RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION:-}" == 1 ]]; then
+      if [[ "${RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION:-}" =~ ^(1|2)$ ]]; then
         raw_v3_manifest_add_phase "$expected_files" "$expected_directories" \
           "$label-obi-pre-stop" full-live || return 1
         raw_v3_manifest_add_pair \
@@ -7313,7 +8613,7 @@ validate_raw_v3_exact_closure() {
     if [[ "${RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION:-}" == 0 ]]; then
       raw_v3_manifest_add_phase "$expected_files" "$expected_directories" \
         pressure-pressured full-live || return 1
-    elif [[ "${RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION:-}" != 1 ]]; then
+    elif [[ ! "${RECORDED_PRESSURE_TRAFFIC_CONTRACT_VERSION:-}" =~ ^(1|2)$ ]]; then
       return 1
     fi
 
@@ -7652,6 +8952,132 @@ validate_claim_summary_bundle() {
   (CDPATH='' cd / && bash "$BUNDLE_DIR/verify.sh" >/dev/null)
 }
 
+validate_claim_v2_documents() {
+  local authority_sha256=""
+  local claims_sha256=""
+  local evidence_id=""
+  local json=""
+  local canonical=""
+
+  for json in acceptance-claims.json derivation-receipt.json; do
+    [[ -f "$BUNDLE_DIR/$json" && ! -L "$BUNDLE_DIR/$json" ]] || return 1
+    canonical="$TMP_DIR/claims-v2-$json"
+    jq -cS -e -s '
+      if length == 1 and (.[0] | type == "object") then .[0]
+      else error("one object required") end
+    ' "$BUNDLE_DIR/$json" >"$canonical" || return 1
+    cmp -s -- "$BUNDLE_DIR/$json" "$canonical" || return 1
+  done
+
+  jq -e '
+    def sha256: type == "string" and test("^[0-9a-f]{64}$");
+    keys == ["issue_32", "issue_34", "issue_36", "schema", "status"] and
+    .schema == "obi-bounded-acceptance-claims-v2" and .status == "passed" and
+    (.issue_34.scenarios | type == "array" and length == 11) and
+    (.issue_34.scenarios[9] as $pressure |
+      ($pressure | keys) == ["bounded_duration_verified", "conservation",
+        "duration_cap_nanos", "exact_parent_count",
+        "explicit_local_root_count", "name", "request_count",
+        "required_metric_pair_and_java_capture_verified", "topology_contract",
+        "w3c_parent_count", "zero_unresolved_parent", "zero_wrong_parent"] and
+      $pressure.name == "pressure" and $pressure.request_count == 128 and
+      $pressure.w3c_parent_count == 1 and
+      $pressure.conservation == "H+R+W=N" and
+      # The legacy topology label names the H/R subpopulation. H+R+W is the
+      # exhaustive v2 classification including the one W3C-parent request.
+      $pressure.topology_contract == "pressure-exact-or-explicit-root" and
+      ($pressure.exact_parent_count + $pressure.explicit_local_root_count +
+        $pressure.w3c_parent_count) == 128) and
+    (.issue_36 |
+      keys == ["full_hash_pressure", "pressure_contract", "status", "traffic"] and
+      .status == "passed" and
+      .pressure_contract == {barrier_schema:"pressure-traffic-barrier-v2",
+        traffic_barrier_cross_binding_verified:true, version:2} and
+      (.traffic |
+        keys == ["conservation", "exact_parent_count",
+          "explicit_local_root_count", "request_count", "unresolved_count",
+          "w3c_parent_count", "wrong_parent_count"] and
+        .request_count == 128 and
+        (.exact_parent_count | type == "number" and floor == . and
+          . >= 0 and . <= 127) and
+        (.explicit_local_root_count | type == "number" and floor == . and
+          . >= 1 and . <= 127) and
+        .w3c_parent_count == 1 and .wrong_parent_count == 0 and
+        .unresolved_count == 0 and .conservation == "H+R+W=N" and
+        (.exact_parent_count + .explicit_local_root_count +
+          .w3c_parent_count) == 128) and
+      (.full_hash_pressure |
+        keys == ["capacity", "capacity_rejected_entries",
+          "capacity_rejection_errno", "content_digest_equal",
+          "fill_content_sha256", "filled_entries", "map_type",
+          "post_traffic_content_sha256"] and
+        .map_type == "non-evicting HASH" and .capacity == 10000 and
+        .filled_entries == 10000 and .capacity_rejected_entries == 1 and
+        .capacity_rejection_errno == "E2BIG" and
+        (.fill_content_sha256 | sha256) and
+        (.post_traffic_content_sha256 | sha256) and
+        .post_traffic_content_sha256 == .fill_content_sha256 and
+        .content_digest_equal == true)) and
+    .issue_36.traffic.exact_parent_count ==
+      .issue_34.scenarios[9].exact_parent_count and
+    .issue_36.traffic.explicit_local_root_count ==
+      .issue_34.scenarios[9].explicit_local_root_count and
+    .issue_36.traffic.w3c_parent_count ==
+      .issue_34.scenarios[9].w3c_parent_count
+  ' "$BUNDLE_DIR/acceptance-claims.json" >/dev/null || return 1
+
+  [[ -f "$BUNDLE_DIR/authority-summary.json" &&
+    ! -L "$BUNDLE_DIR/authority-summary.json" ]] || return 1
+  authority_sha256="$(sha256sum <"$BUNDLE_DIR/authority-summary.json")" ||
+    return 1
+  authority_sha256="${authority_sha256%% *}"
+  claims_sha256="$(sha256sum <"$BUNDLE_DIR/acceptance-claims.json")" ||
+    return 1
+  claims_sha256="${claims_sha256%% *}"
+  is_sha256 "$authority_sha256" && is_sha256 "$claims_sha256" || return 1
+  evidence_id="$(printf '%s\n' 'obi-bounded-claims-evidence-v2' "$BUNDLE_NAME" \
+    "$authority_sha256" "$claims_sha256" | sha256sum)" || return 1
+  evidence_id="${evidence_id%% *}"
+  is_sha256 "$evidence_id" || return 1
+
+  jq -e --arg bundle_name "$BUNDLE_NAME" --arg authority "$authority_sha256" \
+    --arg claims "$claims_sha256" --arg evidence_id "$evidence_id" '
+    keys == ["authority", "bundle_name", "claims", "derivation_contract",
+      "evidence_id", "private_validation_profile", "public_file_order", "schema"] and
+    .schema == "obi-bounded-claim-derivation-v1" and
+    .derivation_contract == "private-raw-v3-to-bounded-claims-v2" and
+    .bundle_name == $bundle_name and .evidence_id == $evidence_id and
+    .authority == {reference:"authority-summary.json", sha256:$authority} and
+    .claims == {reference:"acceptance-claims.json", sha256:$claims} and
+    .private_validation_profile == {
+      exact_complete_producer_roster_validated:true,
+      fixed_invocations_without_keep_validated:true,
+      raw_semantics_recomputable_from_public_bundle:false,
+      raw_semantics_validated_before_projection:true,
+      raw_snapshots_same_device_and_capped:true,
+      required_eleven_stress_pair_ownership_validated:true} and
+    .public_file_order == ["README.md", "SANITIZATION.md",
+      "acceptance-claims.json", "authority-summary.json",
+      "derivation-receipt.json", "verify.sh", "SHA256SUMS"]
+  ' "$BUNDLE_DIR/derivation-receipt.json" >/dev/null
+}
+
+# Claims-v2 keeps the portable verifier as the complete closed-schema oracle
+# for unchanged issue #32 and issue #34 fields. The source verifier independently
+# authenticates the new contract and receipt before invoking those pinned bytes.
+validate_claim_summary_bundle_v2() {
+  local verifier_sha256=""
+
+  validate_claim_v2_documents || return 1
+  [[ -f "$BUNDLE_DIR/verify.sh" && ! -L "$BUNDLE_DIR/verify.sh" ]] || return 1
+  verifier_sha256="$(sha256sum <"$BUNDLE_DIR/verify.sh")" || return 1
+  verifier_sha256="${verifier_sha256%% *}"
+  [[ "$verifier_sha256" == "$CLAIM_V2_VERIFY_SH_SHA256" ]] || return 1
+  find -- "$BUNDLE_DIR" -type f -exec chmod 0444 -- {} + || return 1
+  find -- "$BUNDLE_DIR" -depth -type d -exec chmod 0555 -- {} + || return 1
+  (CDPATH='' cd / && bash "$BUNDLE_DIR/verify.sh" >/dev/null)
+}
+
 validate_fault_security_matrix_bundle() {
   local verifier_sha256=""
 
@@ -7768,7 +9194,8 @@ validate_current_code_compatibility() {
     "$tested_revision" "$TRUSTED_HEAD"; then
     die "current-code policy requires the tested revision to be an ancestor of current HEAD"
   fi
-  git -C "$REPO_ROOT" diff --name-only --no-renames --no-ext-diff --no-textconv -z \
+  git -C "$REPO_ROOT" diff --name-only --no-renames \
+    --no-ext-diff --no-textconv -z \
     "$tested_revision" "$TRUSTED_HEAD" -- >"$changed_paths" || {
     die "current-code policy could not compare the tested revision with current HEAD"
   }
@@ -7898,6 +9325,20 @@ main() {
     usage
     return 0
   fi
+  if [[ $# == 7 && ${1:-} == "--internal-held-source" ]]; then
+    configure_internal_held_source "$2" "$3" "$4" "$5" || {
+      usage >&2
+      return 2
+    }
+    shift 5
+    case "${1:-}" in
+      --claims-v1|--claims-v2|--fault-security-matrix-v1) ;;
+      *)
+        usage >&2
+        return 2
+        ;;
+    esac
+  fi
   if [[ ${1:-} == "--current-code" ]]; then
     REQUIRE_CURRENT_CODE=true
     shift
@@ -7922,6 +9363,14 @@ main() {
         return 2
       }
       VERIFICATION_MODE=claims-v1
+      shift
+      ;;
+    --claims-v2)
+      [[ "$REQUIRE_CURRENT_CODE" == false && $# == 2 ]] || {
+        usage >&2
+        return 2
+      }
+      VERIFICATION_MODE=claims-v2
       shift
       ;;
     --fault-security-matrix-v1)
@@ -7953,7 +9402,11 @@ main() {
   }
   check_dependencies
   sanitize_git_environment
-  resolve_trusted_repository
+  if [[ "$INTERNAL_HELD_SOURCE" == true ]]; then
+    resolve_internal_held_source_authority
+  else
+    resolve_trusted_repository
+  fi
   assert_verification_tmp_parent_is_trusted
   TMP_DIR="$(mktemp -d "$VERIFICATION_TMP_PARENT/verify-retained-evidence.XXXXXX")" || {
     die "could not create temporary verification directory"
@@ -7987,6 +9440,15 @@ main() {
         "$CLAIM_V1_ARCHIVE_MAX_BYTES" 444 555
       validate_claim_summary_bundle || die "claims-v1 bundle is invalid"
       printf 'bounded claims verified: %s (checkout commit %s)\n' \
+        "$BUNDLE_NAME" "$TRUSTED_HEAD"
+      return 0
+      ;;
+    claims-v2)
+      snapshot_external_bundle \
+        "$BUNDLE_DIR" "$CLAIM_V2_ARCHIVE_MAX_FILES" \
+        "$CLAIM_V2_ARCHIVE_MAX_BYTES" 444 555
+      validate_claim_summary_bundle_v2 || die "claims-v2 bundle is invalid"
+      printf 'bounded claims v2 verified: %s (checkout commit %s)\n' \
         "$BUNDLE_NAME" "$TRUSTED_HEAD"
       return 0
       ;;

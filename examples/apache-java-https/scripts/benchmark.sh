@@ -15344,11 +15344,14 @@ validate_pressure_barrier_artifacts_from_values() {
     --argjson requests "$PRESSURE_REQUESTS" \
     --argjson admission_maximum \
       "$((PRESSURE_REQUESTS * PRESSURE_ADMISSION_MAX_EVENTS_PER_REQUEST))" '
+      def count:
+        type == "number" and isfinite and floor == . and
+        . >= 0 and . <= $requests;
       length == 2 and (.[0] as $barrier | .[1] as $inspection | $barrier |
       keys == ["container", "container_inspections", "control", "fill",
         "scenario_label", "schema", "sequence", "session", "status",
         "traffic", "verification"] and
-      .schema == "pressure-traffic-barrier-v1" and .status == "passed" and
+      .schema == "pressure-traffic-barrier-v2" and .status == "passed" and
       .scenario_label == "pressure" and
       .sequence == ["scenario_ready", "capacity_fill_verified",
         "release_published", "scenario_reaped",
@@ -15404,19 +15407,46 @@ validate_pressure_barrier_artifacts_from_values() {
           .verified_absent_entries == 1 and
           .content_sha256 == $fill.content_sha256)) and
       (.traffic |
-        keys == ["exact_hit_count", "explicit_root_count",
+        keys == ["attributable_failure_count", "exact_hit_count",
+          "explicit_root_count",
           "handoff_admission_ambiguous_count",
           "handoff_admission_maximum_count",
-          "handoff_admission_overload_count", "request_count",
-          "result_reference", "result_sha256", "status_reference",
-          "status_sha256", "unresolved_count", "wrong_parent_count"] and
+          "handoff_admission_overload_count", "java_reconciliation_target",
+          "request_count", "result_reference", "result_sha256",
+          "retrieval_valid_count", "status_reference",
+          "status_sha256", "unresolved_count", "w3c_masked_valid_count",
+          "w3c_parent_count", "wrong_parent_count"] and
         .result_reference == "scenario-pressure.json" and
         .result_sha256 == $result_sha256 and
         .status_reference == "scenario-pressure-status.json" and
         .status_sha256 == $status_sha256 and .request_count == $requests and
-        .exact_hit_count + .explicit_root_count == $requests and
-        .explicit_root_count >= 1 and .wrong_parent_count == 0 and
-        .unresolved_count == 0 and
+        all([.exact_hit_count, .explicit_root_count, .w3c_parent_count,
+          .wrong_parent_count, .unresolved_count, .retrieval_valid_count,
+          .attributable_failure_count, .w3c_masked_valid_count][]; count) and
+        .w3c_parent_count == 1 and .explicit_root_count >= 1 and
+        .exact_hit_count + .explicit_root_count + .w3c_parent_count ==
+          .request_count and
+        .wrong_parent_count == 0 and .unresolved_count == 0 and
+        .exact_hit_count <= .retrieval_valid_count and
+        .retrieval_valid_count <= .exact_hit_count + .w3c_parent_count and
+        .explicit_root_count <= .attributable_failure_count and
+        .attributable_failure_count <=
+          .explicit_root_count + .w3c_parent_count and
+        .retrieval_valid_count + .attributable_failure_count ==
+          .request_count and
+        .w3c_masked_valid_count ==
+          .retrieval_valid_count - .exact_hit_count and
+        .w3c_masked_valid_count + .attributable_failure_count -
+          .explicit_root_count == .w3c_parent_count and
+        .w3c_masked_valid_count >= 0 and .w3c_masked_valid_count <= 1 and
+        .java_reconciliation_target == {
+          attributable_absence_count: .attributable_failure_count,
+          diagnostic_self_miss_count: 1,
+          discard_standard_count: .w3c_masked_valid_count,
+          take_sampled_count: .retrieval_valid_count,
+          take_unsampled_count: 0,
+          take_valid_count: .retrieval_valid_count
+        } and
         .handoff_admission_overload_count >= 1 and
         .handoff_admission_overload_count <= $admission_maximum and
         .handoff_admission_ambiguous_count == 0 and
@@ -15438,6 +15468,19 @@ validate_pressure_barrier_artifacts_from_values() {
       .[3].pressure_correlation.exact_hit_count and
     .[0].traffic.explicit_root_count ==
       .[3].pressure_correlation.explicit_root_count and
+    .[0].traffic.w3c_parent_count ==
+      .[3].pressure_correlation.w3c_parent_count and
+    .[3].pressure_correlation == .[4].pressure_correlation.trace and
+    .[0].traffic.request_count ==
+      .[4].pressure_correlation.trace.request_count and
+    .[0].traffic.retrieval_valid_count ==
+      .[4].pressure_correlation.bridge.retrieval_valid_count and
+    .[0].traffic.attributable_failure_count ==
+      .[4].pressure_correlation.bridge.attributable_failure_count and
+    .[0].traffic.w3c_masked_valid_count ==
+      .[4].pressure_correlation.bridge.w3c_masked_valid_count and
+    .[0].traffic.java_reconciliation_target ==
+      .[4].pressure_correlation.java_reconciliation_target and
     .[0].traffic.handoff_admission_overload_count ==
       .[4].pressure_correlation.bridge.handoff_admission_outcome_counts.overload and
     .[4].pressure_correlation.barrier_reference ==
@@ -15589,6 +15632,9 @@ validate_pressure_cell_artifact_values() {
       "$((PRESSURE_REQUESTS * PRESSURE_ADMISSION_MAX_EVENTS_PER_REQUEST))" '
     def positive_integer:
       type == "number" and isfinite and floor == . and . > 0;
+    def count:
+      type == "number" and isfinite and floor == . and
+      . >= 0 and . <= $requests;
     length == 2 and
     .[0] as $status |
     .[1] as $result |
@@ -15598,34 +15644,58 @@ validate_pressure_cell_artifact_values() {
       .exit_status == 0 and
       .metric_status == 0 and
       .result == "scenario-pressure.json" and
-      (.pressure_correlation | type == "object") and
+      (.pressure_correlation |
+        type == "object" and
+        keys == ["barrier_reference", "bridge", "container_inspections",
+          "java_reconciliation_target", "trace"]) and
       (.pressure_correlation.trace |
         ((keys | sort) == [
-          "exact_hit_count", "explicit_root_count", "unresolved_count",
-          "wrong_parent_count"
+          "exact_hit_count", "explicit_root_count", "request_count",
+          "unresolved_count", "w3c_parent_count", "wrong_parent_count"
         ]) and
-        all(.[]; type == "number" and isfinite and floor == . and . >= 0) and
-        .wrong_parent_count == 0 and
-        .unresolved_count == 0 and
-        .exact_hit_count + .explicit_root_count == $requests) and
-      (.pressure_correlation.java_reconciliation_target |
+        all(.[]; count) and .request_count == $requests and
+        .w3c_parent_count == 1 and .explicit_root_count >= 1 and
+        .wrong_parent_count == 0 and .unresolved_count == 0 and
+        .exact_hit_count + .explicit_root_count + .w3c_parent_count ==
+          .request_count) and
+      (.pressure_correlation.trace as $trace |
+       .pressure_correlation.bridge as $bridge |
+       .pressure_correlation.java_reconciliation_target as $java |
+       ($bridge |
+        type == "object" and
         ((keys | sort) == [
-          "attributable_absence_count", "diagnostic_self_miss_count",
-          "take_valid_count"
+          "attributable_failure_count", "handoff_admission_outcome_counts",
+          "retrieval_valid_count", "transport", "w3c_masked_valid_count"
         ]) and
-        all(.[]; type == "number" and isfinite and floor == . and . >= 0) and
-        .take_valid_count >= 0 and
-        .attributable_absence_count >= 0 and
-        .diagnostic_self_miss_count == 1 and
-        .take_valid_count + .attributable_absence_count == $requests and
-        .take_valid_count == $status.pressure_correlation.trace.exact_hit_count and
-        .attributable_absence_count == $status.pressure_correlation.trace.explicit_root_count) and
-      (.pressure_correlation.bridge |
-        type == "object" and .transport == "getsockopt" and
+        .transport == "getsockopt" and
+        (.retrieval_valid_count | count) and
+        (.attributable_failure_count | count) and
+        (.w3c_masked_valid_count | count) and
+        $trace.exact_hit_count <= .retrieval_valid_count and
+        .retrieval_valid_count <=
+          $trace.exact_hit_count + $trace.w3c_parent_count and
+        $trace.explicit_root_count <= .attributable_failure_count and
+        .attributable_failure_count <=
+          $trace.explicit_root_count + $trace.w3c_parent_count and
+        .retrieval_valid_count + .attributable_failure_count ==
+          $trace.request_count and
+        .w3c_masked_valid_count ==
+          .retrieval_valid_count - $trace.exact_hit_count and
+        .w3c_masked_valid_count + .attributable_failure_count -
+          $trace.explicit_root_count == $trace.w3c_parent_count and
+        .w3c_masked_valid_count >= 0 and .w3c_masked_valid_count <= 1 and
         (.handoff_admission_outcome_counts |
           keys == ["ambiguous", "maximum", "overload"] and
           (.overload | positive_integer) and .overload <= .maximum and
           .ambiguous == 0 and .maximum == $admission_maximum)) and
+       $java == {
+         attributable_absence_count: $bridge.attributable_failure_count,
+         diagnostic_self_miss_count: 1,
+         discard_standard_count: $bridge.w3c_masked_valid_count,
+         take_sampled_count: $bridge.retrieval_valid_count,
+         take_unsampled_count: 0,
+         take_valid_count: $bridge.retrieval_valid_count
+       }) and
       (.pressure_correlation.container_inspections |
         keys == ["reference", "sha256", "size_bytes"] and
         .reference == "map-pressure-pressure-container-inspections.json" and
@@ -15637,7 +15707,11 @@ validate_pressure_cell_artifact_values() {
     ($result |
       .status == "passed" and
       .request_count == $requests and
-      (.pressure_correlation | type == "object") and
+      (.pressure_correlation |
+        ((keys | sort) == [
+          "exact_hit_count", "explicit_root_count", "request_count",
+          "unresolved_count", "w3c_parent_count", "wrong_parent_count"
+        ]) and all(.[]; count)) and
       .pressure_correlation == $status.pressure_correlation.trace and
       .pressure_correlation.explicit_root_count >= 1)
   ' >/dev/null || return 1
@@ -15667,6 +15741,9 @@ validate_pressure_cell_artifact_values() {
       (.process_map_id | positive_integer) and (.process_pid | positive_integer) and
       (.process_namespace | positive_integer) and (.token_base | positive_integer) and
       .synthetic_pid == 0 and .synthetic_namespace == 0 and .touched == 0) and
+    # The single capacity rejection is the retained E2BIG proxy for a full,
+    # non-evicting HASH; the post-traffic digest must remain byte-for-byte
+    # identical before cleanup is accepted.
     ($fill |
       ((keys | sort) == [
         "capacity_rejected_entries", "content_sha256", "kernel_name",
@@ -15771,15 +15848,23 @@ canonical_pressure_observation_json_from_values() {
       .[6] as $recovery |
       {
         bounded: true,
-        pressure_contract_version: 1,
+        pressure_contract_version: 2,
         barrier_schema: $barrier.schema,
         barrier_sequence: $barrier.sequence,
         exact_hit_count: $status.pressure_correlation.trace.exact_hit_count,
         explicit_root_count: $status.pressure_correlation.trace.explicit_root_count,
+        w3c_parent_count: $status.pressure_correlation.trace.w3c_parent_count,
         wrong_parent_count: $status.pressure_correlation.trace.wrong_parent_count,
         unresolved_count: $status.pressure_correlation.trace.unresolved_count,
+        retrieval_valid_count: $status.pressure_correlation.bridge.retrieval_valid_count,
+        attributable_failure_count: $status.pressure_correlation.bridge.attributable_failure_count,
+        w3c_masked_valid_count: $status.pressure_correlation.bridge.w3c_masked_valid_count,
         take_valid_count: $status.pressure_correlation.java_reconciliation_target.take_valid_count,
+        take_sampled_count: $status.pressure_correlation.java_reconciliation_target.take_sampled_count,
+        take_unsampled_count: $status.pressure_correlation.java_reconciliation_target.take_unsampled_count,
+        discard_standard_count: $status.pressure_correlation.java_reconciliation_target.discard_standard_count,
         attributable_absence_count: $status.pressure_correlation.java_reconciliation_target.attributable_absence_count,
+        diagnostic_self_miss_count: $status.pressure_correlation.java_reconciliation_target.diagnostic_self_miss_count,
         handoff_admission_overload_count: $status.pressure_correlation.bridge.handoff_admission_outcome_counts.overload,
         handoff_admission_ambiguous_count: $status.pressure_correlation.bridge.handoff_admission_outcome_counts.ambiguous,
         handoff_admission_maximum_count: $status.pressure_correlation.bridge.handoff_admission_outcome_counts.maximum,
@@ -16205,9 +16290,11 @@ validate_path_observation_json_value() {
       (.pressure |
         type == "object" and
         ((keys | sort) == [
-          "attributable_absence_count", "barrier_schema", "barrier_sequence",
-          "bounded", "capacity_rejected_entries", "cleanup_verified",
+          "attributable_absence_count", "attributable_failure_count",
+          "barrier_schema", "barrier_sequence", "bounded",
+          "capacity_rejected_entries", "cleanup_verified",
           "cleanup_verified_absent_entries", "content_sha256",
+          "diagnostic_self_miss_count", "discard_standard_count",
           "exact_hit_count", "explicit_root_count",
           "fill_verified_absent_entries", "fill_verified_present_entries",
           "handoff_admission_ambiguous_count",
@@ -16219,16 +16306,18 @@ validate_path_observation_json_value() {
           "post_traffic_content_verified",
           "post_traffic_verified_absent_entries",
           "post_traffic_verified_present_entries", "pressure_contract_version",
-          "recovery_log_attempts", "recovery_samples", "synthetic_namespace",
-          "synthetic_pid", "take_valid_count", "touched_entries",
-          "unresolved_count", "wrong_parent_count"
+          "recovery_log_attempts", "recovery_samples",
+          "retrieval_valid_count", "synthetic_namespace", "synthetic_pid",
+          "take_sampled_count", "take_unsampled_count", "take_valid_count",
+          "touched_entries", "unresolved_count", "w3c_masked_valid_count",
+          "w3c_parent_count", "wrong_parent_count"
         ]) and
         all(.[];
           type == "boolean" or type == "string" or nonnegative_integer or
           (type == "array" and
             all(.[]; type == "string" or nonnegative_integer))) and
-        .bounded == true and .pressure_contract_version == 1 and
-        .barrier_schema == "pressure-traffic-barrier-v1" and
+        .bounded == true and .pressure_contract_version == 2 and
+        .barrier_schema == "pressure-traffic-barrier-v2" and
         .barrier_sequence == ["scenario_ready", "capacity_fill_verified",
           "release_published", "scenario_reaped",
           "post_traffic_content_verified"] and
@@ -16262,11 +16351,27 @@ validate_path_observation_json_value() {
         .handoff_admission_ambiguous_count == 0 and
         .handoff_admission_maximum_count == ($pressure_requests * 9) and
         .wrong_parent_count == 0 and .unresolved_count == 0 and
-        .explicit_root_count >= 1 and
-        .exact_hit_count + .explicit_root_count == $pressure_requests and
-        .take_valid_count + .attributable_absence_count == $pressure_requests and
-        .take_valid_count == .exact_hit_count and
-        .attributable_absence_count == .explicit_root_count);
+        .w3c_parent_count == 1 and .explicit_root_count >= 1 and
+        .exact_hit_count + .explicit_root_count + .w3c_parent_count ==
+          $pressure_requests and
+        .exact_hit_count <= .retrieval_valid_count and
+        .retrieval_valid_count <= .exact_hit_count + .w3c_parent_count and
+        .explicit_root_count <= .attributable_failure_count and
+        .attributable_failure_count <=
+          .explicit_root_count + .w3c_parent_count and
+        .retrieval_valid_count + .attributable_failure_count ==
+          $pressure_requests and
+        .w3c_masked_valid_count ==
+          .retrieval_valid_count - .exact_hit_count and
+        .w3c_masked_valid_count + .attributable_failure_count -
+          .explicit_root_count == .w3c_parent_count and
+        .w3c_masked_valid_count >= 0 and .w3c_masked_valid_count <= 1 and
+        .take_valid_count == .retrieval_valid_count and
+        .take_sampled_count == .retrieval_valid_count and
+        .take_unsampled_count == 0 and
+        .discard_standard_count == .w3c_masked_valid_count and
+        .attributable_absence_count == .attributable_failure_count and
+        .diagnostic_self_miss_count == 1);
     length == 1 and
     (.[0] as $observation | $observation |
       type == "object" and

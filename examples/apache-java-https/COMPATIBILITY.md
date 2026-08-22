@@ -325,11 +325,16 @@ that primary attempt; an `auto` pass selecting Unix records `getsockopt` then
 selection. Resource-gate baselines and finals are nonnegative snapshots; only
 their recomputed delta may be signed.
 
-A pass requires zero wrong parents. Under live map pressure, an explicit Java
-root is permitted only when the transport-aware bridge pipeline conserves the
-full request count, retains the actual upstream and retrieval failure reasons,
-and reconciles with the aggregate Java diagnostics. Other tests may report a
-miss only when their expected outcome permits it.
+A pass requires zero wrong parents. Under live map pressure, contract 2 and
+`pressure-traffic-barrier-v2` require one deterministic W3C parent, at least one
+explicit Java root, `H+R+W=N`, and zero wrong or unresolved parents. The
+transport-aware bridge and Java layers must satisfy the corresponding `V/F/M`
+retrieval, failure, and W3C-masked-candidate conservation while retaining the
+actual reason counts. The live non-evicting `HASH` must also start empty, fill
+to all 10,000 entries, reject one extra key with kernel `E2BIG`, keep that key
+absent, and retain the same ordered-content digest after traffic. Other tests
+may report a miss only when their expected outcome permits it. These source
+requirements do not promote any pending matrix cell without retained evidence.
 
 The narrowest directly demonstrated configurations are the exact Linux
 7.0.0-1009-aws, unified-cgroup-v2, `amd64`, Temurin 21, Apache 2.4.68, and

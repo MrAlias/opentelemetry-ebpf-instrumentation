@@ -134,21 +134,25 @@ absent, the Apache client span must be a root; when present, the normal ancestry
 check still applies. Every marker must still have one exact Apache client to
 Java remote-parent link, and multiple inbound candidates are rejected.
 
-The pressure scenario is the only exception to item 2. After the complete
-Apache candidate graph is present, it classifies each Java span as an exact hit
-or an explicit root. A root must have a zero parent, no remote-parent bit, and a
-trace distinct from the Apache candidate. Every nonzero parent must still match
-the exact candidate. The result records each outcome and aggregate exact-hit,
-explicit-root, wrong-parent, and unresolved counts. Exact hits plus explicit
-roots must equal the request count, and wrong-parent and unresolved counts must
-both be zero. Aggregate bridge metrics preserve the actual upstream and
-retrieval failure reasons, while Java diagnostics account for valid retrievals,
-roots, and the independent diagnostic self-probe. Transport-aware conservation
-checks reconcile those layers without treating every root as a bridge
-`take/missing` result. A dedicated admission counter independently requires at
-least one capacity-driven `handoff_admission/overload`, no ambiguous admission
-failure, and a request-count-derived upper bound; it is auxiliary and is not
-added to either conservation equation.
+The pressure scenario is the only exception to item 2. Request zero carries one
+deterministic valid W3C parent while the handoff-claim `HASH` map is full; every
+remaining Java span is classified as an exact OBI hit or an explicit local
+root. A root must have a zero parent, no remote-parent bit, and a trace distinct
+from the Apache candidate. Every exact hit must still match the intended Apache
+candidate, and the W3C span must match its supplied trace and parent IDs. With
+`H` exact hits, `R` roots, `W` W3C parents, and `N` requests, the result requires
+`H+R+W=N`, `W=1`, `R>=1`, and zero wrong or unresolved parents.
+
+Aggregate bridge metrics preserve actual upstream and retrieval failure
+reasons. If `V` is the valid-retrieval count, `F` the attributable-failure
+count, and `M` the valid OBI candidate masked by W3C precedence, validation
+requires `H<=V<=H+W`, `R<=F<=R+W`, `V+F=N`, `M=V-H`, and `M+F-R=W` with
+`M` either zero or one. Java diagnostics must report `take_valid=take_sampled=V`,
+`take_unsampled=0`, `discard_standard=M`, `attributable_absence=F`, and one
+independent diagnostic self-miss. A dedicated admission counter independently
+requires at least one capacity-driven `handoff_admission/overload`, no ambiguous
+admission failure, and a request-count-derived upper bound; it is auxiliary and
+is not added to either conservation equation.
 
 All selected spans must have the scenario's exact endpoint and exact random
 marker value in addition to the expected `service.name` and span kind. Prefix,
@@ -292,8 +296,12 @@ exit status, and duration is sealed into an owner-private canonical receipt.
 
 Raw run directories, command logs, the owner-only pressure container inspection
 (`map-pressure-pressure-container-inspections.json`), and that receipt are never
-public artifacts. The projector validates them in its private transaction,
-destroys the raw transaction, and emits only this exact public roster:
+public artifacts. The campaign invokes the projector with `--claims-v2`; the
+projector authenticates pressure source contract 2 and
+`pressure-traffic-barrier-v2`, validates the private transaction, and emits
+schema `obi-bounded-acceptance-claims-v2` in this exact public roster. After
+the projection and its independent verification succeed, the campaign
+separately destroys the raw transaction:
 
 <!-- obi-retained-acceptance-public-roster: begin -->
 
@@ -309,13 +317,16 @@ SHA256SUMS
 
 <!-- obi-retained-acceptance-public-roster: end -->
 
-A separate workflow step runs the bundled verifier from `/`; an always-run
-privacy guard must also prove that no private residue or ambiguous public
-candidate remains before those seven individual files can be uploaded. The
-projection contains bounded derived claims and an internal-consistency check,
-not raw evidence or an authentication claim. Until a
+A source-pinned verifier authenticates the private raw-v3 contract before
+projection. A separate workflow step runs the generated claims-v2 portable
+verifier from `/`; an always-run privacy guard must also prove that no private
+residue or ambiguous public candidate remains before those seven individual
+files can be uploaded. The projection contains bounded derived claims and an
+internal-consistency check, not raw evidence or an authentication claim. Until a
 source-revision-matched workflow artifact passes all three gates, existing
-untested rows remain untested.
+untested rows remain untested. The projector default and explicit `--claims-v1`
+remain a legacy compatibility route; the active campaign never falls back to
+them.
 
 The campaign pins its private transaction, command-log parents, public parent,
 and public closure with open descriptors; campaign-owned private control,
@@ -374,6 +385,94 @@ Source configuration, a successful Compose configuration render, and the
 presence of either campaign are not runtime passes. Only a
 source-revision-matched, independently verified uploaded artifact can promote
 a currently untested row; this runbook does not promote one.
+
+#### Post-run claims-v2 import
+
+After the acceptance and aggregate fault/security artifacts have been
+downloaded together with their GitHub run and artifact API documents, derive
+the importer's canonical output leaf in a private parent. The post-run importer
+then verifies the two bundles and publishes one closed source-bound index:
+
+```bash
+(
+  set -Eeuo pipefail
+  repo_root="$(git rev-parse --show-toplevel)"
+  repo_root="$(cd -- "$repo_root" && pwd -P)"
+  download_dir="$(
+    cd -- "${DOWNLOAD_DIR:?set DOWNLOAD_DIR to the private download directory}" &&
+      pwd -P
+  )"
+  [[ "$download_dir" != "$repo_root" &&
+    "$download_dir" != "$repo_root/"* ]] || exit 1
+  run_json="$download_dir/RUN.json"
+  artifacts_json="$download_dir/ARTIFACTS.json"
+  acceptance_zip="$download_dir/ACCEPTANCE.zip"
+  fault_zip="$download_dir/FAULT.zip"
+  for input in \
+    "$run_json" "$artifacts_json" "$acceptance_zip" "$fault_zip"; do
+    [[ -f "$input" && ! -L "$input" ]] || exit 1
+  done
+  chmod 0600 -- \
+    "$run_json" "$artifacts_json" "$acceptance_zip" "$fault_zip"
+  import_parent="$(mktemp -d /tmp/obi-retained-import.XXXXXX)"
+  chmod 0700 -- "$import_parent"
+  printf 'private import parent: %s\n' "$import_parent" >&2
+  head_sha="$(jq -er '.head_sha' "$run_json")"
+  run_id="$(jq -er '.id | tostring' "$run_json")"
+  run_attempt="$(jq -er '.run_attempt | tostring' "$run_json")"
+  acceptance_receipt_sha="$(
+    unzip -p "$acceptance_zip" derivation-receipt.json | sha256sum |
+      awk '{print $1}'
+  )"
+  fault_receipt_sha="$(
+    unzip -p "$fault_zip" derivation-receipt.json | sha256sum |
+      awk '{print $1}'
+  )"
+  evidence_id="$(
+    printf '%s\n' \
+      "$head_sha" "$run_id" "$run_attempt" \
+      "$acceptance_receipt_sha" "$fault_receipt_sha" |
+      sha256sum | awk '{print $1}'
+  )"
+  output="$import_parent/retained-claims-${head_sha:0:12}-${evidence_id:0:12}"
+
+  "$repo_root/examples/apache-java-https/scripts/import-retained-ci-evidence.sh" \
+    claims-v2 "$run_json" "$artifacts_json" \
+    "$acceptance_zip" "$fault_zip" "$output"
+  (CDPATH='' cd / && bash "$output/verify.sh")
+  printf 'retained claims: %s\n' "$output"
+)
+```
+
+`unzip -p` must select the single root `derivation-receipt.json` member from
+each downloaded artifact; a missing, prefixed, or duplicate member makes the
+derived leaf disagree with the importer's authenticated value and fails closed.
+The private download directory must resolve outside the authority checkout so
+its API documents and ZIPs cannot make that checkout dirty. The importer also
+requires the output leaf to be absent and its physical parent to remain
+caller-owned mode `0700` through publication.
+
+Before the final rename, a collision, caught signal, or ambiguous publication
+result can intentionally preserve one hidden `.retained-ci-import.*` entry in
+that private parent instead of risking deletion through a changed namespace.
+An entry whose exact seal remains authoritative is the sanitized candidate; a
+foreign substitution or injected member is untrusted and must be preserved as
+such. The printed parent path makes this fail-closed residue discoverable for
+review and explicit removal. An uncontested success leaves no importer-owned
+hidden candidate. A caught post-rename signal preserves the committed final,
+and successful lost-ack reconciliation can coexist with a foreign hidden entry.
+
+The `obi-retained-ci-claim-index-v2` index requires issue #36 to be `passed` in
+both inputs and binds this exact ordered pointer pair:
+
+```text
+acceptance/acceptance-claims.json#/issue_36
+fault-security/fault-security-matrix.json#/coverage/issue_36
+```
+
+Its outer portable verifier pins both nested portable verifiers and the exact
+16-file checksum roster before following either pointer. `claims-v1` remains a
+legacy compatibility import and does not represent the pressure-v2 result.
 
 ### Exact component and configuration inventory
 
@@ -564,9 +663,12 @@ The default `all` suite runs, in order:
   reason-coded root, while any wrong parent fails the run;
 - non-evicting handoff-claim capacity rejection under sustained concurrent
   pressure, with the exact PID-zero/namespace-zero synthetic map contents
-  digest-stable through traffic, a positive bounded admission-overload signal,
-  zero ambiguous admission failures, and exact hits and explicit roots
-  reconciled across trace, bridge, and Java diagnostics;
+  filled to all 10,000 entries, one extra admission rejected by the kernel with
+  `E2BIG`, the extra key still absent, and the ordered contents digest-stable
+  through traffic; pressure contract 2 and `pressure-traffic-barrier-v2`
+  require exactly one W3C parent, at least one explicit root,
+  `H+R+W=N`, a positive bounded admission-overload signal, zero ambiguous
+  admission failures, and exact trace/bridge/Java reconciliation;
 - servlet async and executor handoff across varied hop counts, cancellation,
   rejection, and timeout paths;
 - Java 21 virtual-thread migration, mixed execution, and cancellation paths;
@@ -1042,8 +1144,10 @@ Every run retains a timestamped directory under `.runtime/results/` with:
   command, labels, control mount and runtime flags to the successful terminal
   state; its exact SHA-256 and byte size are bound in both the barrier and
   scenario status and the owner-only `0600` artifact is retained with the raw
-  run, never the bounded public claim projection; exact per-request and aggregate
-  parent outcomes with zero wrong or unresolved parents; actual reason-coded
+  run, never the bounded public claims-v2 projection; pressure contract 2 and
+  `pressure-traffic-barrier-v2` require request zero to retain its exact W3C
+  parent, at least one explicit root, `H+R+W=N`, and zero wrong or unresolved
+  parents; actual reason-coded
   upstream and retrieval failures; positive bounded
   `handoff_admission/overload`, zero `handoff_admission/ambiguous`, and
   transport-aware aggregate reconciliation with Java diagnostics;

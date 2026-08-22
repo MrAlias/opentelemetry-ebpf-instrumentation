@@ -6,9 +6,14 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 VERIFIER="$SCRIPT_DIR/verify-retained-evidence.sh"
+CLAIM_PROJECTOR="$SCRIPT_DIR/project-retained-acceptance-evidence.sh"
+AGENT_DOWNLOAD_SOURCE="$SCRIPT_DIR/download-agent.sh"
 TEST_TMP_DIR=""
 readonly MAX_UINT64_DECIMAL='18446744073709551615'
-readonly SCRIPT_DIR VERIFIER MAX_UINT64_DECIMAL
+readonly EMPTY_SHA256='e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+readonly CLAIM_V2_VERIFY_SH_SHA256='2511f18ed4961eea9f979a6fd8bad9ee973ce768adecaebcf0dea31b9aaa8e7d'
+readonly SCRIPT_DIR VERIFIER CLAIM_PROJECTOR AGENT_DOWNLOAD_SOURCE
+readonly MAX_UINT64_DECIMAL EMPTY_SHA256 CLAIM_V2_VERIFY_SH_SHA256
 
 die() {
   printf 'verify-retained-evidence_test.sh: %s\n' "$*" >&2
@@ -28,13 +33,123 @@ check_dependencies() {
   local -a missing=()
   local command_name=""
 
-  for command_name in awk chmod cmp cp find git grep id jq mkdir mktemp \
-    mountpoint mv readlink rm sed sha256sum sort stat tail truncate; do
+  for command_name in awk bash chmod cmp cp dirname find git grep head id jq \
+    mkdir mktemp mountpoint mv readlink rm sed sha256sum sort stat tail \
+    truncate python3; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
       missing+=("$command_name")
     fi
   done
+  [[ -x /usr/bin/timeout ]] || missing+=(/usr/bin/timeout)
   (( ${#missing[@]} == 0 )) || die "missing required commands: ${missing[*]}"
+  [[ -x "$CLAIM_PROJECTOR" ]] || die "claim projector is not executable"
+  [[ -x "$AGENT_DOWNLOAD_SOURCE" ]] || die "agent downloader is not executable"
+}
+
+run_internal_held_source_verifier() {
+  local -r descriptor_kind="$1"
+  local -r source="$2"
+  local -r script_directory="$3"
+  local -r repository_root="$4"
+  local -r expected_head="$5"
+  local -r expected_sha256="$6"
+  shift 6
+
+  python3 -I - "$descriptor_kind" "$source" "$script_directory" \
+    "$repository_root" "$expected_head" "$expected_sha256" "$@" <<'PY'
+import fcntl
+import os
+import sys
+
+(
+    descriptor_kind,
+    source,
+    script_directory,
+    repository_root,
+    expected_head,
+    expected_sha256,
+    *verifier_arguments,
+) = sys.argv[1:]
+
+if descriptor_kind == "sealed":
+    with open(source, "rb") as source_file:
+        source_bytes = source_file.read()
+    descriptor = os.memfd_create(
+        "obi-retained-source-verifier", os.MFD_ALLOW_SEALING
+    )
+    os.fchmod(descriptor, 0o500)
+    written = 0
+    while written < len(source_bytes):
+        written += os.write(descriptor, source_bytes[written:])
+    seals = (
+        fcntl.F_SEAL_WRITE
+        | fcntl.F_SEAL_GROW
+        | fcntl.F_SEAL_SHRINK
+        | fcntl.F_SEAL_SEAL
+    )
+    fcntl.fcntl(descriptor, fcntl.F_ADD_SEALS, seals)
+elif descriptor_kind == "unsealed":
+    descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+else:
+    raise ValueError("unknown held-source descriptor kind")
+
+try:
+    os.set_inheritable(descriptor, True)
+    held_source_path = f"/proc/{os.getpid()}/fd/{descriptor}"
+    os.execve(
+        "/usr/bin/bash",
+        [
+            "bash",
+            held_source_path,
+            "--internal-held-source",
+            script_directory,
+            repository_root,
+            expected_head,
+            expected_sha256,
+            *verifier_arguments,
+        ],
+        {
+            "PATH": "/usr/bin:/bin",
+            "LC_ALL": "C",
+            "LANG": "C",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_NO_LAZY_FETCH": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+        },
+    )
+finally:
+    os.close(descriptor)
+PY
+}
+
+expect_internal_held_source_rejection() {
+  local -r description="$1"
+  shift
+
+  if "$@" >/dev/null 2>&1; then
+    die "internal held-source authority accepted $description"
+  fi
+}
+
+test_trusted_clean_exec_rejects_local_poison() {
+  local -r child_code='source <(head -n -1 -- "$1"); trap - EXIT HUP INT TERM ERR DEBUG RETURN QUIT ALRM; trusted_clean_exec /usr/bin/false'
+
+  if /usr/bin/bash --noprofile --norc -c '
+    source <(head -n -1 -- "$1")
+    trap - EXIT HUP INT TERM ERR DEBUG RETURN QUIT ALRM
+    function local() { exit 0; }
+    trusted_clean_exec /usr/bin/false
+  ' clean-bootstrap-same-shell "$VERIFIER"; then
+    die 'same-shell local function bypassed the verifier clean execution boundary'
+  fi
+
+  if /usr/bin/bash --noprofile --norc -c '
+    function local() { exit 0; }
+    export -f local
+    exec /usr/bin/bash --noprofile --norc -c "$1" clean-bootstrap-child "$2"
+  ' clean-bootstrap-parent "$child_code" "$VERIFIER"; then
+    die 'exported local function bypassed the verifier clean execution boundary'
+  fi
 }
 
 assert_no_invalid_jq_generator_binders() {
@@ -482,7 +597,52 @@ write_java_diagnostics_fixture() {
           | add
         )
       }
-    ' >"$bundle/terminal-java-diagnostics.json"
+  ' >"$bundle/terminal-java-diagnostics.json"
+}
+
+fixture_base36() {
+  local -r decimal="$1"
+  local -r digits='0123456789abcdefghijklmnopqrstuvwxyz'
+  local value=""
+  local encoded=""
+
+  [[ "$decimal" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+  value="$decimal"
+  if ((value == 0)); then
+    printf '0\n'
+    return
+  fi
+  while ((value > 0)); do
+    encoded="${digits:value % 36:1}$encoded"
+    value=$((value / 36))
+  done
+  printf '%s\n' "$encoded"
+}
+
+set_java_diagnostic_fixture() {
+  local -r file="$1"
+  local -r name="$2"
+  local -r decimal="$3"
+  local encoded=""
+  local candidate="$file.tmp"
+
+  [[ "$name" =~ ^[a-z_]+$ && -f "$file" && ! -L "$file" ]] || return 1
+  encoded="$(fixture_base36 "$decimal")" || return 1
+  awk -v wanted="$name" -v replacement="$encoded" '
+    BEGIN { FS = OFS = "," }
+    {
+      for (field_index = 1; field_index <= NF; field_index++) {
+        split($field_index, fields, "=")
+        if (fields[1] == wanted) {
+          $field_index = wanted "=" replacement
+          changed++
+        }
+      }
+      print
+    }
+    END { if (changed != 1) exit 1 }
+  ' "$file" >"$candidate" || return 1
+  mv -- "$candidate" "$file"
 }
 
 write_running_identity_fixture() {
@@ -1920,6 +2080,7 @@ write_raw_v3_scenario_result_fixture() {
   local -r bundle="$1"
   local -r scenario="$2"
   local -r request_count="$3"
+  local -r pressure_contract_version="${4:-0}"
   local endpoint='/api/echo'
   local rows=""
   local marker=""
@@ -2137,21 +2298,52 @@ write_raw_v3_scenario_result_fixture() {
           .response.workload = "servlet-async-executor" |
           .response.handoff_hops = ((2 + ($index % 7)) | tostring) |
           .response.handoff_fault = "none" |
-          if $index == 127 then
+          if $pressure_contract_version == 2 and $index == 0 then
+            .request += {
+              w3c_trace_id: ("a" * 32),
+              w3c_parent_span_id: ("b" * 16),
+              w3c_trace_flags: "01",
+              w3c_case: "valid-w3c-under-full-hash-pressure"
+            } |
+            (.trace.spans[] | select(
+              .service_name == "apache-proxy" and .kind == "SERVER")) |=
+              (.trace_id = ("a" * 32) |
+                .parent_span_id = ("b" * 16) | .flags = 1) |
+            (.trace.spans[] | select(
+              .service_name == "apache-proxy" and .kind == "CLIENT")) |=
+              (.trace_id = ("a" * 32) | .flags = 1) |
+            (.trace.spans[] | select(
+              .service_name == "java-backend" and .kind == "SERVER")) |=
+              (.trace_id = ("a" * 32) |
+                .parent_span_id = ("b" * 16) | .flags = 769)
+          elif $index == 127 then
             (.trace.spans[] | select(
               .service_name == "java-backend" and .kind == "SERVER")) |=
               (.trace_id = ("e" * 32) |
                 .parent_span_id = "0000000000000000" |
-                .flags = 257)
+                .flags = 257) |
+            if $pressure_contract_version == 2 then
+              .pressure_parent_outcome = "explicit_root"
+            else . end
+          elif $pressure_contract_version == 2 then
+            .pressure_parent_outcome = "exact_hit"
           else . end
         )) |
-        .pressure_correlation = {
+        .pressure_correlation = (if $pressure_contract_version == 2 then {
+          request_count: .request_count,
+          exact_hit_count: (.request_count - 2),
+          explicit_root_count: 1,
+          w3c_parent_count: 1,
+          wrong_parent_count: 0,
+          unresolved_count: 0
+        } else {
           exact_hit_count: (.request_count - 1),
           explicit_root_count: 1,
           wrong_parent_count: 0,
           unresolved_count: 0
-        }
-      '
+        } end)
+      ' --argjson pressure_contract_version "$pressure_contract_version" ||
+        return 1
       ;;
     timeout-retry)
       # jq's $case is an internal binding, not a shell expansion.
@@ -2569,7 +2761,26 @@ write_raw_v3_scenario_status_fixture() {
           sha256: ("0" * 64),
           size_bytes: 1
         }
-      } | if $contract_version == 1 then . else
+      } | if $contract_version == 2 then
+        .bridge.phase_outcome_counts = {
+          inject: 128, candidate: 127, stage: 127, retrieval: 127
+        } |
+        .bridge.retrieval_valid_count = 127 |
+        .bridge.upstream_failure_count = 1 |
+        .bridge.upstream_failure_reason_counts.overload = 1 |
+        .bridge += {
+          attributable_failure_count: 1,
+          w3c_masked_valid_count: 1
+        } |
+        .java_reconciliation_target = {
+          take_valid_count: 127,
+          take_sampled_count: 127,
+          take_unsampled_count: 0,
+          discard_standard_count: 1,
+          attributable_absence_count: 1,
+          diagnostic_self_miss_count: 1
+        }
+      elif $contract_version == 1 then . else
         del(.bridge.handoff_admission_outcome_counts, .barrier_reference,
           .container_inspections)
       end)' "$bundle/scenario-$scenario.json")"
@@ -2639,7 +2850,7 @@ write_raw_v3_stress_phase_authority_fixture() {
         'obi_instrumentation_errors_total{error_type="attaching_java_agent",process_name="java"} 0' \
         'obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} 127'
       )
-      if [[ "$pressure_contract_version" == 1 ]]; then
+      if [[ "$pressure_contract_version" =~ ^(1|2)$ ]]; then
         pressure_rows+=(
           'obi_java_remote_parent_operations_total{operation="handoff_admission",status="overload",transport="tcp"} 5'
         )
@@ -2679,7 +2890,7 @@ write_raw_v3_stress_phase_authority_fixture() {
       'obi_instrumentation_errors_total{error_type="attaching_java_agent",process_name="java"} before=0 after=0 delta=0' \
       'obi_java_remote_parent_operations_total{operation="candidate",status="valid",transport="tcp"} before=0 after=127 delta=127'
     )
-    if [[ "$pressure_contract_version" == 1 ]]; then
+    if [[ "$pressure_contract_version" =~ ^(1|2)$ ]]; then
       pressure_rows+=(
         'obi_java_remote_parent_operations_total{operation="handoff_admission",status="overload",transport="tcp"} before=0 after=5 delta=5'
       )
@@ -2694,6 +2905,20 @@ write_raw_v3_stress_phase_authority_fixture() {
     )
     printf '%s\n' "${pressure_rows[@]}" \
       >"$bundle/phases/pressure-after/obi-metrics.delta" || return 1
+    if [[ "$pressure_contract_version" == 2 ]]; then
+      set_java_diagnostic_fixture \
+        "$bundle/phases/pressure-after/java-diagnostics.txt" t_valid 127 ||
+        return 1
+      set_java_diagnostic_fixture \
+        "$bundle/phases/pressure-after/java-diagnostics.txt" t_missing 2 ||
+        return 1
+      set_java_diagnostic_fixture \
+        "$bundle/phases/pressure-after/java-diagnostics.txt" take_sampled 127 ||
+        return 1
+      set_java_diagnostic_fixture \
+        "$bundle/phases/pressure-after/java-diagnostics.txt" \
+        discard_standard 1 || return 1
+    fi
   fi
 }
 
@@ -2987,7 +3212,7 @@ write_raw_pressure_fixture() {
         'status=traffic-complete map_id=41 baseline=0 max_entries=10000 entries=10000 operation=inject transport=tcp inject_total=128 target=128' \
         >"$bundle/map-pressure-pressure-monitor.log"
       ;;
-    1)
+    1|2)
       local cleanup_output_sha256=""
       local cleanup_stderr_sha256=""
       cleanup_output_sha256="$(sha256sum \
@@ -3020,6 +3245,7 @@ write_raw_pressure_fixture() {
 
 write_raw_pressure_barrier_status_fixture() {
   local -r bundle="$1"
+  local -r pressure_contract_version="${2:-1}"
   local ready_sha256=""
   local release_sha256=""
   local fill_sha256=""
@@ -3052,6 +3278,7 @@ write_raw_pressure_barrier_status_fixture() {
   status_sha256="${status_sha256%% *}"
   inspections_sha256="${inspections_sha256%% *}"
   jq -cS -n \
+    --argjson pressure_contract_version "$pressure_contract_version" \
     --arg ready_sha256 "$ready_sha256" \
     --arg release_sha256 "$release_sha256" \
     --arg fill_sha256 "$fill_sha256" \
@@ -3061,8 +3288,11 @@ write_raw_pressure_barrier_status_fixture() {
     --arg inspections_sha256 "$inspections_sha256" \
     --argjson inspections_size "$inspections_size" \
     --slurpfile inspections \
-      "$bundle/map-pressure-pressure-container-inspections.json" '{
-      schema: "pressure-traffic-barrier-v1",
+      "$bundle/map-pressure-pressure-container-inspections.json" \
+    --slurpfile scenario_status "$bundle/scenario-pressure-status.json" '{
+      schema: (if $pressure_contract_version == 2 then
+        "pressure-traffic-barrier-v2" else
+        "pressure-traffic-barrier-v1" end),
       status: "passed",
       scenario_label: "pressure",
       session: "0123456789abcdef0123456789abcdef",
@@ -3110,7 +3340,32 @@ write_raw_pressure_barrier_status_fixture() {
         verified_absent_entries: 1,
         content_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
       },
-      traffic: {
+      traffic: (if $pressure_contract_version == 2 then {
+        result_reference: "scenario-pressure.json",
+        result_sha256: $result_sha256,
+        status_reference: "scenario-pressure-status.json",
+        status_sha256: $status_sha256,
+        request_count: 128,
+        exact_hit_count:
+          $scenario_status[0].pressure_correlation.trace.exact_hit_count,
+        explicit_root_count:
+          $scenario_status[0].pressure_correlation.trace.explicit_root_count,
+        w3c_parent_count:
+          $scenario_status[0].pressure_correlation.trace.w3c_parent_count,
+        retrieval_valid_count:
+          $scenario_status[0].pressure_correlation.bridge.retrieval_valid_count,
+        attributable_failure_count:
+          $scenario_status[0].pressure_correlation.bridge.attributable_failure_count,
+        w3c_masked_valid_count:
+          $scenario_status[0].pressure_correlation.bridge.w3c_masked_valid_count,
+        java_reconciliation_target:
+          $scenario_status[0].pressure_correlation.java_reconciliation_target,
+        handoff_admission_overload_count: 5,
+        handoff_admission_ambiguous_count: 0,
+        handoff_admission_maximum_count: 1152,
+        wrong_parent_count: 0,
+        unresolved_count: 0
+      } else {
         result_reference: "scenario-pressure.json",
         result_sha256: $result_sha256,
         status_reference: "scenario-pressure-status.json",
@@ -3123,7 +3378,7 @@ write_raw_pressure_barrier_status_fixture() {
         handoff_admission_maximum_count: 1152,
         wrong_parent_count: 0,
         unresolved_count: 0
-      }
+      } end)
     }' >"$bundle/map-pressure-pressure-barrier-status.json"
 }
 
@@ -3288,7 +3543,7 @@ raw_v3_pair_labels_fixture() {
     restart-fault helper-attach-rejection
   case "$pressure_contract_version" in
     0) ;;
-    1)
+    1|2)
       printf '%s\n' \
         w3c-match-pre-stop late-attach-pre-stop extension-controls-pre-stop
       ;;
@@ -3370,7 +3625,7 @@ write_raw_v3_pair_fixture() {
   if [[ "$label" != basic ]]; then
     case "$label" in
       late-attach-pre-stop|w3c-match-pre-stop|extension-controls-pre-stop)
-        [[ "$pressure_contract_version" == 1 ]] || return 1
+        [[ "$pressure_contract_version" =~ ^(1|2)$ ]] || return 1
         control_label="${label%-pre-stop}"
         jq -cn --arg boundary "$label" \
           --arg before_reference \
@@ -3396,7 +3651,7 @@ write_raw_v3_pair_fixture() {
           jq -cS --arg boundary "$label" '.boundary = $boundary' "$template" \
             >"$output" || return 1
         else
-          [[ "$pressure_contract_version" == 1 ]] || return 1
+          [[ "$pressure_contract_version" =~ ^(1|2)$ ]] || return 1
           control_label="${label%-obi-stopped}"
           jq -cn --arg boundary "$label" \
             --arg before_reference \
@@ -3433,7 +3688,8 @@ write_raw_v3_pair_fixture() {
                   before:"0", after:"127", delta:"127"},
                 {transport:"tcp", operation:"candidate", status:"valid",
                   before:"0", after:"127", delta:"127"}
-              ] + (if $pressure_contract_version == 1 then [
+              ] + (if $pressure_contract_version == 1 or
+                $pressure_contract_version == 2 then [
                 {transport:"tcp", operation:"handoff_admission",
                   status:"overload", before:"0", after:"5", delta:"5"}
               ] elif $pressure_contract_version == 0 then [] else
@@ -3707,7 +3963,7 @@ materialize_raw_v3_acceptance_scenarios_fixture() {
     scenario-security-status.json >>"$statuses" || return 1
 
   for label in w3c-match late-attach extension-controls; do
-    if [[ "$pressure_contract_version" == 1 ]]; then
+    if [[ "$pressure_contract_version" =~ ^(1|2)$ ]]; then
       materialize_raw_v3_phase_fixture \
         "$bundle" "$label-obi-pre-stop" full-live || return 1
     elif [[ "$pressure_contract_version" != 0 ]]; then
@@ -3717,7 +3973,7 @@ materialize_raw_v3_acceptance_scenarios_fixture() {
       "$bundle" "$label-obi-running" full-live || return 1
     materialize_raw_v3_phase_fixture \
       "$bundle" "$label-obi-stopped" stopped-attestation || return 1
-    if [[ "$pressure_contract_version" == 1 ]]; then
+    if [[ "$pressure_contract_version" =~ ^(1|2)$ ]]; then
       materialize_raw_v3_stopped_pre_stop_fixture \
         "$bundle" "$label" || return 1
     fi
@@ -3763,7 +4019,7 @@ materialize_raw_v3_acceptance_scenarios_fixture() {
   if [[ "$pressure_contract_version" == 0 ]]; then
     materialize_raw_v3_phase_fixture \
       "$bundle" pressure-pressured full-live || return 1
-  elif [[ "$pressure_contract_version" != 1 ]]; then
+  elif [[ ! "$pressure_contract_version" =~ ^(1|2)$ ]]; then
     return 1
   fi
   materialize_raw_v3_phase_fixture "$bundle" final full-unavailable-java || return 1
@@ -4043,8 +4299,10 @@ materialize_raw_v3_exact_fixture() {
   done <"$pairs"
   write_raw_v3_status_files_fixture \
     "$bundle" "$statuses" "$status_owners" || return 1
-  if [[ "$kind" == acceptance && "$pressure_contract_version" == 1 ]]; then
-    write_raw_pressure_barrier_status_fixture "$bundle" || return 1
+  if [[ "$kind" == acceptance &&
+    "$pressure_contract_version" =~ ^(1|2)$ ]]; then
+    write_raw_pressure_barrier_status_fixture \
+      "$bundle" "$pressure_contract_version" || return 1
   fi
   write_raw_v3_exact_index_fixture \
     "$bundle" "$selection" \
@@ -4190,7 +4448,7 @@ create_raw_v3_acceptance_fixture() {
   for scenario in "${stress_scenarios[@]}"; do
     request_count="$(scenario_request_count_fixture "$scenario")" || return 1
     write_raw_v3_scenario_result_fixture \
-      "$bundle" "$scenario" "$request_count"
+      "$bundle" "$scenario" "$request_count" "$pressure_contract_version"
     write_raw_v3_scenario_status_fixture \
       "$bundle" "$scenario" "$pressure_contract_version"
   done
@@ -4603,30 +4861,38 @@ sync_raw_v3_pair_index_hashes_fixture() {
 sync_raw_v3_pressure_status_index_fixture() {
   local -r bundle="$1"
   local -r pair_reference='obi-metric-pairs/pressure.json'
+  local -r java_reference='phases/pressure-after/java-diagnostics.txt'
   local -r status_reference='scenario-pressure-status.json'
   local pair_sha256=""
+  local java_sha256=""
   local status_sha256=""
 
   sync_raw_v3_stress_status_authority_fixture "$bundle" pressure || return 1
   pair_sha256="$(sha256sum <"$bundle/$pair_reference")" || return 1
   pair_sha256="${pair_sha256%% *}"
+  java_sha256="$(sha256sum <"$bundle/$java_reference")" || return 1
+  java_sha256="${java_sha256%% *}"
   status_sha256="$(sha256sum <"$bundle/$status_reference")" || return 1
   status_sha256="${status_sha256%% *}"
   # jq variables below are supplied through --arg.
   # shellcheck disable=SC2016
   replace_json_file "$bundle/obi-metric-boundary-index.json" '
     if ([.boundaries[].captures[] |
-      select(.pair_reference == $pair_reference)] | length) == 1 and
+      select(.pair_reference == $pair_reference and
+        .java_reference == $java_reference)] | length) == 1 and
       ([.boundaries[].status_references[] |
         select(.reference == $status_reference)] | length) == 1 then
       (.boundaries[].captures[] |
-        select(.pair_reference == $pair_reference) | .pair_sha256) =
-          $pair_sha256 |
+        select(.pair_reference == $pair_reference and
+          .java_reference == $java_reference)) |=
+            (.pair_sha256 = $pair_sha256 | .java_sha256 = $java_sha256) |
       (.boundaries[].status_references[] |
         select(.reference == $status_reference) | .sha256) = $status_sha256
     else error("pressure authority cardinality") end
   ' --arg pair_reference "$pair_reference" \
     --arg pair_sha256 "$pair_sha256" \
+    --arg java_reference "$java_reference" \
+    --arg java_sha256 "$java_sha256" \
     --arg status_reference "$status_reference" \
     --arg status_sha256 "$status_sha256" || return 1
   sync_v3_index_envelopes "$bundle"
@@ -4729,7 +4995,19 @@ sync_raw_pressure_barrier_mirrors_fixture() {
         .handoff_admission_outcome_counts.ambiguous) |
     .traffic.handoff_admission_maximum_count =
       ($status[0].pressure_correlation.bridge |
-        .handoff_admission_outcome_counts.maximum)
+        .handoff_admission_outcome_counts.maximum) |
+    if .schema == "pressure-traffic-barrier-v2" then
+      .traffic.w3c_parent_count =
+        $result[0].pressure_correlation.w3c_parent_count |
+      .traffic.retrieval_valid_count =
+        $status[0].pressure_correlation.bridge.retrieval_valid_count |
+      .traffic.attributable_failure_count =
+        $status[0].pressure_correlation.bridge.attributable_failure_count |
+      .traffic.w3c_masked_valid_count =
+        $status[0].pressure_correlation.bridge.w3c_masked_valid_count |
+      .traffic.java_reconciliation_target =
+        $status[0].pressure_correlation.java_reconciliation_target
+    else . end
   ' --arg ready_sha256 "$ready_sha256" \
     --arg release_sha256 "$release_sha256" \
     --arg fill_sha256 "$fill_sha256" \
@@ -4744,6 +5022,113 @@ sync_raw_pressure_barrier_mirrors_fixture() {
     --slurpfile status "$bundle/scenario-pressure-status.json" \
     --slurpfile inspections \
       "$bundle/map-pressure-pressure-container-inspections.json"
+}
+
+reseal_raw_v2_pressure_fixture() {
+  local -r bundle="$1"
+
+  refresh_running_identity_metrics_digest "$bundle" pressure-after || return 1
+  sync_raw_v3_pressure_status_index_fixture "$bundle" || return 1
+  sync_raw_pressure_barrier_mirrors_fixture "$bundle"
+}
+
+set_raw_v2_pressure_hidden_outcome_fixture() {
+  local -r bundle="$1"
+  local -r outcome="$2"
+  local -r after="$bundle/phases/pressure-after/obi-metrics.prom"
+  local -r delta="$bundle/phases/pressure-after/obi-metrics.delta"
+  local -r pair="$bundle/obi-metric-pairs/pressure.json"
+  local -r status="$bundle/scenario-pressure-status.json"
+  local -r diagnostics="$bundle/phases/pressure-after/java-diagnostics.txt"
+  local valid=""
+  local failures=""
+  local masked=""
+  local fixture_missing=""
+
+  case "$outcome" in
+    bridge-valid)
+      valid=127
+      failures=1
+      masked=1
+      fixture_missing=2
+      ;;
+    bridge-failed)
+      valid=126
+      failures=2
+      masked=0
+      fixture_missing=3
+      ;;
+    *) return 1 ;;
+  esac
+
+  awk -v valid="$valid" -v failures="$failures" '
+    /operation="candidate",status="valid",transport="tcp"/ { $2 = valid }
+    /operation="inject",status="overload",transport="tcp"/ { $2 = failures }
+    /operation="inject",status="valid",transport="tcp"/ { $2 = valid }
+    /operation="stage",status="valid",transport="tcp"/ { $2 = valid }
+    /operation="take",status="valid",transport="getsockopt"/ { $2 = valid }
+    { print }
+  ' "$after" >"$after.tmp" || return 1
+  mv -fT -- "$after.tmp" "$after"
+  awk -v valid="$valid" -v failures="$failures" '
+    function rewrite(value) {
+      $2 = "before=0"
+      $3 = "after=" value
+      $4 = "delta=" value
+    }
+    /operation="candidate",status="valid",transport="tcp"/ { rewrite(valid) }
+    /operation="inject",status="overload",transport="tcp"/ { rewrite(failures) }
+    /operation="inject",status="valid",transport="tcp"/ { rewrite(valid) }
+    /operation="stage",status="valid",transport="tcp"/ { rewrite(valid) }
+    /operation="take",status="valid",transport="getsockopt"/ { rewrite(valid) }
+    { print }
+  ' "$delta" >"$delta.tmp" || return 1
+  mv -fT -- "$delta.tmp" "$delta"
+  # jq variables below are supplied through --arg.
+  # shellcheck disable=SC2016
+  replace_canonical_json_file "$pair" '
+    .series |= map(
+      if .operation == "candidate" and .status == "valid" and
+          .transport == "tcp" then
+        .after = $valid | .delta = $valid
+      elif .operation == "inject" and .status == "overload" and
+          .transport == "tcp" then
+        .after = $failures | .delta = $failures
+      elif ((.operation == "inject" or .operation == "stage") and
+          .status == "valid" and .transport == "tcp") or
+          (.operation == "take" and .status == "valid" and
+            .transport == "getsockopt") then
+        .after = $valid | .delta = $valid
+      else . end)
+  ' --arg valid "$valid" --arg failures "$failures" || return 1
+  # jq variables below are supplied through --argjson.
+  # shellcheck disable=SC2016
+  replace_canonical_json_file "$status" '
+    .pressure_correlation.bridge.phase_outcome_counts = {
+      inject:128, candidate:$valid, stage:$valid, retrieval:$valid
+    } |
+    .pressure_correlation.bridge.retrieval_valid_count = $valid |
+    .pressure_correlation.bridge.attributable_failure_count = $failures |
+    .pressure_correlation.bridge.w3c_masked_valid_count = $masked |
+    .pressure_correlation.bridge.upstream_failure_count = $failures |
+    .pressure_correlation.bridge.upstream_failure_reason_counts = {
+      missing:0, stale:0, ambiguous:0, malformed:0,
+      overload:$failures, segmented:0
+    } |
+    .pressure_correlation.java_reconciliation_target = {
+      take_valid_count:$valid, take_sampled_count:$valid,
+      take_unsampled_count:0, discard_standard_count:$masked,
+      attributable_absence_count:$failures, diagnostic_self_miss_count:1
+    }
+  ' --argjson valid "$valid" --argjson failures "$failures" \
+    --argjson masked "$masked" || return 1
+  set_java_diagnostic_fixture "$diagnostics" t_valid "$valid" || return 1
+  set_java_diagnostic_fixture \
+    "$diagnostics" t_missing "$fixture_missing" || return 1
+  set_java_diagnostic_fixture "$diagnostics" take_sampled "$valid" || return 1
+  set_java_diagnostic_fixture "$diagnostics" discard_standard "$masked" ||
+    return 1
+  reseal_raw_v2_pressure_fixture "$bundle"
 }
 
 set_raw_pressure_admission_fixture() {
@@ -6186,6 +6571,315 @@ test_raw_v3_mode() {
 
 }
 
+test_raw_v2_pressure_contract_mutations() {
+  local -r verifier="$1"
+  local -r acceptance="$2"
+  local -r baseline="$TEST_TMP_DIR/raw-v2-pressure-baseline"
+  local -r diagnostics="$acceptance/phases/pressure-after/java-diagnostics.txt"
+  local -r result="$acceptance/scenario-pressure.json"
+  local -r status="$acceptance/scenario-pressure-status.json"
+  local -r barrier="$acceptance/map-pressure-pressure-barrier-status.json"
+
+  cp -a -- "$acceptance" "$baseline"
+  set_raw_v2_pressure_hidden_outcome_fixture \
+    "$acceptance" bridge-failed || return 1
+  "$verifier" --raw-v3 acceptance "$acceptance" >/dev/null ||
+    die 'raw v2 pressure evidence rejected the hidden bridge-failed W3C outcome'
+  restore_external_v3_fixture "$acceptance" "$baseline"
+
+  replace_json_file "$result" '
+    .pressure_correlation.exact_hit_count = 125 |
+    .pressure_correlation.w3c_parent_count = 2
+  ' || return 1
+  replace_canonical_json_file "$status" '
+    .pressure_correlation.trace.exact_hit_count = 125 |
+    .pressure_correlation.trace.w3c_parent_count = 2
+  ' || return 1
+  reseal_raw_v2_pressure_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v2 pressure evidence with a forged W3C-parent count' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$baseline"
+
+  # Move the complete standard-W3C graph to request 1 while converting request
+  # 0 back to an ordinary exact bridge graph. Counts and all digests remain
+  # coherent, so rejection proves the fixed request-0 authority.
+  # shellcheck disable=SC2016
+  replace_json_file "$result" '
+    .cases[0].trace.spans as $zero_spans |
+    .cases[1].trace.spans as $one_spans |
+    ([$zero_spans[] | select(
+      .service_name == "apache-proxy" and .kind == "CLIENT")][0].span_id)
+      as $zero_client |
+    .cases[0].request |= del(.w3c_trace_id, .w3c_parent_span_id,
+      .w3c_trace_flags, .w3c_case) |
+    .cases[0].pressure_parent_outcome = "exact_hit" |
+    (.cases[0].trace.spans[] | select(
+      .service_name == "apache-proxy" and .kind == "SERVER")) |=
+      (.trace_id = ("0" * 31 + "1") |
+        .parent_span_id = "0000000000000000" | .flags = 1) |
+    (.cases[0].trace.spans[] | select(
+      .service_name == "apache-proxy" and .kind == "CLIENT")) |=
+      (.trace_id = ("0" * 31 + "1") | .flags = 1) |
+    (.cases[0].trace.spans[] | select(
+      .service_name == "java-backend" and .kind == "SERVER")) |=
+      (.trace_id = ("0" * 31 + "1") |
+        .parent_span_id = $zero_client | .flags = 769) |
+    .cases[1].request += {
+      w3c_trace_id:("c" * 32), w3c_parent_span_id:("d" * 16),
+      w3c_trace_flags:"01",
+      w3c_case:"valid-w3c-under-full-hash-pressure"
+    } |
+    .cases[1] |= del(.pressure_parent_outcome) |
+    (.cases[1].trace.spans[] | select(
+      .service_name == "apache-proxy" and .kind == "SERVER")) |=
+      (.trace_id = ("c" * 32) | .parent_span_id = ("d" * 16) | .flags = 1) |
+    (.cases[1].trace.spans[] | select(
+      .service_name == "apache-proxy" and .kind == "CLIENT")) |=
+      (.trace_id = ("c" * 32) | .flags = 1) |
+    (.cases[1].trace.spans[] | select(
+      .service_name == "java-backend" and .kind == "SERVER")) |=
+      (.trace_id = ("c" * 32) | .parent_span_id = ("d" * 16) | .flags = 769)
+  ' || return 1
+  reseal_raw_v2_pressure_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v2 pressure evidence with W3C truth at request 1' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$baseline"
+
+  replace_json_file "$result" \
+    '.cases[0].request.w3c_trace_id = ("0" * 32)' || return 1
+  reseal_raw_v2_pressure_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v2 pressure evidence with a zero W3C trace ID' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$baseline"
+
+  replace_json_file "$result" '
+    .cases[0].request.w3c_trace_flags = "00" |
+    (.cases[0].trace.spans[] | select(.service_name == "apache-proxy")) |=
+      (.flags = 0) |
+    (.cases[0].trace.spans[] | select(
+      .service_name == "java-backend" and .kind == "SERVER")) |=
+      (.flags = 768)
+  ' || return 1
+  reseal_raw_v2_pressure_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v2 pressure evidence with unsampled W3C flags' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$baseline"
+
+  replace_json_file "$result" '
+    (.cases[0].trace.spans[] | select(
+      .service_name == "java-backend" and .kind == "SERVER") |
+      .flags) += 4294967296
+  ' || return 1
+  reseal_raw_v2_pressure_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v2 pressure evidence with Java flags above uint32' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$baseline"
+
+  replace_json_file "$result" '
+    (.cases[0].trace.spans[] | select(
+      .service_name == "java-backend" and .kind == "SERVER") |
+      .parent_span_id) = ("e" * 16)
+  ' || return 1
+  reseal_raw_v2_pressure_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v2 pressure evidence with a wrong ModeW3C Java parent' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$baseline"
+
+  # jq variables below bind authenticated span identities from the fixture.
+  # shellcheck disable=SC2016
+  replace_json_file "$result" '
+    ([.cases[0].trace.spans[] | select(
+      .service_name == "apache-proxy" and .kind == "SERVER")][0].span_id)
+      as $apache_server_id |
+    .cases[0].request.w3c_parent_span_id = $apache_server_id |
+    (.cases[0].trace.spans[] | select(
+      .service_name == "apache-proxy" and .kind == "SERVER") |
+      .parent_span_id) = $apache_server_id |
+    (.cases[0].trace.spans[] | select(
+      .service_name == "java-backend" and .kind == "SERVER") |
+      .parent_span_id) = $apache_server_id
+  ' || return 1
+  reseal_raw_v2_pressure_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v2 pressure evidence with a self-parented W3C Apache server' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$baseline"
+
+  # jq variables below bind authenticated span identities from the fixture.
+  # shellcheck disable=SC2016
+  replace_json_file "$result" '
+    ([.cases[0].trace.spans[] | select(
+      .service_name == "java-backend" and .kind == "SERVER")][0].span_id)
+      as $java_server_id |
+    .cases[0].request.w3c_parent_span_id = $java_server_id |
+    (.cases[0].trace.spans[] | select(
+      .service_name == "apache-proxy" and .kind == "SERVER") |
+      .parent_span_id) = $java_server_id |
+    (.cases[0].trace.spans[] | select(
+      .service_name == "java-backend" and .kind == "SERVER") |
+      .parent_span_id) = $java_server_id
+  ' || return 1
+  reseal_raw_v2_pressure_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v2 pressure evidence with a self-parented W3C Java server' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$baseline"
+
+  # jq variables below bind authenticated span identities from the fixture.
+  # shellcheck disable=SC2016
+  replace_json_file "$result" '
+    ([.cases[0].trace.spans[] | select(
+      .service_name == "java-backend" and .kind == "SERVER")][0].span_id)
+      as $duplicate_id |
+    (.cases[0].trace.spans[] | select(
+      .service_name == "apache-proxy" and .kind == "SERVER") |
+      .span_id) = $duplicate_id |
+    (.cases[0].trace.spans[] | select(
+      .service_name == "apache-proxy" and .kind == "CLIENT") |
+      .parent_span_id) = $duplicate_id
+  ' || return 1
+  reseal_raw_v2_pressure_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v2 pressure evidence with a duplicate cross-service span identity' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$baseline"
+
+  replace_json_file "$result" '
+    .cases[1].trace.related_spans =
+      ((.cases[1].trace.related_spans // []) + [
+        (.cases[1].trace.spans[0] |
+          .service_name = "pressure-ancestry-helper" |
+          .kind = "INTERNAL" |
+          .span_id = "f000000000000001" |
+          .parent_span_id = "f000000000000001")
+      ])
+  ' || return 1
+  reseal_raw_v2_pressure_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v2 ordinary pressure evidence with a self-parented related span' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$baseline"
+
+  replace_json_file "$result" '
+    .cases[1].trace.related_spans =
+      ((.cases[1].trace.related_spans // []) + [
+        (.cases[1].trace.spans[0] |
+          .service_name = "pressure-ancestry-helper" |
+          .kind = "INTERNAL" |
+          .span_id = "f000000000000002" |
+          .parent_span_id = "f000000000000003"),
+        (.cases[1].trace.spans[0] |
+          .service_name = "pressure-ancestry-helper" |
+          .kind = "INTERNAL" |
+          .span_id = "f000000000000003" |
+          .parent_span_id = "f000000000000002")
+      ])
+  ' || return 1
+  reseal_raw_v2_pressure_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v2 ordinary pressure evidence with a related-span ancestry cycle' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$baseline"
+
+  replace_canonical_json_file "$status" '
+    .pressure_correlation.bridge.retrieval_valid_count = 128 |
+    .pressure_correlation.bridge.w3c_masked_valid_count = 2 |
+    .pressure_correlation.java_reconciliation_target.take_valid_count = 128 |
+    .pressure_correlation.java_reconciliation_target.take_sampled_count = 128 |
+    .pressure_correlation.java_reconciliation_target.discard_standard_count = 2
+  ' || return 1
+  reseal_raw_v2_pressure_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v2 pressure bridge outside the one-W3C algebra' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$baseline"
+
+  replace_canonical_json_file "$status" '
+    .pressure_correlation.bridge.upstream_failure_reason_counts = {
+      missing:1, stale:0, ambiguous:0, malformed:0, overload:0, segmented:0
+    }
+  ' || return 1
+  reseal_raw_v2_pressure_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v2 pressure bridge with a forged residual reason' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$baseline"
+
+  replace_canonical_json_file "$status" \
+    '.pressure_correlation.bridge.auxiliary_outcome_counts.handoff = 128' ||
+    return 1
+  reseal_raw_v2_pressure_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v2 pressure bridge with handoffs above valid retrievals' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$baseline"
+
+  set_java_diagnostic_fixture "$diagnostics" t_valid 126 || return 1
+  reseal_raw_v2_pressure_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v2 pressure Java target with a wrong valid-take counter' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$baseline"
+
+  set_java_diagnostic_fixture "$diagnostics" d_overload 1 || return 1
+  reseal_raw_v2_pressure_fixture "$acceptance" || return 1
+  expect_external_v3_rejection \
+    'raw v2 pressure Java target with a nonzero d_overload counter' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$baseline"
+
+  replace_canonical_json_file "$barrier" \
+    '.schema = "pressure-traffic-barrier-v1"' || return 1
+  expect_external_v3_rejection \
+    'raw v2 pressure authority with a cross-version barrier schema' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$baseline"
+
+  replace_canonical_json_file "$barrier" \
+    '.traffic.w3c_parent_count = 2' || return 1
+  expect_external_v3_rejection \
+    'raw v2 pressure barrier with W3C count drift' \
+    "$verifier" --raw-v3 acceptance "$acceptance"
+  restore_external_v3_fixture "$acceptance" "$baseline"
+}
+
+test_raw_v2_pressure_contract_smoke() {
+  local -r verifier_source="$1"
+  local -r repository="$TEST_TMP_DIR/pressure-v2-smoke-repository"
+  local -r fixture_verifier="$repository/examples/apache-java-https/scripts/verify-retained-evidence.sh"
+  local -r producer="$repository/examples/apache-java-https/run.sh"
+  local -r acceptance="$TEST_TMP_DIR/pressure-v2-smoke-acceptance"
+  local revision=""
+
+  git init --quiet "$repository"
+  git -C "$repository" config user.email 'pressure-v2-smoke@example.invalid'
+  git -C "$repository" config user.name 'Pressure V2 Smoke Test'
+  git -C "$repository" config commit.gpgSign false
+  mkdir -p -- "${fixture_verifier%/*}"
+  cp -- "$verifier_source" "$fixture_verifier"
+  chmod 0755 -- "$fixture_verifier"
+  printf 'tested source\n' >"$repository/source.txt"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'PRESSURE_TRAFFIC_CONTRACT_VERSION=2' >"$producer"
+  chmod 0755 -- "$producer"
+  commit_fixture "$repository" 'Create W3C pressure producer'
+  revision="$(git -C "$repository" rev-parse HEAD)"
+  create_raw_v3_acceptance_fixture \
+    "$repository" "$revision" "$acceptance" 2
+  "$fixture_verifier" --raw-v3 acceptance "$acceptance" >/dev/null ||
+    die 'raw v2 pressure smoke fixture was rejected'
+  set_raw_v2_pressure_hidden_outcome_fixture \
+    "$acceptance" bridge-failed || return 1
+  "$fixture_verifier" --raw-v3 acceptance "$acceptance" >/dev/null ||
+    die 'raw v2 hidden bridge-failed pressure smoke fixture was rejected'
+}
+
 test_pressure_contract_version_is_source_anchored() {
   local -r verifier_source="$1"
   local -r repository="$TEST_TMP_DIR/pressure-contract-repository"
@@ -6196,12 +6890,18 @@ test_pressure_contract_version_is_source_anchored() {
   local -r v1_bundle="$TEST_TMP_DIR/pressure-contract-v1"
   local -r v1_with_v0_shape="$TEST_TMP_DIR/pressure-contract-v1-with-v0-shape"
   local -r v1_assertion="$TEST_TMP_DIR/pressure-contract-v1-assertion"
+  local -r v2_bundle="$TEST_TMP_DIR/pressure-contract-v2"
+  local -r v2_with_v1_shape="$TEST_TMP_DIR/pressure-contract-v2-with-v1-shape"
+  local -r v2_assertion="$TEST_TMP_DIR/pressure-contract-v2-assertion"
   local -r unknown_assertion="$TEST_TMP_DIR/pressure-contract-unknown-assertion"
   local -r duplicate_assertion="$TEST_TMP_DIR/pressure-contract-duplicate-assertion"
+  local -r mixed_assertion="$TEST_TMP_DIR/pressure-contract-mixed-assertion"
   local v0_revision=""
   local v1_revision=""
+  local v2_revision=""
   local unknown_revision=""
   local duplicate_revision=""
+  local mixed_revision=""
 
   git init --quiet "$repository"
   git -C "$repository" config user.email 'pressure-contract-test@example.invalid'
@@ -6268,6 +6968,26 @@ test_pressure_contract_version_is_source_anchored() {
 
   printf '%s\n' '#!/usr/bin/env bash' \
     'PRESSURE_TRAFFIC_CONTRACT_VERSION=2' >"$producer"
+  commit_fixture "$repository" 'Create W3C pressure contract producer'
+  v2_revision="$(git -C "$repository" rev-parse HEAD)"
+  create_raw_v3_acceptance_fixture \
+    "$repository" "$v2_revision" "$v2_bundle" 2
+  "$fixture_verifier" --raw-v3 acceptance "$v2_bundle" >/dev/null ||
+    die 'W3C raw-v3 pressure evidence was rejected'
+  test_raw_v2_pressure_contract_mutations \
+    "$fixture_verifier" "$v2_bundle" || return 1
+  create_raw_v3_acceptance_fixture \
+    "$repository" "$v2_revision" "$v2_with_v1_shape" 1
+  expect_external_v3_rejection \
+    'barrier-v1 pressure evidence authenticated by a W3C producer' \
+    "$fixture_verifier" --raw-v3 acceptance "$v2_with_v1_shape"
+  create_raw_v3_assertion_fixture \
+    "$repository" "$v2_revision" "$v2_assertion"
+  "$fixture_verifier" --raw-v3 assertion-failure "$v2_assertion" >/dev/null ||
+    die 'W3C pressure producer assertion control was rejected'
+
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'PRESSURE_TRAFFIC_CONTRACT_VERSION=3' >"$producer"
   commit_fixture "$repository" 'Create unknown pressure contract producer'
   unknown_revision="$(git -C "$repository" rev-parse HEAD)"
   create_raw_v3_assertion_fixture \
@@ -6286,6 +7006,748 @@ test_pressure_contract_version_is_source_anchored() {
   expect_external_v3_rejection \
     'duplicate authenticated pressure contract assignments' \
     "$fixture_verifier" --raw-v3 assertion-failure "$duplicate_assertion"
+
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'PRESSURE_TRAFFIC_CONTRACT_VERSION=1' \
+    'PRESSURE_TRAFFIC_CONTRACT_VERSION=2' >"$producer"
+  commit_fixture "$repository" 'Create mixed pressure contract markers'
+  mixed_revision="$(git -C "$repository" rev-parse HEAD)"
+  create_raw_v3_assertion_fixture \
+    "$repository" "$mixed_revision" "$mixed_assertion"
+  expect_external_v3_rejection \
+    'mixed authenticated pressure contract assignments' \
+    "$fixture_verifier" --raw-v3 assertion-failure "$mixed_assertion"
+}
+
+write_claim_runbook_fixture() {
+  local -r repository="$1"
+  local -r revision="$2"
+  local -r acceptance="$3"
+  local -r output="$4"
+  local source_tree_sha256=""
+  local workflow_digest=""
+
+  source_tree_sha256="$(awk -F= \
+    '$1 == "source_tree_sha256" { print $2 }' \
+    "$acceptance/environment.txt")"
+  workflow_digest="$(git -C "$repository" show \
+    "$revision:.github/workflows/java_remote_parent_acceptance_claims.yml" |
+    sha256sum)"
+  workflow_digest="${workflow_digest%% *}"
+  jq -cS -n --arg revision "$revision" --arg tree "$source_tree_sha256" \
+    --arg workflow_digest "$workflow_digest" --arg empty_sha256 "$EMPTY_SHA256" '
+    ["clone", "checkout-exact-revision", "clean-status-before",
+      "certificate-generation", "run-test", "tracecheck-tests",
+      "compose-config", "clean-status-after-validation",
+      "acceptance-all-otel-getsockopt-tls13", "assertion-failure-exit-2",
+      "scoped-cleanup", "clean-status-final"] as $ids |
+    {
+      schema:"obi-apache-java-https-runbook-receipt-v1",
+      source_revision:$revision,
+      source_tree_sha256:$tree,
+      environment:{architecture:"x86_64",compose_version:"2.39.0",
+        docker_version:"28.0.0",go_version:"1.25.0",java_version:"21.0.8",
+        operating_system:"Linux"},
+      execution_locator:{event:"push",head_sha:$revision,kind:"github-actions",
+        repository:"MrAlias/opentelemetry-ebpf-instrumentation",
+        run_attempt:"1",run_id:"123456789",
+        run_url:"https://github.com/MrAlias/opentelemetry-ebpf-instrumentation/actions/runs/123456789/attempts/1",
+        workflow_blob_sha256:$workflow_digest,
+        workflow_path:".github/workflows/java_remote_parent_acceptance_claims.yml",
+        workflow_ref:"MrAlias/opentelemetry-ebpf-instrumentation/.github/workflows/java_remote_parent_acceptance_claims.yml@refs/heads/agent/java-remote-parent-bridge",
+        workflow_sha:$revision},
+      output_contract:{algorithm:"sha256",
+        bytes:"exact-command-order-no-normalization",
+        stream:"combined-stdout-stderr"},
+      commands:[$ids[] as $id | {
+        id:$id,duration_seconds:1,
+        exit_status:(if $id == "assertion-failure-exit-2" then 2 else 0 end),
+        output_sha256:(if $id == "clean-status-before" or
+            $id == "clean-status-after-validation" or
+            $id == "clean-status-final"
+          then $empty_sha256 else ("4" * 64) end),
+        status:(if $id == "assertion-failure-exit-2" then
+          "expected_failure" else "passed" end)}]
+    }
+  ' >"$output"
+  chmod 0600 -- "$output"
+}
+
+make_claim_bundle_mutable() {
+  local -r bundle="$1"
+
+  chmod -R u+rwX -- "$bundle"
+}
+
+seal_claim_bundle_fixture() {
+  local -r bundle="$1"
+
+  find -- "$bundle" -type f -exec chmod 0444 -- {} +
+  find -- "$bundle" -depth -type d -exec chmod 0555 -- {} +
+}
+
+make_claim_bundle_git_portable() {
+  local -r bundle="$1"
+
+  find -- "$bundle" -type f -exec chmod 0644 -- {} +
+  find -- "$bundle" -depth -type d -exec chmod 0755 -- {} +
+}
+
+write_claim_bundle_manifest_fixture() {
+  local -r bundle="$1"
+  local file=""
+  local digest=""
+
+  : >"$bundle/SHA256SUMS"
+  for file in README.md SANITIZATION.md acceptance-claims.json \
+    authority-summary.json derivation-receipt.json verify.sh; do
+    digest="$(sha256sum <"$bundle/$file")"
+    digest="${digest%% *}"
+    printf '%s  ./%s\n' "$digest" "$file" >>"$bundle/SHA256SUMS"
+  done
+}
+
+reseal_claim_v2_relations() {
+  local -r bundle="$1"
+  local authority_sha256=""
+  local claims_sha256=""
+  local evidence_id=""
+  local candidate="$bundle/derivation-receipt.json.candidate"
+
+  authority_sha256="$(sha256sum <"$bundle/authority-summary.json")"
+  authority_sha256="${authority_sha256%% *}"
+  claims_sha256="$(sha256sum <"$bundle/acceptance-claims.json")"
+  claims_sha256="${claims_sha256%% *}"
+  evidence_id="$(printf '%s\n' 'obi-bounded-claims-evidence-v2' \
+    "${bundle##*/}" "$authority_sha256" "$claims_sha256" | sha256sum)"
+  evidence_id="${evidence_id%% *}"
+  jq -cS --arg authority "$authority_sha256" --arg claims "$claims_sha256" \
+    --arg evidence_id "$evidence_id" '
+    .authority.sha256 = $authority |
+    .claims.sha256 = $claims |
+    .evidence_id = $evidence_id
+  ' "$bundle/derivation-receipt.json" >"$candidate"
+  mv -fT -- "$candidate" "$bundle/derivation-receipt.json"
+  write_claim_bundle_manifest_fixture "$bundle"
+}
+
+write_claim_v2_document_receipt() {
+  local -r bundle="$1"
+  local authority_sha256=""
+  local claims_sha256=""
+  local evidence_id=""
+
+  authority_sha256="$(sha256sum <"$bundle/authority-summary.json")"
+  authority_sha256="${authority_sha256%% *}"
+  claims_sha256="$(sha256sum <"$bundle/acceptance-claims.json")"
+  claims_sha256="${claims_sha256%% *}"
+  evidence_id="$(printf '%s\n' 'obi-bounded-claims-evidence-v2' \
+    "${bundle##*/}" "$authority_sha256" "$claims_sha256" | sha256sum)"
+  evidence_id="${evidence_id%% *}"
+  jq -cS -n --arg bundle_name "${bundle##*/}" \
+    --arg authority "$authority_sha256" --arg claims "$claims_sha256" \
+    --arg evidence_id "$evidence_id" '{
+    schema:"obi-bounded-claim-derivation-v1",
+    derivation_contract:"private-raw-v3-to-bounded-claims-v2",
+    bundle_name:$bundle_name,
+    evidence_id:$evidence_id,
+    authority:{reference:"authority-summary.json",sha256:$authority},
+    claims:{reference:"acceptance-claims.json",sha256:$claims},
+    private_validation_profile:{
+      exact_complete_producer_roster_validated:true,
+      fixed_invocations_without_keep_validated:true,
+      raw_snapshots_same_device_and_capped:true,
+      required_eleven_stress_pair_ownership_validated:true,
+      raw_semantics_validated_before_projection:true,
+      raw_semantics_recomputable_from_public_bundle:false},
+    public_file_order:["README.md","SANITIZATION.md",
+      "acceptance-claims.json","authority-summary.json",
+      "derivation-receipt.json","verify.sh","SHA256SUMS"]
+  }' >"$bundle/derivation-receipt.json"
+}
+
+run_claim_v2_document_validator() {
+  local -r verifier="$1"
+  local -r bundle="$2"
+  local -r work="$3"
+
+  mkdir -m 0700 -- "$work"
+  CLAIM_DOCUMENT_VERIFIER="$verifier" CLAIM_DOCUMENT_BUNDLE="$bundle" \
+    CLAIM_DOCUMENT_WORK="$work" bash -c '
+      source <(head -n -1 -- "$CLAIM_DOCUMENT_VERIFIER")
+      trap - ERR EXIT
+      BUNDLE_DIR="$CLAIM_DOCUMENT_BUNDLE"
+      BUNDLE_NAME="${CLAIM_DOCUMENT_BUNDLE##*/}"
+      TMP_DIR="$CLAIM_DOCUMENT_WORK"
+      validate_claim_v2_documents
+    '
+}
+
+expect_claim_v2_document_rejection() {
+  local -r description="$1"
+  local -r verifier="$2"
+  local -r bundle="$3"
+  local -r work="$4"
+
+  if run_claim_v2_document_validator \
+    "$verifier" "$bundle" "$work" >/dev/null 2>&1; then
+    die "claims-v2 document validator accepted $description"
+  fi
+}
+
+test_claim_v2_document_contract_unit() {
+  local -r verifier="$1"
+  local -r parent="$TEST_TMP_DIR/claims-v2-document-unit"
+  local -r baseline="$parent/baseline/unit-public-v2"
+  local bundle=""
+  local candidate=""
+
+  mkdir -p -- "$baseline"
+  jq -cS -n '
+    {
+      schema:"obi-bounded-acceptance-claims-v2",
+      status:"passed",
+      issue_32:{},
+      issue_34:{scenarios:[range(0;11) | {}]},
+      issue_36:{
+        status:"passed",
+        pressure_contract:{version:2,
+          barrier_schema:"pressure-traffic-barrier-v2",
+          traffic_barrier_cross_binding_verified:true},
+        traffic:{request_count:128,exact_parent_count:126,
+          explicit_local_root_count:1,w3c_parent_count:1,
+          wrong_parent_count:0,unresolved_count:0,
+          conservation:"H+R+W=N"},
+        full_hash_pressure:{map_type:"non-evicting HASH",capacity:10000,
+          filled_entries:10000,capacity_rejected_entries:1,
+          capacity_rejection_errno:"E2BIG",
+          fill_content_sha256:("a" * 64),
+          post_traffic_content_sha256:("a" * 64),
+          content_digest_equal:true}}
+    } |
+    .issue_34.scenarios[9] = {
+      bounded_duration_verified:true,conservation:"H+R+W=N",
+      duration_cap_nanos:75000000000,exact_parent_count:126,
+      explicit_local_root_count:1,name:"pressure",request_count:128,
+      required_metric_pair_and_java_capture_verified:true,
+      topology_contract:"pressure-exact-or-explicit-root",
+      w3c_parent_count:1,zero_unresolved_parent:true,zero_wrong_parent:true}
+  ' >"$baseline/acceptance-claims.json"
+  jq -cS -n '{}' >"$baseline/authority-summary.json"
+  write_claim_v2_document_receipt "$baseline"
+  run_claim_v2_document_validator \
+    "$verifier" "$baseline" "$parent/positive-work" ||
+    die 'claims-v2 document validator rejected its positive control'
+
+  bundle="$parent/schema/unit-public-v2"
+  mkdir -p -- "${bundle%/*}"
+  cp -a -- "$baseline" "$bundle"
+  candidate="$bundle/acceptance-claims.json.candidate"
+  jq -cS '.schema = "obi-bounded-acceptance-claims-v1"' \
+    "$bundle/acceptance-claims.json" >"$candidate"
+  mv -fT -- "$candidate" "$bundle/acceptance-claims.json"
+  write_claim_v2_document_receipt "$bundle"
+  expect_claim_v2_document_rejection 'a wrong top schema' \
+    "$verifier" "$bundle" "$parent/schema-work"
+
+  bundle="$parent/algebra/unit-public-v2"
+  mkdir -p -- "${bundle%/*}"
+  cp -a -- "$baseline" "$bundle"
+  candidate="$bundle/acceptance-claims.json.candidate"
+  jq -cS '
+    .issue_36.traffic.exact_parent_count = 125 |
+    .issue_34.scenarios[9].exact_parent_count = 125
+  ' "$bundle/acceptance-claims.json" >"$candidate"
+  mv -fT -- "$candidate" "$bundle/acceptance-claims.json"
+  write_claim_v2_document_receipt "$bundle"
+  expect_claim_v2_document_rejection 'a conservation violation' \
+    "$verifier" "$bundle" "$parent/algebra-work"
+
+  bundle="$parent/digest/unit-public-v2"
+  mkdir -p -- "${bundle%/*}"
+  cp -a -- "$baseline" "$bundle"
+  candidate="$bundle/acceptance-claims.json.candidate"
+  jq -cS '.issue_36.full_hash_pressure.post_traffic_content_sha256 = ("b" * 64)' \
+    "$bundle/acceptance-claims.json" >"$candidate"
+  mv -fT -- "$candidate" "$bundle/acceptance-claims.json"
+  write_claim_v2_document_receipt "$bundle"
+  expect_claim_v2_document_rejection 'unequal content digests' \
+    "$verifier" "$bundle" "$parent/digest-work"
+
+  bundle="$parent/extra/unit-public-v2"
+  mkdir -p -- "${bundle%/*}"
+  cp -a -- "$baseline" "$bundle"
+  candidate="$bundle/acceptance-claims.json.candidate"
+  jq -cS '.issue_36.unexpected = true' \
+    "$bundle/acceptance-claims.json" >"$candidate"
+  mv -fT -- "$candidate" "$bundle/acceptance-claims.json"
+  write_claim_v2_document_receipt "$bundle"
+  expect_claim_v2_document_rejection 'an extra issue #36 key' \
+    "$verifier" "$bundle" "$parent/extra-work"
+
+  bundle="$parent/duplicate/unit-public-v2"
+  mkdir -p -- "${bundle%/*}"
+  cp -a -- "$baseline" "$bundle"
+  candidate="$bundle/acceptance-claims.json.candidate"
+  sed 's/^{/{"schema":"obi-bounded-acceptance-claims-v2",/' \
+    "$bundle/acceptance-claims.json" >"$candidate"
+  mv -fT -- "$candidate" "$bundle/acceptance-claims.json"
+  write_claim_v2_document_receipt "$bundle"
+  expect_claim_v2_document_rejection 'a duplicate JSON key' \
+    "$verifier" "$bundle" "$parent/duplicate-work"
+
+  bundle="$parent/derivation/unit-public-v2"
+  mkdir -p -- "${bundle%/*}"
+  cp -a -- "$baseline" "$bundle"
+  candidate="$bundle/derivation-receipt.json.candidate"
+  jq -cS '.derivation_contract = "private-raw-v3-to-bounded-claims-v1"' \
+    "$bundle/derivation-receipt.json" >"$candidate"
+  mv -fT -- "$candidate" "$bundle/derivation-receipt.json"
+  expect_claim_v2_document_rejection 'a wrong derivation contract' \
+    "$verifier" "$bundle" "$parent/derivation-work"
+}
+
+derive_claim_v1_fixture() {
+  local -r source="$1"
+  local -r destination="$2"
+  local -r projector="$3"
+  local -r work="$TEST_TMP_DIR/claim-v1-verifier-work"
+  local candidate=""
+  local authority_sha256=""
+  local claims_sha256=""
+  local evidence_id=""
+
+  [[ -d "${destination%/*}" && ! -L "${destination%/*}" ]] || return 1
+  mkdir -m 0700 -- "$work"
+  cp -a -- "$source" "$destination"
+  make_claim_bundle_mutable "$destination"
+  candidate="$destination/acceptance-claims.json.candidate"
+  jq -cS '
+    del(.issue_36) |
+    .schema = "obi-bounded-acceptance-claims-v1" |
+    .issue_34.scenarios[9] |=
+      (.exact_parent_count += .w3c_parent_count |
+        del(.conservation, .w3c_parent_count))
+  ' "$destination/acceptance-claims.json" >"$candidate"
+  mv -fT -- "$candidate" "$destination/acceptance-claims.json"
+  rm -f -- "$destination/verify.sh"
+  CLAIM_FIXTURE_PROJECTOR="$projector" \
+    CLAIM_FIXTURE_BUNDLE="$destination" CLAIM_FIXTURE_WORK="$work" \
+    bash -c '
+      source <(head -n -1 -- "$CLAIM_FIXTURE_PROJECTOR")
+      trap - ERR EXIT
+      CANDIDATE_DIRECTORY="$CLAIM_FIXTURE_BUNDLE"
+      WORK_DIRECTORY="$CLAIM_FIXTURE_WORK"
+      write_portable_claim_verifier
+    '
+  authority_sha256="$(sha256sum <"$destination/authority-summary.json")"
+  authority_sha256="${authority_sha256%% *}"
+  claims_sha256="$(sha256sum <"$destination/acceptance-claims.json")"
+  claims_sha256="${claims_sha256%% *}"
+  evidence_id="$(printf '%s\n' 'obi-bounded-claims-evidence-v1' \
+    "${destination##*/}" "$authority_sha256" "$claims_sha256" | sha256sum)"
+  evidence_id="${evidence_id%% *}"
+  candidate="$destination/derivation-receipt.json.candidate"
+  jq -cS --arg bundle_name "${destination##*/}" \
+    --arg authority "$authority_sha256" --arg claims "$claims_sha256" \
+    --arg evidence_id "$evidence_id" '
+    .derivation_contract = "private-raw-v3-to-bounded-claims-v1" |
+    .bundle_name = $bundle_name |
+    .authority.sha256 = $authority |
+    .claims.sha256 = $claims |
+    .evidence_id = $evidence_id
+  ' "$destination/derivation-receipt.json" >"$candidate"
+  mv -fT -- "$candidate" "$destination/derivation-receipt.json"
+  write_claim_bundle_manifest_fixture "$destination"
+  seal_claim_bundle_fixture "$destination"
+}
+
+copy_claim_v2_fixture() {
+  local -r source="$1"
+  local -r parent="$2"
+  local -r destination="$parent/${source##*/}"
+
+  mkdir -m 0700 -- "$parent"
+  cp -a -- "$source" "$destination"
+  make_claim_bundle_mutable "$destination"
+  printf '%s\n' "$destination"
+}
+
+expect_claim_bundle_rejection() {
+  local -r description="$1"
+  local -r verifier="$2"
+  local -r mode="$3"
+  local -r bundle="$4"
+
+  if "$verifier" "$mode" "$bundle" >/dev/null 2>&1; then
+    die "verifier accepted $description"
+  fi
+}
+
+mutate_claim_v2_json_and_reject() {
+  local -r verifier="$1"
+  local -r baseline="$2"
+  local -r parent="$3"
+  local -r slug="$4"
+  local -r description="$5"
+  local -r filter="$6"
+  local bundle=""
+  local candidate=""
+
+  bundle="$(copy_claim_v2_fixture "$baseline" "$parent/$slug")"
+  candidate="$bundle/acceptance-claims.json.candidate"
+  jq -cS "$filter" "$bundle/acceptance-claims.json" >"$candidate"
+  mv -fT -- "$candidate" "$bundle/acceptance-claims.json"
+  reseal_claim_v2_relations "$bundle"
+  seal_claim_bundle_fixture "$bundle"
+  expect_claim_bundle_rejection "$description" "$verifier" --claims-v2 "$bundle"
+}
+
+test_claims_v2_mode() {
+  local -r verifier_source="$1"
+  local -r parent="$TEST_TMP_DIR/claims-v2-mode"
+  local -r repository="$parent/repository"
+  local -r fixture_scripts="$repository/examples/apache-java-https/scripts"
+  local -r fixture_verifier="$fixture_scripts/verify-retained-evidence.sh"
+  local -r fixture_projector="$fixture_scripts/project-retained-acceptance-evidence.sh"
+  local -r acceptance="$parent/private-acceptance"
+  local -r assertion="$parent/private-assertion"
+  local -r runbook="$parent/runbook-receipt.json"
+  local -r v1_output="$parent/v1/public-v1"
+  local -r v2_output="$parent/v2/public-v2"
+  local revision=""
+  local observed_hash=""
+  local source_verifier_sha256=""
+  local held_bash_environment="$parent/internal-held-bash-environment"
+  local held_bash_environment_marker="$parent/internal-held-bash-environment.marker"
+  local held_bash_environment_fd=""
+  local invalid_held_bundle="$parent/invalid-held-bundle"
+  local held_bypass_status=0
+  local tracked_hidden_status=0
+  local tracked_hidden_output=""
+  local replacement_tree=""
+  local replacement_commit=""
+  local replacement_setting=""
+  local literal_commit_object=""
+  local literal_commit_backup="$parent/literal-commit.object"
+  local config_backup="$parent/repository-config"
+  local head_backup="$parent/repository-head"
+  local fifo_probe_status=0
+  local children_before=""
+  local children_after=""
+  local bundle=""
+  local candidate=""
+
+  run_hidden_fifo_probe() {
+    local -r label="$1"
+
+    export -f run_internal_held_source_verifier
+    children_before="$(<"/proc/$BASHPID/task/$BASHPID/children")"
+    set +e
+    /usr/bin/timeout --foreground --kill-after=1s 8s \
+      /usr/bin/bash --noprofile --norc -c '
+        if run_internal_held_source_verifier "$@"; then
+          exit 0
+        fi
+        exit 91
+      ' hidden-source-fifo-probe sealed "$fixture_verifier" \
+        "$fixture_scripts" "$repository" "$revision" \
+        "$source_verifier_sha256" --claims-v2 "$v2_output" \
+        >/dev/null 2>&1
+    fifo_probe_status=$?
+    set -e
+    export -n -f run_internal_held_source_verifier
+    children_after="$(<"/proc/$BASHPID/task/$BASHPID/children")"
+    [[ "$fifo_probe_status" != 0 && "$fifo_probe_status" != 124 ]] ||
+      die "$label did not fail inside the outer eight-second safety bound"
+    [[ "$children_after" == "$children_before" ]] ||
+      die "$label left an unreaped hidden-authority child"
+  }
+
+  mkdir -p -- "$fixture_scripts" "$repository/.github/workflows" \
+    "$repository/examples/apache-java-https" "${v1_output%/*}" "${v2_output%/*}"
+  git init --quiet "$repository"
+  git -C "$repository" config user.email 'claims-v2-test@example.invalid'
+  git -C "$repository" config user.name 'Claims v2 Test'
+  git -C "$repository" config commit.gpgSign false
+  cp -- "$verifier_source" "$fixture_verifier"
+  cp -- "$CLAIM_PROJECTOR" "$fixture_projector"
+  cp -- "$AGENT_DOWNLOAD_SOURCE" "$fixture_scripts/download-agent.sh"
+  chmod 0755 -- "$fixture_verifier" "$fixture_projector" \
+    "$fixture_scripts/download-agent.sh"
+  printf '%s\n' 'name: synthetic acceptance claims' \
+    >"$repository/.github/workflows/java_remote_parent_acceptance_claims.yml"
+  printf '%s\n' 'PRESSURE_TRAFFIC_CONTRACT_VERSION=2' \
+    >"$repository/examples/apache-java-https/run.sh"
+  printf 'tested source\n' >"$repository/source.txt"
+  commit_fixture "$repository" 'Create claims-v2 projection authority'
+  revision="$(git -C "$repository" rev-parse HEAD)"
+  create_raw_v3_acceptance_fixture "$repository" "$revision" "$acceptance" 2
+  create_raw_v3_assertion_fixture "$repository" "$revision" "$assertion"
+  write_claim_runbook_fixture "$repository" "$revision" "$acceptance" "$runbook"
+
+  "$fixture_projector" --claims-v2 \
+    "$acceptance" "$assertion" "$runbook" "$v2_output" >/dev/null
+  derive_claim_v1_fixture "$v2_output" "$v1_output" "$fixture_projector"
+  mkdir -m 0700 -- "$parent/--internal-held-source"
+  set +e
+  tracked_hidden_output="$(CDPATH='' cd -- "$parent" &&
+    "$fixture_verifier" --internal-held-source 2>&1)"
+  tracked_hidden_status=$?
+  set -e
+  [[ "$tracked_hidden_status" == 1 &&
+    "$tracked_hidden_output" == *'bundle directory name is not a safe evidence identifier'* ]] ||
+    die 'single-argument tracked path was captured by the internal-mode parser'
+  "$fixture_verifier" --claims-v1 "$v1_output" >/dev/null ||
+    die 'claims-v1 compatibility control was rejected'
+  "$fixture_verifier" --claims-v2 "$v2_output" >/dev/null ||
+    die 'claims-v2 positive control was rejected'
+  source_verifier_sha256="$(sha256sum <"$fixture_verifier")"
+  source_verifier_sha256="${source_verifier_sha256%% *}"
+  GIT_DIR="$parent/nonexistent-git-dir" GIT_WORK_TREE="$parent" \
+    GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.bare GIT_CONFIG_VALUE_0=true \
+    run_internal_held_source_verifier sealed "$fixture_verifier" \
+      "$fixture_scripts" "$repository" "$revision" \
+      "$source_verifier_sha256" --claims-v2 "$v2_output" >/dev/null ||
+    die 'exact sealed internal held-source control was rejected'
+  replacement_tree="$(git --no-replace-objects -C "$repository" rev-parse \
+    "$revision^{tree}")"
+  replacement_commit="$(printf '%s\n' 'Replacement-policy probe' |
+    git --no-replace-objects -C "$repository" commit-tree \
+      "$replacement_tree" -p "$revision")"
+  literal_commit_object="$repository/.git/objects/${revision:0:2}/${revision:2}"
+  [[ -f "$literal_commit_object" && ! -L "$literal_commit_object" ]] ||
+    die 'hidden-source loose-object fixture lacks the literal commit object'
+  cp -- "$literal_commit_object" "$literal_commit_backup"
+  git --no-replace-objects -C "$repository" cat-file commit "$replacement_commit" |
+    /usr/bin/python3 -I -c '
+import sys
+import zlib
+
+content = sys.stdin.buffer.read(1048577)
+if not content or len(content) > 1048576:
+    raise ValueError("forged commit payload is outside its test bound")
+payload = b"commit " + str(len(content)).encode("ascii") + b"\0" + content
+sys.stdout.buffer.write(zlib.compress(payload))
+' >"$literal_commit_object.next"
+  mv -fT -- "$literal_commit_object.next" "$literal_commit_object"
+  [[ "$(git --no-replace-objects -C "$repository" rev-parse HEAD)" == \
+    "$revision" ]] ||
+    die 'hidden-source loose-object substitution changed the literal HEAD name'
+  expect_internal_held_source_rejection 'a SHA-mismatched loose commit object' \
+    run_internal_held_source_verifier sealed "$fixture_verifier" \
+      "$fixture_scripts" "$repository" "$revision" \
+      "$source_verifier_sha256" --claims-v2 "$v2_output"
+  mv -fT -- "$literal_commit_backup" "$literal_commit_object"
+  git -C "$repository" update-ref \
+    "refs/replace/$revision" "$replacement_commit"
+  expect_internal_held_source_rejection 'a repository replace ref' \
+    run_internal_held_source_verifier sealed "$fixture_verifier" \
+      "$fixture_scripts" "$repository" "$revision" \
+      "$source_verifier_sha256" --claims-v2 "$v2_output"
+  git -C "$repository" update-ref -d "refs/replace/$revision"
+  for replacement_setting in true false; do
+    git -C "$repository" config core.useReplaceRefs "$replacement_setting"
+    expect_internal_held_source_rejection \
+      "explicit core.useReplaceRefs=$replacement_setting" \
+      run_internal_held_source_verifier sealed "$fixture_verifier" \
+        "$fixture_scripts" "$repository" "$revision" \
+        "$source_verifier_sha256" --claims-v2 "$v2_output"
+    git -C "$repository" config --unset-all core.useReplaceRefs
+  done
+  mv -T -- "$repository/.git/config" "$config_backup"
+  mkfifo -m 0600 -- "$repository/.git/config"
+  run_hidden_fifo_probe 'FIFO-backed hidden-source repository config'
+  rm -- "$repository/.git/config"
+  mv -T -- "$config_backup" "$repository/.git/config"
+
+  mv -T -- "$repository/.git/HEAD" "$head_backup"
+  mkfifo -m 0600 -- "$repository/.git/HEAD"
+  run_hidden_fifo_probe 'FIFO-backed hidden-source loose HEAD ref'
+  rm -- "$repository/.git/HEAD"
+  mv -T -- "$head_backup" "$repository/.git/HEAD"
+  mkdir -m 0700 -- "$invalid_held_bundle"
+  {
+    printf ': >%q\n' "$held_bash_environment_marker"
+    printf '%s\n' 'exit 0'
+  } >"$held_bash_environment"
+  chmod 0600 -- "$held_bash_environment"
+  exec {held_bash_environment_fd}<"$held_bash_environment"
+  set +e
+  BASH_ENV="/proc/$BASHPID/fd/$held_bash_environment_fd" \
+    ENV="/proc/$BASHPID/fd/$held_bash_environment_fd" \
+    run_internal_held_source_verifier sealed "$fixture_verifier" \
+      "$fixture_scripts" "$repository" "$revision" \
+      "$source_verifier_sha256" --claims-v2 "$invalid_held_bundle" \
+      >/dev/null 2>&1
+  held_bypass_status=$?
+  set -e
+  exec {held_bash_environment_fd}<&-
+  [[ "$held_bypass_status" != 0 && ! -e "$held_bash_environment_marker" &&
+    ! -L "$held_bash_environment_marker" ]] ||
+    die 'caller BASH_ENV bypassed or executed before the internal held-source verifier'
+  expect_internal_held_source_rejection 'a physical-path spoof' \
+    "$fixture_verifier" --internal-held-source "$fixture_scripts" \
+      "$repository" "$revision" "$source_verifier_sha256" \
+      --claims-v2 "$v2_output"
+  expect_internal_held_source_rejection 'an unsealed parent descriptor' \
+    run_internal_held_source_verifier unsealed "$fixture_verifier" \
+      "$fixture_scripts" "$repository" "$revision" \
+      "$source_verifier_sha256" --claims-v2 "$v2_output"
+  expect_internal_held_source_rejection 'a spoofed script directory' \
+    run_internal_held_source_verifier sealed "$fixture_verifier" \
+      "$repository/examples/apache-java-https" "$repository" "$revision" \
+      "$source_verifier_sha256" --claims-v2 "$v2_output"
+  expect_internal_held_source_rejection 'a spoofed repository root' \
+    run_internal_held_source_verifier sealed "$fixture_verifier" \
+      "$fixture_scripts" "$parent" "$revision" "$source_verifier_sha256" \
+      --claims-v2 "$v2_output"
+  expect_internal_held_source_rejection 'a spoofed checkout HEAD' \
+    run_internal_held_source_verifier sealed "$fixture_verifier" \
+      "$fixture_scripts" "$repository" \
+      bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+      "$source_verifier_sha256" --claims-v2 "$v2_output"
+  expect_internal_held_source_rejection 'a spoofed held-source hash' \
+    run_internal_held_source_verifier sealed "$fixture_verifier" \
+      "$fixture_scripts" "$repository" "$revision" \
+      bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+      --claims-v2 "$v2_output"
+  (CDPATH='' cd / && bash "$v1_output/verify.sh" >/dev/null) ||
+    die 'claims-v1 portable verifier rejected its positive control'
+  (CDPATH='' cd / && bash "$v2_output/verify.sh" >/dev/null) ||
+    die 'claims-v2 portable verifier rejected its positive control'
+  observed_hash="$(sha256sum <"$v2_output/verify.sh")"
+  observed_hash="${observed_hash%% *}"
+  [[ "$observed_hash" == "$CLAIM_V2_VERIFY_SH_SHA256" ]] ||
+    die "claims-v2 portable verifier hash drifted: $observed_hash"
+  jq -e '
+    .schema == "obi-bounded-acceptance-claims-v2" and
+    .issue_36.traffic.request_count == 128 and
+    .issue_36.traffic.w3c_parent_count == 1 and
+    .issue_36.traffic.conservation == "H+R+W=N"
+  ' "$v2_output/acceptance-claims.json" >/dev/null ||
+    die 'claims-v2 positive fixture omitted the pressure contract'
+  jq -e '
+    .derivation_contract == "private-raw-v3-to-bounded-claims-v2"
+  ' "$v2_output/derivation-receipt.json" >/dev/null ||
+    die 'claims-v2 positive fixture omitted the derivation contract'
+  expect_claim_bundle_rejection 'a claims-v1 bundle routed as claims-v2' \
+    "$fixture_verifier" --claims-v2 "$v1_output"
+  expect_claim_bundle_rejection 'a claims-v2 bundle routed as claims-v1' \
+    "$fixture_verifier" --claims-v1 "$v2_output"
+  if (CDPATH='' cd "${v2_output%/*}" && \
+    "$fixture_verifier" --claims-v2 "${v2_output##*/}" >/dev/null 2>&1); then
+    die 'claims-v2 accepted a relative bundle directory'
+  fi
+
+  bundle="$(copy_claim_v2_fixture "$v2_output" "$parent/git-portable")"
+  make_claim_bundle_git_portable "$bundle"
+  "$fixture_verifier" --claims-v2 "$bundle" >/dev/null ||
+    die 'claims-v2 rejected a safe Git-portable bundle'
+  chmod 0600 -- "$bundle/README.md"
+  expect_claim_bundle_rejection 'an inconsistent claims-v2 file mode' \
+    "$fixture_verifier" --claims-v2 "$bundle"
+
+  mutate_claim_v2_json_and_reject "$fixture_verifier" "$v2_output" "$parent" \
+    schema 'a fully resealed claims-v1 top schema in claims-v2 mode' \
+    '.schema = "obi-bounded-acceptance-claims-v1"'
+  mutate_claim_v2_json_and_reject "$fixture_verifier" "$v2_output" "$parent" \
+    issue32 'a fully resealed change to legacy issue #32 claims' \
+    '.issue_32.basic_control.request_count = 2'
+  mutate_claim_v2_json_and_reject "$fixture_verifier" "$v2_output" "$parent" \
+    issue34 'a fully resealed change to legacy issue #34 claims' \
+    '.issue_34.map_safety.capacity = 9999'
+  mutate_claim_v2_json_and_reject "$fixture_verifier" "$v2_output" "$parent" \
+    topology 'a fully resealed widened pressure topology label' \
+    '.issue_34.scenarios[9].topology_contract =
+      "pressure-exact-explicit-root-or-w3c-parent"'
+  mutate_claim_v2_json_and_reject "$fixture_verifier" "$v2_output" "$parent" \
+    field 'a fully resealed wrong issue #36 pressure-contract version' \
+    '.issue_36.pressure_contract.version = 1'
+  mutate_claim_v2_json_and_reject "$fixture_verifier" "$v2_output" "$parent" \
+    type 'a fully resealed string issue #36 W3C count' \
+    '.issue_36.traffic.w3c_parent_count = "1"'
+  mutate_claim_v2_json_and_reject "$fixture_verifier" "$v2_output" "$parent" \
+    range 'fully resealed out-of-range issue #36 H/R counts' \
+    '.issue_36.traffic.exact_parent_count = 128 |
+      .issue_36.traffic.explicit_local_root_count = -1 |
+      .issue_34.scenarios[9].exact_parent_count = 128 |
+      .issue_34.scenarios[9].explicit_local_root_count = -1'
+  mutate_claim_v2_json_and_reject "$fixture_verifier" "$v2_output" "$parent" \
+    digest 'a fully resealed unequal issue #36 content digest' \
+    '.issue_36.full_hash_pressure.post_traffic_content_sha256 = ("b" * 64)'
+  mutate_claim_v2_json_and_reject "$fixture_verifier" "$v2_output" "$parent" \
+    algebra 'a fully resealed issue #36 conservation violation' \
+    '.issue_36.traffic.exact_parent_count = 125 |
+      .issue_34.scenarios[9].exact_parent_count = 125'
+  mutate_claim_v2_json_and_reject "$fixture_verifier" "$v2_output" "$parent" \
+    crossbind 'a fully resealed issue #34/#36 pressure cross-binding mismatch' \
+    '.issue_36.traffic.exact_parent_count = 125 |
+      .issue_36.traffic.explicit_local_root_count = 2'
+  mutate_claim_v2_json_and_reject "$fixture_verifier" "$v2_output" "$parent" \
+    extra-key 'a fully resealed extra issue #36 key' \
+    '.issue_36.unexpected = true'
+
+  bundle="$(copy_claim_v2_fixture "$v2_output" "$parent/duplicate-key")"
+  candidate="$bundle/acceptance-claims.json.candidate"
+  sed 's/^{/{"schema":"obi-bounded-acceptance-claims-v2",/' \
+    "$bundle/acceptance-claims.json" >"$candidate"
+  mv -fT -- "$candidate" "$bundle/acceptance-claims.json"
+  reseal_claim_v2_relations "$bundle"
+  seal_claim_bundle_fixture "$bundle"
+  expect_claim_bundle_rejection 'a fully resealed duplicate JSON key' \
+    "$fixture_verifier" --claims-v2 "$bundle"
+
+  bundle="$(copy_claim_v2_fixture "$v2_output" "$parent/derivation")"
+  candidate="$bundle/derivation-receipt.json.candidate"
+  jq -cS '.derivation_contract = "private-raw-v3-to-bounded-claims-v1"' \
+    "$bundle/derivation-receipt.json" >"$candidate"
+  mv -fT -- "$candidate" "$bundle/derivation-receipt.json"
+  reseal_claim_v2_relations "$bundle"
+  seal_claim_bundle_fixture "$bundle"
+  expect_claim_bundle_rejection 'a fully resealed claims-v1 derivation receipt' \
+    "$fixture_verifier" --claims-v2 "$bundle"
+
+  bundle="$(copy_claim_v2_fixture "$v2_output" "$parent/receipt-hash")"
+  candidate="$bundle/derivation-receipt.json.candidate"
+  jq -cS '.claims.sha256 = ("b" * 64)' \
+    "$bundle/derivation-receipt.json" >"$candidate"
+  mv -fT -- "$candidate" "$bundle/derivation-receipt.json"
+  write_claim_bundle_manifest_fixture "$bundle"
+  seal_claim_bundle_fixture "$bundle"
+  expect_claim_bundle_rejection 'a manifest-resealed false claims receipt hash' \
+    "$fixture_verifier" --claims-v2 "$bundle"
+
+  bundle="$(copy_claim_v2_fixture "$v2_output" "$parent/bundle-name")"
+  candidate="$bundle/derivation-receipt.json.candidate"
+  jq -cS '.bundle_name = "different-public-v2"' \
+    "$bundle/derivation-receipt.json" >"$candidate"
+  mv -fT -- "$candidate" "$bundle/derivation-receipt.json"
+  reseal_claim_v2_relations "$bundle"
+  seal_claim_bundle_fixture "$bundle"
+  expect_claim_bundle_rejection 'a fully resealed mismatched bundle name' \
+    "$fixture_verifier" --claims-v2 "$bundle"
+
+  bundle="$(copy_claim_v2_fixture "$v2_output" "$parent/verifier-hash")"
+  printf '\n' >>"$bundle/verify.sh"
+  write_claim_bundle_manifest_fixture "$bundle"
+  seal_claim_bundle_fixture "$bundle"
+  expect_claim_bundle_rejection 'a manifest-resealed alternate portable verifier' \
+    "$fixture_verifier" --claims-v2 "$bundle"
+
+  bundle="$(copy_claim_v2_fixture "$v2_output" "$parent/manifest-hash")"
+  candidate="$bundle/SHA256SUMS.candidate"
+  sed '1s/^[0-9a-f]/g/' "$bundle/SHA256SUMS" >"$candidate"
+  mv -fT -- "$candidate" "$bundle/SHA256SUMS"
+  seal_claim_bundle_fixture "$bundle"
+  expect_claim_bundle_rejection 'a mutated claims-v2 checksum manifest' \
+    "$fixture_verifier" --claims-v2 "$bundle"
+
+  bundle="$(copy_claim_v2_fixture "$v2_output" "$parent/extra-file")"
+  printf 'unexpected\n' >"$bundle/unexpected.txt"
+  seal_claim_bundle_fixture "$bundle"
+  expect_claim_bundle_rejection 'an extra claims-v2 bundle file' \
+    "$fixture_verifier" --claims-v2 "$bundle"
 }
 
 main() {
@@ -6301,8 +7763,13 @@ main() {
 
   [[ $# -le 1 &&
     ( "$requested_suite" == all ||
+      "$requested_suite" == claims-v2 ||
+      "$requested_suite" == claims-v2-unit ||
+      "$requested_suite" == pressure-w3c ||
+      "$requested_suite" == pressure-w3c-smoke ||
       "$requested_suite" == fault-security-profiles ) ]] || {
-    printf 'Usage: %s [fault-security-profiles]\n' "${BASH_SOURCE[0]##*/}" >&2
+    printf 'Usage: %s [claims-v2|claims-v2-unit|pressure-w3c|pressure-w3c-smoke|fault-security-profiles]\n' \
+      "${BASH_SOURCE[0]##*/}" >&2
     return 2
   }
   check_dependencies
@@ -6311,8 +7778,33 @@ main() {
   umask 022
   [[ -x "$VERIFIER" ]] || die "verifier is not executable: $VERIFIER"
   TEST_TMP_DIR="$(mktemp -d)"
-  if [[ "$requested_suite" == all ]]; then
+  test_trusted_clean_exec_rejects_local_poison
+  if [[ "$requested_suite" == all || "$requested_suite" == claims-v2 ||
+    "$requested_suite" == claims-v2-unit ]]; then
+    test_claim_v2_document_contract_unit "$VERIFIER"
+  fi
+  if [[ "$requested_suite" == claims-v2-unit ]]; then
+    printf 'verify-retained-evidence claims-v2 document unit tests passed\n'
+    return 0
+  fi
+  if [[ "$requested_suite" == all || "$requested_suite" == claims-v2 ]]; then
+    test_claims_v2_mode "$VERIFIER"
+  fi
+  if [[ "$requested_suite" == claims-v2 ]]; then
+    printf 'verify-retained-evidence claims-v2 tests passed\n'
+    return 0
+  fi
+  if [[ "$requested_suite" == pressure-w3c-smoke ]]; then
+    test_raw_v2_pressure_contract_smoke "$VERIFIER"
+    printf 'verify-retained-evidence pressure W3C smoke tests passed\n'
+    return 0
+  fi
+  if [[ "$requested_suite" == all || "$requested_suite" == pressure-w3c ]]; then
     test_pressure_contract_version_is_source_anchored "$VERIFIER"
+  fi
+  if [[ "$requested_suite" == pressure-w3c ]]; then
+    printf 'verify-retained-evidence pressure W3C contract tests passed\n'
+    return 0
   fi
   repository="$TEST_TMP_DIR/repository"
   fixture_verifier="$repository/examples/apache-java-https/scripts/verify-retained-evidence.sh"

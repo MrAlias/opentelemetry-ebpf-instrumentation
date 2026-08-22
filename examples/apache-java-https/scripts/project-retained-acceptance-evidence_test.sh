@@ -39,6 +39,7 @@ readonly -a TEST_CASES=(
   post-move-verifier-failure
   private-cleanup-failure
   raw-source-owner-contract
+  claims-v2-projection
 )
 
 usage() {
@@ -202,10 +203,15 @@ write_verifier_wrapper() {
     '  printf '\''%s\n'\'' "$2" >>"$PROJECTOR_TEST_PRIVATE_MODE_LOG"' \
     'fi' \
     'if [[ "${PROJECTOR_TEST_FAIL_POST_MOVE:-false}" == true &&' \
-    '  "$#" == 2 && "$1" == --claims-v1 &&' \
+    '  "$#" == 2 && "$1" =~ ^--claims-v[12]$ &&' \
     '  "$2" == "${PROJECTOR_TEST_POST_MOVE_PATH:-}" ]]; then' \
     '  printf '\''projector-test injected post-move verifier failure\n'\'' >&2' \
     '  exit 97' \
+    'fi' \
+    'if [[ "$#" == 2 && "$1" == --claims-v2 ]]; then' \
+    '  jq -e '\''.schema == "obi-bounded-acceptance-claims-v2"'\'' "$2/acceptance-claims.json" >/dev/null || exit 96' \
+    '  jq -e '\''.derivation_contract == "private-raw-v3-to-bounded-claims-v2"'\'' "$2/derivation-receipt.json" >/dev/null || exit 96' \
+    '  exec bash "$2/verify.sh"' \
     'fi' \
     'exec "$real_verifier" "$@"' \
     >"$output"
@@ -391,11 +397,13 @@ build_private_inputs() {
   local -r acceptance="$3"
   local -r assertion="$4"
   local -r runbook="$5"
-  local -r builder_work="$TEST_TMP_DIR/fixture-builder"
+  local -r pressure_contract_version="${6:-1}"
+  local -r builder_work="$TEST_TMP_DIR/fixture-builder-v$pressure_contract_version"
 
   mkdir -m 0700 -- "$builder_work"
   bash -s -- "$FIXTURE_BUILDERS" "$builder_work" "$repository" "$revision" \
-    "$acceptance" "$assertion" "$runbook" <<'FIXTURE_BUILDER'
+    "$acceptance" "$assertion" "$runbook" "$pressure_contract_version" \
+    <<'FIXTURE_BUILDER'
 set -Eeuo pipefail
 fixture_builders="$1"
 builder_work="$2"
@@ -404,12 +412,14 @@ revision="$4"
 acceptance="$5"
 assertion="$6"
 runbook="$7"
+pressure_contract_version="$8"
 # The existing test is the schema-fixture library; omit only its main call.
 # shellcheck disable=SC1090
 source <(head -n -1 -- "$fixture_builders")
 trap - EXIT
 TEST_TMP_DIR="$builder_work"
-create_raw_v3_acceptance_fixture "$repository" "$revision" "$acceptance" 1
+create_raw_v3_acceptance_fixture \
+  "$repository" "$revision" "$acceptance" "$pressure_contract_version"
 create_raw_v3_assertion_fixture "$repository" "$revision" "$assertion"
 source_tree_sha256="$(awk -F= '$1 == "source_tree_sha256" { print $2 }' \
   "$acceptance/environment.txt")"
@@ -591,6 +601,8 @@ write_claim_checksum_manifest() {
 
 reseal_claim_relations() {
   local -r bundle="$1"
+  local -r claims_version="${2:-1}"
+  local evidence_domain=""
   local authority_sha256=""
   local claims_sha256=""
   local evidence_id=""
@@ -600,7 +612,12 @@ reseal_claim_relations() {
   authority_sha256="${authority_sha256%% *}"
   claims_sha256="$(sha256sum <"$bundle/acceptance-claims.json")"
   claims_sha256="${claims_sha256%% *}"
-  evidence_id="$(printf '%s\n' 'obi-bounded-claims-evidence-v1' \
+  case "$claims_version" in
+    1) evidence_domain='obi-bounded-claims-evidence-v1' ;;
+    2) evidence_domain='obi-bounded-claims-evidence-v2' ;;
+    *) return 1 ;;
+  esac
+  evidence_id="$(printf '%s\n' "$evidence_domain" \
     "${bundle##*/}" "$authority_sha256" "$claims_sha256" | sha256sum)"
   evidence_id="${evidence_id%% *}"
   jq -cS --arg bundle_name "${bundle##*/}" --arg authority "$authority_sha256" \
@@ -616,8 +633,9 @@ expect_claim_bundle_rejection() {
   local -r description="$1"
   local -r verifier="$2"
   local -r bundle="$3"
+  local -r verifier_mode="${4:---claims-v1}"
 
-  if "$verifier" --claims-v1 "$bundle" >/dev/null 2>&1; then
+  if "$verifier" "$verifier_mode" "$bundle" >/dev/null 2>&1; then
     die "trusted claims verifier accepted $description"
   fi
   if (CDPATH='' cd / && bash "$bundle/verify.sh" >/dev/null 2>&1); then
@@ -757,7 +775,8 @@ test_cli() {
   local status=0
 
   help_output="$("$projector" --help)" || die "projector --help failed"
-  [[ "$help_output" == *'Usage:'* && "$help_output" == *'ABS_ACCEPTANCE_ALL'* ]] ||
+  [[ "$help_output" == *'Usage:'* && "$help_output" == *'ABS_ACCEPTANCE_ALL'* &&
+    "$help_output" == *'--claims-v1'* && "$help_output" == *'--claims-v2'* ]] ||
     die "projector --help omitted its contract"
   if "$projector" --unknown >"$TEST_TMP_DIR/unknown.stdout" \
     2>"$TEST_TMP_DIR/unknown.stderr"; then
@@ -808,6 +827,8 @@ test_success_and_determinism() {
   assert_exact_claim_closure "$first"
   assert_raw_sensitive_artifacts_absent "$first" "$acceptance"
   jq -e '
+    .schema == "obi-bounded-acceptance-claims-v1" and
+    (has("issue_36") | not) and
     .issue_32.producer_status_roster.boundary_count == 35 and
     .issue_32.producer_status_roster.status_entry_count == 56 and
     .issue_34.scenarios[8] as $timeout |
@@ -821,7 +842,8 @@ test_success_and_determinism() {
   ' "$first/acceptance-claims.json" >/dev/null ||
     die "public claims did not preserve accepted timeout and pressure outcome splits"
 
-  "$projector" "$acceptance" "$assertion" "$runbook" "$second" >/dev/null
+  "$projector" --claims-v1 \
+    "$acceptance" "$assertion" "$runbook" "$second" >/dev/null
   "$verifier" --claims-v1 "$second" >/dev/null
   run_portable_claim_verifier "$second"
   assert_sealed_output "$second"
@@ -1779,6 +1801,137 @@ test_raw_source_owner_contract() {
       "$projector" "$acceptance" "$assertion" "$runbook" "$wrong_output"
 }
 
+test_claims_v2_projection() {
+  local -r projector="$1"
+  local -r legacy_verifier="$2"
+  local -r claims_v2_verifier="$3"
+  local -r repository="$4"
+  local -r v1_acceptance="$5"
+  local -r v1_assertion="$6"
+  local -r v1_runbook="$7"
+  local -r parent="$TEST_TMP_DIR/claims-v2-projection"
+  local -r v1_raw_reject="$parent/v1-raw-cannot-project-v2"
+  local -r acceptance="$parent/private-acceptance-v2"
+  local -r assertion="$parent/private-assertion-v2"
+  local -r runbook="$parent/runbook-v2.json"
+  local -r v2_raw_reject="$parent/v2-raw-cannot-project-v1"
+  local -r v2_output="$parent/public-v2"
+  local -r verifier_log="$parent/verifier-calls.log"
+  local revision=""
+  local bundle=""
+  local candidate=""
+  local -a verifier_calls=()
+
+  mkdir -m 0700 -- "$parent"
+  expect_failure_without_output \
+    'claims-v2 projection from authenticated raw pressure contract v1' \
+    'claims-v2 requires authenticated raw pressure contract v2 and barrier v2 evidence' \
+    "$v1_raw_reject" "$parent/v1-raw-reject" \
+    "$projector" --claims-v2 \
+      "$v1_acceptance" "$v1_assertion" "$v1_runbook" "$v1_raw_reject"
+
+  printf '%s\n' 'PRESSURE_TRAFFIC_CONTRACT_VERSION=2' \
+    >"$repository/examples/apache-java-https/run.sh"
+  commit_fixture "$repository" 'Select pressure traffic contract v2'
+  revision="$(git -C "$repository" rev-parse HEAD)"
+  build_private_inputs \
+    "$repository" "$revision" "$acceptance" "$assertion" "$runbook" 2
+
+  expect_failure_without_output \
+    'claims-v1 projection from authenticated raw pressure contract v2' \
+    'claims-v1 requires authenticated raw pressure contract v0 or v1 evidence' \
+    "$v2_raw_reject" "$parent/v2-raw-reject" \
+    "$projector" --claims-v1 \
+      "$acceptance" "$assertion" "$runbook" "$v2_raw_reject"
+
+  PROJECTOR_TEST_VERIFIER_LOG="$verifier_log" \
+    "$projector" --claims-v2 \
+      "$acceptance" "$assertion" "$runbook" "$v2_output" >/dev/null
+  mapfile -t verifier_calls <"$verifier_log"
+  [[ ${#verifier_calls[@]} == 4 &&
+    "${verifier_calls[0]}" == $'--raw-v3\tacceptance' &&
+    "${verifier_calls[1]}" == $'--raw-v3\tassertion-failure' &&
+    "${verifier_calls[2]}" == $'--claims-v2\t'*'/public-v2' &&
+    "${verifier_calls[3]}" == $'--claims-v2\t'"$v2_output" ]] ||
+    die "projector did not use claims-v2 for candidate and post-move verification"
+  "$claims_v2_verifier" --claims-v2 "$v2_output" >/dev/null
+  run_portable_claim_verifier "$v2_output"
+  assert_sealed_output "$v2_output"
+  assert_exact_claim_closure "$v2_output"
+  assert_raw_sensitive_artifacts_absent "$v2_output" "$acceptance"
+  jq -e '
+    .schema == "obi-bounded-acceptance-claims-v2" and
+    .status == "passed" and
+    (.issue_34.scenarios[9] as $pressure |
+      $pressure.request_count == 128 and
+      $pressure.exact_parent_count == 126 and
+      $pressure.explicit_local_root_count == 1 and
+      $pressure.w3c_parent_count == 1 and
+      $pressure.conservation == "H+R+W=N" and
+      ($pressure.exact_parent_count + $pressure.explicit_local_root_count +
+        $pressure.w3c_parent_count) == 128) and
+    .issue_36 == {
+      status:"passed",
+      pressure_contract:{version:2,
+        barrier_schema:"pressure-traffic-barrier-v2",
+        traffic_barrier_cross_binding_verified:true},
+      traffic:{request_count:128,exact_parent_count:126,
+        explicit_local_root_count:1,w3c_parent_count:1,
+        wrong_parent_count:0,unresolved_count:0,conservation:"H+R+W=N"},
+      full_hash_pressure:{map_type:"non-evicting HASH",capacity:10000,
+        filled_entries:10000,capacity_rejected_entries:1,
+        capacity_rejection_errno:"E2BIG",
+        fill_content_sha256:.issue_36.full_hash_pressure.fill_content_sha256,
+        post_traffic_content_sha256:
+          .issue_36.full_hash_pressure.post_traffic_content_sha256,
+        content_digest_equal:true}
+    } and
+    (.issue_36.full_hash_pressure.fill_content_sha256 |
+      type == "string" and test("^[0-9a-f]{64}$")) and
+    .issue_36.full_hash_pressure.post_traffic_content_sha256 ==
+      .issue_36.full_hash_pressure.fill_content_sha256
+  ' "$v2_output/acceptance-claims.json" >/dev/null ||
+    die "claims-v2 projection omitted the exact issue #36 contract"
+  jq -e '
+    .schema == "obi-bounded-claim-derivation-v1" and
+    .derivation_contract == "private-raw-v3-to-bounded-claims-v2"
+  ' "$v2_output/derivation-receipt.json" >/dev/null ||
+    die "claims-v2 derivation receipt did not select the v2 contract"
+  if "$legacy_verifier" --claims-v1 "$v2_output" >/dev/null 2>&1; then
+    die "legacy claims-v1 verifier accepted a claims-v2 bundle"
+  fi
+
+  bundle="$parent/mutated-content/public-v2"
+  mkdir -m 0700 -- "${bundle%/*}"
+  cp -a -- "$v2_output" "$bundle"
+  make_claim_bundle_mutable "$bundle"
+  candidate="$bundle/acceptance-claims.json.candidate"
+  jq -cS '
+    .issue_36.full_hash_pressure.post_traffic_content_sha256 = ("b" * 64)
+  ' "$bundle/acceptance-claims.json" >"$candidate"
+  mv -fT -- "$candidate" "$bundle/acceptance-claims.json"
+  reseal_claim_relations "$bundle" 2
+  seal_claim_bundle "$bundle"
+  expect_claim_bundle_rejection \
+    'a fully resealed unequal issue #36 content digest' \
+    "$claims_v2_verifier" "$bundle" --claims-v2
+
+  bundle="$parent/mutated-cross-binding/public-v2"
+  mkdir -m 0700 -- "${bundle%/*}"
+  cp -a -- "$v2_output" "$bundle"
+  make_claim_bundle_mutable "$bundle"
+  candidate="$bundle/acceptance-claims.json.candidate"
+  jq -cS '
+    .issue_36.pressure_contract.traffic_barrier_cross_binding_verified = false
+  ' "$bundle/acceptance-claims.json" >"$candidate"
+  mv -fT -- "$candidate" "$bundle/acceptance-claims.json"
+  reseal_claim_relations "$bundle" 2
+  seal_claim_bundle "$bundle"
+  expect_claim_bundle_rejection \
+    'a fully resealed false traffic/barrier cross-binding claim' \
+    "$claims_v2_verifier" "$bundle" --claims-v2
+}
+
 run_selected_cases() {
   local -i first_ordinal="$1"
   local -i last_ordinal="$2"
@@ -1788,6 +1941,8 @@ run_selected_cases() {
   local -r assertion="$6"
   local -r runbook="$7"
   local -r publication_shim="$8"
+  local -r claims_v2_verifier="$9"
+  local -r repository="${10}"
   local -i ordinal=0
   local -i executed=0
   local case_name=""
@@ -1878,6 +2033,11 @@ run_selected_cases() {
         test_raw_source_owner_contract \
           "$projector" "$verifier" "$acceptance" "$assertion" "$runbook"
         ;;
+      claims-v2-projection)
+        test_claims_v2_projection \
+          "$projector" "$verifier" "$claims_v2_verifier" "$repository" \
+          "$acceptance" "$assertion" "$runbook"
+        ;;
       *)
         die "internal error: no implementation for test case $ordinal ($case_name)"
         ;;
@@ -1961,7 +2121,8 @@ main() {
   run_selected_cases \
     "$first_ordinal" "$last_ordinal" \
     "$fixture_projector" "$fixture_real_verifier" \
-    "$acceptance" "$assertion" "$runbook" "$publication_shim"
+    "$acceptance" "$assertion" "$runbook" "$publication_shim" \
+    "$fixture_verifier" "$repository"
 
   if ((first_ordinal == 1 && last_ordinal == ${#TEST_CASES[@]})); then
     printf 'project-retained-acceptance-evidence success and fail-closed tests passed\n'

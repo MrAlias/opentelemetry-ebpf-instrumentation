@@ -186,8 +186,10 @@ type caseResult struct {
 }
 
 type pressureCorrelationSummary struct {
+	RequestCount      int `json:"request_count"`
 	ExactHitCount     int `json:"exact_hit_count"`
 	ExplicitRootCount int `json:"explicit_root_count"`
+	W3CParentCount    int `json:"w3c_parent_count"`
 	WrongParentCount  int `json:"wrong_parent_count"`
 	UnresolvedCount   int `json:"unresolved_count"`
 }
@@ -339,6 +341,7 @@ const (
 	restartPhaseWhileStopped      = "obi-stopped"
 	restartPhaseAfterRestart      = "after-restart"
 	bridgeDiagnosticsHeader       = "X-OBI-Java-Diagnostics"
+	pressureW3CCase               = "valid-w3c-under-full-hash-pressure"
 	maxJavaDiagnosticsCounter     = uint64(999_999_999)
 )
 
@@ -940,6 +943,9 @@ func makeRequests(cfg config) ([]requestCase, error) {
 	if cfg.scenario == "slow-body" && count < 2 {
 		return nil, fmt.Errorf("scenario %s requires at least two requests", cfg.scenario)
 	}
+	if cfg.scenario == "pressure" && count < 2 {
+		return nil, fmt.Errorf("scenario %s requires at least two requests", cfg.scenario)
+	}
 	if cfg.scenario == "tls-boundary" && count != 3 {
 		return nil, fmt.Errorf("scenario %s requires exactly three requests", cfg.scenario)
 	}
@@ -1126,6 +1132,11 @@ func makeRequests(cfg config) ([]requestCase, error) {
 			if err := addW3CContext(random, &requests[i], "01", "valid-w3c-during-obi-restart"); err != nil {
 				return nil, err
 			}
+		}
+	}
+	if cfg.scenario == "pressure" {
+		if err := addW3CContext(random, &requests[0], "01", pressureW3CCase); err != nil {
+			return nil, err
 		}
 	}
 	if usesInBandJavaDiagnostics(cfg.scenario) {
@@ -3095,7 +3106,11 @@ func expectationFor(cfg config, request requestCase) tracecheck.Expectation {
 	case "pipelining":
 		mode = tracecheck.ModePipelinedBridge
 	case "pressure":
-		mode = tracecheck.ModePressure
+		if request.W3CCase == pressureW3CCase {
+			mode = tracecheck.ModeW3C
+		} else {
+			mode = tracecheck.ModePressure
+		}
 	case "disabled":
 		mode = tracecheck.ModeDisabled
 	case "uninstrumented":
@@ -3143,11 +3158,20 @@ func summarizePressureCorrelation(
 	cfg config,
 	cases []caseResult,
 ) pressureCorrelationSummary {
-	var summary pressureCorrelationSummary
+	summary := pressureCorrelationSummary{RequestCount: len(cases)}
 	for index := range cases {
+		expectation := expectationFor(cfg, cases[index].Request)
+		if expectation.Mode == tracecheck.ModeW3C {
+			if err := tracecheck.AssertSnapshot(cases[index].Trace, expectation); err != nil {
+				summary.UnresolvedCount++
+			} else {
+				summary.W3CParentCount++
+			}
+			continue
+		}
 		outcome, _ := tracecheck.ClassifyPressureParent(
 			cases[index].Trace,
-			expectationFor(cfg, cases[index].Request),
+			expectation,
 		)
 		cases[index].PressureParentOutcome = outcome
 		switch outcome {
@@ -3165,13 +3189,17 @@ func summarizePressureCorrelation(
 }
 
 func validatePressureCorrelation(summary pressureCorrelationSummary, requestCount int) error {
-	if summary.WrongParentCount != 0 || summary.UnresolvedCount != 0 ||
-		summary.ExactHitCount+summary.ExplicitRootCount != requestCount {
+	if summary.RequestCount != requestCount ||
+		summary.W3CParentCount != 1 || summary.ExplicitRootCount < 1 ||
+		summary.WrongParentCount != 0 || summary.UnresolvedCount != 0 ||
+		summary.ExactHitCount+summary.ExplicitRootCount+summary.W3CParentCount != summary.RequestCount {
 		return fmt.Errorf(
-			"pressure correlation expected exact hits plus explicit roots=%d with wrong=0 unresolved=0, got exact_hits=%d explicit_roots=%d wrong=%d unresolved=%d",
+			"pressure correlation expected request_count=%d with exact hits plus explicit roots plus one W3C parent, explicit_roots>=1 wrong=0 unresolved=0, got request_count=%d exact_hits=%d explicit_roots=%d w3c_parents=%d wrong=%d unresolved=%d",
 			requestCount,
+			summary.RequestCount,
 			summary.ExactHitCount,
 			summary.ExplicitRootCount,
+			summary.W3CParentCount,
 			summary.WrongParentCount,
 			summary.UnresolvedCount,
 		)

@@ -3288,7 +3288,7 @@ project_claims() {
     "$projector_log_identity" == *":$EUID:600:1" ]] || return 1
   assert_verified_input_fd_unchanged "$projector" "$projector_fd" \
     "$projector_identity" "$projector_digest" || return 1
-  if projector_execute "$projector" "$RAW_ACCEPTANCE" \
+  if projector_execute "$projector" --claims-v2 "$RAW_ACCEPTANCE" \
       "$RAW_ASSERTION" "$RECEIPT" "$OUTPUT_DIRECTORY" \
       >&"$projector_log_fd" 2>&1; then
     projector_status=0

@@ -233,13 +233,75 @@ func TestConcurrencyResultEncodesItsAssertionMode(t *testing.T) {
 	assert.Contains(t, output.String(), "\"assertion_mode\": \"uninstrumented\"")
 }
 
-func TestPressureUsesReasonCodedParentPolicy(t *testing.T) {
-	expectation := expectationFor(
-		config{scenario: "pressure"},
-		requestCase{Marker: "pressure", Endpoint: "/api/handoff"},
-	)
+func TestPressureInjectsOneDeterministicW3CParentAfterMarkerGeneration(t *testing.T) {
+	cfg := config{scenario: "pressure", requestCount: 4, seed: 42}
+	first, err := makeRequests(cfg)
+	require.NoError(t, err)
+	second, err := makeRequests(cfg)
+	require.NoError(t, err)
 
-	assert.Equal(t, tracecheck.ModePressure, expectation.Mode)
+	require.Len(t, first, 4)
+	assert.Equal(t, []string{
+		"pressure-00-eea0057bb1831e72",
+		"pressure-01-e0f1c6825c350776",
+		"pressure-02-8a6d36765340e3ad",
+		"pressure-03-58a47307f2209f92",
+	}, []string{first[0].Marker, first[1].Marker, first[2].Marker, first[3].Marker})
+	assert.Equal(t, first[0].W3CTraceID, second[0].W3CTraceID)
+	assert.Equal(t, first[0].W3CParentSpanID, second[0].W3CParentSpanID)
+	assert.Len(t, first[0].W3CTraceID, 32)
+	assert.Len(t, first[0].W3CParentSpanID, 16)
+	assert.Equal(t, "01", first[0].W3CTraceFlags)
+	assert.Equal(t, pressureW3CCase, first[0].W3CCase)
+	assert.False(t, first[0].InvalidW3C)
+	headerRequest, err := newHTTPRequest(
+		context.Background(),
+		config{baseURL: "https://example.test"},
+		first[0],
+	)
+	require.NoError(t, err)
+	assert.Equal(t,
+		"00-"+first[0].W3CTraceID+"-"+first[0].W3CParentSpanID+"-01",
+		headerRequest.Header.Get("traceparent"),
+	)
+	for index := 1; index < len(first); index++ {
+		assert.Empty(t, first[index].W3CTraceID, "request %d trace ID", index)
+		assert.Empty(t, first[index].W3CParentSpanID, "request %d parent span ID", index)
+		assert.Empty(t, first[index].W3CTraceFlags, "request %d trace flags", index)
+		assert.Empty(t, first[index].W3CCase, "request %d W3C case", index)
+		headerRequest, err := newHTTPRequest(
+			context.Background(),
+			config{baseURL: "https://example.test"},
+			first[index],
+		)
+		require.NoError(t, err)
+		assert.Empty(t, headerRequest.Header.Get("traceparent"), "request %d traceparent", index)
+	}
+}
+
+func TestPressureRequiresAtLeastTwoRequests(t *testing.T) {
+	_, err := makeRequests(config{scenario: "pressure", requestCount: 1, seed: 42})
+	require.ErrorContains(t, err, "requires at least two requests")
+}
+
+func TestPressureSplitsW3CAndReasonCodedParentPolicies(t *testing.T) {
+	requests, err := makeRequests(config{scenario: "pressure", requestCount: 3, seed: 42})
+	require.NoError(t, err)
+
+	assert.Equal(t, tracecheck.ModeW3C, expectationFor(
+		config{scenario: "pressure"},
+		requests[0],
+	).Mode)
+	for index := 1; index < len(requests); index++ {
+		assert.Equal(t, tracecheck.ModePressure, expectationFor(
+			config{scenario: "pressure"},
+			requests[index],
+		).Mode)
+	}
+	assert.Equal(t, tracecheck.ModePressure, expectationFor(
+		config{scenario: "pressure"},
+		requestCase{Marker: "pressure", Endpoint: "/api/handoff", W3CCase: "other"},
+	).Mode)
 }
 
 func TestCoalescedBridgeCorrelationAcceptsOnlyReceiveAmbiguity(t *testing.T) {
@@ -1379,15 +1441,19 @@ func TestRunResultEncodingKeepsPressureCountsOnSeparateLines(t *testing.T) {
 	result := &runResult{
 		Status: "failed",
 		PressureCorrelation: &pressureCorrelationSummary{
+			RequestCount:      11,
 			ExactHitCount:     7,
 			ExplicitRootCount: 2,
+			W3CParentCount:    1,
 			WrongParentCount:  1,
 		},
 	}
 
 	require.NoError(t, encodeRunResult(&output, result))
+	assert.Contains(t, output.String(), "\n    \"request_count\": 11,\n")
 	assert.Contains(t, output.String(), "\n    \"exact_hit_count\": 7,\n")
 	assert.Contains(t, output.String(), "\n    \"explicit_root_count\": 2,\n")
+	assert.Contains(t, output.String(), "\n    \"w3c_parent_count\": 1,\n")
 	assert.Contains(t, output.String(), "\n    \"wrong_parent_count\": 1,\n")
 }
 
@@ -1495,7 +1561,11 @@ func TestAwaitAssertionsClearsResolvedMarkerWithoutReusingFailedFetch(t *testing
 		{Request: exactB.Request, Trace: snapshots[1]},
 	}
 	summary := summarizePressureCorrelation(cfg, cases)
-	assert.Equal(t, pressureCorrelationSummary{ExactHitCount: 1, UnresolvedCount: 1}, summary)
+	assert.Equal(t, pressureCorrelationSummary{
+		RequestCount:    2,
+		ExactHitCount:   1,
+		UnresolvedCount: 1,
+	}, summary)
 	assert.Equal(t, tracecheck.PressureParentExactHit, cases[0].PressureParentOutcome)
 	assert.Equal(t, tracecheck.PressureParentUnresolved, cases[1].PressureParentOutcome)
 
@@ -3698,7 +3768,10 @@ func TestPressureCorrelationCountsExactMissingWrongAndUnresolved(t *testing.T) {
 		apacheService: "apache-proxy",
 		javaService:   "java-backend",
 	}
+	requests, err := makeRequests(config{scenario: "pressure", requestCount: 2, seed: 42})
+	require.NoError(t, err)
 	cases := []caseResult{
+		w3cPressureCase(requests[0]),
 		pressureCase("exact", "trace-exact", "client-exact", "trace-exact", "client-exact"),
 		pressureCase("missing", "trace-candidate", "client-missing", "trace-root", ""),
 		pressureCase("wrong", "trace-wanted", "client-wanted", "trace-foreign", "foreign"),
@@ -3708,23 +3781,131 @@ func TestPressureCorrelationCountsExactMissingWrongAndUnresolved(t *testing.T) {
 	summary := summarizePressureCorrelation(cfg, cases)
 
 	assert.Equal(t, pressureCorrelationSummary{
+		RequestCount:      5,
 		ExactHitCount:     1,
 		ExplicitRootCount: 1,
+		W3CParentCount:    1,
 		WrongParentCount:  1,
 		UnresolvedCount:   1,
 	}, summary)
-	assert.Equal(t, tracecheck.PressureParentExactHit, cases[0].PressureParentOutcome)
-	assert.Equal(t, tracecheck.PressureParentExplicitRoot, cases[1].PressureParentOutcome)
-	assert.Equal(t, tracecheck.PressureParentWrong, cases[2].PressureParentOutcome)
-	assert.Equal(t, tracecheck.PressureParentUnresolved, cases[3].PressureParentOutcome)
+	assert.Empty(t, cases[0].PressureParentOutcome)
+	assert.Equal(t, tracecheck.PressureParentExactHit, cases[1].PressureParentOutcome)
+	assert.Equal(t, tracecheck.PressureParentExplicitRoot, cases[2].PressureParentOutcome)
+	assert.Equal(t, tracecheck.PressureParentWrong, cases[3].PressureParentOutcome)
+	assert.Equal(t, tracecheck.PressureParentUnresolved, cases[4].PressureParentOutcome)
 	require.Error(t, validatePressureCorrelation(summary, len(cases)))
 
-	valid := pressureCorrelationSummary{ExactHitCount: 3, ExplicitRootCount: 1}
-	require.NoError(t, validatePressureCorrelation(valid, 4))
-	require.NoError(t, validatePressureCorrelation(
-		pressureCorrelationSummary{ExplicitRootCount: 4},
-		4,
-	))
+	valid := pressureCorrelationSummary{
+		RequestCount:      3,
+		ExactHitCount:     1,
+		ExplicitRootCount: 1,
+		W3CParentCount:    1,
+	}
+	require.NoError(t, validatePressureCorrelation(valid, 3))
+}
+
+func TestPressureW3CParentRequiresTheActualW3CGraph(t *testing.T) {
+	cfg := config{
+		scenario:      "pressure",
+		apacheService: "apache-proxy",
+		javaService:   "java-backend",
+	}
+	requests, err := makeRequests(config{scenario: "pressure", requestCount: 2, seed: 42})
+	require.NoError(t, err)
+
+	mutations := map[string]func(*caseResult){
+		"trace": func(result *caseResult) {
+			result.Trace.Spans[2].TraceID = "foreign-trace"
+		},
+		"parent": func(result *caseResult) {
+			result.Trace.Spans[2].ParentSpanID = "foreign-parent"
+		},
+		"flags": func(result *caseResult) {
+			result.Trace.Spans[2].Flags = 0x300
+		},
+		"remote": func(result *caseResult) {
+			result.Trace.Spans[2].Flags = 0x101
+		},
+		"candidate graph": func(result *caseResult) {
+			result.Trace.Spans[1].ParentSpanID = "foreign-parent"
+		},
+		"candidate flags": func(result *caseResult) {
+			result.Trace.Spans[1].Flags = 0
+		},
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			w3cCase := w3cPressureCase(requests[0])
+			mutate(&w3cCase)
+			require.Error(t, tracecheck.AssertSnapshot(
+				w3cCase.Trace,
+				expectationFor(cfg, w3cCase.Request),
+			))
+			cases := []caseResult{
+				w3cCase,
+				pressureCase("root", "candidate-trace", "client-root", "root-trace", ""),
+			}
+			summary := summarizePressureCorrelation(cfg, cases)
+			assert.Equal(t, pressureCorrelationSummary{
+				RequestCount:      2,
+				ExplicitRootCount: 1,
+				UnresolvedCount:   1,
+			}, summary)
+			assert.Empty(t, cases[0].PressureParentOutcome)
+			require.Error(t, validatePressureCorrelation(summary, len(cases)))
+		})
+	}
+}
+
+func TestValidatePressureCorrelationRequiresOneW3CParentOneRootAndExactTotals(t *testing.T) {
+	tests := map[string]struct {
+		summary      pressureCorrelationSummary
+		requestCount int
+	}{
+		"no W3C parent": {
+			summary:      pressureCorrelationSummary{RequestCount: 3, ExactHitCount: 2, ExplicitRootCount: 1},
+			requestCount: 3,
+		},
+		"two W3C parents": {
+			summary:      pressureCorrelationSummary{RequestCount: 3, ExplicitRootCount: 1, W3CParentCount: 2},
+			requestCount: 3,
+		},
+		"no explicit root": {
+			summary:      pressureCorrelationSummary{RequestCount: 3, ExactHitCount: 2, W3CParentCount: 1},
+			requestCount: 3,
+		},
+		"wrong parent": {
+			summary:      pressureCorrelationSummary{RequestCount: 2, ExplicitRootCount: 1, W3CParentCount: 1, WrongParentCount: 1},
+			requestCount: 2,
+		},
+		"unresolved": {
+			summary:      pressureCorrelationSummary{RequestCount: 2, ExplicitRootCount: 1, W3CParentCount: 1, UnresolvedCount: 1},
+			requestCount: 2,
+		},
+		"wrong total": {
+			summary: pressureCorrelationSummary{
+				RequestCount:      4,
+				ExactHitCount:     1,
+				ExplicitRootCount: 1,
+				W3CParentCount:    1,
+			},
+			requestCount: 4,
+		},
+		"reported request count mismatch": {
+			summary: pressureCorrelationSummary{
+				RequestCount:      3,
+				ExactHitCount:     1,
+				ExplicitRootCount: 1,
+				W3CParentCount:    1,
+			},
+			requestCount: 4,
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			require.Error(t, validatePressureCorrelation(test.summary, test.requestCount))
+		})
+	}
 }
 
 func pressureCase(
@@ -3769,6 +3950,45 @@ func pressureCase(
 				SpanID:       "java-" + marker,
 				ParentSpanID: javaParentSpanID,
 				Flags:        javaFlags,
+				Attributes:   attributes,
+			},
+		}},
+	}
+}
+
+func w3cPressureCase(request requestCase) caseResult {
+	attributes := map[string]string{
+		"http.request.header.x-obi-demo-id": request.Marker,
+		"http.route":                        request.Endpoint,
+	}
+	return caseResult{
+		Request: request,
+		Trace: tracecheck.Snapshot{Marker: request.Marker, Spans: []tracecheck.Span{
+			{
+				ServiceName:  "apache-proxy",
+				Kind:         "SERVER",
+				TraceID:      request.W3CTraceID,
+				SpanID:       "apache-server",
+				ParentSpanID: request.W3CParentSpanID,
+				Flags:        0x301,
+				Attributes:   attributes,
+			},
+			{
+				ServiceName:  "apache-proxy",
+				Kind:         "CLIENT",
+				TraceID:      request.W3CTraceID,
+				SpanID:       "obi-candidate",
+				ParentSpanID: "apache-server",
+				Flags:        0x001,
+				Attributes:   attributes,
+			},
+			{
+				ServiceName:  "java-backend",
+				Kind:         "SERVER",
+				TraceID:      request.W3CTraceID,
+				SpanID:       "java-server",
+				ParentSpanID: request.W3CParentSpanID,
+				Flags:        0x301,
 				Attributes:   attributes,
 			},
 		}},

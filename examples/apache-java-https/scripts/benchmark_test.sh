@@ -517,21 +517,27 @@ write_pressure_contract_artifacts_fixture() {
   owner_gid="$(id -g)" || return 1
   [[ "$owner_gid" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
   jq '.pressure_correlation = {
-    exact_hit_count: 127, explicit_root_count: 1,
-    wrong_parent_count: 0, unresolved_count: 0
+    request_count: 128, exact_hit_count: 126, explicit_root_count: 1,
+    w3c_parent_count: 1, wrong_parent_count: 0, unresolved_count: 0
   }' "$result" >"$result.tmp" || return 1
   mv -T -- "$result.tmp" "$result" || return 1
   jq '.pressure_correlation = {
-    trace: {exact_hit_count: 127, explicit_root_count: 1,
-      wrong_parent_count: 0, unresolved_count: 0},
+    trace: {request_count: 128, exact_hit_count: 126, explicit_root_count: 1,
+      w3c_parent_count: 1, wrong_parent_count: 0, unresolved_count: 0},
     bridge: {
       transport: "getsockopt",
+      retrieval_valid_count: 127,
+      attributable_failure_count: 1,
+      w3c_masked_valid_count: 1,
       handoff_admission_outcome_counts: {
         overload: 5, ambiguous: 0, maximum: 1152
       }
     },
-    java_reconciliation_target: {take_valid_count: 127,
-      attributable_absence_count: 1, diagnostic_self_miss_count: 1},
+    java_reconciliation_target: {
+      take_valid_count: 127, take_sampled_count: 127,
+      take_unsampled_count: 0, discard_standard_count: 1,
+      attributable_absence_count: 1, diagnostic_self_miss_count: 1
+    },
     barrier_reference: "map-pressure-pressure-barrier-status.json"
   }' "$status" >"$status.tmp" || return 1
   mv -T -- "$status.tmp" "$status" || return 1
@@ -691,7 +697,7 @@ write_pressure_contract_artifacts_fixture() {
     --argjson inspections_size "$inspections_size" --arg user "$EUID:$owner_gid" \
     --arg container_id "$container_id" '
     {
-      schema: "pressure-traffic-barrier-v1", status: "passed",
+      schema: "pressure-traffic-barrier-v2", status: "passed",
       scenario_label: "pressure", session: $session,
       sequence: ["scenario_ready", "capacity_fill_verified",
         "release_published", "scenario_reaped",
@@ -728,7 +734,14 @@ write_pressure_contract_artifacts_fixture() {
         result_reference: "scenario-pressure.json", result_sha256: $result_sha256,
         status_reference: "scenario-pressure-status.json",
         status_sha256: $status_sha256, request_count: 128,
-        exact_hit_count: 127, explicit_root_count: 1,
+        exact_hit_count: 126, explicit_root_count: 1, w3c_parent_count: 1,
+        retrieval_valid_count: 127, attributable_failure_count: 1,
+        w3c_masked_valid_count: 1,
+        java_reconciliation_target: {
+          take_valid_count: 127, take_sampled_count: 127,
+          take_unsampled_count: 0, discard_standard_count: 1,
+          attributable_absence_count: 1, diagnostic_self_miss_count: 1
+        },
         handoff_admission_overload_count: 5,
         handoff_admission_ambiguous_count: 0,
         handoff_admission_maximum_count: 1152,
@@ -736,6 +749,29 @@ write_pressure_contract_artifacts_fixture() {
       }
     }
   ' >"$runner/map-pressure-pressure-barrier-status.json"
+}
+
+refresh_pressure_contract_barrier_digests() {
+  local -r runner="$1"
+  local -r result="$runner/scenario-pressure.json"
+  local -r status="$runner/scenario-pressure-status.json"
+  local -r barrier="$runner/map-pressure-pressure-barrier-status.json"
+  local result_sha256=""
+  local status_sha256=""
+
+  [[ -f "$result" && ! -L "$result" &&
+    -f "$status" && ! -L "$status" &&
+    -f "$barrier" && ! -L "$barrier" ]] || return 1
+  result_sha256="$(sha256sum <"$result")" || return 1
+  status_sha256="$(sha256sum <"$status")" || return 1
+  result_sha256="${result_sha256%% *}"
+  status_sha256="${status_sha256%% *}"
+  jq -cS --arg result_sha256 "$result_sha256" \
+    --arg status_sha256 "$status_sha256" '
+      .traffic.result_sha256 = $result_sha256 |
+      .traffic.status_sha256 = $status_sha256
+    ' "$barrier" >"$barrier.tmp" || return 1
+  mv -T -- "$barrier.tmp" "$barrier"
 }
 
 fake_write_runner_artifacts() {
@@ -3441,17 +3477,25 @@ write_path_observation_fixture() {
       pressure="$(jq -cn --argjson max_entries "$pressure_max_entries" '
         {
           bounded: true,
-          pressure_contract_version: 1,
-          barrier_schema: "pressure-traffic-barrier-v1",
+          pressure_contract_version: 2,
+          barrier_schema: "pressure-traffic-barrier-v2",
           barrier_sequence: ["scenario_ready", "capacity_fill_verified",
             "release_published", "scenario_reaped",
             "post_traffic_content_verified"],
-          exact_hit_count: 127,
+          exact_hit_count: 126,
           explicit_root_count: 1,
+          w3c_parent_count: 1,
           wrong_parent_count: 0,
           unresolved_count: 0,
+          retrieval_valid_count: 127,
+          attributable_failure_count: 1,
+          w3c_masked_valid_count: 1,
           take_valid_count: 127,
+          take_sampled_count: 127,
+          take_unsampled_count: 0,
+          discard_standard_count: 1,
           attributable_absence_count: 1,
+          diagnostic_self_miss_count: 1,
           handoff_admission_overload_count: 5,
           handoff_admission_ambiguous_count: 0,
           handoff_admission_maximum_count: 1152,
@@ -3539,6 +3583,19 @@ write_path_observation_fixture() {
 test_bounded_paths_are_correctness_observations_not_performance_samples() {
   local -r observation="$TEST_TMP_DIR/path-observation.json"
   local -r invalid="$TEST_TMP_DIR/path-observation-invalid.json"
+  local filter=""
+  local label=""
+
+  pressure_mutation_must_fail() {
+    local -r mutation_filter="$1"
+    local -r mutation_label="$2"
+
+    jq "$mutation_filter" "$observation" >"$invalid" || return 1
+    if validate_path_observation_schema "$invalid"; then
+      printf 'pressure path observation accepted %s\n' "$mutation_label" >&2
+      return 1
+    fi
+  }
 
   write_path_observation_fixture "$observation"
   validate_path_observation_schema "$observation" || {
@@ -3587,16 +3644,54 @@ test_bounded_paths_are_correctness_observations_not_performance_samples() {
     printf 'exact pressure observation was rejected\n' >&2
     return 1
   }
+  jq -e '
+    .pressure.pressure_contract_version == 2 and
+    .pressure.barrier_schema == "pressure-traffic-barrier-v2" and
+    .pressure.exact_hit_count == 126 and
+    .pressure.explicit_root_count == 1 and
+    .pressure.w3c_parent_count == 1 and
+    .pressure.retrieval_valid_count == 127 and
+    .pressure.attributable_failure_count == 1 and
+    .pressure.w3c_masked_valid_count == 1 and
+    .pressure.take_valid_count == 127 and
+    .pressure.take_sampled_count == 127 and
+    .pressure.take_unsampled_count == 0 and
+    .pressure.discard_standard_count == 1 and
+    .pressure.attributable_absence_count == 1 and
+    .pressure.diagnostic_self_miss_count == 1
+  ' "$observation" >/dev/null || return 1
   jq '.observation.runner_requested_requests = 127' "$observation" >"$invalid"
   if validate_path_observation_schema "$invalid"; then
     printf 'pressure observation accepted the wrong request count\n' >&2
     return 1
   fi
-  jq '.pressure.take_valid_count = 126' "$observation" >"$invalid"
-  if validate_path_observation_schema "$invalid"; then
-    printf 'pressure observation accepted incomplete Java reconciliation\n' >&2
-    return 1
-  fi
+  while IFS='|' read -r label filter; do
+    pressure_mutation_must_fail "$filter" "$label" || return 1
+  done <<'EOF'
+contract version 1|.pressure.pressure_contract_version = 1
+barrier schema v1|.pressure.barrier_schema = "pressure-traffic-barrier-v1"
+missing W3C field|del(.pressure.w3c_parent_count)
+extra pressure field|.pressure.untrusted_count = 0
+W=0|.pressure.w3c_parent_count = 0
+W=2|.pressure.w3c_parent_count = 2
+R=0|.pressure.explicit_root_count = 0
+H+R+W!=N|.pressure.exact_hit_count = 125
+wrong parent|.pressure.wrong_parent_count = 1
+unresolved parent|.pressure.unresolved_count = 1
+V<H|.pressure.retrieval_valid_count = 125
+V>H+W|.pressure.retrieval_valid_count = 128
+F<R|.pressure.attributable_failure_count = 0
+F>R+W|.pressure.attributable_failure_count = 3
+V+F!=N|.pressure.retrieval_valid_count = 126
+M!=V-H|.pressure.w3c_masked_valid_count = 0
+M outside 0..1|.pressure.w3c_masked_valid_count = 2
+take_valid!=V|.pressure.take_valid_count = 126
+take_sampled!=V|.pressure.take_sampled_count = 126
+take_unsampled!=0|.pressure.take_unsampled_count = 1
+discard_standard!=M|.pressure.discard_standard_count = 0
+attributable_absence!=F|.pressure.attributable_absence_count = 2
+diagnostic_self_miss!=1|.pressure.diagnostic_self_miss_count = 0
+EOF
   jq 'del(.pressure.recovery_samples)' "$observation" >"$invalid"
   if validate_path_observation_schema "$invalid"; then
     printf 'pressure observation accepted incomplete recovery evidence\n' >&2
@@ -3879,6 +3974,237 @@ test_pressure_capacity_is_live_bounded_and_exactly_reconciled() (
   fi
   mv -T -- "$cleanup.valid" "$cleanup"
 )
+
+test_pressure_contract_v2_raw_artifacts_are_exact_and_cross_bound() (
+  local -r root="$TEST_TMP_DIR/pressure-contract-v2-raw"
+  local -r observation="$root/path-observation.json"
+  local -r runner="$root/preflight/runner"
+  local -r result="$runner/scenario-pressure.json"
+  local -r status="$runner/scenario-pressure-status.json"
+  local -r barrier="$runner/map-pressure-pressure-barrier-status.json"
+  local target=""
+  local filter=""
+  local index=0
+  local label=""
+  local accepted=false
+  local canonical=""
+  local -a mutations=(
+    result 'result trace missing N' 'del(.pressure_correlation.request_count)'
+    result 'result trace N mismatch' '.pressure_correlation.request_count = 127'
+    barrier 'barrier schema v1' '.schema = "pressure-traffic-barrier-v1"'
+    barrier 'barrier N mismatch' '.traffic.request_count = 127'
+    barrier 'barrier H+R+W mismatch' '.traffic.exact_hit_count = 125'
+    barrier 'barrier R=0' '.traffic.explicit_root_count = 0'
+    barrier 'barrier W=0' '.traffic.w3c_parent_count = 0'
+    barrier 'barrier V<H' '.traffic.retrieval_valid_count = 125'
+    barrier 'barrier V>H+W' '.traffic.retrieval_valid_count = 128'
+    barrier 'barrier F<R' '.traffic.attributable_failure_count = 0'
+    barrier 'barrier F>R+W' '.traffic.attributable_failure_count = 3'
+    barrier 'barrier V+F!=N' '.traffic.retrieval_valid_count = 126'
+    barrier 'barrier M!=V-H' '.traffic.w3c_masked_valid_count = 0'
+    barrier 'barrier M outside 0..1' '.traffic.w3c_masked_valid_count = 2'
+    barrier 'barrier take_valid!=V' '.traffic.java_reconciliation_target.take_valid_count = 126'
+    barrier 'barrier take_sampled!=V' '.traffic.java_reconciliation_target.take_sampled_count = 126'
+    barrier 'barrier take_unsampled!=0' '.traffic.java_reconciliation_target.take_unsampled_count = 1'
+    barrier 'barrier discard_standard!=M' '.traffic.java_reconciliation_target.discard_standard_count = 0'
+    barrier 'barrier attributable_absence!=F' '.traffic.java_reconciliation_target.attributable_absence_count = 2'
+    barrier 'barrier diagnostic_self_miss!=1' '.traffic.java_reconciliation_target.diagnostic_self_miss_count = 0'
+    barrier 'barrier Java target extra key' '.traffic.java_reconciliation_target.extra = 0'
+    status 'status trace missing N' 'del(.pressure_correlation.trace.request_count)'
+    status 'status trace extra key' '.pressure_correlation.trace.extra = 0'
+    status 'status bridge extra key' '.pressure_correlation.bridge.untrusted_extra = 0'
+    status 'status bridge M mismatch' '.pressure_correlation.bridge.w3c_masked_valid_count = 0'
+    status 'status Java target mismatch' '.pressure_correlation.java_reconciliation_target.take_sampled_count = 126'
+  )
+
+  restore_raw_fixture() {
+    mv -T -- "$result.mutation-base" "$result"
+    mv -T -- "$status.mutation-base" "$status"
+    mv -T -- "$barrier.mutation-base" "$barrier"
+  }
+
+  raw_mutation_must_fail() {
+    local -r mutation_target="$1"
+    local -r mutation_filter="$2"
+    local -r mutation_label="$3"
+    local mutation_file=""
+    local path_accepted=false
+
+    command cp -- "$result" "$result.mutation-base" || return 1
+    command cp -- "$status" "$status.mutation-base" || return 1
+    command cp -- "$barrier" "$barrier.mutation-base" || return 1
+    case "$mutation_target" in
+      result) mutation_file="$result" ;;
+      status) mutation_file="$status" ;;
+      barrier) mutation_file="$barrier" ;;
+      *) restore_raw_fixture; return 1 ;;
+    esac
+    jq -cS "$mutation_filter" "$mutation_file.mutation-base" \
+      >"$mutation_file" || {
+      restore_raw_fixture
+      return 1
+    }
+    refresh_pressure_contract_barrier_digests "$runner" || {
+      restore_raw_fixture
+      return 1
+    }
+    accepted=false
+    if validate_pressure_cell_artifacts "$runner"; then
+      accepted=true
+    fi
+    if validate_path_observation_source_artifacts "$observation"; then
+      path_accepted=true
+    fi
+    restore_raw_fixture || return 1
+    if [[ "$accepted" == true || "$path_accepted" == true ]]; then
+      printf 'pressure raw/path contract accepted %s\n' \
+        "$mutation_label" >&2
+      return 1
+    fi
+  }
+
+  mkdir -p -- "$root"
+  write_path_observation_fixture "$observation" getsockopt-pressure
+  materialize_path_observation_sources "$observation"
+  validate_pressure_cell_artifacts "$runner" || {
+    printf 'valid pressure v2 raw fixture was rejected\n' >&2
+    return 1
+  }
+
+  for ((index = 0; index < ${#mutations[@]}; index += 3)); do
+    target="${mutations[index]}"
+    label="${mutations[index + 1]}"
+    filter="${mutations[index + 2]}"
+    raw_mutation_must_fail "$target" "$filter" "$label" || return 1
+  done
+
+  # A valid alternative H/R/V/F split remains internally coherent, but a
+  # result-only rewrite must not cross the status or barrier authority seams.
+  raw_mutation_must_fail result '
+    .pressure_correlation.exact_hit_count = 125 |
+    .pressure_correlation.explicit_root_count = 2
+  ' 'result/status trace cross-binding mismatch' || return 1
+
+  command cp -- "$result" "$result.mutation-base"
+  command cp -- "$status" "$status.mutation-base"
+  command cp -- "$barrier" "$barrier.mutation-base"
+  jq -cS '
+    .pressure_correlation.exact_hit_count = 125 |
+    .pressure_correlation.explicit_root_count = 2
+  ' "$result.mutation-base" >"$result" || return 1
+  jq -cS '
+    .pressure_correlation.trace.exact_hit_count = 125 |
+    .pressure_correlation.trace.explicit_root_count = 2 |
+    .pressure_correlation.bridge.retrieval_valid_count = 126 |
+    .pressure_correlation.bridge.attributable_failure_count = 2 |
+    .pressure_correlation.java_reconciliation_target.take_valid_count = 126 |
+    .pressure_correlation.java_reconciliation_target.take_sampled_count = 126 |
+    .pressure_correlation.java_reconciliation_target.attributable_absence_count = 2
+  ' "$status.mutation-base" >"$status" || return 1
+  refresh_pressure_contract_barrier_digests "$runner" || return 1
+  accepted=false
+  if validate_pressure_cell_artifacts "$runner"; then accepted=true; fi
+  restore_raw_fixture || return 1
+  if [[ "$accepted" == true ]]; then
+    printf 'pressure raw contract accepted a coherent status/result split not bound to the barrier\n' >&2
+    return 1
+  fi
+
+  # Conversely, an internally coherent alternate barrier must not override
+  # the independently retained result and status contract.
+  raw_mutation_must_fail barrier '
+    .traffic.exact_hit_count = 125 |
+    .traffic.explicit_root_count = 2 |
+    .traffic.retrieval_valid_count = 126 |
+    .traffic.attributable_failure_count = 2 |
+    .traffic.java_reconciliation_target.take_valid_count = 126 |
+    .traffic.java_reconciliation_target.take_sampled_count = 126 |
+    .traffic.java_reconciliation_target.attributable_absence_count = 2
+  ' 'coherent barrier/status/result cross-binding mismatch' || return 1
+
+  # The other permitted W3C branch (V=H, F=R+W, M=0) is accepted when all
+  # independently retained authorities agree.
+  command cp -- "$result" "$result.mutation-base"
+  command cp -- "$status" "$status.mutation-base"
+  command cp -- "$barrier" "$barrier.mutation-base"
+  jq -cS '
+    .pressure_correlation.bridge.retrieval_valid_count = 126 |
+    .pressure_correlation.bridge.attributable_failure_count = 2 |
+    .pressure_correlation.bridge.w3c_masked_valid_count = 0 |
+    .pressure_correlation.java_reconciliation_target.take_valid_count = 126 |
+    .pressure_correlation.java_reconciliation_target.take_sampled_count = 126 |
+    .pressure_correlation.java_reconciliation_target.discard_standard_count = 0 |
+    .pressure_correlation.java_reconciliation_target.attributable_absence_count = 2
+  ' "$status.mutation-base" >"$status" || return 1
+  refresh_pressure_contract_barrier_digests "$runner" || return 1
+  jq -cS '
+    .traffic.retrieval_valid_count = 126 |
+    .traffic.attributable_failure_count = 2 |
+    .traffic.w3c_masked_valid_count = 0 |
+    .traffic.java_reconciliation_target.take_valid_count = 126 |
+    .traffic.java_reconciliation_target.take_sampled_count = 126 |
+    .traffic.java_reconciliation_target.discard_standard_count = 0 |
+    .traffic.java_reconciliation_target.attributable_absence_count = 2
+  ' "$barrier" >"$barrier.tmp" || return 1
+  mv -T -- "$barrier.tmp" "$barrier"
+  validate_pressure_cell_artifacts "$runner" canonical || {
+    restore_raw_fixture
+    printf 'pressure raw contract rejected the valid M=0 W3C branch\n' >&2
+    return 1
+  }
+  jq -e '
+    .retrieval_valid_count == 126 and .attributable_failure_count == 2 and
+    .w3c_masked_valid_count == 0 and .take_sampled_count == 126 and
+    .discard_standard_count == 0 and .attributable_absence_count == 2
+  ' <<<"$canonical" >/dev/null || {
+    restore_raw_fixture
+    return 1
+  }
+  restore_raw_fixture || return 1
+
+  # Admission overload is separately bounded pressure evidence. It may vary
+  # without changing H/R/W, V/F/M, or the Java target.
+  command cp -- "$result" "$result.mutation-base"
+  command cp -- "$status" "$status.mutation-base"
+  command cp -- "$barrier" "$barrier.mutation-base"
+  jq -cS '
+    .pressure_correlation.bridge.handoff_admission_outcome_counts.overload = 6
+  ' "$status.mutation-base" >"$status" || return 1
+  refresh_pressure_contract_barrier_digests "$runner" || return 1
+  jq -cS '.traffic.handoff_admission_overload_count = 6' \
+    "$barrier" >"$barrier.tmp" || return 1
+  mv -T -- "$barrier.tmp" "$barrier"
+  validate_pressure_cell_artifacts "$runner" canonical || {
+    restore_raw_fixture
+    printf 'pressure raw contract coupled admission overload to W3C attribution\n' >&2
+    return 1
+  }
+  jq -e '
+    .handoff_admission_overload_count == 6 and
+    .retrieval_valid_count == 127 and .attributable_failure_count == 1 and
+    .w3c_masked_valid_count == 1
+  ' <<<"$canonical" >/dev/null || {
+    restore_raw_fixture
+    return 1
+  }
+  restore_raw_fixture
+)
+
+test_pressure_consumer_source_preserves_full_hash_contract_literals() {
+  local -r source="$TEST_SCRIPT_DIR/benchmark.sh"
+
+  # These are intentional literal jq fragments in the production source.
+  # shellcheck disable=SC2016
+  [[ "$(grep -Fc -- 'E2BIG proxy' "$source")" == 1 &&
+    "$(grep -Fc -- 'non-evicting HASH' "$source")" == 1 &&
+    "$(grep -Fc -- '.map_type == "Hash"' "$source")" -ge 2 &&
+    "$(grep -Fc -- '.capacity_rejected_entries == 1' "$source")" -ge 3 &&
+    "$(grep -Fc -- '.content_sha256 == $fill.content_sha256' "$source")" -ge 2 &&
+    "$(grep -Fc -- '.post_traffic_content_sha256 == .content_sha256' "$source")" == 1 ]] || {
+    printf 'pressure consumer source lost the literal full non-evicting HASH/E2BIG/digest contract\n' >&2
+    return 1
+  }
+}
 
 test_lookup_coverage_uses_observed_once_vocabulary() {
   local -r root="$TEST_TMP_DIR/lookup-coverage"
@@ -14102,7 +14428,15 @@ test_complete_mode_fake_run_publishes_resolvable_bounded_evidence() {
     (.paths[] | select(.observation.cell == "getsockopt-pressure") |
       .observation.pressure |
       .map_id == 41 and .kernel_map_name == "java_remote_par" and
-      .pressure_contract_version == 1 and .synthetic_pid == 0 and
+      .pressure_contract_version == 2 and
+      .barrier_schema == "pressure-traffic-barrier-v2" and
+      .exact_hit_count == 126 and .explicit_root_count == 1 and
+      .w3c_parent_count == 1 and .retrieval_valid_count == 127 and
+      .attributable_failure_count == 1 and .w3c_masked_valid_count == 1 and
+      .take_valid_count == 127 and .take_sampled_count == 127 and
+      .take_unsampled_count == 0 and .discard_standard_count == 1 and
+      .attributable_absence_count == 1 and .diagnostic_self_miss_count == 1 and
+      .synthetic_pid == 0 and
       .synthetic_namespace == 0 and .occupancy_before_fill == 0 and
       .touched_entries == $pressure_max_entries and
       .fill_verified_present_entries == $pressure_max_entries and
@@ -14154,6 +14488,15 @@ main() {
   if [[ "${BENCHMARK_TEST_ONLY:-}" == "terminal-native-signal" ]]; then
     test_terminal_native_perl_reaps_active_git_child_on_signal
     printf 'benchmark.sh terminal native Git signal-mask test passed\n'
+    return 0
+  fi
+  if [[ "${BENCHMARK_TEST_ONLY:-}" == "pressure-contract-v2" ]]; then
+    test_bounded_paths_are_correctness_observations_not_performance_samples
+    test_pressure_recovery_evidence_parses_canonical_samples_and_log
+    test_pressure_capacity_is_live_bounded_and_exactly_reconciled
+    test_pressure_contract_v2_raw_artifacts_are_exact_and_cross_bound
+    test_pressure_consumer_source_preserves_full_hash_contract_literals
+    printf 'benchmark.sh pressure contract v2 consumer tests passed\n'
     return 0
   fi
   if [[ "${BENCHMARK_TEST_ONLY:-}" == "terminal-source-authority" ]]; then
@@ -14291,6 +14634,8 @@ main() {
   test_bounded_paths_are_correctness_observations_not_performance_samples
   test_pressure_recovery_evidence_parses_canonical_samples_and_log
   test_pressure_capacity_is_live_bounded_and_exactly_reconciled
+  test_pressure_contract_v2_raw_artifacts_are_exact_and_cross_bound
+  test_pressure_consumer_source_preserves_full_hash_contract_literals
   test_lookup_coverage_uses_observed_once_vocabulary
   test_application_source_identity_is_exact_across_core_and_complete_cells
   test_application_source_identity_rejects_coordinated_manifest_forgery

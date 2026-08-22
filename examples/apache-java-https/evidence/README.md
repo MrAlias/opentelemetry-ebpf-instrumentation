@@ -85,14 +85,17 @@ schema.
 The current raw-v3 pressure contract also retains
 `map-pressure-pressure-container-inspections.json` privately. Its canonical
 running/terminal lifecycle is bound by exact SHA-256 and byte-size descriptors
-in the raw barrier and scenario status. It is not part of any historical bundle
-listed below, any normalized lookup observation, or the public claims-v1
-closure. The public projector remains exactly seven files, and its producer
-status roster remains 35 boundaries and 56 status entries. Public commitment
-bytes may still change: the private manifest commitment changes, and the
-descriptor-bearing pressure status changes its existing producer-roster
-digest. Those changes propagate to the authority, claims, derivation receipt,
-evidence ID, and checksum manifest without adding a public field or file.
+in pressure source contract 2, `pressure-traffic-barrier-v2`, and the scenario
+status. It is not part of any historical bundle listed below, any normalized
+lookup observation, or the public claims-v2 closure. The active projector still
+emits exactly seven files, and its producer status roster remains 35 boundaries
+and 56 status entries. Claims-v2 adds the bounded issue #36 pressure result and
+keeps the private inspection absent. Public commitment bytes may still change:
+the private manifest commitment changes, and the descriptor-bearing pressure
+status changes its existing producer-roster digest. Those changes propagate to
+the authority, claims, derivation receipt, evidence ID, and checksum manifest
+without adding a public file. Claims-v1 remains a legacy compatibility shape;
+it cannot represent the exhaustive `H+R+W=N` pressure-v2 result.
 
 | Evidence | Result | Matrix cell |
 | --- | --- | --- |

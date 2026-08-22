@@ -12,7 +12,7 @@ set +m
 # in the already authenticated producer blob. Keep it unique and literal.
 # Parsed from the authenticated source by the raw-v3 verifier.
 # shellcheck disable=SC2034
-PRESSURE_TRAFFIC_CONTRACT_VERSION=1
+PRESSURE_TRAFFIC_CONTRACT_VERSION=2
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd -P)"
@@ -13574,6 +13574,76 @@ retain_pressure_control_evidence() {
   PRESSURE_CONTROL_EVIDENCE_TRANSACTION_ID=""
 }
 
+pressure_w3c_status_crosslinks_are_exact() {
+  (($# == 6)) || return 1
+  local -r input="$1"
+  local -r label="$2"
+  local -r transport="$3"
+  local -r request_count="$4"
+  local -r container_inspections="$5"
+  local -r deadline="$6"
+
+  [[ "$label" =~ ^pressure(-run-[0-9]{2})?$ &&
+    ( "$transport" == getsockopt || "$transport" == unix ) &&
+    "$request_count" =~ ^[1-9][0-9]*$ && "$request_count" -le 1000 &&
+    "$deadline" =~ ^[1-9][0-9]*$ ]] || return 1
+  run_pressure_bounded "$deadline" 5 jq -e \
+    --arg label "$label" \
+    --arg transport "$transport" \
+    --argjson requests "$request_count" \
+    --argjson inspections "$container_inspections" '
+      def count:
+        type == "number" and floor == . and . >= 0 and . <= $requests;
+      .status == "passed" and .scenario == "pressure" and
+      .result == ("scenario-" + $label + ".json") and
+      (.pressure_correlation | keys) == ["barrier_reference","bridge",
+        "container_inspections","java_reconciliation_target","trace"] and
+      .pressure_correlation.barrier_reference ==
+        ("map-pressure-" + $label + "-barrier-status.json") and
+      .pressure_correlation.container_inspections == $inspections and
+      .pressure_correlation.trace as $trace |
+      ($trace | keys) == ["exact_hit_count","explicit_root_count",
+        "request_count","unresolved_count","w3c_parent_count",
+        "wrong_parent_count"] and
+      all([$trace.exact_hit_count,$trace.explicit_root_count,
+        $trace.w3c_parent_count,$trace.wrong_parent_count,
+        $trace.unresolved_count][]; count) and
+      $trace.request_count == $requests and
+      $trace.w3c_parent_count == 1 and
+      $trace.explicit_root_count >= 1 and
+      $trace.wrong_parent_count == 0 and $trace.unresolved_count == 0 and
+      ($trace.exact_hit_count + $trace.explicit_root_count +
+        $trace.w3c_parent_count) == $requests and
+      .pressure_correlation.bridge as $bridge |
+      $bridge.transport == $transport and
+      ($bridge.retrieval_valid_count | count) and
+      ($bridge.attributable_failure_count | count) and
+      ($bridge.w3c_masked_valid_count | count) and
+      $bridge.w3c_masked_valid_count <= 1 and
+      $bridge.retrieval_valid_count >= $trace.exact_hit_count and
+      $bridge.retrieval_valid_count <=
+        ($trace.exact_hit_count + $trace.w3c_parent_count) and
+      $bridge.attributable_failure_count >= $trace.explicit_root_count and
+      $bridge.attributable_failure_count <=
+        ($trace.explicit_root_count + $trace.w3c_parent_count) and
+      ($bridge.retrieval_valid_count +
+        $bridge.attributable_failure_count) == $requests and
+      $bridge.w3c_masked_valid_count ==
+        ($bridge.retrieval_valid_count - $trace.exact_hit_count) and
+      ($bridge.w3c_masked_valid_count +
+        $bridge.attributable_failure_count - $trace.explicit_root_count) ==
+          $trace.w3c_parent_count and
+      .pressure_correlation.java_reconciliation_target == {
+        attributable_absence_count:$bridge.attributable_failure_count,
+        diagnostic_self_miss_count:1,
+        discard_standard_count:$bridge.w3c_masked_valid_count,
+        take_sampled_count:$bridge.retrieval_valid_count,
+        take_unsampled_count:0,
+        take_valid_count:$bridge.retrieval_valid_count
+      }
+    ' "$input" >/dev/null
+}
+
 finalize_pressure_barrier_status() {
   local -r label="$1"
   local -r result="$2"
@@ -13588,8 +13658,12 @@ finalize_pressure_barrier_status() {
   local exact_hits=""
   local request_count=""
   local roots=""
+  local w3c_parents=""
   local wrong=""
   local unresolved=""
+  local retrieval_valid=""
+  local attributable_failures=""
+  local w3c_masked_valid=""
   local admission_overload=""
   local admission_ambiguous=""
   local admission_maximum=""
@@ -13608,7 +13682,6 @@ finalize_pressure_barrier_status() {
   local output_identity=""
   local fill_read=""
   local verify_read=""
-  local result_read=""
   local status_read=""
   local output_anchor=""
   local cleanup_status=0
@@ -13633,8 +13706,6 @@ finalize_pressure_barrier_status() {
     "$fill" "$deadline" fill_read || return $?
   pressure_registered_or_lexical_read_path \
     "$verify" "$deadline" verify_read || return $?
-  pressure_registered_or_lexical_read_path \
-    "$result" "$deadline" result_read || return $?
   pressure_registered_or_lexical_read_path \
     "$scenario_status_file" "$deadline" status_read || return $?
   pressure_transaction_target_path_is_allowed \
@@ -13696,29 +13767,34 @@ finalize_pressure_barrier_status() {
     "$SCENARIO_RECONCILIATION_MAX_LINES" "$deadline" || return $?
   bounded_evidence_file \
     "$scenario_status_file" 65536 1024 "$deadline" || return $?
-  run_pressure_bounded "$deadline" 5 jq -e --arg label "$label" \
-    --argjson inspections "$container_inspections_descriptor" '
-    .status == "passed" and .scenario == "pressure" and
-    .result == ("scenario-" + $label + ".json") and
-    .pressure_correlation.barrier_reference ==
-      ("map-pressure-" + $label + "-barrier-status.json") and
-    .pressure_correlation.container_inspections == $inspections and
-    .pressure_correlation.trace.wrong_parent_count == 0 and
-    .pressure_correlation.trace.unresolved_count == 0
-  ' "$status_read" >/dev/null || return $?
+  request_count="$(pressure_scenario_count \
+    "$result" request_count 1000 "$deadline")" || return $?
+  pressure_w3c_status_crosslinks_are_exact \
+    "$status_read" "$label" "$SELECTED_TRANSPORT" "$request_count" \
+    "$container_inspections_descriptor" "$deadline" || return $?
   exact_hits="$(run_pressure_bounded "$deadline" 5 jq -er \
     '.pressure_correlation.trace.exact_hit_count' \
     "$status_read")" || return $?
-  request_count="$(run_pressure_bounded \
-    "$deadline" 5 jq -er '.request_count' "$result_read")" || return $?
   roots="$(run_pressure_bounded "$deadline" 5 jq -er \
     '.pressure_correlation.trace.explicit_root_count' \
+    "$status_read")" || return $?
+  w3c_parents="$(run_pressure_bounded "$deadline" 5 jq -er \
+    '.pressure_correlation.trace.w3c_parent_count' \
     "$status_read")" || return $?
   wrong="$(run_pressure_bounded "$deadline" 5 jq -er \
     '.pressure_correlation.trace.wrong_parent_count' \
     "$status_read")" || return $?
   unresolved="$(run_pressure_bounded "$deadline" 5 jq -er \
     '.pressure_correlation.trace.unresolved_count' \
+    "$status_read")" || return $?
+  retrieval_valid="$(run_pressure_bounded "$deadline" 5 jq -er \
+    '.pressure_correlation.bridge.retrieval_valid_count' \
+    "$status_read")" || return $?
+  attributable_failures="$(run_pressure_bounded "$deadline" 5 jq -er \
+    '.pressure_correlation.bridge.attributable_failure_count' \
+    "$status_read")" || return $?
+  w3c_masked_valid="$(run_pressure_bounded "$deadline" 5 jq -er \
+    '.pressure_correlation.bridge.w3c_masked_valid_count' \
     "$status_read")" || return $?
   admission_overload="$(run_pressure_bounded "$deadline" 5 jq -er \
     '.pressure_correlation.bridge.handoff_admission_outcome_counts.overload' \
@@ -13732,15 +13808,51 @@ finalize_pressure_barrier_status() {
   expected_admission_maximum="$(
     pressure_admission_max_events "$request_count"
   )" || return 1
-  [[ "$roots" =~ ^[1-9][0-9]*$ &&
+  [[ "$roots" =~ ^[1-9][0-9]*$ && "$w3c_parents" == 1 &&
     "$admission_overload" =~ ^[1-9][0-9]*$ &&
     "$admission_ambiguous" == 0 &&
     "$admission_maximum" == "$expected_admission_maximum" &&
     "$wrong" == 0 && "$unresolved" == 0 &&
     "$exact_hits" =~ ^(0|[1-9][0-9]*)$ &&
+    "$retrieval_valid" =~ ^(0|[1-9][0-9]*)$ &&
+    "$attributable_failures" =~ ^(0|[1-9][0-9]*)$ &&
+    "$w3c_masked_valid" =~ ^(0|1)$ &&
     "$request_count" =~ ^[1-9][0-9]*$ ]] || return 1
-  ((request_count <= 1000 && exact_hits + roots == request_count)) || return 1
+  ((request_count <= 1000 && exact_hits + roots + w3c_parents == request_count &&
+    exact_hits <= retrieval_valid &&
+    retrieval_valid <= exact_hits + w3c_parents &&
+    roots <= attributable_failures &&
+    attributable_failures <= roots + w3c_parents &&
+    retrieval_valid + attributable_failures == request_count &&
+    w3c_masked_valid == retrieval_valid - exact_hits &&
+    w3c_masked_valid + attributable_failures - roots == w3c_parents)) ||
+    return 1
   ((admission_overload <= admission_maximum)) || return 1
+  run_pressure_bounded "$deadline" 5 jq -e \
+    --argjson request_count "$request_count" \
+    --argjson hits "$exact_hits" \
+    --argjson roots "$roots" \
+    --argjson w3c "$w3c_parents" \
+    --argjson valid "$retrieval_valid" \
+    --argjson failures "$attributable_failures" \
+    --argjson masked "$w3c_masked_valid" '
+      .pressure_correlation.trace == {
+        exact_hit_count:$hits,
+        explicit_root_count:$roots,
+        request_count:$request_count,
+        unresolved_count:0,
+        w3c_parent_count:$w3c,
+        wrong_parent_count:0
+      } and
+      .pressure_correlation.java_reconciliation_target == {
+        attributable_absence_count:$failures,
+        diagnostic_self_miss_count:1,
+        discard_standard_count:$masked,
+        take_sampled_count:$valid,
+        take_unsampled_count:0,
+        take_valid_count:$valid
+      }
+    ' "$status_read" >/dev/null || return $?
   ready_digest="$(sha256_file "$ready" "$deadline")" || return $?
   release_digest="$(sha256_file "$release" "$deadline")" || return $?
   fill_digest="$(sha256_file "$fill" "$deadline")" || return $?
@@ -13766,7 +13878,7 @@ finalize_pressure_barrier_status() {
   pressure_registered_candidate_descriptor_path \
     "$candidate" "$deadline" candidate_descriptor || return $?
   if run_pressure_bounded "$deadline" 5 jq -cS -n \
-    --arg schema pressure-traffic-barrier-v1 \
+    --arg schema pressure-traffic-barrier-v2 \
     --arg label "$label" \
     --arg session "$PRESSURE_CONTROL_SESSION" \
     --arg ready_reference "${ready#"$RESULT_DIR/"}" \
@@ -13789,6 +13901,10 @@ finalize_pressure_barrier_status() {
     --argjson request_count "$request_count" \
     --argjson exact_hits "$exact_hits" \
     --argjson roots "$roots" \
+    --argjson w3c_parents "$w3c_parents" \
+    --argjson retrieval_valid "$retrieval_valid" \
+    --argjson attributable_failures "$attributable_failures" \
+    --argjson w3c_masked_valid "$w3c_masked_valid" \
     --argjson admission_overload "$admission_overload" \
     --argjson admission_maximum "$admission_maximum" '
       {
@@ -13843,6 +13959,18 @@ finalize_pressure_barrier_status() {
           request_count: $request_count,
           exact_hit_count: $exact_hits,
           explicit_root_count: $roots,
+          w3c_parent_count: $w3c_parents,
+          retrieval_valid_count: $retrieval_valid,
+          attributable_failure_count: $attributable_failures,
+          w3c_masked_valid_count: $w3c_masked_valid,
+          java_reconciliation_target: {
+            attributable_absence_count: $attributable_failures,
+            diagnostic_self_miss_count: 1,
+            discard_standard_count: $w3c_masked_valid,
+            take_sampled_count: $retrieval_valid,
+            take_unsampled_count: 0,
+            take_valid_count: $retrieval_valid
+          },
           handoff_admission_overload_count: $admission_overload,
           handoff_admission_ambiguous_count: 0,
           handoff_admission_maximum_count: $admission_maximum,
@@ -15428,7 +15556,8 @@ pressure_scenario_count() {
   local resolved_input=""
   local size=""
 
-  [[ "$field" =~ ^[a-z_]+$ && "$deadline" =~ ^[1-9][0-9]*$ ]] &&
+  [[ "$field" =~ ^[a-z][a-z0-9_]*$ &&
+    "$deadline" =~ ^[1-9][0-9]*$ ]] &&
     ((deadline > SECONDS)) || return 1
   pressure_registered_or_lexical_read_path \
     "$input" "$deadline" resolved_input || return $?
@@ -15440,6 +15569,7 @@ pressure_scenario_count() {
   value="$(run_with_optional_pressure_deadline \
     "$deadline" 5 env LC_ALL=C awk \
     -v maximum_lines="$SCENARIO_RECONCILIATION_MAX_LINES" \
+    -v field="$field" \
     -v wanted="\"$field\":" '
     NR > maximum_lines { invalid = 1; exit }
     $1 == wanted {
@@ -15449,9 +15579,26 @@ pressure_scenario_count() {
         invalid = 1
       }
       matches++
+      if (field == "request_count") {
+        if ($0 ~ /^  "request_count": /) {
+          root_matches++
+        } else if ($0 ~ /^    "request_count": /) {
+          correlation_matches++
+        } else {
+          invalid = 1
+        }
+        if (matches == 1) {
+          first_value = value
+        } else if (value != first_value) {
+          invalid = 1
+        }
+      }
     }
     END {
-      if (invalid || matches != 1) {
+      request_count_invalid = field == "request_count" &&
+        (matches != 2 || root_matches != 1 || correlation_matches != 1)
+      other_count_invalid = field != "request_count" && matches != 1
+      if (invalid || request_count_invalid || other_count_invalid) {
         exit 1
       }
       print value
@@ -26219,8 +26366,12 @@ run_scenario() {
   local expected_java_missing=0
   local pressure_hits=0
   local pressure_roots=0
+  local pressure_w3c=0
   local pressure_wrong=0
   local pressure_unresolved=0
+  local pressure_bridge_valid=0
+  local pressure_bridge_failures=0
+  local pressure_w3c_masked_valid=0
   local pressure_runtime_quiesced=false
   local pressure_traffic_completed=false
   local pressure_evidence_cleanup_deadline=0
@@ -26345,8 +26496,12 @@ run_scenario() {
     expected_java_missing="$baseline_java_missing"
     pressure_hits=0
     pressure_roots=0
+    pressure_w3c=0
     pressure_wrong=0
     pressure_unresolved=0
+    pressure_bridge_valid=0
+    pressure_bridge_failures=0
+    pressure_w3c_masked_valid=0
     pressure_runtime_quiesced=false
     pressure_traffic_completed=false
     pressure_evidence_cleanup_deadline=0
@@ -26695,6 +26850,9 @@ run_scenario() {
         pressure_roots="$(pressure_scenario_count \
           "$output" explicit_root_count "$expected_requests" \
           "$pressure_evidence_work_deadline")" || pressure_roots=""
+        pressure_w3c="$(pressure_scenario_count \
+          "$output" w3c_parent_count "$expected_requests" \
+          "$pressure_evidence_work_deadline")" || pressure_w3c=""
         pressure_wrong="$(pressure_scenario_count \
           "$output" wrong_parent_count "$expected_requests" \
           "$pressure_evidence_work_deadline")" || pressure_wrong=""
@@ -26705,26 +26863,26 @@ run_scenario() {
       else
         pressure_hits=""
         pressure_roots=""
+        pressure_w3c=""
         pressure_wrong=""
         pressure_unresolved=""
       fi
       if [[ -n "$pressure_hits" && -n "$pressure_roots" && \
-        -n "$pressure_wrong" && -n "$pressure_unresolved" ]]; then
+        -n "$pressure_w3c" && -n "$pressure_wrong" && \
+        -n "$pressure_unresolved" ]]; then
         printf -v pressure_trace_json \
-          '{"exact_hit_count":%d,"explicit_root_count":%d,"wrong_parent_count":%d,"unresolved_count":%d}' \
+          '{"request_count":%d,"exact_hit_count":%d,"explicit_root_count":%d,"w3c_parent_count":%d,"wrong_parent_count":%d,"unresolved_count":%d}' \
+          "$expected_requests" \
           "$pressure_hits" \
           "$pressure_roots" \
+          "$pressure_w3c" \
           "$pressure_wrong" \
           "$pressure_unresolved"
-        printf -v pressure_java_json \
-          '{"take_valid_count":%d,"attributable_absence_count":%d,"diagnostic_self_miss_count":%d}' \
-          "$((pressure_hits + pressure_wrong))" \
-          "$pressure_roots" \
-          "$baseline_java_missing"
       fi
       if [[ -z "$pressure_hits" || -z "$pressure_roots" || \
-        -z "$pressure_wrong" || -z "$pressure_unresolved" ]] || \
-        ((pressure_hits + pressure_roots + pressure_wrong +
+        -z "$pressure_w3c" || -z "$pressure_wrong" || \
+        -z "$pressure_unresolved" ]] || \
+        ((pressure_hits + pressure_roots + pressure_w3c + pressure_wrong +
           pressure_unresolved != expected_requests)); then
         log_error "pressure scenario did not report complete bounded parent outcomes"
         expected_bridge_valid=0
@@ -26734,13 +26892,17 @@ run_scenario() {
           scenario_status=1
         fi
       else
-        expected_bridge_valid="$((pressure_hits + pressure_wrong))"
+        # H is the only pre-reconciliation lower bound: the single W3C
+        # request may add either one valid take or one attributable failure.
+        expected_bridge_valid="$pressure_hits"
         expected_bridge_missing="$baseline_bridge_missing"
-        expected_java_missing="$((baseline_java_missing + pressure_roots))"
+        expected_java_missing="$baseline_java_missing"
         if ((scenario_status == 0 &&
-          (pressure_roots == 0 || pressure_wrong != 0 || pressure_unresolved != 0 ||
-          pressure_hits + pressure_roots != expected_requests))); then
-          log_error "pressure scenario did not report at least one explicit root with zero wrong or unresolved parents"
+          (pressure_roots == 0 || pressure_w3c != 1 ||
+          baseline_java_missing != 1 ||
+          pressure_wrong != 0 || pressure_unresolved != 0 ||
+          pressure_hits + pressure_roots + pressure_w3c != expected_requests))); then
+          log_error "pressure scenario did not report H+R+W=N with W=1, R>=1, wrong=0, unresolved=0"
           scenario_status=1
         fi
       fi
@@ -26883,21 +27045,66 @@ run_scenario() {
           "$timeout_drop_reason"; then
           metric_status=1
         fi
-      elif [[ "$name" == "pressure" && -n "$pressure_hits" &&
-        -n "$pressure_roots" && -n "$pressure_wrong" && -n "$pressure_unresolved" ]]; then
-        pressure_bridge_json="$(pressure_bridge_reconciliation \
-          "$RESULT_DIR/phases/$after_phase/obi-metrics.delta" \
-          "$SELECTED_TRANSPORT" \
-          "$expected_bridge_valid" \
-          "$pressure_roots" \
-          "$expected_requests")" || {
-        pressure_bridge_json="null"
-        metric_status=1
-      }
-        if [[ "$SELECTED_TRANSPORT" == "unix" && "$pressure_roots" != "0" ]] && \
-          pressure_unix_already_consumed_roots_are_reconciled \
-            "$pressure_bridge_json" "$pressure_roots"; then
-          pressure_unix_already_consumed_reconciled=true
+      elif [[ "$name" == "pressure" ]]; then
+        if [[ -n "$pressure_hits" && -n "$pressure_roots" &&
+          -n "$pressure_w3c" && -n "$pressure_wrong" &&
+          -n "$pressure_unresolved" ]]; then
+          pressure_bridge_json="$(pressure_w3c_bridge_reconciliation \
+            "$RESULT_DIR/phases/$after_phase/obi-metrics.delta" \
+            "$SELECTED_TRANSPORT" \
+            "$pressure_hits" \
+            "$pressure_roots" \
+            "$pressure_w3c" \
+            "$expected_requests")" || {
+            pressure_bridge_json="null"
+            metric_status=1
+          }
+          if [[ "$pressure_bridge_json" != null ]]; then
+            pressure_bridge_valid="$(jq -er '.retrieval_valid_count' \
+              <<<"$pressure_bridge_json")" || pressure_bridge_valid=""
+            pressure_bridge_failures="$(jq -er '.attributable_failure_count' \
+              <<<"$pressure_bridge_json")" || pressure_bridge_failures=""
+            pressure_w3c_masked_valid="$(jq -er '.w3c_masked_valid_count' \
+              <<<"$pressure_bridge_json")" || pressure_w3c_masked_valid=""
+            if [[ ! "$pressure_bridge_valid" =~ ^(0|[1-9][0-9]*)$ ||
+              ! "$pressure_bridge_failures" =~ ^(0|[1-9][0-9]*)$ ||
+              ! "$pressure_w3c_masked_valid" =~ ^(0|1)$ ]] ||
+              ((pressure_hits > pressure_bridge_valid ||
+                pressure_bridge_valid > pressure_hits + pressure_w3c ||
+                pressure_roots > pressure_bridge_failures ||
+                pressure_bridge_failures > pressure_roots + pressure_w3c ||
+                pressure_bridge_valid + pressure_bridge_failures != expected_requests ||
+                pressure_w3c_masked_valid != pressure_bridge_valid - pressure_hits ||
+                pressure_w3c_masked_valid +
+                  pressure_bridge_failures - pressure_roots != pressure_w3c)); then
+              pressure_java_json="null"
+              metric_status=1
+            else
+              expected_bridge_valid="$pressure_bridge_valid"
+              expected_java_missing="$((
+                baseline_java_missing + pressure_bridge_failures
+              ))"
+              printf -v pressure_java_json \
+                '{"take_valid_count":%d,"take_sampled_count":%d,"take_unsampled_count":0,"discard_standard_count":%d,"attributable_absence_count":%d,"diagnostic_self_miss_count":%d}' \
+                "$pressure_bridge_valid" \
+                "$pressure_bridge_valid" \
+                "$pressure_w3c_masked_valid" \
+                "$pressure_bridge_failures" \
+                "$baseline_java_missing"
+            fi
+          fi
+          if [[ "$SELECTED_TRANSPORT" == "unix" ]]; then
+            if [[ "$pressure_bridge_json" != null &&
+              "$pressure_bridge_failures" =~ ^[1-9][0-9]*$ ]] &&
+              pressure_unix_already_consumed_roots_are_reconciled \
+                "$pressure_bridge_json" "$pressure_bridge_failures"; then
+              pressure_unix_already_consumed_reconciled=true
+            else
+              metric_status=1
+            fi
+          fi
+        else
+          metric_status=1
         fi
       elif ! assert_bridge_metric_delta \
         "$RESULT_DIR/phases/$after_phase/obi-metrics.delta" \
@@ -26941,6 +27148,9 @@ run_scenario() {
             expected_sampled="$((expected_requests / 2))"
             expected_unsampled="$(((expected_requests + 1) / 2))"
             ;;
+          pressure)
+            expected_standard="$pressure_w3c_masked_valid"
+            ;;
           primary-w3c-stale|unix-w3c-stale)
             expected_stale="$expected_requests"
             ;;
@@ -26966,7 +27176,7 @@ run_scenario() {
             "$expected_sampled" \
             "$expected_unsampled" \
             "$expected_standard" \
-            "$pressure_roots"; then
+            "$pressure_bridge_failures"; then
             metric_status=1
           fi
 		elif ! assert_java_diagnostics_delta \
@@ -41644,19 +41854,34 @@ metric_delta_operation_total() {
   ' "$input"
 }
 
-pressure_bridge_reconciliation() {
+pressure_bridge_reconciliation_internal() {
   local -r input="$1"
   local -r transport="$2"
-  local -r expected_valid="$3"
+  local -r expected_hits="$3"
   local -r expected_roots="$4"
-  local -r expected_requests="$5"
-  local -r supplied_maximum_admission="${6:-}"
+  local -r expected_w3c="$5"
+  local -r expected_requests="$6"
+  local -r supplied_maximum_admission="${7:-}"
+  local -r emit_w3c_fields="$8"
   local maximum_admission=""
 
   [[ ( "$transport" == "getsockopt" || "$transport" == "unix" ) &&
-    "$expected_valid" =~ ^(0|[1-9][0-9]*)$ &&
+    "$expected_hits" =~ ^(0|[1-9][0-9]*)$ &&
     "$expected_roots" =~ ^[1-9][0-9]*$ &&
-    "$expected_requests" =~ ^[1-9][0-9]*$ ]] || return 1
+    "$expected_w3c" =~ ^(0|1)$ &&
+    "$expected_requests" =~ ^[1-9][0-9]*$ &&
+    ( "$emit_w3c_fields" == true || "$emit_w3c_fields" == false ) ]] ||
+    return 1
+  bounded_decimal "$expected_hits" "$MAX_SHELL_INTEGER" true >/dev/null ||
+    return 1
+  bounded_decimal "$expected_roots" "$MAX_SHELL_INTEGER" false >/dev/null ||
+    return 1
+  bounded_decimal "$expected_requests" "$MAX_SHELL_INTEGER" false >/dev/null ||
+    return 1
+  ((expected_hits <= MAX_SHELL_INTEGER - expected_roots &&
+    expected_hits + expected_roots <= MAX_SHELL_INTEGER - expected_w3c &&
+    expected_hits + expected_roots + expected_w3c == expected_requests)) ||
+    return 1
   benchmark_pressure_trusted_regular_path "$input" || return $?
   if [[ -n "$supplied_maximum_admission" ]]; then
     bounded_decimal "$supplied_maximum_admission" "$MAX_SHELL_INTEGER" false \
@@ -41670,10 +41895,12 @@ pressure_bridge_reconciliation() {
 
   awk \
     -v selected="$transport" \
-    -v wanted_valid="$expected_valid" \
+    -v wanted_hits="$expected_hits" \
     -v wanted_roots="$expected_roots" \
+    -v wanted_w3c="$expected_w3c" \
     -v wanted_requests="$expected_requests" \
-    -v max_admission="$maximum_admission" '
+    -v max_admission="$maximum_admission" \
+    -v emit_w3c="$emit_w3c_fields" '
     function label(line, name, value) {
       value = line
       sub("^.*" name "=\"", "", value)
@@ -41803,33 +42030,45 @@ pressure_bridge_reconciliation() {
     }
     END {
       upstream_fail = inject_fail + candidate_fail + stage_fail
+      failure_count = selected == "getsockopt" ?
+        upstream_fail + retrieval_fail : retrieval_fail
+      masked_valid = retrieval_valid - wanted_hits
       if (inject_total != wanted_requests || inject_valid != candidate_total ||
-          candidate_valid != stage_total || retrieval_valid != wanted_valid ||
+          candidate_valid != stage_total ||
+          retrieval_valid < wanted_hits ||
+          retrieval_valid > wanted_hits + wanted_w3c ||
+          failure_count < wanted_roots ||
+          failure_count > wanted_roots + wanted_w3c ||
+          retrieval_valid + failure_count != wanted_requests ||
+          masked_valid + (failure_count - wanted_roots) != wanted_w3c ||
+          masked_valid < 0 || masked_valid > 1 ||
           handoff_valid > retrieval_valid ||
           (selected != "getsockopt" && handoff_valid != 0) ||
 	      admission_total != admission_overload + admission_ambiguous ||
 	      admission_overload_rows != 1 || admission_ambiguous_rows > 1 ||
 	      admission_overload < 1 || admission_overload > max_admission ||
-	      admission_ambiguous != 0 ||
-          wanted_valid + wanted_roots != wanted_requests) {
-	    printf "pressure bridge pipeline mismatch: requests=%d inject=%d/%d candidate=%d/%d stage=%d/%d retrieval=%d/%d handoff=%d admission=%d/%d/%d expected_valid=%d roots=%d\n",
+	      admission_ambiguous != 0) {
+	    printf "pressure bridge pipeline mismatch: requests=%d inject=%d/%d candidate=%d/%d stage=%d/%d retrieval=%d/%d failures=%d masked_valid=%d handoff=%d admission=%d/%d/%d expected_hits=%d roots=%d w3c=%d\n",
           wanted_requests, inject_valid, inject_total, candidate_valid, candidate_total,
           stage_valid, stage_total, retrieval_valid, retrieval_total,
-	      handoff_valid, admission_overload, admission_ambiguous, admission_total,
-	      wanted_valid, wanted_roots > "/dev/stderr"
+	      failure_count, masked_valid, handoff_valid, admission_overload,
+	      admission_ambiguous, admission_total, wanted_hits, wanted_roots,
+	      wanted_w3c > "/dev/stderr"
         failed = 1
       }
       if (selected == "getsockopt") {
         if (stage_valid != retrieval_total ||
-            upstream_fail + retrieval_fail != wanted_roots) {
-          printf "getsockopt pressure root mismatch: upstream_failures=%d retrieval_failures=%d roots=%d stage_valid=%d retrieval_total=%d\n",
-            upstream_fail, retrieval_fail, wanted_roots, stage_valid, retrieval_total > "/dev/stderr"
+            upstream_fail + retrieval_fail != failure_count) {
+	      printf "getsockopt pressure failure mismatch: upstream_failures=%d retrieval_failures=%d failures=%d stage_valid=%d retrieval_total=%d\n",
+            upstream_fail, retrieval_fail, failure_count, stage_valid,
+            retrieval_total > "/dev/stderr"
           failed = 1
         }
-      } else if (retrieval_total != wanted_requests || retrieval_fail != wanted_roots ||
-                 upstream_fail > wanted_roots) {
-        printf "unix pressure root mismatch: upstream_failures=%d retrieval_failures=%d roots=%d retrieval_total=%d requests=%d\n",
-          upstream_fail, retrieval_fail, wanted_roots, retrieval_total,
+      } else if (retrieval_total != wanted_requests ||
+                 retrieval_fail != failure_count ||
+                 upstream_fail > failure_count) {
+	      printf "unix pressure failure mismatch: upstream_failures=%d retrieval_failures=%d failures=%d retrieval_total=%d requests=%d\n",
+          upstream_fail, retrieval_fail, failure_count, retrieval_total,
           wanted_requests > "/dev/stderr"
         failed = 1
       }
@@ -41839,11 +42078,35 @@ pressure_bridge_reconciliation() {
       printf "{\"transport\":\"%s\",\"phase_outcome_counts\":{\"inject\":%d,\"candidate\":%d,\"stage\":%d,\"retrieval\":%d},", selected, inject_total, candidate_total, stage_total, retrieval_total
       printf "\"auxiliary_outcome_counts\":{\"handoff\":%d},", handoff_valid
 	  printf "\"handoff_admission_outcome_counts\":{\"overload\":%d,\"ambiguous\":%d,\"maximum\":%d},", admission_overload, admission_ambiguous, max_admission
-      printf "\"retrieval_valid_count\":%d,\"upstream_failure_count\":%d,\"retrieval_failure_count\":%d,", retrieval_valid, upstream_fail, retrieval_fail
+      printf "\"retrieval_valid_count\":%d,", retrieval_valid
+      if (emit_w3c == "true") {
+        printf "\"attributable_failure_count\":%d,\"w3c_masked_valid_count\":%d,", failure_count, masked_valid
+      }
+      printf "\"upstream_failure_count\":%d,\"retrieval_failure_count\":%d,", upstream_fail, retrieval_fail
       printf "\"upstream_failure_reason_counts\":{\"missing\":%d,\"stale\":%d,\"ambiguous\":%d,\"malformed\":%d,\"overload\":%d,\"segmented\":%d},", upstream_reason["missing"], upstream_reason["stale"], upstream_reason["ambiguous"], upstream_reason["malformed"], upstream_reason["overload"], upstream_reason["segmented"]
       printf "\"retrieval_failure_reason_counts\":{\"missing\":%d,\"stale\":%d,\"unsupported\":%d,\"malformed\":%d,\"version_mismatch\":%d,\"ambiguous\":%d,\"unauthorized\":%d,\"already_consumed\":%d,\"timeout\":%d,\"overload\":%d,\"transport_error\":%d,\"disabled\":%d}}\n", retrieval_reason["missing"], retrieval_reason["stale"], retrieval_reason["unsupported"], retrieval_reason["malformed"], retrieval_reason["version_mismatch"], retrieval_reason["ambiguous"], retrieval_reason["unauthorized"], retrieval_reason["already_consumed"], retrieval_reason["timeout"], retrieval_reason["overload"], retrieval_reason["transport_error"], retrieval_reason["disabled"]
     }
   ' "$input"
+}
+
+# Preserve the positional v1 benchmark-cycle interface and its exact JSON
+# shape.  The benchmark workload has no standard W3C request, so every valid
+# bridge take must be a trace hit and every attributable failure must be a
+# trace root.
+pressure_bridge_reconciliation() {
+  pressure_bridge_reconciliation_internal \
+    "$1" "$2" "$3" "$4" 0 "$5" "${6:-}" false
+}
+
+# The scenario pressure contract has one valid standard-W3C request.  Its
+# bridge retrieval may either succeed and be discarded in favor of W3C, or
+# fail while the W3C parent remains valid.  The returned v2-only fields bind
+# that masked outcome without changing the benchmark-cycle interface above.
+pressure_w3c_bridge_reconciliation() {
+  (($# == 6 || $# == 7)) || return 1
+  [[ "$5" == 1 ]] || return 1
+  pressure_bridge_reconciliation_internal \
+    "$1" "$2" "$3" "$4" "$5" "$6" "${7:-}" true
 }
 
 pressure_unix_already_consumed_roots_are_reconciled() {

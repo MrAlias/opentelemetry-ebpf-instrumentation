@@ -547,16 +547,17 @@ write_location_aware_projector_fixture() {
       '[[ "$script_path" == "$script_source" ]] || exit 91' \
       'script_directory="$(CDPATH= cd -P -- "$(dirname -- "$script_source")" && pwd -P)"' \
       '[[ -x "$script_directory/verify-retained-evidence.sh" ]]' \
-      '[[ $# == 4 ]]' \
-      '"$script_directory/verify-retained-evidence.sh" "$4" "$script_source"'
+      '[[ $# == 5 && "$1" == --claims-v2 ]]' \
+      '"$script_directory/verify-retained-evidence.sh" "$5" "$script_source" "$1"'
   } >"$scripts/project-retained-acceptance-evidence.sh"
   {
     printf '%s\n' \
       '#!/usr/bin/env bash' \
       'set -Eeuo pipefail' \
-      '[[ $# == 2 ]]' \
+      '[[ $# == 3 ]]' \
       'mkdir -m 0700 -- "$1"' \
-      'printf '\''%s\n'\'' "$2" >"$1/projector-source"'
+      'printf '\''%s\n'\'' "$2" >"$1/projector-source"' \
+      'printf '\''%s\n'\'' "$3" >"$1/projector-selector"'
   } >"$scripts/verify-retained-evidence.sh"
   chmod 0755 -- "$scripts/project-retained-acceptance-evidence.sh" \
     "$scripts/verify-retained-evidence.sh"
@@ -1312,10 +1313,11 @@ mock_campaign_execute() {
 
 mock_projector_execute() {
   local -r projector="$1"
-  local -r acceptance="$2"
-  local -r assertion_result="$3"
-  local -r receipt="$4"
-  local -r output="$5"
+  local -r selector="$2"
+  local -r acceptance="$3"
+  local -r assertion_result="$4"
+  local -r receipt="$5"
+  local -r output="$6"
   local receipt_text=""
   local mutant=""
   local receipt_mutation=""
@@ -1323,10 +1325,12 @@ mock_projector_execute() {
   [[ -f "$projector" &&
     "$(readlink -f -- "$projector")" == \
       "$CHECKOUT_DIRECTORY/examples/apache-java-https/scripts/project-retained-acceptance-evidence.sh" &&
+    "$selector" == --claims-v2 &&
     "$acceptance" == "$RAW_ACCEPTANCE" &&
     "$assertion_result" == "$RAW_ASSERTION" &&
     "$receipt" == "$RECEIPT" && "$output" == "$OUTPUT_DIRECTORY" ]] || return 1
   : >"$CASE_ROOT/projector-invoked"
+  printf '%s\n' "$selector" >"$CASE_ROOT/projector-selector"
   assert_receipt_unchanged || return 1
   validate_receipt "$receipt" || return 1
   [[ "$(stat -Lc '%u:%a:%h' -- "$receipt")" == "$EUID:600:1" ]] ||
@@ -1611,6 +1615,9 @@ test_success_and_failure_campaigns() {
   assert_success_state_machine "$success_root/stderr.log"
   assert_success_handoff "$success_root"
   assert_observed_receipt "$success_root/observed-receipt.json"
+  [[ -f "$success_root/projector-selector" &&
+    "$(<"$success_root/projector-selector")" == --claims-v2 ]] ||
+    die 'successful campaign silently fell back from claims-v2 projection'
   ! grep -Fq 'acceptance_failure_classification=' "$success_root/stderr.log" ||
     die 'successful campaign emitted a failure classification'
   [[ -d "$success_root/public-parent/test-claims" &&
@@ -2798,9 +2805,13 @@ test_real_location_aware_projector_execution() {
   local assertion_result="$case_root/assertion"
   local receipt="$case_root/receipt.json"
   local procfd_output="$case_root/procfd-output"
+  local default_output="$case_root/public/default-output"
+  local claims_v1_output="$case_root/public/claims-v1-output"
   local projected_output="$case_root/public/projected"
   local projector_fd=""
   local projector_procfd=""
+  local default_status=0
+  local claims_v1_status=0
   local procfd_status=0
 
   mkdir -p -- "$case_root/public" "$case_root/private"
@@ -2809,10 +2820,24 @@ test_real_location_aware_projector_execution() {
   chmod 0600 -- "$receipt"
   write_location_aware_projector_fixture "$scripts"
 
+  set +e
+  "$projector" "$acceptance" "$assertion_result" "$receipt" \
+    "$default_output" >/dev/null 2>&1
+  default_status=$?
+  "$projector" --claims-v1 "$acceptance" "$assertion_result" "$receipt" \
+    "$claims_v1_output" >/dev/null 2>&1
+  claims_v1_status=$?
+  set -e
+  [[ "$default_status" != 0 && "$claims_v1_status" != 0 &&
+    ! -e "$default_output" && ! -L "$default_output" &&
+    ! -e "$claims_v1_output" && ! -L "$claims_v1_output" ]] ||
+    die 'location-aware projector fixture accepted a default/v1 fallback'
+
   exec {projector_fd}<"$projector"
   projector_procfd="/proc/$BASHPID/fd/$projector_fd"
   set +e
-  "$projector_procfd" "$acceptance" "$assertion_result" "$receipt" \
+  "$projector_procfd" --claims-v2 \
+    "$acceptance" "$assertion_result" "$receipt" \
     "$procfd_output" >/dev/null 2>&1
   procfd_status=$?
   set -e
@@ -2846,7 +2871,9 @@ test_real_location_aware_projector_execution() {
 
     project_claims
     [[ -f "$projected_output/projector-source" &&
-      "$(<"$projected_output/projector-source")" == "$projector" ]]
+      "$(<"$projected_output/projector-source")" == "$projector" &&
+      -f "$projected_output/projector-selector" &&
+      "$(<"$projected_output/projector-selector")" == --claims-v2 ]]
     exec {PRIVATE_DIRECTORY_FD}<&-
   ) || die 'project_claims did not execute the pinned canonical projector path'
 }
@@ -3060,7 +3087,10 @@ test_static_privacy_and_wiring_contract() {
   grep -Fq 'bytes: "exact-command-order-no-normalization"' "$CAMPAIGN_RUNNER" ||
     return 1
   grep -Fq 'stream: "combined-stdout-stderr"' "$CAMPAIGN_RUNNER" || return 1
-  grep -Fq 'if projector_execute "$projector" "$RAW_ACCEPTANCE"' \
+  [[ "$(grep -Fc \
+    'if projector_execute "$projector" --claims-v2 "$RAW_ACCEPTANCE"' \
+    "$CAMPAIGN_RUNNER")" == 1 ]] || return 1
+  ! grep -Fq 'if projector_execute "$projector" "$RAW_ACCEPTANCE"' \
     "$CAMPAIGN_RUNNER" || return 1
   grep -Fq '"${PUBLIC_VERIFY_TIMEOUT_SECONDS}s" bash "$verifier")"; then' \
     "$CAMPAIGN_RUNNER" || return 1

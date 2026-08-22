@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -35,11 +36,18 @@ const (
 	maxResponseHeaderBytes = 64 << 10
 	maxTrustedCABytes      = 1 << 20
 	maxJSONSafeInteger     = uint64(1<<53 - 1)
+	maxReceiverMarkerBytes = 128
+	requestMarkerWidth     = 7
+	maxMarkerPrefixBytes   = maxReceiverMarkerBytes - 1 - requestMarkerWidth
 
 	tlsVerificationNotApplicable = "not_applicable"
 	tlsVerificationCAFile        = "verified_ca_file"
 	latencyHistogramEncoding     = "sorted_rle_nanos_v1"
+	requestMarkerEncoding        = "prefix-dash-zero-padded-ordinal-v1"
+	defaultRequestMarker         = "benchmark-load"
 )
+
+var canonicalMarkerPrefix = regexp.MustCompile(`^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$`)
 
 type config struct {
 	baseURL        string
@@ -52,6 +60,7 @@ type config struct {
 	requestLimit   uint64
 	seed           uint64
 	w3c            bool
+	markerPrefix   string
 }
 
 type latencySummary struct {
@@ -89,6 +98,11 @@ type runResult struct {
 	ThroughputPerSecond float64        `json:"throughput_per_second"`
 	Latency             latencySummary `json:"latency"`
 	FirstFailure        string         `json:"first_failure,omitempty"`
+	MarkerPrefix        string         `json:"marker_prefix,omitempty"`
+	MarkerEncoding      string         `json:"marker_encoding,omitempty"`
+	AdmittedRequests    uint64         `json:"admitted_requests,omitempty"`
+	FirstRequestOrdinal uint64         `json:"first_request_ordinal,omitempty"`
+	LastRequestOrdinal  uint64         `json:"last_request_ordinal,omitempty"`
 }
 
 type measurements struct {
@@ -155,6 +169,7 @@ func parseFlags(arguments []string) (config, error) {
 	flags.Uint64Var(&cfg.requestLimit, "request-limit", cfg.requestLimit, "maximum requests")
 	flags.Uint64Var(&cfg.seed, "seed", 0, "deterministic W3C identifier seed")
 	flags.BoolVar(&cfg.w3c, "w3c", false, "send a valid W3C traceparent on every request")
+	flags.StringVar(&cfg.markerPrefix, "marker-prefix", "", "canonical run-unique request marker prefix")
 	if err := flags.Parse(arguments); err != nil {
 		return config{}, err
 	}
@@ -182,6 +197,18 @@ func validateConfig(cfg config) error {
 	}
 	if cfg.seed > maxJSONSafeInteger {
 		return fmt.Errorf("--seed must be between 0 and %d", maxJSONSafeInteger)
+	}
+	if cfg.markerPrefix != "" {
+		if len(cfg.markerPrefix) > maxMarkerPrefixBytes ||
+			!canonicalMarkerPrefix.MatchString(cfg.markerPrefix) {
+			return fmt.Errorf(
+				"--marker-prefix must be 1-%d bytes of canonical lowercase alphanumeric dash-separated text",
+				maxMarkerPrefixBytes,
+			)
+		}
+		if cfg.markerPrefix == defaultRequestMarker {
+			return fmt.Errorf("--marker-prefix %q collides with the default marker namespace", cfg.markerPrefix)
+		}
 	}
 	if cfg.connectionMode != "close" && cfg.connectionMode != "reuse" {
 		return errors.New("--connection-mode must be close or reuse")
@@ -374,6 +401,15 @@ func run(parent context.Context, cfg config) (runResult, error) {
 	result.FinishedAt = time.Now().UTC()
 	result.TrafficElapsedNanos = time.Since(startedAt).Nanoseconds()
 	result.RequestLimitReached = admissions.count() == cfg.requestLimit
+	if cfg.markerPrefix != "" {
+		result.MarkerPrefix = cfg.markerPrefix
+		result.MarkerEncoding = requestMarkerEncoding
+		result.AdmittedRequests = admissions.count()
+		if result.AdmittedRequests > 0 {
+			result.FirstRequestOrdinal = 1
+			result.LastRequestOrdinal = result.AdmittedRequests
+		}
+	}
 	result.SuccessfulRequests, result.FailedRequests, result.FirstFailure, result.Latency = measurements.summary()
 	if result.TrafficElapsedNanos > 0 {
 		result.ThroughputPerSecond = float64(result.SuccessfulRequests) /
@@ -436,7 +472,14 @@ func sendRequest(
 	if err != nil {
 		return err
 	}
-	request.Header.Set("X-OBI-Demo-ID", "benchmark-load")
+	marker := defaultRequestMarker
+	if cfg.markerPrefix != "" {
+		marker, err = requestMarker(cfg.markerPrefix, requestNumber)
+		if err != nil {
+			return err
+		}
+	}
+	request.Header.Set("X-OBI-Demo-ID", marker)
 	request.Close = cfg.connectionMode == "close"
 	if cfg.w3c {
 		request.Header.Set("traceparent", traceparent(cfg.seed, requestNumber))
@@ -458,6 +501,21 @@ func sendRequest(
 		return fmt.Errorf("response body exceeds %d bytes", maxResponseBytes)
 	}
 	return nil
+}
+
+func requestMarker(prefix string, requestNumber uint64) (string, error) {
+	if prefix == "" || len(prefix) > maxMarkerPrefixBytes ||
+		!canonicalMarkerPrefix.MatchString(prefix) || prefix == defaultRequestMarker {
+		return "", errors.New("invalid canonical marker prefix")
+	}
+	if requestNumber == 0 || requestNumber > maxRequestLimit {
+		return "", fmt.Errorf("request marker ordinal must be between 1 and %d", maxRequestLimit)
+	}
+	marker := fmt.Sprintf("%s-%0*d", prefix, requestMarkerWidth, requestNumber)
+	if len(marker) > maxReceiverMarkerBytes {
+		return "", errors.New("request marker exceeds receiver limit")
+	}
+	return marker, nil
 }
 
 func traceparent(seed, requestNumber uint64) string {

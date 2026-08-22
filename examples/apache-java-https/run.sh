@@ -130,6 +130,55 @@ PRESSURE_RUNTIME_CLEANUP_DEADLINE_SECONDS=180
 PRESSURE_MAX_ENTRIES=50000
 PRESSURE_EXPECTED_MAP_CAPACITY=10000
 PRESSURE_ADMISSION_MAX_EVENTS_PER_REQUEST=9
+# The targeted pressure-cycle campaign is deliberately source-coupled.  These
+# are protocol constants, not tuning knobs: changing any member creates a new
+# evidence contract and must update the hostile validator tests with it.
+BENCHMARK_PRESSURE_CYCLE_COUNT=10
+BENCHMARK_PRESSURE_LOAD_SECONDS=60
+BENCHMARK_PRESSURE_IDLE_SECONDS=30
+BENCHMARK_PRESSURE_RECOVERY_SAMPLES=2
+BENCHMARK_PRESSURE_CONCURRENCY=16
+BENCHMARK_PRESSURE_REQUEST_TIMEOUT_SECONDS=10
+BENCHMARK_PRESSURE_REQUEST_LIMIT=4096
+BENCHMARK_PRESSURE_MAX_SUCCESSFUL_REQUESTS=2000
+BENCHMARK_PRESSURE_CLIENT_TIMEOUT_SECONDS=95
+BENCHMARK_PRESSURE_LOAD_OVERRUN_SECONDS=1
+BENCHMARK_PRESSURE_CONTROL_DEADLINE_SECONDS=300
+BENCHMARK_PRESSURE_RESULT_MAX_BYTES=1048576
+BENCHMARK_PRESSURE_CLIENT_COMMIT_MAX_BYTES=65536
+BENCHMARK_PRESSURE_STDERR_MAX_BYTES=65536
+BENCHMARK_PRESSURE_STDERR_MAX_LINES=512
+BENCHMARK_PRESSURE_RESOURCE_MAX_BYTES=1048576
+BENCHMARK_PRESSURE_RESOURCE_MAX_LINES=1
+BENCHMARK_PRESSURE_STATS_MAX_BYTES=65536
+BENCHMARK_PRESSURE_STATS_MAX_LINES=3
+BENCHMARK_PRESSURE_STATS_ROW_MAX_BYTES=16384
+BENCHMARK_PRESSURE_STACK_MAX_BYTES=8192
+BENCHMARK_PRESSURE_TRACE_RESET_MAX_BYTES=4096
+BENCHMARK_PRESSURE_TRACE_SNAPSHOT_MAX_BYTES=100663296
+BENCHMARK_PRESSURE_TRACE_SETTLEMENT_TIMEOUT_SECONDS=45
+BENCHMARK_PRESSURE_TRACE_SETTLEMENT_SAMPLES=2
+BENCHMARK_PRESSURE_TRACE_MAX_SPANS=10000
+BENCHMARK_PRESSURE_TRACE_MAX_RETAINED_BYTES=67108864
+BENCHMARK_PRESSURE_TRACE_MAX_VALUE_BYTES=4096
+BENCHMARK_PRESSURE_TRACE_SPANS_PER_REQUEST=3
+BENCHMARK_PRESSURE_ADMISSION_RECEIPT_MAX_BYTES=1048576
+BENCHMARK_PRESSURE_MANIFEST_MAX_BYTES=1048576
+BENCHMARK_PRESSURE_AGGREGATE_MAX_BYTES=1048576
+BENCHMARK_PRESSURE_JSON_MAX_DEPTH=64
+BENCHMARK_PRESSURE_PYTHON_EXECUTABLE=/usr/bin/python3
+BENCHMARK_PRESSURE_ENV_EXECUTABLE=/usr/bin/env
+BENCHMARK_PRESSURE_TIMEOUT_EXECUTABLE=/usr/bin/timeout
+BENCHMARK_PRESSURE_BROKER_TIMEOUT_SECONDS=10
+BENCHMARK_PRESSURE_BROKER_KILL_GRACE_SECONDS=1
+BENCHMARK_PRESSURE_PUBLICATION_AMBIGUOUS_STATUS=75
+BENCHMARK_PRESSURE_COHERENT_MAX_DIRECTORY_ENTRIES=2048
+BENCHMARK_PRESSURE_COHERENT_MAX_DIRECTORY_NAME_BYTES=131072
+BENCHMARK_PRESSURE_BASE_URL="http://127.0.0.1:18080"
+BENCHMARK_PRESSURE_PATH="/api/echo?delay_ms=500"
+BENCHMARK_PRESSURE_CONNECTION_MODE="close"
+BENCHMARK_PRESSURE_HISTOGRAM_ENCODING="sorted_rle_nanos_v1"
+BENCHMARK_PRESSURE_MARKER_ENCODING="prefix-dash-zero-padded-ordinal-v1"
 RECEIVE_CURSOR_MAP_MAX_ENTRIES=10000
 RECEIVE_CURSOR_MAP_RECOVERY_TIMEOUT_SECONDS=10
 RECEIVE_CURSOR_MAP_RECOVERY_CONSECUTIVE_SAMPLES=2
@@ -305,6 +354,49 @@ readonly PRESSURE_RUNTIME_CLEANUP_STAGE_MAX_RETRIES
 readonly PRESSURE_RUNTIME_CLEANUP_DEADLINE_SECONDS
 readonly PRESSURE_EXPECTED_MAP_CAPACITY
 readonly PRESSURE_ADMISSION_MAX_EVENTS_PER_REQUEST
+readonly BENCHMARK_PRESSURE_CYCLE_COUNT
+readonly BENCHMARK_PRESSURE_LOAD_SECONDS BENCHMARK_PRESSURE_IDLE_SECONDS
+readonly BENCHMARK_PRESSURE_RECOVERY_SAMPLES
+readonly BENCHMARK_PRESSURE_CONCURRENCY
+readonly BENCHMARK_PRESSURE_REQUEST_TIMEOUT_SECONDS
+readonly BENCHMARK_PRESSURE_REQUEST_LIMIT
+readonly BENCHMARK_PRESSURE_MAX_SUCCESSFUL_REQUESTS
+readonly BENCHMARK_PRESSURE_CLIENT_TIMEOUT_SECONDS
+readonly BENCHMARK_PRESSURE_LOAD_OVERRUN_SECONDS
+readonly BENCHMARK_PRESSURE_CONTROL_DEADLINE_SECONDS
+readonly BENCHMARK_PRESSURE_RESULT_MAX_BYTES
+readonly BENCHMARK_PRESSURE_CLIENT_COMMIT_MAX_BYTES
+readonly BENCHMARK_PRESSURE_STDERR_MAX_BYTES
+readonly BENCHMARK_PRESSURE_STDERR_MAX_LINES
+readonly BENCHMARK_PRESSURE_RESOURCE_MAX_BYTES
+readonly BENCHMARK_PRESSURE_RESOURCE_MAX_LINES
+readonly BENCHMARK_PRESSURE_STATS_MAX_BYTES BENCHMARK_PRESSURE_STATS_MAX_LINES
+readonly BENCHMARK_PRESSURE_STATS_ROW_MAX_BYTES
+readonly BENCHMARK_PRESSURE_STACK_MAX_BYTES
+readonly BENCHMARK_PRESSURE_TRACE_RESET_MAX_BYTES
+readonly BENCHMARK_PRESSURE_TRACE_SNAPSHOT_MAX_BYTES
+readonly BENCHMARK_PRESSURE_TRACE_SETTLEMENT_TIMEOUT_SECONDS
+readonly BENCHMARK_PRESSURE_TRACE_SETTLEMENT_SAMPLES
+readonly BENCHMARK_PRESSURE_TRACE_MAX_SPANS
+readonly BENCHMARK_PRESSURE_TRACE_MAX_RETAINED_BYTES
+readonly BENCHMARK_PRESSURE_TRACE_MAX_VALUE_BYTES
+readonly BENCHMARK_PRESSURE_TRACE_SPANS_PER_REQUEST
+readonly BENCHMARK_PRESSURE_ADMISSION_RECEIPT_MAX_BYTES
+readonly BENCHMARK_PRESSURE_MANIFEST_MAX_BYTES
+readonly BENCHMARK_PRESSURE_AGGREGATE_MAX_BYTES
+readonly BENCHMARK_PRESSURE_JSON_MAX_DEPTH
+readonly BENCHMARK_PRESSURE_PYTHON_EXECUTABLE
+readonly BENCHMARK_PRESSURE_ENV_EXECUTABLE
+readonly BENCHMARK_PRESSURE_TIMEOUT_EXECUTABLE
+readonly BENCHMARK_PRESSURE_BROKER_TIMEOUT_SECONDS
+readonly BENCHMARK_PRESSURE_BROKER_KILL_GRACE_SECONDS
+readonly BENCHMARK_PRESSURE_PUBLICATION_AMBIGUOUS_STATUS
+readonly BENCHMARK_PRESSURE_COHERENT_MAX_DIRECTORY_ENTRIES
+readonly BENCHMARK_PRESSURE_COHERENT_MAX_DIRECTORY_NAME_BYTES
+readonly BENCHMARK_PRESSURE_BASE_URL BENCHMARK_PRESSURE_PATH
+readonly BENCHMARK_PRESSURE_CONNECTION_MODE
+readonly BENCHMARK_PRESSURE_HISTOGRAM_ENCODING
+readonly BENCHMARK_PRESSURE_MARKER_ENCODING
 # This source marker is consumed by the raw-v3 verifier, not by this shell.
 # shellcheck disable=SC2034
 readonly PRESSURE_TRAFFIC_CONTRACT_VERSION
@@ -687,7 +779,7 @@ Options:
                           delayed-otlp-suppression, assertion-failure, fail-open,
                           diagnostic-nondisclosure,
                           restart, disabled, uninstrumented, benchmark-disabled,
-                          or benchmark-uninstrumented.
+                          benchmark-uninstrumented, or benchmark-pressure-cycles.
                           Default: all
   --requests COUNT        Requests per scenario (1-1000); scenario default
                           when omitted.
@@ -884,7 +976,7 @@ parse_args() {
       ;;
   esac
   case "$SCENARIO" in
-    all|basic|keepalive|pipelining|concurrency|connection-churn|fd-port-reuse|slow-body|tls-boundary|coalesced-bridge|timeout-retry|pressure|handoff|virtual-thread|netty|netty-server|dispatch|w3c|w3c-match|obi-flags|w3c-fault|primary-w3c-fault|primary-generation-mismatch|unix-generation-mismatch|pid-reuse|primary-w3c-stale|unix-w3c-stale|w3c-only|security|restart-fault|helper-attach-failure|delayed-otlp-suppression|assertion-failure|fail-open|permanent-absence|auto-unavailable|diagnostic-nondisclosure|restart|disabled|uninstrumented|benchmark-disabled|benchmark-uninstrumented)
+    all|basic|keepalive|pipelining|concurrency|connection-churn|fd-port-reuse|slow-body|tls-boundary|coalesced-bridge|timeout-retry|pressure|handoff|virtual-thread|netty|netty-server|dispatch|w3c|w3c-match|obi-flags|w3c-fault|primary-w3c-fault|primary-generation-mismatch|unix-generation-mismatch|pid-reuse|primary-w3c-stale|unix-w3c-stale|w3c-only|security|restart-fault|helper-attach-failure|delayed-otlp-suppression|assertion-failure|fail-open|permanent-absence|auto-unavailable|diagnostic-nondisclosure|restart|disabled|uninstrumented|benchmark-disabled|benchmark-uninstrumented|benchmark-pressure-cycles)
       ;;
     *)
       die "unsupported scenario: $SCENARIO"
@@ -942,6 +1034,20 @@ parse_args() {
     }
     [[ "$KEEP_RUNNING" == "false" ]] || {
       die "the diagnostic-nondisclosure scenario cannot leave diagnostic logging running"
+    }
+  fi
+  if [[ "$SCENARIO" == "benchmark-pressure-cycles" ]]; then
+    [[ "$TRANSPORT" == "getsockopt" ]] || {
+      die "the benchmark-pressure-cycles scenario requires --transport getsockopt"
+    }
+    [[ "$REQUEST_COUNT" == "0" ]] || {
+      die "the benchmark-pressure-cycles scenario does not accept a custom request count"
+    }
+    [[ "$REPEAT_COUNT" == "1" ]] || {
+      die "the benchmark-pressure-cycles scenario has exactly ten internal cycles"
+    }
+    [[ "$KEEP_RUNNING" == "false" ]] || {
+      die "the benchmark-pressure-cycles scenario cannot leave the stack running"
     }
   fi
   if [[ "$SCENARIO" == "w3c-fault" && "$TRANSPORT" != "unix" ]]; then
@@ -1622,6 +1728,17 @@ run_bounded() {
   local -r seconds="$1"
   shift
   timeout --signal=TERM --kill-after=10s "${seconds}s" "$@" </dev/null
+}
+
+# The benchmark capture owns a dedicated job-control process group.  Keep the
+# timeout in that group so its entire descendant tree can be stopped when the
+# capture shell itself receives a signal; the generic timeout helper creates a
+# nested process group that cannot be authenticated by the capture owner.
+run_bounded_foreground_group() {
+  local -r seconds="$1"
+  shift
+  timeout --foreground --signal=TERM --kill-after=10s \
+    "${seconds}s" "$@" </dev/null
 }
 
 record_failure() {
@@ -6585,11 +6702,26 @@ pressure_registered_or_lexical_read_path() {
     pressure_transaction_parent_identity_matches "$path" "$deadline" || return $?
   elif pressure_transaction_target_path_is_allowed "$path" key resolved; then
     pressure_transaction_parent_identity_matches "$path" "$deadline" || return $?
+  elif [[ "$path" =~ ^/proc/self/fd/[1-9][0-9]*$ ]]; then
+    # A caller that already holds a regular-file descriptor may pass its
+    # procfs handle.  Unlike a lexical symlink, this handle pins the inode for
+    # every subsequent bounded read.
+    [[ -f "$path" ]] || return 1
   else
     [[ -f "$path" && ! -L "$path" ]] || return 1
   fi
   [[ -f "$resolved" ]] || return 1
   printf -v "$output_variable" '%s' "$resolved"
+}
+
+benchmark_pressure_trusted_regular_path() {
+  local -r path="$1"
+
+  if [[ "$path" =~ ^/proc/self/fd/[1-9][0-9]*$ ]]; then
+    [[ -f "$path" ]]
+    return
+  fi
+  [[ ! -L "$path" && -f "$path" ]]
 }
 
 pressure_tx_for_target() {
@@ -13256,6 +13388,8 @@ retain_pressure_control_evidence() {
   local expected_release_payload=""
   local observed_ready_identity=""
   local observed_release_identity=""
+  local ready_payload=""
+  local release_payload=""
   local ready_candidate=""
   local release_candidate=""
   local publication_status=0
@@ -15274,7 +15408,7 @@ pressure_result_hex() {
   local marker=""
   local value=""
 
-  [[ "$field" =~ ^[a-z_]+$ ]] || return 1
+  [[ "$field" =~ ^[a-z][a-z0-9_]*$ ]] || return 1
   record="$(pressure_result_record "$input" "$deadline")" || return $?
   marker="\"$field\":\""
   [[ "$record" == *"$marker"* ]] || return 1
@@ -17818,6 +17952,8233 @@ cleanup_map_pressure() {
   ((PRESSURE_CLEANUP_DEADLINE > SECONDS)) || return 124
   PRESSURE_ACTIVE=false
   PRESSURE_CLEANUP_DELETION_ATTEMPT_OPEN=false
+}
+
+benchmark_pressure_monotonic_centiseconds() {
+  local uptime=""
+  local whole=""
+  local fraction=""
+
+  IFS=' ' read -r uptime _ </proc/uptime || return $?
+  [[ "$uptime" =~ ^([0-9]+)\.([0-9]+)$ ]] || return 1
+  whole="${BASH_REMATCH[1]}"
+  fraction="${BASH_REMATCH[2]}00"
+  fraction="${fraction:0:2}"
+  printf '%s\n' "$((10#$whole * 100 + 10#$fraction))"
+}
+
+# Reexec the currently running Bash through a retained executable descriptor,
+# then start an absolute broker command with an empty environment.  Assigning
+# POSIXLY_CORRECT changes Bash command lookup immediately: `exec` becomes a
+# special builtin and therefore precedes same-shell or imported functions named
+# exec.  Its `-c` option clears the environment before the reexec dynamic loader
+# runs, so neither LD_* nor exported Bash functions reach the clean POSIX shell.
+# A long per-process descriptor spelling also prevents a predeclared slash-name
+# function from naming this invocation.  The clean shell verifies that the
+# retained descriptor is its own executable, closes it, and uses the same
+# special-builtin `exec -c` for the supplied absolute command.  This function is
+# called only from an already-isolated subshell or coprocess and never returns on
+# success.
+benchmark_pressure_clean_broker_exec() {
+  local bootstrap_fd=""
+  local bootstrap_path=/proc
+  local bootstrap_index=0
+  local -r bootstrap_pid="$BASHPID"
+
+  (($# > 0)) || return 1
+  {
+    for ((bootstrap_index = 0; bootstrap_index < 96; bootstrap_index++)); do
+      if ((RANDOM & 1)); then
+        bootstrap_path+=/.
+      else
+        bootstrap_path+=//
+      fi
+    done
+    bootstrap_path+="/$bootstrap_pid/fd/$bootstrap_fd"
+    [[ "$bootstrap_fd" =~ ^[1-9][0-9]*$ &&
+      "$bootstrap_path" == /* && -e "/proc/$bootstrap_pid/fd/$bootstrap_fd" &&
+      "/proc/$bootstrap_pid/exe" -ef "/proc/$bootstrap_pid/fd/$bootstrap_fd" ]] ||
+      return 1
+    POSIXLY_CORRECT=1
+    [[ -o posix ]] || return 1
+    exec -c "$bootstrap_path" --noprofile --norc --posix -c '
+      expected_pid=$1
+      bootstrap_fd=$2
+      shift 2
+      [[ -o posix && "$BASHPID" == "$expected_pid" &&
+        "$bootstrap_fd" =~ ^[1-9][0-9]*$ &&
+        /proc/self/exe -ef "/proc/self/fd/$bootstrap_fd" ]] || exit 1
+      exec {bootstrap_fd}<&-
+      exec -c "$@"
+    ' benchmark-pressure-clean-bootstrap "$bootstrap_pid" "$bootstrap_fd" "$@"
+  } {bootstrap_fd}<"/proc/$bootstrap_pid/exe"
+}
+
+# The pressure evidence brokers are part of the authority boundary.  Resolve no
+# executable through PATH.  The isolated Python process authenticates its own
+# executable, timeout parent, imported modules, mapped libraries, and every
+# ancestor as root-owned and non-group/world-writable.  Root-level replacement
+# remains outside this harness's same-user mutation model.
+benchmark_pressure_broker_executables_are_authenticated() (
+  [[ "$BENCHMARK_PRESSURE_PYTHON_EXECUTABLE" == /usr/bin/python3 &&
+    "$BENCHMARK_PRESSURE_ENV_EXECUTABLE" == /usr/bin/env &&
+    "$BENCHMARK_PRESSURE_TIMEOUT_EXECUTABLE" == /usr/bin/timeout ]] || return 1
+  benchmark_pressure_clean_broker_exec \
+    "$BENCHMARK_PRESSURE_ENV_EXECUTABLE" -i LC_ALL=C LANG=C \
+    PATH=/usr/bin:/bin \
+    "$BENCHMARK_PRESSURE_TIMEOUT_EXECUTABLE" --signal=TERM \
+    --kill-after="${BENCHMARK_PRESSURE_BROKER_KILL_GRACE_SECONDS}s" \
+    "${BENCHMARK_PRESSURE_BROKER_TIMEOUT_SECONDS}s" \
+    "$BENCHMARK_PRESSURE_PYTHON_EXECUTABLE" -I /dev/fd/3 \
+    "$BENCHMARK_PRESSURE_PYTHON_EXECUTABLE" \
+    "$BENCHMARK_PRESSURE_TIMEOUT_EXECUTABLE" \
+    "$BENCHMARK_PRESSURE_ENV_EXECUTABLE" 3<<'PY'
+import os
+import stat
+import sys
+
+
+def fail():
+    raise SystemExit(1)
+
+
+def trusted_root_file(path, executable=False):
+    resolved = os.path.realpath(path)
+    value = os.stat(resolved, follow_symlinks=False)
+    if (not resolved.startswith("/") or not stat.S_ISREG(value.st_mode) or
+            value.st_uid != 0 or
+            value.st_gid != 0 or stat.S_IMODE(value.st_mode) & 0o022 or
+            (executable and not stat.S_IMODE(value.st_mode) & 0o111)):
+        fail()
+    parent = os.path.dirname(resolved)
+    while True:
+        value = os.stat(parent, follow_symlinks=False)
+        if (not stat.S_ISDIR(value.st_mode) or value.st_uid != 0 or
+                value.st_gid != 0 or stat.S_IMODE(value.st_mode) & 0o022):
+            fail()
+        if parent == "/":
+            break
+        parent = os.path.dirname(parent)
+    return resolved
+
+
+if dict(os.environ) != {"LC_ALL": "C", "LANG": "C", "PATH": "/usr/bin:/bin"}:
+    fail()
+python = trusted_root_file(sys.argv[1], executable=True)
+timeout = trusted_root_file(sys.argv[2], executable=True)
+environment = trusted_root_file(sys.argv[3], executable=True)
+if (os.path.realpath("/proc/self/exe") != python or
+        os.path.realpath(f"/proc/{os.getppid()}/exe") != timeout or
+        environment != "/usr/bin/env"):
+    fail()
+paths = set()
+for module in tuple(sys.modules.values()):
+    path = getattr(module, "__file__", "")
+    if path and path != "/dev/fd/3":
+        paths.add(path)
+with open("/proc/self/maps", "r", encoding="ascii") as mappings:
+    for row in mappings:
+        fields = row.rstrip("\n").split(None, 5)
+        if len(fields) == 6 and fields[5].startswith("/"):
+            if fields[5].endswith(" (deleted)"):
+                fail()
+            paths.add(fields[5])
+for path in paths:
+    trusted_root_file(path)
+PY
+)
+
+# Read one bounded regular-file image and retain it in a write-sealed memfd.
+# The broker exists only long enough for this shell to duplicate the sealed
+# descriptor.  Callers must use the returned /proc/self/fd path for every
+# parser, jq projection, digest, and auxiliary comparison in one transaction;
+# the lexical source remains useful only for terminal name/identity binding.
+benchmark_pressure_hold_file_snapshot() {
+  local -r input="$1"
+  local -r maximum_bytes="$2"
+  local -r output_fd_name="$3"
+  local -r output_source_identity_name="${4:-}"
+  local -r output_sha256_name="${5:-}"
+  local -r output_size_name="${6:-}"
+  local broker_pid=""
+  local broker_stdout_fd=""
+  local broker_stdin_fd=""
+  local holder_pid=""
+  local remote_fd=""
+  local source_identity=""
+  local source_sha256=""
+  local source_size=""
+  local extra=""
+  local held_fd=""
+  local held_identity=""
+  local held_sha256=""
+  local source_mode=""
+  local broker_status=0
+  local wait_status=0
+
+  [[ "$maximum_bytes" =~ ^[1-9][0-9]*$ &&
+    "$maximum_bytes" -le "$BENCHMARK_PRESSURE_TRACE_SNAPSHOT_MAX_BYTES" &&
+    "$output_fd_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+    ( -z "$output_source_identity_name" ||
+      "$output_source_identity_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ) &&
+    ( -z "$output_sha256_name" ||
+      "$output_sha256_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ) &&
+    ( -z "$output_size_name" ||
+      "$output_size_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ) ]] || return 1
+  benchmark_pressure_trusted_regular_path "$input" || return $?
+
+  coproc BENCHMARK_PRESSURE_SNAPSHOT_BROKER {
+    benchmark_pressure_clean_broker_exec \
+      "$BENCHMARK_PRESSURE_ENV_EXECUTABLE" -i LC_ALL=C LANG=C \
+      PATH=/usr/bin:/bin \
+      "$BENCHMARK_PRESSURE_TIMEOUT_EXECUTABLE" --signal=TERM \
+      --kill-after="${BENCHMARK_PRESSURE_BROKER_KILL_GRACE_SECONDS}s" \
+      "${BENCHMARK_PRESSURE_BROKER_TIMEOUT_SECONDS}s" \
+      "$BENCHMARK_PRESSURE_PYTHON_EXECUTABLE" -I /dev/fd/3 \
+      "$input" "$maximum_bytes" "$EUID" \
+      "$BENCHMARK_PRESSURE_PYTHON_EXECUTABLE" \
+      "$BENCHMARK_PRESSURE_TIMEOUT_EXECUTABLE" \
+      "$BENCHMARK_PRESSURE_ENV_EXECUTABLE" 3<<'PY'
+import fcntl
+import hashlib
+import os
+import re
+import stat
+import sys
+
+
+def fail():
+    raise ValueError("invalid pressure evidence source")
+
+
+def trusted_root_path(path):
+    resolved = os.path.realpath(path)
+    if not resolved.startswith("/"):
+        fail()
+    value = os.stat(resolved, follow_symlinks=False)
+    if (not stat.S_ISREG(value.st_mode) or value.st_uid != 0 or
+            value.st_gid != 0 or stat.S_IMODE(value.st_mode) & 0o022):
+        fail()
+    parent = os.path.dirname(resolved)
+    while True:
+        value = os.stat(parent, follow_symlinks=False)
+        if (not stat.S_ISDIR(value.st_mode) or value.st_uid != 0 or
+                value.st_gid != 0 or stat.S_IMODE(value.st_mode) & 0o022):
+            fail()
+        if parent == "/":
+            break
+        parent = os.path.dirname(parent)
+
+
+def authenticate_runtime(expected_executable, expected_parent):
+    if dict(os.environ) != {
+            "LC_ALL": "C", "LANG": "C", "PATH": "/usr/bin:/bin"}:
+        fail()
+    paths = {"/proc/self/exe"}
+    for module in tuple(sys.modules.values()):
+        path = getattr(module, "__file__", "")
+        if path and path != "/dev/fd/3":
+            paths.add(path)
+    with open("/proc/self/maps", "r", encoding="ascii") as mappings:
+        for row in mappings:
+            fields = row.rstrip("\n").split(None, 5)
+            if len(fields) == 6 and fields[5].startswith("/"):
+                if fields[5].endswith(" (deleted)"):
+                    fail()
+                paths.add(fields[5])
+    for path in paths:
+        trusted_root_path(path)
+    if (os.path.realpath("/proc/self/exe") !=
+            os.path.realpath(expected_executable) or
+            os.path.realpath(f"/proc/{os.getppid()}/exe") !=
+            os.path.realpath(expected_parent)):
+        fail()
+
+
+path = sys.argv[1]
+maximum = int(sys.argv[2])
+owner = int(sys.argv[3])
+expected_executable = sys.argv[4]
+expected_parent = sys.argv[5]
+expected_environment = sys.argv[6]
+descriptor = re.fullmatch(r"/proc/self/fd/([1-9][0-9]*)", path)
+if (maximum < 1 or expected_executable != "/usr/bin/python3" or
+        expected_parent != "/usr/bin/timeout" or
+        expected_environment != "/usr/bin/env"):
+    fail()
+authenticate_runtime(expected_executable, expected_parent)
+trusted_root_path(expected_environment)
+if descriptor:
+    # Reopen the inherited descriptor through procfs so this read has its own
+    # open-file offset.  dup(2) would share and advance the retained authority's
+    # offset, causing a later snapshot in the same transaction to see EOF.
+    source_fd = os.open(
+        path,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK,
+    )
+else:
+    source_fd = os.open(
+        path,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOFOLLOW,
+    )
+try:
+    before = os.fstat(source_fd)
+    mode = stat.S_IMODE(before.st_mode)
+    if (not stat.S_ISREG(before.st_mode) or before.st_uid != owner or
+            mode not in (0o600, 0o644) or before.st_nlink not in (0, 1) or
+            before.st_size < 0 or before.st_size > maximum):
+        fail()
+    chunks = []
+    remaining = maximum + 1
+    while remaining:
+        chunk = os.read(source_fd, min(65536, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    contents = b"".join(chunks)
+    after = os.fstat(source_fd)
+    if (len(contents) != before.st_size or len(contents) > maximum or
+            (after.st_dev, after.st_ino, after.st_uid,
+             stat.S_IMODE(after.st_mode), after.st_nlink, after.st_size,
+             after.st_mtime_ns, after.st_ctime_ns) !=
+            (before.st_dev, before.st_ino, before.st_uid,
+             mode, before.st_nlink, before.st_size,
+             before.st_mtime_ns, before.st_ctime_ns)):
+        fail()
+finally:
+    os.close(source_fd)
+
+held_fd = os.memfd_create(
+    "obi-benchmark-pressure-snapshot",
+    os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
+)
+os.fchmod(held_fd, mode)
+offset = 0
+while offset < len(contents):
+    offset += os.write(held_fd, contents[offset:])
+os.lseek(held_fd, 0, os.SEEK_SET)
+seals = (fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW |
+         fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
+fcntl.fcntl(held_fd, fcntl.F_ADD_SEALS, seals)
+if fcntl.fcntl(held_fd, fcntl.F_GET_SEALS) != seals:
+    fail()
+identity = ":".join(str(value) for value in (
+    before.st_dev, before.st_ino, before.st_uid, format(mode, "o"),
+    before.st_nlink, before.st_size,
+))
+print(
+    f"{os.getpid()}\t{held_fd}\t{identity}\t"
+    f"{hashlib.sha256(contents).hexdigest()}\t{len(contents)}",
+    flush=True,
+)
+if sys.stdin.buffer.read(1) != b"x":
+    fail()
+PY
+  }
+  broker_pid="$BENCHMARK_PRESSURE_SNAPSHOT_BROKER_PID"
+  broker_stdout_fd="${BENCHMARK_PRESSURE_SNAPSHOT_BROKER[0]}"
+  broker_stdin_fd="${BENCHMARK_PRESSURE_SNAPSHOT_BROKER[1]}"
+  if IFS=$'\t' read -r holder_pid remote_fd source_identity source_sha256 \
+    source_size extra <&"$broker_stdout_fd"; then :
+  else
+    broker_status=$?
+  fi
+  if ((broker_status == 0)) &&
+    [[ -z "$extra" && "$holder_pid" =~ ^[1-9][0-9]*$ &&
+      "$remote_fd" =~ ^[1-9][0-9]*$ &&
+      "$source_identity" =~ \
+        ^[0-9]+:[1-9][0-9]*:$EUID:(600|644):(0|1):(0|[1-9][0-9]*)$ &&
+      "$source_sha256" =~ ^[0-9a-f]{64}$ &&
+      "$source_size" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    exec {held_fd}<"/proc/$holder_pid/fd/$remote_fd" || broker_status=$?
+  else
+    ((broker_status != 0)) || broker_status=1
+  fi
+  { printf 'x' >&"$broker_stdin_fd"; } 2>/dev/null || true
+  exec {broker_stdin_fd}>&-
+  if wait "$broker_pid"; then :; else
+    wait_status=$?
+    ((broker_status != 0)) || broker_status="$wait_status"
+  fi
+  unset BENCHMARK_PRESSURE_SNAPSHOT_BROKER \
+    BENCHMARK_PRESSURE_SNAPSHOT_BROKER_PID
+  ((broker_status == 0)) || {
+    [[ ! "$held_fd" =~ ^[0-9]+$ ]] || exec {held_fd}<&-
+    return "$broker_status"
+  }
+  IFS=: read -r _ _ _ source_mode _ _ <<<"$source_identity" || {
+    exec {held_fd}<&-
+    return 1
+  }
+  held_identity="$(stat -Lc '%u:%a:%h:%s' -- "/proc/self/fd/$held_fd")" || {
+    exec {held_fd}<&-
+    return 1
+  }
+  held_sha256="$(sha256sum -- "/proc/self/fd/$held_fd")" || {
+    exec {held_fd}<&-
+    return 1
+  }
+  held_sha256="${held_sha256%% *}"
+  [[ "$held_identity" == "$EUID:$source_mode:0:$source_size" &&
+    "$held_sha256" == "$source_sha256" ]] || {
+    exec {held_fd}<&-
+    return 1
+  }
+  printf -v "$output_fd_name" '%s' "$held_fd"
+  [[ -z "$output_source_identity_name" ]] ||
+    printf -v "$output_source_identity_name" '%s' "$source_identity"
+  [[ -z "$output_sha256_name" ]] ||
+    printf -v "$output_sha256_name" '%s' "$source_sha256"
+  [[ -z "$output_size_name" ]] ||
+    printf -v "$output_size_name" '%s' "$source_size"
+}
+
+# Establish one coherent point-in-time authority over a bounded file set.  The
+# broker receives only retained numeric directory/member FDs plus a tab-framed
+# lexical roster.  It opens every public name with openat(O_NOFOLLOW), hashes
+# both public and retained images, checks exact metadata and directory rosters,
+# then repeats one shared fresh-open name/member/directory sweep before
+# PRECOMMIT and again after the shell's irrevocable lease/ACK.  Its final "ok"
+# frame is the transaction's linearization point.
+# In capture mode, the broker also returns write-sealed memfd images of the C
+# members; callers perform no later lexical reopen.
+benchmark_pressure_coherent_file_set() {
+  local -r mode="$1"
+  local -r specification="$2"
+  local output_one_name="${3:-}"
+  local output_two_name="${4:-}"
+  local output_three_name="${5:-}"
+  local lease_variable_name="${6:-}"
+  local lease_callback="${7:-}"
+  local broker_pid=""
+  local broker_stdout_fd=""
+  local broker_stdin_fd=""
+  local ready=""
+  local capture_count=""
+  local holder_pid=""
+  local watchdog_pid=""
+  local remote_one=""
+  local remote_two=""
+  local remote_three=""
+  local extra=""
+  local final=""
+  local capture_one_fd=""
+  local capture_two_fd=""
+  local capture_three_fd=""
+  local status=0
+  local wait_status=0
+  local lease_surrendered=false
+  local test_delay_seconds="${BENCHMARK_PRESSURE_TEST_COHERENT_DELAY_SECONDS:-0}"
+  local test_ignore_term="${BENCHMARK_PRESSURE_TEST_COHERENT_IGNORE_TERM:-false}"
+  local test_precommit_delay_seconds=\
+"${BENCHMARK_PRESSURE_TEST_COHERENT_PRECOMMIT_DELAY_SECONDS:-0}"
+  local test_fail_after_worker_reap=\
+"${BENCHMARK_PRESSURE_TEST_COHERENT_FAIL_AFTER_WORKER_REAP:-false}"
+  local test_post_reap_delay_seconds=\
+"${BENCHMARK_PRESSURE_TEST_COHERENT_POST_REAP_DELAY_SECONDS:-0}"
+  local test_post_commit_delay_seconds=\
+"${BENCHMARK_PRESSURE_TEST_COHERENT_POST_COMMIT_DELAY_SECONDS:-0}"
+
+  [[ "$mode" =~ ^(verify|capture3|publish_marker)$ && -n "$specification" &&
+    ${#specification} -le 1048576 &&
+    ( -z "$lease_variable_name" ||
+      "$lease_variable_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ) &&
+    ( -z "$lease_callback" ||
+      "$lease_callback" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ) &&
+    "$test_delay_seconds" =~ ^(0|[1-9][0-9]*)$ &&
+    "$test_delay_seconds" -le 60 &&
+    "$test_ignore_term" =~ ^(true|false)$ &&
+    "$test_precommit_delay_seconds" =~ ^(0|[1-9][0-9]*)$ &&
+    "$test_precommit_delay_seconds" -le 60 &&
+    "$test_fail_after_worker_reap" =~ ^(true|false)$ &&
+    "$test_post_reap_delay_seconds" =~ ^(0|[1-9][0-9]*)$ &&
+    "$test_post_reap_delay_seconds" -le 5 &&
+    "$test_post_commit_delay_seconds" =~ ^(0|[1-9][0-9]*)$ &&
+    "$test_post_commit_delay_seconds" -le 5 ]] || return 1
+  if [[ "$mode" == capture3 ]]; then
+    [[ "$output_one_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+      "$output_two_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+      "$output_three_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+      "$output_one_name" != "$output_two_name" &&
+      "$output_one_name" != "$output_three_name" &&
+      "$output_two_name" != "$output_three_name" ]] || return 1
+  else
+    [[ -z "$output_one_name" && -z "$output_two_name" &&
+      -z "$output_three_name" ]] || return 1
+  fi
+  [[ -z "$lease_callback" || -n "$lease_variable_name" ]] || return 1
+  [[ "$mode" != publish_marker || -n "$lease_variable_name" ]] || return 1
+  coproc BENCHMARK_PRESSURE_COHERENT_SET_BROKER {
+    benchmark_pressure_clean_broker_exec \
+      "$BENCHMARK_PRESSURE_ENV_EXECUTABLE" -i LC_ALL=C LANG=C \
+      PATH=/usr/bin:/bin \
+      "$BENCHMARK_PRESSURE_PYTHON_EXECUTABLE" -I /dev/fd/3 \
+      "$mode" "$EUID" "$BENCHMARK_PRESSURE_BROKER_TIMEOUT_SECONDS" \
+      "$BENCHMARK_PRESSURE_BROKER_KILL_GRACE_SECONDS" \
+      "$BENCHMARK_PRESSURE_COHERENT_MAX_DIRECTORY_ENTRIES" \
+      "$BENCHMARK_PRESSURE_COHERENT_MAX_DIRECTORY_NAME_BYTES" \
+      "$BENCHMARK_PRESSURE_PYTHON_EXECUTABLE" "$test_delay_seconds" \
+      "$test_ignore_term" "$test_precommit_delay_seconds" \
+      "$test_fail_after_worker_reap" \
+      "$BENCHMARK_PRESSURE_ENV_EXECUTABLE" \
+      "$test_post_reap_delay_seconds" \
+      "$test_post_commit_delay_seconds" 3<<'PY'
+import ctypes
+import fcntl
+import hashlib
+import os
+import re
+import select
+import signal
+import stat
+import sys
+import time
+
+
+# Invalid adversarial sets are an ordinary fail-closed result; never emit a
+# traceback into benchmark diagnostics.
+sys.excepthook = lambda *_: None
+
+
+MAX_SPEC_BYTES = 1_048_576
+MAX_ROWS = 2048
+MAX_DIRECTORIES = 32
+MAX_MEMBERS = 1024
+MAX_MEMBER_BYTES = 100_663_296
+MAX_TOTAL_BYTES = 1_073_741_824
+MAX_DIRECTORY_ENTRIES = int(sys.argv[5])
+MAX_DIRECTORY_NAME_BYTES = int(sys.argv[6])
+EXPECTED_EXECUTABLE = sys.argv[7]
+TEST_DELAY_SECONDS = int(sys.argv[8])
+TEST_IGNORE_TERM = sys.argv[9] == "true"
+TEST_PRECOMMIT_DELAY_SECONDS = int(sys.argv[10])
+TEST_FAIL_AFTER_WORKER_REAP = sys.argv[11] == "true"
+EXPECTED_ENVIRONMENT = sys.argv[12]
+TEST_POST_REAP_DELAY_SECONDS = int(sys.argv[13])
+TEST_POST_COMMIT_DELAY_SECONDS = int(sys.argv[14])
+SEALS = (fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW |
+         fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
+AT_EMPTY_PATH = 0x1000
+LIBC = ctypes.CDLL(None, use_errno=True)
+LIBC.linkat.argtypes = [ctypes.c_int, ctypes.c_char_p,
+                        ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+LIBC.linkat.restype = ctypes.c_int
+EMPTY_PATH = ctypes.c_char_p(b"")
+
+
+def fail():
+    raise ValueError("invalid coherent pressure file set")
+
+
+def trusted_root_path(path):
+    resolved = os.path.realpath(path)
+    if not resolved.startswith("/"):
+        fail()
+    value = os.stat(resolved, follow_symlinks=False)
+    if (not stat.S_ISREG(value.st_mode) or value.st_uid != 0 or
+            value.st_gid != 0 or stat.S_IMODE(value.st_mode) & 0o022):
+        fail()
+    parent = os.path.dirname(resolved)
+    while True:
+        value = os.stat(parent, follow_symlinks=False)
+        if (not stat.S_ISDIR(value.st_mode) or value.st_uid != 0 or
+                value.st_gid != 0 or stat.S_IMODE(value.st_mode) & 0o022):
+            fail()
+        if parent == "/":
+            break
+        parent = os.path.dirname(parent)
+
+
+def authenticate_runtime(expected_executable):
+    if dict(os.environ) != {
+            "LC_ALL": "C", "LANG": "C", "PATH": "/usr/bin:/bin"}:
+        fail()
+    paths = {"/proc/self/exe"}
+    for module in tuple(sys.modules.values()):
+        path = getattr(module, "__file__", "")
+        if path and path != "/dev/fd/3":
+            paths.add(path)
+    with open("/proc/self/maps", "r", encoding="ascii") as mappings:
+        for row in mappings:
+            fields = row.rstrip("\n").split(None, 5)
+            if len(fields) == 6 and fields[5].startswith("/"):
+                if fields[5].endswith(" (deleted)"):
+                    fail()
+                paths.add(fields[5])
+    for path in paths:
+        trusted_root_path(path)
+    if os.path.realpath("/proc/self/exe") != os.path.realpath(expected_executable):
+        fail()
+
+
+def basic_signature(value):
+    return (value.st_dev, value.st_ino, value.st_uid,
+            stat.S_IMODE(value.st_mode))
+
+
+def full_signature(value):
+    return (value.st_dev, value.st_ino, value.st_uid,
+            stat.S_IMODE(value.st_mode), value.st_nlink, value.st_size,
+            value.st_mtime_ns, value.st_ctime_ns)
+
+
+def parse_uint(value, nonzero=False):
+    if not re.fullmatch(r"(?:0|[1-9][0-9]*)", value):
+        fail()
+    parsed = int(value)
+    if nonzero and parsed == 0:
+        fail()
+    return parsed
+
+
+def parse_identity(value, components):
+    fields = value.split(":")
+    if len(fields) != components:
+        fail()
+    parsed = [parse_uint(field, index == 1)
+              for index, field in enumerate(fields)]
+    parsed[3] = int(fields[3], 8)
+    if parsed[3] > 0o7777:
+        fail()
+    return tuple(parsed)
+
+
+def open_lexical_directory(path):
+    descriptor = re.fullmatch(r"/proc/self/fd/([1-9][0-9]*)", path)
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NONBLOCK
+    if not descriptor:
+        if not path.startswith("/") or "\t" in path or "\n" in path:
+            fail()
+        flags |= os.O_NOFOLLOW
+    return os.open(path, flags)
+
+
+def read_exact(fd, size):
+    if size < 0 or size > MAX_MEMBER_BYTES:
+        fail()
+    chunks = []
+    offset = 0
+    while offset < size:
+        chunk = os.pread(fd, min(65536, size - offset), offset)
+        if not chunk:
+            fail()
+        chunks.append(chunk)
+        offset += len(chunk)
+    if os.pread(fd, 1, size):
+        fail()
+    return b"".join(chunks)
+
+
+def scan_directory(directory, authority_fd=None):
+    observed = {}
+    entry_count = 0
+    name_bytes = 0
+    scan_fd = os.open(
+        ".", os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NONBLOCK |
+        os.O_NOFOLLOW,
+        dir_fd=directory["fd"] if authority_fd is None else authority_fd)
+    try:
+        with os.scandir(scan_fd) as iterator:
+            for entry in iterator:
+                entry_count += 1
+                name_bytes += len(os.fsencode(entry.name))
+                if (entry_count > MAX_DIRECTORY_ENTRIES or
+                        name_bytes > MAX_DIRECTORY_NAME_BYTES):
+                    fail()
+                if entry.name in observed or not re.fullmatch(
+                        r"[A-Za-z0-9._-]+", entry.name):
+                    fail()
+                observed[entry.name] = entry.stat(follow_symlinks=False)
+    finally:
+        os.close(scan_fd)
+    if directory["roster"] == "exact":
+        expected = {member["leaf"] for member in directory["members"]
+                    if member["kind"] not in ("A", "M")}
+        if set(observed) != expected:
+            fail()
+    for member in directory["members"]:
+        leaf = member["leaf"]
+        if member["kind"] in ("A", "M"):
+            if leaf in observed:
+                fail()
+            continue
+        if leaf not in observed:
+            fail()
+        value = observed[leaf]
+        if member["kind"] in ("F", "C"):
+            if not stat.S_ISREG(value.st_mode):
+                fail()
+            if basic_signature(value) + (value.st_nlink, value.st_size) != \
+                    member["identity"]:
+                fail()
+        elif member["kind"] == "D":
+            if not stat.S_ISDIR(value.st_mode) or \
+                    basic_signature(value) != member["identity"]:
+                fail()
+
+
+mode = sys.argv[1]
+owner = int(sys.argv[2])
+deadline_seconds = int(sys.argv[3])
+kill_grace_seconds = int(sys.argv[4])
+if (EXPECTED_EXECUTABLE != "/usr/bin/python3" or
+        mode not in ("verify", "capture3", "publish_marker") or
+        owner != os.geteuid() or deadline_seconds < 2 or
+        deadline_seconds > 60 or kill_grace_seconds < 1 or
+        kill_grace_seconds >= deadline_seconds or
+        MAX_DIRECTORY_ENTRIES < 1 or MAX_DIRECTORY_ENTRIES > 8192 or
+        MAX_DIRECTORY_NAME_BYTES < 255 or
+        MAX_DIRECTORY_NAME_BYTES > MAX_SPEC_BYTES or
+        TEST_DELAY_SECONDS < 0 or TEST_DELAY_SECONDS > 60 or
+        TEST_PRECOMMIT_DELAY_SECONDS < 0 or
+        TEST_PRECOMMIT_DELAY_SECONDS > 60 or
+        sys.argv[9] not in ("true", "false") or
+        sys.argv[11] not in ("true", "false") or
+        EXPECTED_ENVIRONMENT != "/usr/bin/env" or
+        TEST_POST_REAP_DELAY_SECONDS < 0 or
+        TEST_POST_REAP_DELAY_SECONDS > 5 or
+        TEST_POST_COMMIT_DELAY_SECONDS < 0 or
+        TEST_POST_COMMIT_DELAY_SECONDS > 5):
+    fail()
+authenticate_runtime(EXPECTED_EXECUTABLE)
+trusted_root_path(EXPECTED_ENVIRONMENT)
+
+
+# The launch process is a supervisor, not the authority worker.  It blocks
+# externally actionable signals, starts both children behind one-byte gates,
+# owns pidfds for both, and exactly reaps both on every setup and protocol path.
+# The watchdog can exit successfully only after reading the authenticated
+# cancel byte before the absolute deadline; early death or expiry denies commit.
+lifecycle_signals = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
+inherited_signal_mask = signal.pthread_sigmask(signal.SIG_BLOCK, lifecycle_signals)
+deadline_ns = time.monotonic_ns() + deadline_seconds * 1_000_000_000
+worker_messages_read, worker_messages_write = os.pipe2(os.O_CLOEXEC)
+worker_commands_read, worker_commands_write = os.pipe2(os.O_CLOEXEC)
+expiry_read, expiry_write = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
+worker_start_read, worker_start_write = os.pipe2(os.O_CLOEXEC)
+watchdog_start_read, watchdog_start_write = os.pipe2(os.O_CLOEXEC)
+watchdog_cancel_read, watchdog_cancel_write = os.pipe2(os.O_CLOEXEC)
+worker_pid = os.fork()
+if worker_pid != 0:
+    os.close(worker_messages_write)
+    os.close(worker_commands_read)
+    os.close(worker_start_read)
+    worker_pidfd = -1
+    watchdog_pid = -1
+    watchdog_pidfd = -1
+    worker_reaped = False
+    watchdog_reaped = False
+
+    def close_if_open(fd):
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def exact_wait(pid):
+        while True:
+            try:
+                waited, wait_status = os.waitpid(pid, 0)
+                if waited != pid:
+                    fail()
+                return wait_status
+            except InterruptedError:
+                continue
+
+    def pidfd_ready(pidfd, milliseconds=0):
+        poller = select.poll()
+        poller.register(pidfd, select.POLLIN)
+        return bool(poller.poll(milliseconds))
+
+    def signal_pidfd(pidfd, signum):
+        try:
+            signal.pidfd_send_signal(pidfd, signum)
+        except ProcessLookupError:
+            pass
+
+    def reap_watchdog(require_cancel=False):
+        global watchdog_reaped, watchdog_cancel_write, watchdog_pidfd
+        if watchdog_pid <= 0 or watchdog_reaped:
+            return not require_cancel
+        if watchdog_cancel_write >= 0:
+            try:
+                os.write(watchdog_cancel_write, b"C")
+            except (BrokenPipeError, OSError):
+                pass
+            close_if_open(watchdog_cancel_write)
+            watchdog_cancel_write = -1
+        if watchdog_pidfd >= 0 and not pidfd_ready(
+                watchdog_pidfd, kill_grace_seconds * 1000):
+            signal_pidfd(watchdog_pidfd, signal.SIGTERM)
+            if not pidfd_ready(watchdog_pidfd, kill_grace_seconds * 1000):
+                signal_pidfd(watchdog_pidfd, signal.SIGKILL)
+        wait_status = exact_wait(watchdog_pid)
+        watchdog_reaped = True
+        close_if_open(watchdog_pidfd)
+        watchdog_pidfd = -1
+        canceled = (os.WIFEXITED(wait_status) and
+                    os.WEXITSTATUS(wait_status) == 0)
+        if require_cancel and not canceled:
+            fail()
+        return canceled
+
+    def reap_worker():
+        global worker_reaped, worker_pidfd
+        if worker_reaped:
+            return None
+        if worker_pidfd >= 0:
+            signal_pidfd(worker_pidfd, signal.SIGTERM)
+            if not pidfd_ready(worker_pidfd, kill_grace_seconds * 1000):
+                signal_pidfd(worker_pidfd, signal.SIGKILL)
+        wait_status = exact_wait(worker_pid)
+        worker_reaped = True
+        close_if_open(worker_pidfd)
+        worker_pidfd = -1
+        return wait_status
+
+    def deadline_expired():
+        expired = time.monotonic_ns() >= deadline_ns
+        try:
+            if os.read(expiry_read, 1):
+                expired = True
+        except BlockingIOError:
+            pass
+        return expired
+
+    def signal_pending():
+        return bool(signal.sigpending().intersection(lifecycle_signals))
+
+    def read_control_line(fd, maximum):
+        data = bytearray()
+        poller = select.poll()
+        poller.register(fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+        while len(data) <= maximum:
+            remaining_ns = deadline_ns - time.monotonic_ns()
+            if remaining_ns <= 0:
+                fail()
+            events = poller.poll(max(1, (remaining_ns + 999_999) // 1_000_000))
+            if not events:
+                fail()
+            chunk = os.read(fd, 1)
+            if not chunk:
+                fail()
+            data.extend(chunk)
+            if chunk == b"\n":
+                return bytes(data)
+        fail()
+
+    def write_all(fd, payload):
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(fd, payload[offset:])
+
+    supervisor_status = 1
+    try:
+        worker_pidfd = os.pidfd_open(worker_pid, 0)
+        watchdog_pid = os.fork()
+        if watchdog_pid == 0:
+            watchdog_status = 1
+            try:
+                # Retain only the start gate, cancel pipe, expiry notification,
+                # and worker pidfd.  In particular the watchdog must not inherit
+                # any caller directory/member authority descriptor.
+                keep = []
+                for index, descriptor in enumerate((
+                        worker_pidfd, watchdog_start_read,
+                        watchdog_cancel_read, expiry_write)):
+                    keep.append(fcntl.fcntl(
+                        descriptor, fcntl.F_DUPFD_CLOEXEC, 1024 + index))
+                os.closerange(0, 1024)
+                for index, descriptor in enumerate(keep):
+                    os.dup2(descriptor, 3 + index)
+                os.closerange(7, os.sysconf("SC_OPEN_MAX"))
+                worker_pidfd = 3
+                watchdog_start_read = 4
+                watchdog_cancel_read = 5
+                expiry_write = 6
+                signal.pthread_sigmask(signal.SIG_SETMASK, inherited_signal_mask)
+                if os.read(watchdog_start_read, 2) != b"S":
+                    os._exit(1)
+                poller = select.poll()
+                poller.register(watchdog_cancel_read,
+                                select.POLLIN | select.POLLHUP | select.POLLERR)
+                remaining_ns = deadline_ns - time.monotonic_ns()
+                events = [] if remaining_ns <= 0 else poller.poll(
+                    max(1, (remaining_ns + 999_999) // 1_000_000))
+                if events:
+                    canceled = os.read(watchdog_cancel_read, 2)
+                    if canceled == b"C" and time.monotonic_ns() < deadline_ns:
+                        watchdog_status = 0
+                    else:
+                        watchdog_status = 1
+                else:
+                    try:
+                        os.write(expiry_write, b"E")
+                    except BlockingIOError:
+                        pass
+                    signal_pidfd(worker_pidfd, signal.SIGTERM)
+                    if not pidfd_ready(worker_pidfd, kill_grace_seconds * 1000):
+                        signal_pidfd(worker_pidfd, signal.SIGKILL)
+                    watchdog_status = 2
+            except BaseException:
+                watchdog_status = 1
+            finally:
+                os._exit(watchdog_status)
+        os.close(watchdog_start_read)
+        watchdog_start_read = -1
+        os.close(watchdog_cancel_read)
+        watchdog_cancel_read = -1
+        os.close(expiry_write)
+        expiry_write = -1
+        watchdog_pidfd = os.pidfd_open(watchdog_pid, 0)
+        write_all(worker_start_write, b"S")
+        close_if_open(worker_start_write)
+        worker_start_write = -1
+        write_all(watchdog_start_write, b"S")
+        close_if_open(watchdog_start_write)
+        watchdog_start_write = -1
+
+        ready_row = read_control_line(worker_messages_read, 256)
+        ready_fields = ready_row.rstrip(b"\n").split(b"\t")
+        if (len(ready_fields) < 2 or ready_fields[0] != b"R" or
+                ready_fields[1] not in (b"0", b"3") or
+                len(ready_fields) != 2 + int(ready_fields[1])):
+            fail()
+        for value in ready_fields[2:]:
+            if not re.fullmatch(rb"[1-9][0-9]*", value):
+                fail()
+        if signal_pending() or deadline_expired():
+            fail()
+        shell_ready = [b"ready", ready_fields[1], str(worker_pid).encode(),
+                       str(watchdog_pid).encode()]
+        shell_ready.extend(ready_fields[2:])
+        write_all(1, b"\t".join(shell_ready) + b"\n")
+        if read_control_line(0, 16) != b"validate\n":
+            fail()
+        write_all(worker_commands_write, b"validate\n")
+        if read_control_line(worker_messages_read, 16) != b"P\n":
+            fail()
+        if (signal_pending() or deadline_expired() or
+                pidfd_ready(worker_pidfd) or pidfd_ready(watchdog_pidfd)):
+            fail()
+        write_all(1, b"precommit\n")
+        if read_control_line(0, 16) != b"commit\n":
+            fail()
+        if TEST_PRECOMMIT_DELAY_SECONDS:
+            time.sleep(TEST_PRECOMMIT_DELAY_SECONDS)
+        reap_watchdog(require_cancel=True)
+        if deadline_expired() or signal_pending() or pidfd_ready(worker_pidfd):
+            fail()
+        write_all(worker_commands_write, b"commit\n")
+        os.close(worker_commands_write)
+        worker_commands_write = -1
+        remaining_ns = deadline_ns - time.monotonic_ns()
+        if (remaining_ns <= 0 or not pidfd_ready(
+                worker_pidfd,
+                max(1, (remaining_ns + 999_999) // 1_000_000))):
+            signal_pidfd(worker_pidfd, signal.SIGTERM)
+            if not pidfd_ready(worker_pidfd, kill_grace_seconds * 1000):
+                signal_pidfd(worker_pidfd, signal.SIGKILL)
+                if not pidfd_ready(worker_pidfd, kill_grace_seconds * 1000):
+                    fail()
+        worker_wait_status = exact_wait(worker_pid)
+        worker_reaped = True
+        close_if_open(worker_pidfd)
+        worker_pidfd = -1
+        if not os.WIFEXITED(worker_wait_status) or \
+                os.WEXITSTATUS(worker_wait_status) != 0:
+            fail()
+        if TEST_POST_REAP_DELAY_SECONDS:
+            time.sleep(TEST_POST_REAP_DELAY_SECONDS)
+        if TEST_FAIL_AFTER_WORKER_REAP:
+            fail()
+        if mode != "publish_marker":
+            write_all(1, b"ok\n")
+        supervisor_status = 0
+    except BaseException:
+        supervisor_status = 1
+    finally:
+        for descriptor in (worker_start_write, watchdog_start_write,
+                           watchdog_cancel_write):
+            close_if_open(descriptor)
+        try:
+            if watchdog_pid > 0 and not watchdog_reaped:
+                reap_watchdog()
+        except BaseException:
+            supervisor_status = 1
+        try:
+            if not worker_reaped:
+                reap_worker()
+        except BaseException:
+            supervisor_status = 1
+        for descriptor in (worker_messages_read, worker_commands_write,
+                           expiry_read, watchdog_start_read,
+                           watchdog_cancel_read):
+            close_if_open(descriptor)
+    os._exit(supervisor_status)
+
+# Worker branch: only this process parses, opens, hashes, and validates the
+# supplied authority set.  It never owns or signals the watchdog.
+os.close(worker_messages_read)
+os.close(worker_commands_write)
+os.close(expiry_read)
+os.close(expiry_write)
+os.close(worker_start_write)
+os.close(watchdog_start_read)
+os.close(watchdog_start_write)
+os.close(watchdog_cancel_read)
+os.close(watchdog_cancel_write)
+os.close(1)
+if os.read(worker_start_read, 2) != b"S":
+    os._exit(1)
+os.close(worker_start_read)
+signal.pthread_sigmask(signal.SIG_SETMASK, inherited_signal_mask)
+if TEST_IGNORE_TERM:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+raw_rows = []
+total_spec = 0
+while True:
+    row = sys.stdin.buffer.readline(MAX_SPEC_BYTES + 1)
+    if not row:
+        fail()
+    total_spec += len(row)
+    if total_spec > MAX_SPEC_BYTES or len(row) > MAX_SPEC_BYTES:
+        fail()
+    if row == b"Z\n":
+        break
+    if not row.endswith(b"\n"):
+        fail()
+    try:
+        decoded = row[:-1].decode("utf-8")
+    except UnicodeDecodeError:
+        fail()
+    raw_rows.append(decoded.split("\t"))
+    if len(raw_rows) > MAX_ROWS:
+        fail()
+
+if not raw_rows or raw_rows[0] != ["V", "1"]:
+    fail()
+directories = {}
+member_rows = []
+for fields in raw_rows[1:]:
+    if fields[0] == "P":
+        if len(fields) != 6:
+            fail()
+        index = parse_uint(fields[1])
+        inherited_fd = parse_uint(fields[2], True)
+        lexical = fields[3]
+        identity = parse_identity(fields[4], 4)
+        roster = fields[5]
+        if (index in directories or len(directories) >= MAX_DIRECTORIES or
+                roster not in ("exact", "relevant") or identity[2] != owner or
+                (identity[3] & 0o022) != 0):
+            fail()
+        fd = os.dup(inherited_fd)
+        lexical_fd = open_lexical_directory(lexical)
+        initial = os.fstat(fd)
+        lexical_initial = os.fstat(lexical_fd)
+        if (not stat.S_ISDIR(initial.st_mode) or
+                basic_signature(initial) != identity or
+                basic_signature(lexical_initial) != identity):
+            fail()
+        directories[index] = {
+            "fd": fd, "lexical_fd": lexical_fd, "lexical": lexical,
+            "identity": identity, "initial": full_signature(initial),
+            "lexical_initial": full_signature(lexical_initial),
+            "roster": roster, "members": [],
+        }
+    else:
+        member_rows.append(fields)
+
+if not directories:
+    fail()
+opened = []
+captures = []
+markers = []
+total_bytes = 0
+seen = set()
+for fields in member_rows:
+    kind = fields[0]
+    if kind == "X":
+        if len(fields) != 4 or len(seen) >= MAX_MEMBERS:
+            fail()
+        held_fd = parse_uint(fields[1], True)
+        identity = parse_identity(fields[2], 6)
+        digest_field = fields[3]
+        key = ("X", held_fd)
+        if (key in seen or identity[2] != owner or
+                identity[3] not in (0o600, 0o644) or
+                identity[4] not in (0, 1) or
+                not re.fullmatch(r"[0-9a-f]{64}", digest_field)):
+            fail()
+        seen.add(key)
+        total_bytes += identity[5]
+        if total_bytes > MAX_TOTAL_BYTES:
+            fail()
+        held = os.dup(held_fd)
+        held_stat = os.fstat(held)
+        if (not stat.S_ISREG(held_stat.st_mode) or
+                basic_signature(held_stat) +
+                (held_stat.st_nlink, held_stat.st_size) != identity or
+                hashlib.sha256(read_exact(held, identity[5])).hexdigest() !=
+                digest_field):
+            fail()
+        member = {"kind": kind, "identity": identity,
+                  "sha256": digest_field, "held_fd": held,
+                  "held_initial": full_signature(held_stat)}
+        opened.append(member)
+        continue
+    if kind not in ("F", "C", "D", "A", "M"):
+        fail()
+    required_fields = {"F": 6, "C": 5, "D": 5, "A": 3, "M": 6}[kind]
+    if len(fields) != required_fields:
+        fail()
+    index = parse_uint(fields[1])
+    if index not in directories:
+        fail()
+    leaf = fields[2]
+    key = (index, leaf)
+    if (not re.fullmatch(r"[A-Za-z0-9._-]+", leaf) or leaf in (".", "..") or
+            key in seen or
+            len(seen) >= MAX_MEMBERS):
+        fail()
+    seen.add(key)
+    directory = directories[index]
+    member = {"kind": kind, "leaf": leaf, "directory": directory}
+    directory["members"].append(member)
+    if kind in ("A", "M"):
+        try:
+            os.stat(leaf, dir_fd=directory["fd"], follow_symlinks=False)
+        except FileNotFoundError:
+            if kind == "A":
+                continue
+        else:
+            fail()
+    if kind == "M":
+        held_fd = parse_uint(fields[3], True)
+        identity = parse_identity(fields[4], 6)
+        digest_field = fields[5]
+        if (identity[2] != owner or identity[3] != 0o600 or
+                identity[4] != 0 or
+                not re.fullmatch(r"[0-9a-f]{64}", digest_field)):
+            fail()
+        total_bytes += identity[5]
+        if total_bytes > MAX_TOTAL_BYTES:
+            fail()
+        held = os.dup(held_fd)
+        held_stat = os.fstat(held)
+        contents = read_exact(held, identity[5])
+        if (not stat.S_ISREG(held_stat.st_mode) or
+                basic_signature(held_stat) +
+                (held_stat.st_nlink, held_stat.st_size) != identity or
+                hashlib.sha256(contents).hexdigest() != digest_field):
+            fail()
+        marker_fd = os.open(
+            ".", os.O_RDWR | os.O_CLOEXEC | os.O_TMPFILE, 0o600,
+            dir_fd=directory["fd"])
+        os.fchmod(marker_fd, 0o600)
+        offset = 0
+        while offset < len(contents):
+            offset += os.write(marker_fd, contents[offset:])
+        os.fsync(marker_fd)
+        marker_stat = os.fstat(marker_fd)
+        if (not stat.S_ISREG(marker_stat.st_mode) or
+                marker_stat.st_uid != owner or
+                stat.S_IMODE(marker_stat.st_mode) != 0o600 or
+                marker_stat.st_nlink != 0 or marker_stat.st_size != len(contents) or
+                hashlib.sha256(read_exact(marker_fd, len(contents))).hexdigest() !=
+                digest_field):
+            fail()
+        member.update(identity=identity, sha256=digest_field, held_fd=held,
+                      held_initial=full_signature(held_stat), marker_fd=marker_fd,
+                      marker_initial=full_signature(marker_stat),
+                      directory_fd=directory["fd"])
+        markers.append(member)
+        opened.append(member)
+        continue
+    if kind == "D":
+        held_fd = parse_uint(fields[3], True)
+        identity = parse_identity(fields[4], 4)
+        if identity[2] != owner or identity[3] != 0o700:
+            fail()
+        public_fd = os.open(
+            leaf, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY |
+            os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=directory["fd"])
+        held = os.dup(held_fd)
+        public_stat = os.fstat(public_fd)
+        held_stat = os.fstat(held)
+        if (not stat.S_ISDIR(public_stat.st_mode) or
+                basic_signature(public_stat) != identity or
+                basic_signature(held_stat) != identity):
+            fail()
+        member.update(identity=identity, public_fd=public_fd, held_fd=held,
+                      public_initial=full_signature(public_stat),
+                      held_initial=full_signature(held_stat))
+        opened.append(member)
+        continue
+    identity_field = fields[4] if kind == "F" else fields[3]
+    digest_field = fields[5] if kind == "F" else fields[4]
+    identity = parse_identity(identity_field, 6)
+    if (identity[2] != owner or identity[3] not in (0o600, 0o644) or
+            identity[4] != 1 or not re.fullmatch(r"[0-9a-f]{64}", digest_field)):
+        fail()
+    total_bytes += identity[5]
+    if total_bytes > MAX_TOTAL_BYTES:
+        fail()
+    public_fd = os.open(
+        leaf, os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOFOLLOW,
+        dir_fd=directory["fd"])
+    public_stat = os.fstat(public_fd)
+    if (not stat.S_ISREG(public_stat.st_mode) or
+            basic_signature(public_stat) +
+            (public_stat.st_nlink, public_stat.st_size) != identity):
+        fail()
+    contents = read_exact(public_fd, identity[5])
+    if hashlib.sha256(contents).hexdigest() != digest_field:
+        fail()
+    member.update(identity=identity, sha256=digest_field,
+                  public_fd=public_fd,
+                  public_initial=full_signature(public_stat))
+    if kind == "F":
+        held_fd = parse_uint(fields[3], True)
+        held = os.dup(held_fd)
+        held_stat = os.fstat(held)
+        if (not stat.S_ISREG(held_stat.st_mode) or
+                basic_signature(held_stat) +
+                (held_stat.st_nlink, held_stat.st_size) != identity or
+                hashlib.sha256(read_exact(held, identity[5])).hexdigest() !=
+                digest_field):
+            fail()
+        member.update(held_fd=held, held_initial=full_signature(held_stat))
+    else:
+        capture_fd = os.memfd_create(
+            "obi-benchmark-pressure-coherent", os.MFD_CLOEXEC |
+            os.MFD_ALLOW_SEALING)
+        os.fchmod(capture_fd, identity[3])
+        offset = 0
+        while offset < len(contents):
+            offset += os.write(capture_fd, contents[offset:])
+        os.lseek(capture_fd, 0, os.SEEK_SET)
+        fcntl.fcntl(capture_fd, fcntl.F_ADD_SEALS, SEALS)
+        capture_stat = os.fstat(capture_fd)
+        if (fcntl.fcntl(capture_fd, fcntl.F_GET_SEALS) != SEALS or
+                not stat.S_ISREG(capture_stat.st_mode) or
+                capture_stat.st_uid != owner or
+                stat.S_IMODE(capture_stat.st_mode) != identity[3] or
+                capture_stat.st_nlink != 0 or
+                capture_stat.st_size != identity[5] or
+                hashlib.sha256(read_exact(capture_fd, identity[5])).hexdigest() !=
+                digest_field):
+            fail()
+        member.update(capture_fd=capture_fd,
+                      capture_initial=full_signature(capture_stat))
+        captures.append(capture_fd)
+    opened.append(member)
+
+if (mode == "capture3") != (len(captures) == 3):
+    fail()
+if (mode == "publish_marker") != (len(markers) == 1):
+    fail()
+if mode in ("verify", "publish_marker") and captures:
+    fail()
+for directory in directories.values():
+    scan_directory(directory)
+    if (full_signature(os.fstat(directory["fd"])) != directory["initial"] or
+            full_signature(os.fstat(directory["lexical_fd"])) !=
+            directory["lexical_initial"]):
+        fail()
+
+
+def verify_member_image(member, descriptor, expected_signature):
+    value = os.fstat(descriptor)
+    if full_signature(value) != expected_signature:
+        fail()
+    if member["kind"] == "D":
+        if not stat.S_ISDIR(value.st_mode):
+            fail()
+        return
+    if not stat.S_ISREG(value.st_mode):
+        fail()
+    size = member["identity"][5]
+    if (value.st_size != size or
+            hashlib.sha256(read_exact(descriptor, size)).hexdigest() !=
+            member["sha256"] or
+            full_signature(os.fstat(descriptor)) != expected_signature):
+        fail()
+    if (descriptor == member.get("capture_fd") and
+            fcntl.fcntl(descriptor, fcntl.F_GET_SEALS) != SEALS):
+        fail()
+
+
+def verify_member_signature(member, descriptor, expected_signature):
+    value = os.fstat(descriptor)
+    if (full_signature(value) != expected_signature or
+            (member["kind"] == "D" and not stat.S_ISDIR(value.st_mode)) or
+            (member["kind"] != "D" and not stat.S_ISREG(value.st_mode))):
+        fail()
+    if (descriptor == member.get("capture_fd") and
+            fcntl.fcntl(descriptor, fcntl.F_GET_SEALS) != SEALS):
+        fail()
+
+
+def retained_member_descriptors(member):
+    result = []
+    for descriptor_key, signature_key in (
+            ("public_fd", "public_initial"),
+            ("held_fd", "held_initial"),
+            ("marker_fd", "marker_initial"),
+            ("capture_fd", "capture_initial")):
+        if descriptor_key in member:
+            result.append((member[descriptor_key], member[signature_key]))
+    return result
+
+
+def coherent_sweep():
+    fresh_directories = []
+    fresh_members = []
+    try:
+        # Acquire every lexical directory and every present member afresh.  All
+        # names use openat(O_NOFOLLOW), and each bounded roster is checked from
+        # the fresh directory description before any image is trusted.
+        for directory in directories.values():
+            if (full_signature(os.fstat(directory["fd"])) !=
+                    directory["initial"] or
+                    full_signature(os.fstat(directory["lexical_fd"])) !=
+                    directory["lexical_initial"]):
+                fail()
+            lexical_fd = open_lexical_directory(directory["lexical"])
+            fresh_directories.append((directory, lexical_fd))
+            if full_signature(os.fstat(lexical_fd)) != \
+                    directory["lexical_initial"]:
+                fail()
+            scan_directory(directory, lexical_fd)
+            for member in directory["members"]:
+                if member["kind"] in ("A", "M"):
+                    continue
+                flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | \
+                    os.O_NOFOLLOW
+                if member["kind"] == "D":
+                    flags |= os.O_DIRECTORY
+                descriptor = os.open(
+                    member["leaf"], flags, dir_fd=lexical_fd)
+                fresh_members.append((member, descriptor))
+
+        # Hash every retained and freshly opened regular-file image.  A second
+        # signature pass after all hashes detects an earlier member changing
+        # while a later member was read.
+        for member in opened:
+            for descriptor, expected_signature in \
+                    retained_member_descriptors(member):
+                verify_member_image(member, descriptor, expected_signature)
+        for member, descriptor in fresh_members:
+            verify_member_image(
+                member, descriptor, member["public_initial"])
+
+        # Reopen and rescan every lexical directory after all member hashes.
+        # The kept first-pass descriptions and original authority FDs are then
+        # re-fstat together, closing cross-member and cross-directory ordering
+        # gaps within this one bounded operation.
+        for directory in directories.values():
+            terminal_fd = open_lexical_directory(directory["lexical"])
+            try:
+                if full_signature(os.fstat(terminal_fd)) != \
+                        directory["lexical_initial"]:
+                    fail()
+                scan_directory(directory, terminal_fd)
+            finally:
+                os.close(terminal_fd)
+        for member in opened:
+            for descriptor, expected_signature in \
+                    retained_member_descriptors(member):
+                verify_member_signature(member, descriptor, expected_signature)
+        for member, descriptor in fresh_members:
+            verify_member_signature(
+                member, descriptor, member["public_initial"])
+        for directory, lexical_fd in fresh_directories:
+            if (full_signature(os.fstat(directory["fd"])) !=
+                    directory["initial"] or
+                    full_signature(os.fstat(directory["lexical_fd"])) !=
+                    directory["lexical_initial"] or
+                    full_signature(os.fstat(lexical_fd)) !=
+                    directory["lexical_initial"]):
+                fail()
+    finally:
+        for _, descriptor in fresh_members:
+            os.close(descriptor)
+        for _, descriptor in fresh_directories:
+            os.close(descriptor)
+
+frame = ["R", str(len(captures))]
+frame.extend(str(fd) for fd in captures)
+encoded_frame = ("\t".join(frame) + "\n").encode("ascii")
+if os.write(worker_messages_write, encoded_frame) != len(encoded_frame):
+    fail()
+if os.read(worker_commands_read, 9) != b"validate\n":
+    fail()
+
+if TEST_DELAY_SECONDS:
+    time.sleep(TEST_DELAY_SECONDS)
+
+# Block externally actionable signals before both terminal sweeps.  A pathname
+# mutation changes its directory timestamps/roster even if restored; an
+# in-place mutation changes the retained member signature.
+blocked_signals = {signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGALRM}
+signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
+coherent_sweep()
+
+# Precompute the marker syscall arguments while rollback is still permitted.
+# After the worker receives commit, its production tail performs only the final
+# no-clobber linkat and direct process exit.
+if mode == "publish_marker":
+    marker = markers[0]
+    link_source_fd = marker["marker_fd"]
+    link_directory_fd = marker["directory_fd"]
+    link_leaf = ctypes.c_char_p(marker["leaf"].encode("ascii"))
+
+if (time.monotonic_ns() >= deadline_ns or
+        signal.sigpending().intersection(blocked_signals)):
+    fail()
+
+if os.write(worker_messages_write, b"P\n") != 2:
+    fail()
+if os.read(worker_commands_read, 7) != b"commit\n":
+    fail()
+
+# The shell has now surrendered rollback and acknowledged PRECOMMIT, while the
+# public marker remains absent.  Reacquire and rehash the complete authority set
+# once more.  Any rejection or death here is post-lease ambiguity; only a clean
+# second sweep reaches the terminal action below.
+if TEST_POST_COMMIT_DELAY_SECONDS:
+    time.sleep(TEST_POST_COMMIT_DELAY_SECONDS)
+coherent_sweep()
+if (time.monotonic_ns() >= deadline_ns or
+        signal.sigpending().intersection(blocked_signals)):
+    fail()
+
+if mode == "publish_marker":
+    # The supervisor has canceled and exactly reaped the watchdog before this
+    # command.  The lease is irrevocable; only the final no-clobber link and
+    # direct exit remain on the production path.
+    os._exit(0 if LIBC.linkat(
+        link_source_fd, EMPTY_PATH, link_directory_fd,
+        link_leaf, AT_EMPTY_PATH) == 0 else 1)
+os._exit(0)
+PY
+  }
+  broker_pid="$BENCHMARK_PRESSURE_COHERENT_SET_BROKER_PID"
+  broker_stdout_fd="${BENCHMARK_PRESSURE_COHERENT_SET_BROKER[0]}"
+  broker_stdin_fd="${BENCHMARK_PRESSURE_COHERENT_SET_BROKER[1]}"
+  { printf '%s' "$specification"; printf 'Z\n'; } >&"$broker_stdin_fd" ||
+    status=$?
+  if ((status == 0)); then
+    IFS=$'\t' read -r ready capture_count holder_pid watchdog_pid remote_one \
+      remote_two remote_three extra <&"$broker_stdout_fd" || status=$?
+  fi
+  if ((status == 0)); then
+    [[ "$ready" == ready && "$holder_pid" =~ ^[1-9][0-9]*$ &&
+      "$watchdog_pid" =~ ^[1-9][0-9]*$ &&
+      "$capture_count" =~ ^[03]$ && -z "$extra" ]] || status=1
+  fi
+  if ((status == 0)) && [[ "$mode" == capture3 ]]; then
+    [[ "$capture_count" == 3 && "$remote_one" =~ ^[1-9][0-9]*$ &&
+      "$remote_two" =~ ^[1-9][0-9]*$ &&
+      "$remote_three" =~ ^[1-9][0-9]*$ ]] || status=1
+    if ((status == 0)); then
+      exec {capture_one_fd}<"/proc/$holder_pid/fd/$remote_one" || status=$?
+      exec {capture_two_fd}<"/proc/$holder_pid/fd/$remote_two" || status=$?
+      exec {capture_three_fd}<"/proc/$holder_pid/fd/$remote_three" || status=$?
+    fi
+  elif ((status == 0)); then
+    [[ "$capture_count" == 0 && -z "$remote_one" && -z "$remote_two" &&
+      -z "$remote_three" ]] || status=1
+  fi
+  if ((status == 0)); then
+    printf 'validate\n' >&"$broker_stdin_fd" || status=$?
+  fi
+  if ((status == 0)); then
+    ready=""
+    extra=""
+    IFS=$'\t' read -r ready extra <&"$broker_stdout_fd" || status=$?
+    [[ "$ready" == precommit && -z "$extra" ]] || status=1
+  fi
+  if ((status == 0)) &&
+    [[ "${publication_signal_status:-0}" =~ ^(129|130|143)$ ]]; then
+    status="${publication_signal_status}"
+  fi
+  if ((status == 0)) &&
+    [[ "${capture_signal_status:-0}" =~ ^(129|130|143)$ ]]; then
+    status="${capture_signal_status}"
+  fi
+  if ((status == 0)) && [[ -n "$lease_callback" ]]; then
+    "$lease_callback" || status=$?
+  fi
+  if ((status == 0)) && [[ -n "$lease_variable_name" ]]; then
+    printf -v "$lease_variable_name" '%s' true || status=$?
+  fi
+  if ((status == 0)); then
+    # PRECOMMIT has been accepted for every mode.  All remaining broker work is
+    # post-lease, even when a pure verifier has no external rollback latch.
+    lease_surrendered=true
+  fi
+  if ((status == 0)); then
+    printf 'commit\n' >&"$broker_stdin_fd" || status=$?
+  fi
+  exec {broker_stdin_fd}>&-
+  if ((status == 0)) && [[ "$mode" != publish_marker ]]; then
+    IFS= read -r final <&"$broker_stdout_fd" || status=$?
+    [[ "$final" == ok ]] || status=1
+  fi
+  exec {broker_stdout_fd}<&-
+  while true; do
+    if wait "$broker_pid" 2>/dev/null; then
+      wait_status=0
+      break
+    else
+      wait_status=$?
+    fi
+    if ((wait_status >= 128)) &&
+      [[ "${publication_signal_status:-0}" =~ ^(129|130|143)$ ||
+        "${capture_signal_status:-0}" =~ ^(129|130|143)$ ]]; then
+      continue
+    fi
+    break
+  done
+  ((status != 0 || wait_status == 0)) || status="$wait_status"
+  unset BENCHMARK_PRESSURE_COHERENT_SET_BROKER \
+    BENCHMARK_PRESSURE_COHERENT_SET_BROKER_PID
+  if ((status != 0)); then
+    [[ ! "$capture_one_fd" =~ ^[0-9]+$ ]] || exec {capture_one_fd}<&-
+    [[ ! "$capture_two_fd" =~ ^[0-9]+$ ]] || exec {capture_two_fd}<&-
+    [[ ! "$capture_three_fd" =~ ^[0-9]+$ ]] || exec {capture_three_fd}<&-
+    if [[ "$lease_surrendered" == true ]]; then
+      return "$BENCHMARK_PRESSURE_PUBLICATION_AMBIGUOUS_STATUS"
+    fi
+    return "$status"
+  fi
+  if [[ "$mode" == capture3 ]]; then
+    printf -v "$output_one_name" '%s' "$capture_one_fd"
+    printf -v "$output_two_name" '%s' "$capture_two_fd"
+    printf -v "$output_three_name" '%s' "$capture_three_fd"
+  fi
+}
+
+benchmark_pressure_commit_file_no_clobber() (
+  local -r source="$1"
+  local -r target="$2"
+  local -r mode="$3"
+  local -r required_target_parent_identity="${4:-}"
+  local -r required_source_parent_identity="${5:-}"
+  local -r required_source_identity="${6:-}"
+  local -r required_source_sha256="${7:-}"
+  local source_parent="${source%/*}"
+  local source_leaf="${source##*/}"
+  local target_parent="${target%/*}"
+  local target_leaf="${target##*/}"
+  local source_parent_fd=""
+  local target_parent_fd=""
+  local source_parent_descriptor=""
+  local target_parent_descriptor=""
+  local source_parent_identity=""
+  local target_parent_identity=""
+  local lexical_source_parent_identity=""
+  local lexical_target_parent_identity=""
+  local pinned_source=""
+  local pinned_target=""
+  local source_fd=""
+  local source_descriptor=""
+  local source_identity=""
+  local target_identity=""
+  local source_base_identity=""
+  local source_sha256=""
+  local source_size=""
+  local observed_sha256=""
+  local coherent_specification=$'V\t1\n'
+  local cleanup_path=""
+  local cleanup_status=0
+  local cleanup_armed=false
+  local completed=false
+  local rollback_surrendered=false
+  local linearization_in_progress=false
+  local linearization_status=0
+  local publication_signal_status=0
+  local publication_owner_bashpid="$BASHPID"
+  local -a owned_member=()
+
+  benchmark_pressure_single_file_commit_signal() {
+    publication_signal_status="$1"
+    if [[ "$linearization_in_progress" != true ]]; then
+      [[ "$completed" != true ]] || exit 0
+      [[ "$rollback_surrendered" != true ]] ||
+        exit "$BENCHMARK_PRESSURE_PUBLICATION_AMBIGUOUS_STATUS"
+      exit "$publication_signal_status"
+    fi
+  }
+
+  benchmark_pressure_single_file_commit_cleanup() {
+    local -r saved_status="$?"
+
+    trap - EXIT HUP INT TERM
+    set +e
+    if [[ "$completed" != true && "$rollback_surrendered" != true &&
+      "$cleanup_armed" == true &&
+      ${#owned_member[@]} -eq 2 ]]; then
+      if [[ -n "$pinned_source" ]]; then
+        benchmark_pressure_cleanup_owned_set_leaf \
+          "$pinned_source" "${owned_member[@]}" || cleanup_status=$?
+      fi
+      if [[ -n "$pinned_target" ]]; then
+        benchmark_pressure_cleanup_owned_set_leaf \
+          "$pinned_target" "${owned_member[@]}" || cleanup_status=$?
+      fi
+    fi
+    if ((saved_status == 0 && cleanup_status != 0)); then
+      exit "$cleanup_status"
+    fi
+    exit "$saved_status"
+  }
+  trap benchmark_pressure_single_file_commit_cleanup EXIT
+  trap 'benchmark_pressure_single_file_commit_signal 129' HUP
+  trap 'benchmark_pressure_single_file_commit_signal 130' INT
+  trap 'benchmark_pressure_single_file_commit_signal 143' TERM
+
+  [[ "$mode" =~ ^(600|644)$ &&
+    "$source_leaf" =~ ^[A-Za-z0-9._-]+$ &&
+    "$target_leaf" =~ ^[A-Za-z0-9._-]+$ &&
+    "$source" != "$target" &&
+    "$required_target_parent_identity" =~ \
+      ^[0-9]+:[1-9][0-9]*:$EUID:[0-7]{3,4}$ &&
+    "$required_source_parent_identity" =~ \
+      ^[0-9]+:[1-9][0-9]*:$EUID:[0-7]{3,4}$ &&
+    "$required_source_identity" =~ \
+      ^[0-9]+:[1-9][0-9]*:$EUID:$mode:1$ &&
+    "$required_source_sha256" =~ ^[0-9a-f]{64}$ ]] || return 1
+  if [[ "$source_parent" =~ ^/proc/self/fd/[1-9][0-9]*$ ]]; then
+    [[ -d "$source_parent" ]] || return 1
+  else
+    [[ -d "$source_parent" && ! -L "$source_parent" ]] || return 1
+  fi
+  if [[ "$target_parent" =~ ^/proc/self/fd/[1-9][0-9]*$ ]]; then
+    [[ -d "$target_parent" ]] || return 1
+  else
+    [[ -d "$target_parent" && ! -L "$target_parent" ]] || return 1
+  fi
+
+  # Both parent capabilities are retained before the candidate is acquired.
+  exec {source_parent_fd}<"$source_parent" || return $?
+  exec {target_parent_fd}<"$target_parent" || return $?
+  source_parent_descriptor="/proc/self/fd/$source_parent_fd"
+  target_parent_descriptor="/proc/self/fd/$target_parent_fd"
+  pinned_source="$source_parent_descriptor/$source_leaf"
+  pinned_target="$target_parent_descriptor/$target_leaf"
+  source_parent_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "$source_parent_descriptor")" || return $?
+  target_parent_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "$target_parent_descriptor")" || return $?
+  lexical_source_parent_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "$source_parent")" || return $?
+  lexical_target_parent_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "$target_parent")" || return $?
+  [[ "$source_parent_identity" == "$required_source_parent_identity" &&
+    "$target_parent_identity" == "$required_target_parent_identity" &&
+    "$lexical_source_parent_identity" == "$source_parent_identity" &&
+    "$lexical_target_parent_identity" == "$target_parent_identity" &&
+    "$source_parent" -ef "$source_parent_descriptor" &&
+    "$target_parent" -ef "$target_parent_descriptor" &&
+    ! -L "$pinned_source" && -f "$pinned_source" &&
+    ! -L "$source" &&
+    "$source" -ef "$pinned_source" &&
+    ! -L "$pinned_target" && ! -e "$pinned_target" &&
+    ! -L "$target" && ! -e "$target" ]] || return 1
+  benchmark_pressure_parent_identity_allows_mode \
+    "$target_parent_identity" "$mode" || return $?
+  benchmark_pressure_parent_identity_allows_mode \
+    "$source_parent_identity" "$mode" || return $?
+  exec {source_fd}<"$pinned_source" || return $?
+  source_descriptor="/proc/self/fd/$source_fd"
+  source_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "$source_descriptor")" || return $?
+  [[ ! -L "$pinned_source" && ! -L "$source" &&
+    "$source_identity" == "$required_source_identity" &&
+    "$pinned_source" -ef "$source_descriptor" &&
+    "$source" -ef "$source_descriptor" ]] || return 1
+  source_base_identity="${source_identity%:1}"
+  source_sha256="$(sha256sum -- "$source_descriptor")" || return $?
+  source_sha256="${source_sha256%% *}"
+  source_size="$(stat -Lc '%s' -- "$source_descriptor")" || return $?
+  [[ "$source_sha256" == "$required_source_sha256" &&
+    "$source_size" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+  owned_member=("$source_base_identity" "$source_sha256")
+
+  cleanup_armed=true
+  ln -T -- "$pinned_source" "$pinned_target" || return $?
+  [[ ! -L "$pinned_target" && ! -L "$target" ]] || return 1
+  source_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "$source_descriptor")" || return $?
+  target_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "$pinned_target")" || return $?
+  observed_sha256="$(sha256sum -- "$source_descriptor")" || return $?
+  observed_sha256="${observed_sha256%% *}"
+  [[ ! -L "$pinned_target" && ! -L "$target" &&
+    "$source_identity" == "$source_base_identity:2" &&
+    "$target_identity" == "$source_identity" &&
+    "$observed_sha256" == "$source_sha256" &&
+    "$pinned_source" -ef "$source_descriptor" &&
+    "$pinned_target" -ef "$source_descriptor" &&
+    ! -L "$pinned_target" ]] || return 1
+
+  # Consume only the source name derived from the retained source-parent FD.
+  benchmark_pressure_cleanup_owned_set_leaf \
+    "$pinned_source" "${owned_member[@]}" || return $?
+  [[ ! -L "$pinned_target" && ! -L "$target" ]] || return 1
+  source_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "$source_descriptor")" || return $?
+  target_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "$pinned_target")" || return $?
+  observed_sha256="$(sha256sum -- "$source_descriptor")" || return $?
+  observed_sha256="${observed_sha256%% *}"
+  lexical_source_parent_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "$source_parent")" || return $?
+  lexical_target_parent_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "$target_parent")" || return $?
+  [[ ! -L "$pinned_target" && ! -L "$target" &&
+    "$source_identity" == "$source_base_identity:1" &&
+    "$target_identity" == "$source_identity" &&
+    "$observed_sha256" == "$source_sha256" &&
+    "$lexical_source_parent_identity" == "$source_parent_identity" &&
+    "$lexical_target_parent_identity" == "$target_parent_identity" &&
+    "$source_parent" -ef "$source_parent_descriptor" &&
+    "$target_parent" -ef "$target_parent_descriptor" &&
+    "$pinned_target" -ef "$source_descriptor" &&
+    "$target" -ef "$source_descriptor" &&
+    ! -L "$pinned_source" && ! -e "$pinned_source" &&
+    ! -L "$source" && ! -e "$source" ]] || return 1
+  sync -f "$target_parent_descriptor" || return $?
+  [[ ! -L "$pinned_target" && ! -L "$target" ]] || return 1
+  source_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "$source_descriptor")" || return $?
+  target_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "$pinned_target")" || return $?
+  observed_sha256="$(sha256sum -- "$source_descriptor")" || return $?
+  observed_sha256="${observed_sha256%% *}"
+  lexical_source_parent_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "$source_parent")" || return $?
+  lexical_target_parent_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "$target_parent")" || return $?
+  [[ ! -L "$pinned_target" && ! -L "$target" &&
+    "$source_identity" == "$source_base_identity:1" &&
+    "$target_identity" == "$source_identity" &&
+    "$observed_sha256" == "$source_sha256" &&
+    "$lexical_source_parent_identity" == "$source_parent_identity" &&
+    "$lexical_target_parent_identity" == "$target_parent_identity" &&
+    "$source_parent" -ef "$source_parent_descriptor" &&
+    "$target_parent" -ef "$target_parent_descriptor" &&
+    "$pinned_target" -ef "$source_descriptor" &&
+    "$target" -ef "$source_descriptor" &&
+    ! -L "$pinned_source" && ! -e "$pinned_source" &&
+    ! -L "$source" && ! -e "$source" ]] || return 1
+  printf -v coherent_specification \
+    '%sP\t0\t%s\t%s\t%s\trelevant\nP\t1\t%s\t%s\t%s\trelevant\n' \
+    "$coherent_specification" "$source_parent_fd" "$source_parent" \
+    "$source_parent_identity" "$target_parent_fd" "$target_parent" \
+    "$target_parent_identity"
+  printf -v coherent_specification '%sA\t0\t%s\n' \
+    "$coherent_specification" "$source_leaf"
+  printf -v coherent_specification '%sF\t1\t%s\t%s\t%s:1:%s\t%s\n' \
+    "$coherent_specification" "$target_leaf" "$source_fd" \
+    "$source_base_identity" "$source_size" "$source_sha256"
+  linearization_in_progress=true
+  if benchmark_pressure_coherent_file_set verify "$coherent_specification" \
+    "" "" "" rollback_surrendered; then
+    linearization_status=0
+  else
+    linearization_status=$?
+  fi
+  if ((linearization_status == 0)) && [[ "$rollback_surrendered" == true ]]; then
+    completed=true
+    return 0
+  fi
+  [[ "$rollback_surrendered" != true ]] ||
+    return "$BENCHMARK_PRESSURE_PUBLICATION_AMBIGUOUS_STATUS"
+  linearization_in_progress=false
+  ((publication_signal_status == 0)) || return "$publication_signal_status"
+  return "$linearization_status"
+)
+
+benchmark_pressure_capture_candidate_authority() {
+  local -r path="$1"
+  local -r mode="$2"
+  local -r output_parent_identity_name="$3"
+  local -r output_source_identity_name="$4"
+  local -r output_sha256_name="$5"
+  local parent="${path%/*}"
+  local leaf="${path##*/}"
+  local parent_fd=""
+  local parent_descriptor=""
+  local captured_parent_identity=""
+  local lexical_parent_identity=""
+  local pinned_path=""
+  local source_fd=""
+  local source_descriptor=""
+  local captured_source_identity=""
+  local captured_source_sha256=""
+
+  [[ "$mode" =~ ^(600|644)$ && "$leaf" =~ ^[A-Za-z0-9._-]+$ &&
+    "$output_parent_identity_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+    "$output_source_identity_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+    "$output_sha256_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+  if [[ "$parent" =~ ^/proc/self/fd/[1-9][0-9]*$ ]]; then
+    [[ -d "$parent" ]] || return 1
+  else
+    [[ -d "$parent" && ! -L "$parent" ]] || return 1
+  fi
+  exec {parent_fd}<"$parent" || return $?
+  parent_descriptor="/proc/self/fd/$parent_fd"
+  pinned_path="$parent_descriptor/$leaf"
+  captured_parent_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "$parent_descriptor")" ||
+    return $?
+  lexical_parent_identity="$(stat -Lc '%d:%i:%u:%a' -- "$parent")" ||
+    return $?
+  [[ "$captured_parent_identity" == "$lexical_parent_identity" &&
+    "$captured_parent_identity" =~ \
+      ^[0-9]+:[1-9][0-9]*:$EUID:[0-7]{3,4}$ &&
+    "$parent" -ef "$parent_descriptor" &&
+    -f "$pinned_path" && ! -L "$pinned_path" &&
+    "$path" -ef "$pinned_path" ]] || return 1
+  exec {source_fd}<"$pinned_path" || return $?
+  source_descriptor="/proc/self/fd/$source_fd"
+  captured_source_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "$source_descriptor")" || return $?
+  captured_source_sha256="$(sha256sum -- "$source_descriptor")" || return $?
+  captured_source_sha256="${captured_source_sha256%% *}"
+  [[ "$captured_source_identity" =~ \
+      ^[0-9]+:[1-9][0-9]*:$EUID:$mode:1$ &&
+    "$captured_source_sha256" =~ ^[0-9a-f]{64}$ &&
+    "$pinned_path" -ef "$source_descriptor" &&
+    "$path" -ef "$source_descriptor" ]] || return 1
+  printf -v "$output_parent_identity_name" '%s' "$captured_parent_identity"
+  printf -v "$output_source_identity_name" '%s' "$captured_source_identity"
+  printf -v "$output_sha256_name" '%s' "$captured_source_sha256"
+}
+
+benchmark_pressure_parent_identity_allows_mode() {
+  local -r identity="$1"
+  local -r file_mode="$2"
+  local device=""
+  local inode=""
+  local owner=""
+  local parent_mode=""
+  local extra=""
+
+  IFS=: read -r device inode owner parent_mode extra <<<"$identity" || return $?
+  [[ -z "$extra" && "$device" =~ ^[0-9]+$ && "$inode" =~ ^[1-9][0-9]*$ &&
+    "$owner" == "$EUID" && "$parent_mode" =~ ^[0-7]{3,4}$ &&
+    "$file_mode" =~ ^(600|644)$ ]] || return 1
+  if [[ "$file_mode" == 600 ]]; then
+    [[ "$parent_mode" == 700 ]]
+    return
+  fi
+  (((8#$parent_mode & 8#022) == 0))
+}
+
+benchmark_pressure_quarantine_exact_file() (
+  local -r path="$1"
+  local -r expected_base_identity="$2"
+  local -r expected_links="$3"
+  local -r expected_sha256="$4"
+  local parent="${path%/*}"
+  local leaf="${path##*/}"
+  local parent_fd=""
+  local pinned_parent=""
+  local pinned_path=""
+  local parent_identity=""
+  local lexical_parent_identity=""
+  local quarantine=""
+  local quarantine_identity=""
+  local quarantined=""
+  local observed_identity=""
+  local observed_sha256=""
+  local parent_is_descriptor=false
+
+  if [[ "$parent" =~ ^/proc/self/fd/[1-9][0-9]*$ ]]; then
+    [[ -d "$parent" ]] || return 1
+    parent_is_descriptor=true
+  else
+    [[ -d "$parent" && ! -L "$parent" ]] || return 1
+  fi
+  [[ "$expected_base_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:(600|644)$ &&
+    "$expected_links" =~ ^[12]$ && "$expected_sha256" =~ ^[0-9a-f]{64}$ &&
+    "$leaf" =~ ^[A-Za-z0-9._-]+$ &&
+    ( -e "$path" || -L "$path" ) ]] || return 1
+  exec {parent_fd}<"$parent" || return $?
+  pinned_parent="/proc/self/fd/$parent_fd"
+  pinned_path="$pinned_parent/$leaf"
+  parent_identity="$(stat -Lc '%d:%i:%u:%a' -- "$pinned_parent")" || return $?
+  lexical_parent_identity="$(stat -Lc '%d:%i:%u:%a' -- "$parent")" || return $?
+  [[ "$parent_identity" == "$lexical_parent_identity" &&
+    "$parent_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:[0-7]{3,4}$ &&
+    "$parent" -ef "$pinned_parent" &&
+    ( "$parent_is_descriptor" == true || ! -L "$parent" ) &&
+    -f "$pinned_path" &&
+    ! -L "$pinned_path" ]] || return 1
+  quarantine="$(mktemp -d "$pinned_parent/.benchmark-pressure-quarantine.XXXXXX")" ||
+    return $?
+  chmod 0700 -- "$quarantine" || return $?
+  quarantine_identity="$(stat -Lc '%u:%a' -- "$quarantine")" || return $?
+  [[ "$quarantine_identity" == "$EUID:700" ]] || return 1
+  quarantined="$quarantine/quarantined"
+  mv -T -- "$pinned_path" "$quarantined" || return $?
+  [[ ! -e "$pinned_path" && ! -L "$pinned_path" ]] || return 1
+  observed_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$quarantined")" ||
+    return $?
+  observed_sha256="$(sha256sum -- "$quarantined")" || return $?
+  observed_sha256="${observed_sha256%% *}"
+  if [[ "$observed_identity" != "$expected_base_identity:$expected_links" ||
+    "$observed_sha256" != "$expected_sha256" ]]; then
+    # Unknown bytes are deliberately left in the owner-private quarantine.
+    return 1
+  fi
+  rm -- "$quarantined" || return $?
+  rmdir -- "$quarantine" || return $?
+  lexical_parent_identity="$(stat -Lc '%d:%i:%u:%a' -- "$parent")" || return $?
+  [[ "$lexical_parent_identity" == "$parent_identity" &&
+    "$parent" -ef "$pinned_parent" &&
+    ( "$parent_is_descriptor" == true || ! -L "$parent" ) &&
+    ! -e "$path" && ! -L "$path" ]]
+)
+
+benchmark_pressure_publish_validated_file() (
+  local -r source="$1"
+  local -r target="$2"
+  local -r mode="$3"
+  local -r validator="$4"
+  shift 4
+  local source_identity=""
+  local source_base_identity=""
+  local source_sha256=""
+  local source_size=""
+  local publication_snapshot_fd=""
+  local publication_snapshot_path=""
+  local publication_source_identity=""
+  local publication_snapshot_sha256=""
+  local publication_snapshot_size=""
+  local publication_snapshot_identity=""
+  local target_identity=""
+  local target_sha256=""
+  local source_parent="${source%/*}"
+  local source_leaf="${source##*/}"
+  local source_parent_fd=""
+  local source_parent_identity=""
+  local current_source_parent_identity=""
+  local pinned_source=""
+  local target_parent="${target%/*}"
+  local target_leaf="${target##*/}"
+  local target_parent_fd=""
+  local target_parent_identity=""
+  local current_parent_identity=""
+  local pinned_target=""
+  local validation_status=0
+  local rollback_status=0
+  local required_source_identity="${BENCHMARK_PRESSURE_REQUIRED_PUBLICATION_SOURCE_IDENTITY:-}"
+  local required_source_sha256="${BENCHMARK_PRESSURE_REQUIRED_PUBLICATION_SOURCE_SHA256:-}"
+  local BENCHMARK_PRESSURE_PUBLICATION_SOURCE_LEXICAL_PATH="$source"
+
+  [[ "$validator" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ &&
+    "$source_leaf" =~ ^[A-Za-z0-9._-]+$ &&
+    "$target_leaf" =~ ^[A-Za-z0-9._-]+$ &&
+    -d "$source_parent" && ! -L "$source_parent" &&
+    -d "$target_parent" && ! -L "$target_parent" ]] || return 1
+  exec {source_parent_fd}<"$source_parent" || return $?
+  exec {target_parent_fd}<"$target_parent" || return $?
+  pinned_source="/proc/self/fd/$source_parent_fd/$source_leaf"
+  pinned_target="/proc/self/fd/$target_parent_fd/$target_leaf"
+  source_parent_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "/proc/self/fd/$source_parent_fd")" || return $?
+  target_parent_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "/proc/self/fd/$target_parent_fd")" || return $?
+  current_source_parent_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "$source_parent")" || return $?
+  current_parent_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "$target_parent")" || return $?
+  [[ "$source_parent_identity" =~ \
+      ^[0-9]+:[1-9][0-9]*:$EUID:[0-7]{3,4}$ &&
+    "$target_parent_identity" =~ \
+      ^[0-9]+:[1-9][0-9]*:$EUID:[0-7]{3,4}$ &&
+    "$current_source_parent_identity" == "$source_parent_identity" &&
+    "$current_parent_identity" == "$target_parent_identity" &&
+    "$source_parent" -ef "/proc/self/fd/$source_parent_fd" &&
+    "$target_parent" -ef "/proc/self/fd/$target_parent_fd" &&
+    -f "$pinned_source" && ! -L "$pinned_source" &&
+    "$source" -ef "$pinned_source" ]] || return 1
+  benchmark_pressure_parent_identity_allows_mode \
+    "$target_parent_identity" "$mode" || return $?
+  source_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$pinned_source")" ||
+    return $?
+  [[ "$source_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:$mode:1$ &&
+    ( -z "$required_source_identity" ||
+      "$source_identity" == "$required_source_identity" ) &&
+    ( -z "$required_source_sha256" ||
+      "$required_source_sha256" =~ ^[0-9a-f]{64}$ ) ]] || return 1
+  source_base_identity="${source_identity%:1}"
+  benchmark_pressure_hold_file_snapshot \
+    "$pinned_source" "$BENCHMARK_PRESSURE_TRACE_SNAPSHOT_MAX_BYTES" \
+    publication_snapshot_fd publication_source_identity \
+    publication_snapshot_sha256 publication_snapshot_size || return $?
+  publication_snapshot_path="/proc/self/fd/$publication_snapshot_fd"
+  [[ "${publication_source_identity%:*}" == "$source_identity" &&
+    "$publication_snapshot_sha256" =~ ^[0-9a-f]{64}$ &&
+    "$publication_snapshot_size" =~ ^(0|[1-9][0-9]*)$ &&
+    ( -z "$required_source_sha256" ||
+      "$publication_snapshot_sha256" == "$required_source_sha256" ) ]] || return 1
+  source_sha256="$(sha256sum -- "$pinned_source")" || return $?
+  source_sha256="${source_sha256%% *}"
+  source_size="$(stat -Lc '%s' -- "$pinned_source")" || return $?
+  [[ "$source_sha256" == "$publication_snapshot_sha256" &&
+    "$source_size" == "$publication_snapshot_size" &&
+    "$(stat -Lc '%d:%i:%u:%a:%h' -- "$pinned_source")" == \
+      "$source_identity" &&
+    "$source" -ef "$pinned_source" ]] ||
+    return 1
+  if "$validator" "$publication_snapshot_path" "$@"; then
+    target_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$pinned_source")" ||
+      validation_status=$?
+    if ((validation_status == 0)); then
+      target_sha256="$(sha256sum -- "$pinned_source")" || validation_status=$?
+      target_sha256="${target_sha256%% *}"
+    fi
+    if ((validation_status == 0)); then
+      publication_snapshot_identity="$(stat -Lc '%u:%a:%h:%s' -- \
+        "$publication_snapshot_path")" ||
+        validation_status=$?
+    fi
+    if ((validation_status == 0)) &&
+      [[ "$target_identity" == "$source_identity" &&
+        "$target_sha256" == "$publication_snapshot_sha256" &&
+        "$source" -ef "$pinned_source" &&
+        "$(stat -Lc '%d:%i:%u:%a' -- "$source_parent")" == \
+          "$source_parent_identity" &&
+        "$publication_snapshot_identity" == \
+          "$EUID:$mode:0:$publication_snapshot_size" ]]; then :
+    else
+      ((validation_status != 0)) || validation_status=1
+    fi
+  else
+    validation_status=$?
+    ((validation_status != 0)) || validation_status=1
+  fi
+  if ((validation_status != 0)); then
+    if [[ -e "$pinned_source" || -L "$pinned_source" ]]; then
+      benchmark_pressure_quarantine_exact_file \
+        "$pinned_source" "$source_base_identity" 1 "$source_sha256" ||
+        rollback_status=$?
+    fi
+    ((rollback_status == 0)) || return "$rollback_status"
+    return "$validation_status"
+  fi
+  benchmark_pressure_commit_file_no_clobber \
+    "$source" "$target" "$mode" "$target_parent_identity" \
+    "$source_parent_identity" "$source_identity" \
+    "$publication_snapshot_sha256" || return $?
+  # The inner descriptor-pinned commit broker is the terminal publication
+  # authority.  Do not reopen or reinterpret either lexical name after its
+  # coherent success boundary.
+  return 0
+)
+
+benchmark_pressure_stack_identity_json() {
+  local service=""
+  local container_id=""
+  local before=""
+  local after=""
+  local inspected_id=""
+  local host_pid=""
+  local started_at=""
+  local running=""
+  local project=""
+  local owner=""
+  local service_label=""
+  local container_name=""
+  local extra=""
+  local result='[]'
+  local row=""
+
+  for service in obi java-backend apache-proxy; do
+    container_id="$(run_bounded 10 "${COMPOSE[@]}" ps --quiet "$service")" || return $?
+    [[ "$container_id" =~ ^[0-9a-f]{64}$ ]] || return 1
+    before="$(run_bounded 10 docker inspect --format \
+      '{{.Id}}|{{.State.Pid}}|{{.State.StartedAt}}|{{.State.Running}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "io.opentelemetry.obi.apache-java-https.owner"}}|{{index .Config.Labels "com.docker.compose.service"}}|{{.Name}}' \
+      "$container_id")" || return $?
+    IFS='|' read -r inspected_id host_pid started_at running project owner \
+      service_label container_name extra <<<"$before"
+    [[ -z "$extra" && "$inspected_id" == "$container_id" &&
+      "$host_pid" =~ ^[1-9][0-9]*$ &&
+      "$started_at" != "0001-01-01T00:00:00Z" && -n "$started_at" &&
+      "$running" == true && "$project" == "$PROJECT_NAME" &&
+      "$owner" == "$PROJECT_SENTINEL_VALUE" &&
+      "$service_label" == "$service" &&
+      "$container_name" =~ ^/[a-z0-9][a-z0-9_.-]{0,126}$ ]] || return 1
+    after="$(run_bounded 10 docker inspect --format \
+      '{{.Id}}|{{.State.Pid}}|{{.State.StartedAt}}|{{.State.Running}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "io.opentelemetry.obi.apache-java-https.owner"}}|{{index .Config.Labels "com.docker.compose.service"}}|{{.Name}}' \
+      "$container_id")" || return $?
+    [[ "$after" == "$before" ]] || return 1
+    row="$(jq -cS -n \
+      --arg service "$service" \
+      --arg container_id "$container_id" \
+      --arg container_name "${container_name#/}" \
+      --argjson host_pid "$host_pid" \
+      --arg started_at "$started_at" \
+      '{service:$service,container_id:$container_id,container_name:$container_name,
+        host_pid:$host_pid,started_at:$started_at}')" || return $?
+    result="$(jq -cS --argjson row "$row" '. + [$row]' <<<"$result")" || return $?
+  done
+  jq -cSe '
+    length == 3 and
+    map(.service) == ["obi", "java-backend", "apache-proxy"] and
+    all(.[];
+      (keys == ["container_id","container_name","host_pid","service","started_at"]) and
+      (.container_id | test("^[0-9a-f]{64}$")) and
+      (.container_name | test("^[a-z0-9][a-z0-9_.-]{0,126}$")) and
+      (.host_pid | type == "number" and floor == . and . >= 1) and
+      (.started_at | type == "string" and length > 0))
+  ' <<<"$result"
+}
+
+validate_benchmark_pressure_stack_identity_file() (
+  local input="$1"
+  local input_fd=""
+
+  benchmark_pressure_trusted_regular_path "$input" || return $?
+  benchmark_pressure_hold_file_snapshot \
+    "$input" "$BENCHMARK_PRESSURE_STACK_MAX_BYTES" input_fd || return $?
+  input="/proc/self/fd/$input_fd"
+  bounded_evidence_file "$input" "$BENCHMARK_PRESSURE_STACK_MAX_BYTES" 1 ||
+    return $?
+  benchmark_pressure_json_has_unique_object_keys \
+    "$input" "$BENCHMARK_PRESSURE_STACK_MAX_BYTES" || return $?
+  jq -se '
+    length == 1 and (.[0] |
+      type == "array" and length == 3 and
+      map(.service) == ["obi","java-backend","apache-proxy"] and
+      ([.[].container_id] | unique | length) == 3 and
+      ([.[].container_name] | unique | length) == 3 and
+      all(.[];
+        keys == ["container_id","container_name","host_pid","service",
+          "started_at"] and
+        (.container_id | test("^[0-9a-f]{64}$")) and
+        (.container_name | test("^[a-z0-9][a-z0-9_.-]{0,126}$")) and
+        (.host_pid | type == "number" and floor == . and . >= 1) and
+        (.started_at | type == "string" and
+          test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T"))))
+  ' "$input" >/dev/null
+)
+
+validate_benchmark_pressure_result() (
+  local result="$1"
+  local -r expected_marker_prefix="$2"
+  local result_fd=""
+  local result_bytes=""
+  local raw_value_count=""
+
+  [[ "$expected_marker_prefix" =~ ^pressure-[0-9a-f]{32}-cycle-(0[1-9]|10)$ ]] ||
+    return 1
+  benchmark_pressure_trusted_regular_path "$result" || return $?
+  benchmark_pressure_hold_file_snapshot \
+    "$result" "$BENCHMARK_PRESSURE_RESULT_MAX_BYTES" result_fd || return $?
+  result="/proc/self/fd/$result_fd"
+  bounded_evidence_file "$result" "$BENCHMARK_PRESSURE_RESULT_MAX_BYTES" 1 ||
+    return $?
+  result_bytes="$(stat -Lc '%s' -- "$result")" || return $?
+  [[ "$result_bytes" =~ ^[1-9][0-9]*$ ]] || return 1
+  ((result_bytes <= BENCHMARK_PRESSURE_RESULT_MAX_BYTES)) || return 1
+  benchmark_pressure_json_has_unique_object_keys \
+    "$result" "$BENCHMARK_PRESSURE_RESULT_MAX_BYTES" || return $?
+  raw_value_count="$(jq --stream -n '
+    reduce inputs as $event (0;
+      if ($event | length) == 2 then . + 1 else . end)
+  ' "$result")" || return $?
+  [[ "$raw_value_count" =~ ^[1-9][0-9]*$ ]] || return 1
+  ((raw_value_count <= 28 + 2 * BENCHMARK_PRESSURE_MAX_SUCCESSFUL_REQUESTS)) ||
+    return 1
+  jq -se \
+    --arg base_url "$BENCHMARK_PRESSURE_BASE_URL" \
+    --arg path "$BENCHMARK_PRESSURE_PATH" \
+    --arg connection_mode "$BENCHMARK_PRESSURE_CONNECTION_MODE" \
+    --arg histogram_encoding "$BENCHMARK_PRESSURE_HISTOGRAM_ENCODING" \
+    --arg marker_prefix "$expected_marker_prefix" \
+    --arg marker_encoding "$BENCHMARK_PRESSURE_MARKER_ENCODING" \
+    --argjson duration_nanos "$((BENCHMARK_PRESSURE_LOAD_SECONDS * 1000000000))" \
+    --argjson maximum_traffic_elapsed_nanos "$(((BENCHMARK_PRESSURE_LOAD_SECONDS + BENCHMARK_PRESSURE_LOAD_OVERRUN_SECONDS) * 1000000000))" \
+    --argjson request_timeout_nanos "$((BENCHMARK_PRESSURE_REQUEST_TIMEOUT_SECONDS * 1000000000))" \
+    --argjson concurrency "$BENCHMARK_PRESSURE_CONCURRENCY" \
+    --argjson request_limit "$BENCHMARK_PRESSURE_REQUEST_LIMIT" \
+    --argjson maximum_successful_requests "$BENCHMARK_PRESSURE_MAX_SUCCESSFUL_REQUESTS" \
+    --argjson maximum_safe_integer "$MAX_JSON_SAFE_INTEGER" \
+    --argjson raw_value_count "$raw_value_count" '
+      def finite_number: type == "number" and isfinite;
+      def positive_integer:
+        finite_number and floor == . and . > 0 and . <= $maximum_safe_integer;
+      def non_negative_integer:
+        finite_number and floor == . and . >= 0 and . <= $maximum_safe_integer;
+      def timestamp_parts:
+        capture("^(?<base>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\\.(?<fraction>[0-9]{0,8}[1-9]))?Z$") as $parts |
+        ($parts.base + "Z" | fromdateiso8601) as $seconds |
+        select($seconds > 0) |
+        select(($seconds | todateiso8601) == ($parts.base + "Z")) |
+        [$seconds, (((($parts.fraction // "") + "000000000")[0:9]) | tonumber)];
+      def nearest_rank($runs; $count; $percent):
+        ((($count * $percent + 99) / 100) | floor) as $rank |
+        (reduce $runs[] as $run ({seen:0,value:null};
+          if .value != null then . else
+            (.seen + $run.count) as $next | .seen = $next |
+            if $next >= $rank then .value = $run.nanos else . end
+          end) | .value);
+      length == 1 and (.[0] |
+        . as $result |
+        (.started_at | timestamp_parts) as $started |
+        (.finished_at | timestamp_parts) as $finished |
+        (.successful_requests * 1000000000 / .traffic_elapsed_nanos) as $expected_throughput |
+        ([1e-12, ($expected_throughput * 1e-12)] | max) as $throughput_tolerance |
+        keys == ["admitted_requests","base_url","canceled","concurrency",
+          "connection_mode","failed_requests","finished_at",
+          "first_request_ordinal","last_request_ordinal","latency",
+          "marker_encoding","marker_prefix","path","request_limit",
+          "request_limit_reached","request_timeout_nanos",
+          "requested_duration_nanos","seed","started_at","status",
+          "successful_requests","throughput_per_second","tls_verification",
+          "traffic_elapsed_nanos","w3c"] and
+        $started <= $finished and .status == "passed" and
+        .base_url == $base_url and .path == $path and
+        .connection_mode == $connection_mode and
+        .tls_verification == "not_applicable" and .w3c == false and
+        (.seed | non_negative_integer) and .seed == 0 and
+        (.requested_duration_nanos | positive_integer) and
+        .requested_duration_nanos == $duration_nanos and
+        (.request_timeout_nanos | positive_integer) and
+        .request_timeout_nanos == $request_timeout_nanos and
+        (.concurrency | positive_integer) and .concurrency == $concurrency and
+        (.request_limit | positive_integer) and .request_limit == $request_limit and
+        .request_limit_reached == false and .canceled == false and
+        (.successful_requests | positive_integer and
+          . <= $maximum_successful_requests) and
+        (.failed_requests | non_negative_integer and . == 0) and
+        .marker_prefix == $marker_prefix and
+        .marker_encoding == $marker_encoding and
+        .admitted_requests == .successful_requests and
+        .first_request_ordinal == 1 and
+        .last_request_ordinal == .successful_requests and
+        (.traffic_elapsed_nanos | positive_integer and
+          . >= $duration_nanos and . < $maximum_traffic_elapsed_nanos) and
+        (.throughput_per_second | finite_number and . > 0) and
+        ((.throughput_per_second - $expected_throughput) |
+          if . < 0 then -. else . end) <= $throughput_tolerance and
+        (.latency | type == "object") and
+        (.latency | keys) == ["histogram","histogram_encoding","p50_nanos",
+          "p95_nanos","p99_nanos"] and
+        .latency.histogram_encoding == $histogram_encoding and
+        (.latency.histogram | type == "array" and length > 0 and
+          length <= $request_limit) and
+        all(.latency.histogram[];
+          type == "object" and keys == ["count","nanos"] and
+          (.nanos | positive_integer and . <= $maximum_traffic_elapsed_nanos) and
+          (.count | positive_integer)) and
+        .latency.histogram as $histogram |
+        ($histogram | length) as $histogram_length |
+        $raw_value_count == (28 + 2 * $histogram_length) and
+        all(range(1; $histogram_length);
+          $histogram[.].nanos > $histogram[. - 1].nanos) and
+        ([$histogram[].count] | add) == .successful_requests and
+        (.latency.p50_nanos | positive_integer) and
+        (.latency.p95_nanos | positive_integer) and
+        (.latency.p99_nanos | positive_integer) and
+        .latency.p50_nanos == nearest_rank($histogram; .successful_requests; 50) and
+        .latency.p95_nanos == nearest_rank($histogram; .successful_requests; 95) and
+        .latency.p99_nanos == nearest_rank($histogram; .successful_requests; 99))
+  ' "$result" >/dev/null
+)
+
+publish_benchmark_pressure_control_file() {
+  local -r name="$1"
+  local -r evidence="$2"
+  local -r expected_cycle="${3:-}"
+  local committed_evidence="$evidence"
+  local committed_stderr=""
+  local committed_receipt=""
+  local deadline=""
+  local payload=""
+  local target=""
+  local target_anchor=""
+  local control_descriptor=""
+  local identity=""
+  local marker_prefix=""
+
+  case "$name" in
+    "$PRESSURE_CONTROL_READY_FILE")
+      [[ "$PRESSURE_BARRIER_RUNTIME_STATUS" == prepared &&
+        "$PRESSURE_ACTIVE" == true &&
+        "$PRESSURE_MAP_MAX_ENTRIES" == "$PRESSURE_EXPECTED_MAP_CAPACITY" &&
+        "$PRESSURE_TOUCHED_ENTRIES" == "$PRESSURE_EXPECTED_MAP_CAPACITY" &&
+        "$PRESSURE_CAPACITY_REJECTED_ENTRIES" == 1 &&
+        "$PRESSURE_VERIFIED_PRESENT_ENTRIES" == "$PRESSURE_EXPECTED_MAP_CAPACITY" &&
+        "$PRESSURE_VERIFIED_ABSENT_ENTRIES" == 1 ]] || return 1
+      pressure_result_has_contract "$evidence" fill "$PRESSURE_CONTROL_DEADLINE" ||
+        return $?
+      ;;
+    "$PRESSURE_CONTROL_RELEASE_FILE")
+      [[ "$PRESSURE_BARRIER_RUNTIME_STATUS" == ready &&
+        "$expected_cycle" =~ ^([1-9]|10)$ ]] || return 1
+      benchmark_pressure_client_bundle_images_for_consumer \
+        "$evidence" "$expected_cycle" committed_evidence committed_stderr \
+        committed_receipt || return $?
+      marker_prefix="$(jq -er '.marker_prefix' "$committed_evidence")" || return $?
+      [[ "$marker_prefix" =~ ^pressure-${PRESSURE_CONTROL_SESSION}-cycle-(0[1-9]|10)$ ]] ||
+        return 1
+      validate_benchmark_pressure_result "$committed_evidence" "$marker_prefix" ||
+        return $?
+      ;;
+    *) return 1 ;;
+  esac
+  deadline="$(pressure_publication_deadline \
+    "$PRESSURE_CONTROL_DEADLINE" \
+    "$PRESSURE_CONTROL_PUBLICATION_TIMEOUT_SECONDS")" || return $?
+  pressure_control_live_directory_matches "$deadline" || return $?
+  payload="$(pressure_control_payload "$name")" || return $?
+  target="$PRESSURE_CONTROL_LIVE_DIR/$name"
+  pressure_transaction_target_path_is_allowed \
+    "$target" "" target_anchor || return 1
+  [[ ! -e "$target_anchor" && ! -L "$target_anchor" ]] || return 1
+  control_descriptor="/proc/$PRESSURE_TRANSACTION_OWNER_BASHPID/fd/$PRESSURE_TRANSACTION_CONTROL_PARENT_FD"
+  run_pressure_bounded "$deadline" 5 bash -c '
+    set -Eeuo pipefail
+    umask 077
+    set -o noclobber
+    printf "%s\n" "$1" >"$2/$3"
+    sync "$2/$3"
+  ' benchmark-pressure-control "$payload" "$control_descriptor" "$name" || return $?
+  identity="$(pressure_control_live_file_identity "$name" "$deadline")" || return $?
+  if [[ "$name" == "$PRESSURE_CONTROL_READY_FILE" ]]; then
+    PRESSURE_CONTROL_READY_IDENTITY="$identity"
+    PRESSURE_BARRIER_RUNTIME_STATUS=ready
+  else
+    PRESSURE_CONTROL_RELEASE_IDENTITY="$identity"
+    PRESSURE_BARRIER_RUNTIME_STATUS=released
+  fi
+}
+
+benchmark_pressure_client_absent() {
+  local -r container_name="$1"
+  local -r remove_owned="$2"
+  local listing=""
+  local inspection=""
+  local container_id=""
+  local inspected_name=""
+  local project=""
+  local owner=""
+  local service=""
+  local image_id=""
+  local extra=""
+
+  [[ "$container_name" =~ ^[a-z0-9][a-z0-9_.-]{0,126}$ &&
+    "$remove_owned" =~ ^(true|false)$ ]] || return 1
+  listing="$(run_bounded 10 docker container ls --all --no-trunc \
+    --filter "name=^/${container_name}$" --format '{{.ID}}')" || return $?
+  [[ "$listing" != *$'\n'* ]] || return 1
+  [[ -n "$listing" ]] || return 0
+  [[ "$remove_owned" == true && "$listing" =~ ^[0-9a-f]{64}$ ]] || return 1
+  inspection="$(run_bounded 10 docker inspect --format \
+    '{{.Id}}|{{.Name}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "io.opentelemetry.obi.apache-java-https.owner"}}|{{index .Config.Labels "com.docker.compose.service"}}|{{.Image}}' \
+    "$listing")" || return $?
+  IFS='|' read -r container_id inspected_name project owner service image_id extra \
+    <<<"$inspection"
+  [[ -z "$extra" && "$container_id" == "$listing" &&
+    "$inspected_name" == "/$container_name" &&
+    "$project" == "$PROJECT_NAME" && "$owner" == "$PROJECT_SENTINEL_VALUE" &&
+    "$service" == benchmark && "$image_id" == "$PRESSURE_TRACECHECK_IMAGE_ID" ]] ||
+    return 1
+  run_bounded 15 docker container rm --force "$container_id" >/dev/null || return $?
+  listing="$(run_bounded 10 docker container ls --all --no-trunc \
+    --filter "name=^/${container_name}$" --format '{{.ID}}')" || return $?
+  [[ -z "$listing" ]]
+}
+
+benchmark_pressure_run_client_captured() (
+  local -r stdout_output="$1"
+  local -r stderr_output="$2"
+  local -r status_output="$3"
+  local -r timeout_seconds="$4"
+  shift 4
+  local stdout_fifo=""
+  local stderr_fifo=""
+  local capture_dir=""
+  local output_parent="${stdout_output%/*}"
+  local output_parent_fd=""
+  local output_parent_descriptor=""
+  local output_parent_identity=""
+  local stdout_leaf="${stdout_output##*/}"
+  local stderr_leaf="${stderr_output##*/}"
+  local status_leaf="${status_output##*/}"
+  local stdout_fd=""
+  local stderr_fd=""
+  local status_fd=""
+  local stdout_rw_fd=""
+  local stderr_rw_fd=""
+  local status_rw_fd=""
+  local stdout_descriptor=""
+  local stderr_descriptor=""
+  local status_descriptor=""
+  local pinned_stdout_output=""
+  local pinned_stderr_output=""
+  local pinned_status_output=""
+  local stdout_identity=""
+  local stderr_identity=""
+  local status_identity=""
+  local stdout_sha256=""
+  local stderr_sha256=""
+  local status_sha256=""
+  local stdout_size=""
+  local stderr_size=""
+  local callback="${BENCHMARK_PRESSURE_CLIENT_CAPTURE_CALLBACK:-}"
+  local callback_status=0
+  local bounded_capture=""
+  local line_capture=""
+  local bounded_size=""
+  local stdout_pid=""
+  local stderr_pid=""
+  local command_pid=""
+  local command_pgid=""
+  local command_status=0
+  local stdout_status=0
+  local stderr_status=0
+  local capture_status=0
+  local size=""
+  local lines=""
+  local registration_index=0
+  local stdout_registration_index=-1
+  local stderr_registration_index=-1
+  local status_registration_index=-1
+  # Test hooks consume this through dynamic scope.
+  # shellcheck disable=SC2034
+  local capture_owner_bashpid="$BASHPID"
+  local capture_signal_status=0
+  local capture_registration_in_progress=false
+  local publication_linearization_in_progress=false
+  local publication_broker_active=false
+  local publication_sealed=false
+  local -a registered_descriptors=()
+  local -a registered_identities=()
+  local -a registered_digests=()
+  local -a registered_cleanup_paths=()
+
+  benchmark_pressure_client_capture_signal() {
+    capture_signal_status="$1"
+    [[ "$publication_sealed" != true ]] || return 0
+    if [[ "$capture_registration_in_progress" != true &&
+      "$publication_broker_active" != true ]]; then
+      exit "$capture_signal_status"
+    fi
+  }
+
+  benchmark_pressure_client_capture_cleanup() {
+    local -r saved_status="$?"
+    local pid=""
+    local attempt=0
+    local descriptor=""
+    local identity=""
+    local registered_identity=""
+    local registered_digest=""
+    local digest=""
+    local cleanup_path=""
+    local cleanup_status=0
+    local cleanup_index=0
+    local -a owned_members=()
+
+    trap - EXIT HUP INT TERM
+    set +m 2>/dev/null || true
+    if [[ "$publication_sealed" == true ]]; then
+      exit "$saved_status"
+    fi
+    if [[ "$command_pgid" =~ ^[1-9][0-9]*$ &&
+      "$command_pgid" != "$BASHPID" ]]; then
+      kill -TERM -- "-$command_pgid" 2>/dev/null || true
+      for ((attempt = 0; attempt < 20; attempt++)); do
+        kill -0 -- "-$command_pgid" 2>/dev/null || break
+        sleep 0.05
+      done
+      if kill -0 -- "-$command_pgid" 2>/dev/null; then
+        kill -KILL -- "-$command_pgid" 2>/dev/null || true
+      fi
+    fi
+    for pid in "$stdout_pid" "$stderr_pid"; do
+      if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$pid" 2>/dev/null; then
+        kill -TERM "$pid" 2>/dev/null || true
+      fi
+    done
+    for pid in "$command_pid" "$stdout_pid" "$stderr_pid"; do
+      if [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
+        wait "$pid" 2>/dev/null || true
+      fi
+    done
+    rm -f -- "$stdout_fifo" "$stderr_fifo" 2>/dev/null || true
+    if [[ -n "$capture_dir" && -d "$capture_dir" && ! -L "$capture_dir" ]]; then
+      rmdir -- "$capture_dir" 2>/dev/null || true
+    fi
+    for ((cleanup_index = 0;
+      cleanup_index < ${#registered_descriptors[@]};
+      cleanup_index++)); do
+      descriptor="${registered_descriptors[cleanup_index]}"
+      identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$descriptor" 2>/dev/null)" || {
+        cleanup_status=1
+        continue
+      }
+      digest="$(sha256sum -- "$descriptor" 2>/dev/null)" || {
+        cleanup_status=1
+        continue
+      }
+      digest="${digest%% *}"
+      registered_identity="${registered_identities[cleanup_index]}"
+      registered_digest="${registered_digests[cleanup_index]}"
+      [[ "$identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:600:(0|1|2)$ &&
+        ( -z "$registered_identity" ||
+          "${registered_identity%:*}" == "${identity%:*}" ) &&
+        "$digest" =~ ^[0-9a-f]{64}$ &&
+        ( -z "$registered_digest" ||
+          ( "$registered_digest" =~ ^[0-9a-f]{64}$ &&
+            "$digest" == "$registered_digest" ) ) ]] || {
+        cleanup_status=1
+        continue
+      }
+      owned_members+=("${identity%:*}" "$digest")
+    done
+    if ((${#owned_members[@]} >= 2)); then
+      for cleanup_path in "${registered_cleanup_paths[@]}"; do
+        [[ -n "$cleanup_path" ]] || continue
+        benchmark_pressure_cleanup_owned_set_leaf \
+          "$cleanup_path" "${owned_members[@]}" || cleanup_status=$?
+      done
+    fi
+    if ((saved_status == 0 && cleanup_status != 0)); then
+      exit "$cleanup_status"
+    fi
+    exit "$saved_status"
+  }
+  trap benchmark_pressure_client_capture_cleanup EXIT
+  trap 'benchmark_pressure_client_capture_signal 129' HUP
+  trap 'benchmark_pressure_client_capture_signal 130' INT
+  trap 'benchmark_pressure_client_capture_signal 143' TERM
+
+  [[ "${stderr_output%/*}" == "$output_parent" &&
+    "${status_output%/*}" == "$output_parent" &&
+    "$stdout_leaf" =~ ^[A-Za-z0-9._-]+$ &&
+    "$stderr_leaf" =~ ^[A-Za-z0-9._-]+$ &&
+    "$status_leaf" =~ ^[A-Za-z0-9._-]+$ &&
+    "$stdout_leaf" != "$stderr_leaf" && "$stdout_leaf" != "$status_leaf" &&
+    "$stderr_leaf" != "$status_leaf" &&
+    -d "$output_parent" && ! -L "$output_parent" &&
+    ! -e "$stdout_output" && ! -L "$stdout_output" &&
+    ! -e "$stderr_output" && ! -L "$stderr_output" &&
+    ! -e "$status_output" && ! -L "$status_output" &&
+    ( -z "$callback" || "$callback" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ) &&
+    "$timeout_seconds" =~ ^[1-9][0-9]*$ && $# -gt 0 ]] || return 1
+  exec {output_parent_fd}<"$output_parent" || return $?
+  output_parent_descriptor="/proc/self/fd/$output_parent_fd"
+  output_parent_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "$output_parent_descriptor")" || return $?
+  [[ "$output_parent_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:700$ &&
+    "$output_parent" -ef "$output_parent_descriptor" ]] || return 1
+  pinned_stdout_output="$output_parent_descriptor/$stdout_leaf"
+  pinned_stderr_output="$output_parent_descriptor/$stderr_leaf"
+  pinned_status_output="$output_parent_descriptor/$status_leaf"
+  registered_cleanup_paths=(
+    "$pinned_stdout_output"
+    "$pinned_stderr_output"
+    "$pinned_status_output"
+    "$output_parent_descriptor/.benchmark-client-commit.capture"
+    "$output_parent_descriptor/.benchmark-client-failure.capture"
+    "$output_parent_descriptor/benchmark-result.json"
+    "$output_parent_descriptor/benchmark.stderr.log"
+    "$output_parent_descriptor/benchmark-client-commit.json"
+    "$output_parent_descriptor/benchmark.failure.stdout.log"
+    "$output_parent_descriptor/benchmark.failure.stderr.log"
+    "$output_parent_descriptor/benchmark-client-failure.json"
+  )
+  umask 077
+  set -o noclobber
+  capture_registration_in_progress=true
+  exec {stdout_fd}>"$pinned_stdout_output" || return $?
+  registration_index="${#registered_descriptors[@]}"
+  stdout_registration_index="$registration_index"
+  registered_descriptors+=("/proc/self/fd/$stdout_fd")
+  registered_identities+=("")
+  registered_digests+=("")
+  exec {stdout_rw_fd}<>"/proc/self/fd/$stdout_fd" || return $?
+  exec {stdout_fd}>&-
+  stdout_fd="$stdout_rw_fd"
+  stdout_descriptor="/proc/self/fd/$stdout_fd"
+  registered_descriptors[registration_index]="$stdout_descriptor"
+  stdout_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$stdout_descriptor")" ||
+    return $?
+  [[ "$stdout_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:600:1$ &&
+    "$pinned_stdout_output" -ef "$stdout_descriptor" &&
+    "$stdout_output" -ef "$stdout_descriptor" ]] || return 1
+  registered_identities[registration_index]="$stdout_identity"
+  capture_registration_in_progress=false
+  ((capture_signal_status == 0)) || return "$capture_signal_status"
+
+  capture_registration_in_progress=true
+  exec {stderr_fd}>"$pinned_stderr_output" || return $?
+  registration_index="${#registered_descriptors[@]}"
+  stderr_registration_index="$registration_index"
+  registered_descriptors+=("/proc/self/fd/$stderr_fd")
+  registered_identities+=("")
+  registered_digests+=("")
+  exec {stderr_rw_fd}<>"/proc/self/fd/$stderr_fd" || return $?
+  exec {stderr_fd}>&-
+  stderr_fd="$stderr_rw_fd"
+  stderr_descriptor="/proc/self/fd/$stderr_fd"
+  registered_descriptors[registration_index]="$stderr_descriptor"
+  stderr_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$stderr_descriptor")" ||
+    return $?
+  [[ "$stderr_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:600:1$ &&
+    "$pinned_stderr_output" -ef "$stderr_descriptor" &&
+    "$stderr_output" -ef "$stderr_descriptor" ]] || return 1
+  registered_identities[registration_index]="$stderr_identity"
+  capture_registration_in_progress=false
+  ((capture_signal_status == 0)) || return "$capture_signal_status"
+
+  capture_registration_in_progress=true
+  exec {status_fd}>"$pinned_status_output" || return $?
+  registration_index="${#registered_descriptors[@]}"
+  status_registration_index="$registration_index"
+  registered_descriptors+=("/proc/self/fd/$status_fd")
+  registered_identities+=("")
+  registered_digests+=("")
+  exec {status_rw_fd}<>"/proc/self/fd/$status_fd" || return $?
+  exec {status_fd}>&-
+  status_fd="$status_rw_fd"
+  status_descriptor="/proc/self/fd/$status_fd"
+  registered_descriptors[registration_index]="$status_descriptor"
+  status_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$status_descriptor")" ||
+    return $?
+  [[ "$status_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:600:1$ &&
+    "$pinned_status_output" -ef "$status_descriptor" &&
+    "$status_output" -ef "$status_descriptor" ]] || return 1
+  registered_identities[registration_index]="$status_identity"
+  capture_registration_in_progress=false
+  ((capture_signal_status == 0)) || return "$capture_signal_status"
+  set +o noclobber
+  capture_dir="$(mktemp -d "${stdout_output%/*}/.benchmark-capture.XXXXXX")" ||
+    return $?
+  chmod 0700 -- "$capture_dir" || return $?
+  [[ "$(stat -Lc '%u:%a' -- "$capture_dir")" == "$EUID:700" ]] || return 1
+  stdout_fifo="$capture_dir/stdout"
+  stderr_fifo="$capture_dir/stderr"
+  mkfifo -m 0600 -- "$stdout_fifo" "$stderr_fifo" || return $?
+  LC_ALL=C head -c "$((BENCHMARK_PRESSURE_RESULT_MAX_BYTES + 1))" \
+    -- "$stdout_fifo" >"$stdout_descriptor" &
+  stdout_pid=$!
+  LC_ALL=C head -c "$((BENCHMARK_PRESSURE_STDERR_MAX_BYTES + 1))" \
+    -- "$stderr_fifo" >"$stderr_descriptor" &
+  stderr_pid=$!
+  set -m
+  run_bounded_foreground_group "$timeout_seconds" "$@" \
+    >"$stdout_fifo" 2>"$stderr_fifo" &
+  command_pid=$!
+  command_pgid="$command_pid"
+  if wait "$command_pid" 2>/dev/null; then
+    command_status=0
+  else
+    command_status=$?
+  fi
+  command_pid=""
+  set +m 2>/dev/null
+  if kill -0 -- "-$command_pgid" 2>/dev/null; then
+    capture_status=125
+    kill -TERM -- "-$command_pgid" 2>/dev/null || true
+    for ((size = 0; size < 20; size++)); do
+      kill -0 -- "-$command_pgid" 2>/dev/null || break
+      sleep 0.05
+    done
+    if kill -0 -- "-$command_pgid" 2>/dev/null; then
+      kill -KILL -- "-$command_pgid" 2>/dev/null || true
+    fi
+  fi
+  command_pgid=""
+  if wait "$stdout_pid"; then :; else stdout_status=$?; fi
+  stdout_pid=""
+  if wait "$stderr_pid"; then :; else stderr_status=$?; fi
+  stderr_pid=""
+  rm -f -- "$stdout_fifo" "$stderr_fifo" || return $?
+  stdout_fifo=""
+  stderr_fifo=""
+
+  size="$(stat -Lc '%s' -- "$stdout_descriptor")" || return $?
+  lines="$(awk 'END { print NR + 0 }' "$stdout_descriptor")" || return $?
+  [[ "$size" =~ ^(0|[1-9][0-9]*)$ && "$lines" =~ ^(0|[1-9][0-9]*)$ ]] ||
+    return 1
+  if ((size > BENCHMARK_PRESSURE_RESULT_MAX_BYTES || lines > 1)); then
+    capture_status=125
+    line_capture="$capture_dir/stdout.lines"
+    bounded_capture="$capture_dir/stdout.bounded"
+    LC_ALL=C head -n 1 -- "$stdout_descriptor" >"$line_capture" || return $?
+    LC_ALL=C head -c "$BENCHMARK_PRESSURE_RESULT_MAX_BYTES" \
+      -- "$line_capture" >"$bounded_capture" || return $?
+    bounded_size="$(stat -Lc '%s' -- "$bounded_capture")" || return $?
+    dd if="$bounded_capture" of="$stdout_descriptor" bs=65536 \
+      conv=notrunc status=none || return $?
+    truncate -s "$bounded_size" -- "$stdout_descriptor" || return $?
+    rm -- "$line_capture" "$bounded_capture" || return $?
+  fi
+  size="$(stat -Lc '%s' -- "$stderr_descriptor")" || return $?
+  lines="$(awk 'END { print NR + 0 }' "$stderr_descriptor")" || return $?
+  [[ "$size" =~ ^(0|[1-9][0-9]*)$ && "$lines" =~ ^(0|[1-9][0-9]*)$ ]] ||
+    return 1
+  if ((size > BENCHMARK_PRESSURE_STDERR_MAX_BYTES ||
+    lines > BENCHMARK_PRESSURE_STDERR_MAX_LINES)); then
+    capture_status=125
+    line_capture="$capture_dir/stderr.lines"
+    bounded_capture="$capture_dir/stderr.bounded"
+    LC_ALL=C head -n "$BENCHMARK_PRESSURE_STDERR_MAX_LINES" \
+      -- "$stderr_descriptor" >"$line_capture" || return $?
+    LC_ALL=C head -c "$BENCHMARK_PRESSURE_STDERR_MAX_BYTES" \
+      -- "$line_capture" >"$bounded_capture" || return $?
+    bounded_size="$(stat -Lc '%s' -- "$bounded_capture")" || return $?
+    dd if="$bounded_capture" of="$stderr_descriptor" bs=65536 \
+      conv=notrunc status=none || return $?
+    truncate -s "$bounded_size" -- "$stderr_descriptor" || return $?
+    rm -- "$line_capture" "$bounded_capture" || return $?
+  fi
+  ((stdout_status == 0 && stderr_status == 0)) || capture_status=125
+  stdout_sha256="$(sha256sum -- "$stdout_descriptor")" || return $?
+  stdout_sha256="${stdout_sha256%% *}"
+  stderr_sha256="$(sha256sum -- "$stderr_descriptor")" || return $?
+  stderr_sha256="${stderr_sha256%% *}"
+  [[ "$(stat -Lc '%d:%i:%u:%a:%h' -- "$stdout_descriptor")" == \
+      "$stdout_identity" &&
+    "$(stat -Lc '%d:%i:%u:%a:%h' -- "$stderr_descriptor")" == \
+      "$stderr_identity" &&
+    "$(stat -Lc '%d:%i:%u:%a:%h' -- "$status_descriptor")" == \
+      "$status_identity" &&
+    "$(stat -Lc '%d:%i:%u:%a' -- "$output_parent")" == \
+      "$output_parent_identity" &&
+    "$output_parent" -ef "$output_parent_descriptor" &&
+    "$pinned_stdout_output" -ef "$stdout_descriptor" &&
+    "$pinned_stderr_output" -ef "$stderr_descriptor" &&
+    "$pinned_status_output" -ef "$status_descriptor" &&
+    "$stdout_output" -ef "$stdout_descriptor" &&
+    "$stderr_output" -ef "$stderr_descriptor" &&
+    "$status_output" -ef "$status_descriptor" ]] || capture_status=125
+  registered_digests[stdout_registration_index]="$stdout_sha256"
+  registered_digests[stderr_registration_index]="$stderr_sha256"
+  printf 'command_status=%d\ncapture_status=%d\n' \
+    "$command_status" "$capture_status" >"$status_descriptor" || return $?
+  status_sha256="$(sha256sum -- "$status_descriptor")" || return $?
+  status_sha256="${status_sha256%% *}"
+  [[ "$status_sha256" =~ ^[0-9a-f]{64}$ &&
+    "$(stat -Lc '%d:%i:%u:%a:%h' -- "$status_descriptor")" == \
+      "$status_identity" &&
+    "$pinned_status_output" -ef "$status_descriptor" &&
+    "$status_output" -ef "$status_descriptor" ]] || return 1
+  registered_digests[status_registration_index]="$status_sha256"
+  rmdir -- "$capture_dir" || return $?
+  capture_dir=""
+  if [[ -n "$callback" ]]; then
+    # The callback may cross the public-marker linearization boundary and set
+    # the dynamically scoped publication_sealed latch.  Defer outer-shell
+    # signals until that callback has returned and the latch is observable by
+    # this EXIT cleanup owner.
+    publication_linearization_in_progress=true
+    if "$callback" "$stdout_descriptor" "$stderr_descriptor" \
+      "$status_descriptor" "$stdout_identity" "$stderr_identity" \
+      "$status_identity" "$stdout_sha256" "$stderr_sha256" \
+      "$command_status" "$capture_status" "$output_parent" \
+      "$output_parent_descriptor" "$output_parent_identity"; then
+      callback_status=0
+    else
+      callback_status=$?
+    fi
+    publication_linearization_in_progress=false
+    [[ "$publication_sealed" != true ]] || return "$callback_status"
+    ((capture_signal_status == 0)) || return "$capture_signal_status"
+    return "$callback_status"
+  fi
+  ((capture_status == 0)) || return "$capture_status"
+  return "$command_status"
+)
+
+benchmark_pressure_publish_client_success() {
+  local -r cycle="$1"
+  local -r lexical_parent="$2"
+  local -r parent_descriptor="$3"
+  local -r parent_identity="$4"
+  local -r stdout_source_leaf="$5"
+  local -r stderr_source_leaf="$6"
+  local -r stdout_target_leaf="$7"
+  local -r stderr_target_leaf="$8"
+  local -r stdout_descriptor="$9"
+  local -r stderr_descriptor="${10}"
+  local -r stdout_identity="${11}"
+  local -r stderr_identity="${12}"
+  local -r stdout_sha256="${13}"
+  local -r stderr_sha256="${14}"
+  local receipt_candidate="$parent_descriptor/.benchmark-client-commit.capture"
+  local receipt_target_leaf=benchmark-client-commit.json
+  local receipt_fd=""
+  local receipt_descriptor=""
+  local receipt_identity=""
+  local receipt_sha256=""
+  local stdout_size=""
+  local stderr_size=""
+  local registration_index=0
+
+  [[ "$cycle" =~ ^([1-9]|10)$ &&
+    "$parent_descriptor" =~ ^/proc/self/fd/[1-9][0-9]*$ &&
+    "$parent_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:700$ &&
+    "$stdout_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:600:1$ &&
+    "$stderr_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:600:1$ &&
+    "$stdout_sha256" =~ ^[0-9a-f]{64}$ &&
+    "$stderr_sha256" =~ ^[0-9a-f]{64}$ &&
+    ! -e "$receipt_candidate" && ! -L "$receipt_candidate" &&
+    ! -e "$parent_descriptor/$receipt_target_leaf" &&
+    ! -L "$parent_descriptor/$receipt_target_leaf" ]] || return 1
+  stdout_size="$(stat -Lc '%s' -- "$stdout_descriptor")" || return $?
+  stderr_size="$(stat -Lc '%s' -- "$stderr_descriptor")" || return $?
+  [[ "$stdout_size" =~ ^(0|[1-9][0-9]*)$ &&
+    "$stderr_size" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+  umask 077
+  set -o noclobber
+  capture_registration_in_progress=true
+  if exec {receipt_fd}<>"$receipt_candidate"; then
+    set +o noclobber
+  else
+    local -r receipt_open_status="$?"
+    set +o noclobber
+    return "$receipt_open_status"
+  fi
+  registration_index="${#registered_descriptors[@]}"
+  registered_descriptors+=("/proc/self/fd/$receipt_fd")
+  registered_identities+=("")
+  registered_digests+=("")
+  receipt_descriptor="/proc/self/fd/$receipt_fd"
+  registered_descriptors[registration_index]="$receipt_descriptor"
+  receipt_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "$receipt_descriptor")" || return $?
+  [[ "$receipt_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:600:1$ &&
+    "$receipt_candidate" -ef "$receipt_descriptor" ]] || return 1
+  registered_identities[registration_index]="$receipt_identity"
+  capture_registration_in_progress=false
+  ((capture_signal_status == 0)) || return "$capture_signal_status"
+  jq -cS -n \
+    --argjson cycle "$cycle" --arg parent_identity "$parent_identity" \
+    --arg result_identity "${stdout_identity%:1}" \
+    --arg result_sha256 "$stdout_sha256" \
+    --argjson result_size "$stdout_size" \
+    --arg stderr_identity "${stderr_identity%:1}" \
+    --arg stderr_sha256 "$stderr_sha256" \
+    --argjson stderr_size "$stderr_size" '
+      {schema:"obi-benchmark-pressure-client-commit-v1",status:"committed",
+       kind:"success_pair",cycle:$cycle,parent_identity:$parent_identity,
+       member_count:2,
+       members:[
+         {role:"benchmark_result",name:"benchmark-result.json",
+          identity:$result_identity,sha256:$result_sha256,size_bytes:$result_size},
+         {role:"benchmark_stderr",name:"benchmark.stderr.log",
+          identity:$stderr_identity,sha256:$stderr_sha256,size_bytes:$stderr_size}
+       ]}
+    ' >"$receipt_descriptor" || return $?
+  receipt_sha256="$(sha256sum -- "$receipt_descriptor")" || return $?
+  receipt_sha256="${receipt_sha256%% *}"
+  [[ "$(stat -Lc '%d:%i:%u:%a:%h' -- "$receipt_descriptor")" == \
+      "$receipt_identity" &&
+    "$receipt_sha256" =~ ^[0-9a-f]{64}$ &&
+    "$receipt_candidate" -ef "$receipt_descriptor" ]] || return 1
+  registered_digests[registration_index]="$receipt_sha256"
+  benchmark_pressure_publish_owned_file_set \
+    "$lexical_parent" "$parent_descriptor" "$parent_identity" 3 \
+    "$stdout_source_leaf" "$stdout_target_leaf" \
+      "$stdout_identity" "$stdout_sha256" \
+    "$stderr_source_leaf" "$stderr_target_leaf" \
+      "$stderr_identity" "$stderr_sha256" \
+    "${receipt_candidate##*/}" "$receipt_target_leaf" \
+      "$receipt_identity" "$receipt_sha256" || return $?
+}
+
+benchmark_pressure_finalize_client_capture() {
+  local -r stdout_descriptor="$1"
+  local -r stderr_descriptor="$2"
+  local -r status_descriptor="$3"
+  local -r stdout_identity="$4"
+  local -r stderr_identity="$5"
+  local -r status_identity="$6"
+  local -r stdout_sha256="$7"
+  local -r stderr_sha256="$8"
+  local command_status="$9"
+  local capture_status="${10}"
+  local -r lexical_parent="${11}"
+  local -r parent_descriptor="${12}"
+  local -r parent_identity="${13}"
+  local cleanup_status=0
+  local status_name=""
+  local status_value=""
+  local extra=""
+  local saw_command_status=false
+  local saw_capture_status=false
+  local stdout_source_leaf="${candidate##*/}"
+  local stderr_source_leaf="${stderr_candidate##*/}"
+  local status_source_leaf="${status_candidate##*/}"
+  local stdout_target_leaf="${client_result_target##*/}"
+  local stderr_target_leaf="${client_stderr_target##*/}"
+
+  [[ "$stdout_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:600:1$ &&
+    "$stderr_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:600:1$ &&
+    "$status_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:600:1$ &&
+    "$stdout_sha256" =~ ^[0-9a-f]{64}$ &&
+    "$stderr_sha256" =~ ^[0-9a-f]{64}$ &&
+    "$command_status" =~ ^(0|[1-9][0-9]*)$ &&
+    "$capture_status" =~ ^(0|[1-9][0-9]*)$ &&
+    "$status_source_leaf" == .benchmark-status.capture &&
+    "$parent_descriptor" =~ ^/proc/self/fd/[1-9][0-9]*$ &&
+    -d "$parent_descriptor" &&
+    "$parent_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:700$ &&
+    "$(stat -Lc '%d:%i:%u:%a' -- "$parent_descriptor")" == \
+      "$parent_identity" &&
+    "$(stat -Lc '%d:%i:%u:%a' -- "$lexical_parent")" == \
+      "$parent_identity" &&
+    "$lexical_parent" -ef "$parent_descriptor" ]] || return 1
+  while IFS='=' read -r status_name status_value extra; do
+    [[ -z "$extra" && "$status_value" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+    case "$status_name" in
+      command_status)
+        [[ "$saw_command_status" == false ]] || return 1
+        saw_command_status=true
+        [[ "$status_value" == "$command_status" ]] || return 1
+        ;;
+      capture_status)
+        [[ "$saw_capture_status" == false ]] || return 1
+        saw_capture_status=true
+        [[ "$status_value" == "$capture_status" ]] || return 1
+        ;;
+      *) return 1 ;;
+    esac
+  done <"$status_descriptor"
+  [[ "$saw_command_status" == true && "$saw_capture_status" == true ]] ||
+    return 1
+  benchmark_pressure_cleanup_owned_candidate \
+    "$parent_descriptor/$status_source_leaf" "${status_identity%:1}" 1 ||
+    return $?
+  if benchmark_pressure_client_absent "$container_name" true; then :
+  else cleanup_status=$?
+  fi
+  if ((command_status == 0 && capture_status == 0 && cleanup_status == 0)); then
+    if validate_benchmark_pressure_result \
+      "$stdout_descriptor" "$marker_prefix"; then :
+    else command_status=65
+    fi
+  fi
+  if ((command_status != 0 || capture_status != 0 || cleanup_status != 0)); then
+    if benchmark_pressure_retain_client_failure \
+      "$cycle" "$cycle_dir" "$candidate" "$stderr_candidate" \
+      "$command_status" "$capture_status" "$cleanup_status" \
+      "$stdout_descriptor" "$stderr_descriptor" "$stdout_identity" \
+      "$stderr_identity" "$stdout_sha256" "$stderr_sha256" \
+      "$lexical_parent" "$parent_descriptor" "$parent_identity"; then :
+    else
+      local -r retain_status="$?"
+      return "$retain_status"
+    fi
+    publication_sealed=true
+    ((cleanup_status == 0)) || return "$cleanup_status"
+    ((capture_status == 0)) || return "$capture_status"
+    return "$command_status"
+  fi
+  benchmark_pressure_publish_client_success \
+    "$cycle" "$lexical_parent" "$parent_descriptor" "$parent_identity" \
+    "$stdout_source_leaf" "$stderr_source_leaf" \
+    "$stdout_target_leaf" "$stderr_target_leaf" \
+    "$stdout_descriptor" "$stderr_descriptor" \
+    "$stdout_identity" "$stderr_identity" "$stdout_sha256" "$stderr_sha256" ||
+    return $?
+  publication_sealed=true
+}
+
+benchmark_pressure_retain_client_failure() {
+  local -r cycle="$1"
+  local -r cycle_dir="$2"
+  local -r stdout_candidate="$3"
+  local -r stderr_candidate="$4"
+  local -r command_status="$5"
+  local -r capture_status="$6"
+  local -r cleanup_status="$7"
+  local -r stdout_read_path="${8:-$stdout_candidate}"
+  local -r stderr_read_path="${9:-$stderr_candidate}"
+  local -r stdout_identity="${10:-}"
+  local -r stderr_identity="${11:-}"
+  local -r supplied_stdout_sha256="${12:-}"
+  local -r supplied_stderr_sha256="${13:-}"
+  local -r lexical_parent="${14:-}"
+  local -r parent_descriptor="${15:-}"
+  local -r parent_identity="${16:-}"
+  local stdout_target="$cycle_dir/benchmark.failure.stdout.log"
+  local stderr_target="$cycle_dir/benchmark.failure.stderr.log"
+  local receipt_target="$cycle_dir/benchmark-client-failure.json"
+  local receipt_candidate="$parent_descriptor/.benchmark-client-failure.capture"
+  local receipt_fd=""
+  local receipt_descriptor=""
+  local receipt_identity=""
+  local receipt_sha256=""
+  local stdout_sha256=""
+  local stderr_sha256=""
+  local stdout_bytes=""
+  local stderr_bytes=""
+  local registration_index=0
+
+  [[ "$cycle" =~ ^([1-9]|10)$ && "$command_status" =~ ^(0|[1-9][0-9]*)$ &&
+    "$capture_status" =~ ^(0|[1-9][0-9]*)$ &&
+    "$cleanup_status" =~ ^(0|[1-9][0-9]*)$ &&
+    "$stdout_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:600:1$ &&
+    "$stderr_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:600:1$ &&
+    "$supplied_stdout_sha256" =~ ^[0-9a-f]{64}$ &&
+    "$supplied_stderr_sha256" =~ ^[0-9a-f]{64}$ &&
+    "$parent_descriptor" =~ ^/proc/self/fd/[1-9][0-9]*$ &&
+    -d "$parent_descriptor" &&
+    "$parent_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:700$ &&
+    "$(stat -Lc '%d:%i:%u:%a' -- "$parent_descriptor")" == \
+      "$parent_identity" &&
+    "$(stat -Lc '%d:%i:%u:%a' -- "$lexical_parent")" == \
+      "$parent_identity" &&
+    "$lexical_parent" -ef "$parent_descriptor" &&
+    ! -e "$receipt_candidate" && ! -L "$receipt_candidate" &&
+    ! -e "$receipt_target" && ! -L "$receipt_target" &&
+    ! -e "$stdout_target" && ! -L "$stdout_target" &&
+    ! -e "$stderr_target" && ! -L "$stderr_target" ]] || return 1
+  bounded_evidence_file "$stdout_read_path" \
+    "$BENCHMARK_PRESSURE_RESULT_MAX_BYTES" 1 || return $?
+  bounded_evidence_file "$stderr_read_path" \
+    "$BENCHMARK_PRESSURE_STDERR_MAX_BYTES" \
+    "$BENCHMARK_PRESSURE_STDERR_MAX_LINES" || return $?
+  stdout_sha256="$(sha256sum -- "$stdout_read_path")" || return $?
+  stdout_sha256="${stdout_sha256%% *}"
+  stderr_sha256="$(sha256sum -- "$stderr_read_path")" || return $?
+  stderr_sha256="${stderr_sha256%% *}"
+  stdout_bytes="$(stat -Lc '%s' -- "$stdout_read_path")" || return $?
+  stderr_bytes="$(stat -Lc '%s' -- "$stderr_read_path")" || return $?
+  [[ "$stdout_sha256" == "$supplied_stdout_sha256" &&
+    "$stderr_sha256" == "$supplied_stderr_sha256" ]] || return 1
+  umask 077
+  set -o noclobber
+  capture_registration_in_progress=true
+  if exec {receipt_fd}<>"$receipt_candidate"; then
+    set +o noclobber
+  else
+    local -r receipt_open_status="$?"
+    set +o noclobber
+    return "$receipt_open_status"
+  fi
+  registration_index="${#registered_descriptors[@]}"
+  registered_descriptors+=("/proc/self/fd/$receipt_fd")
+  registered_identities+=("")
+  registered_digests+=("")
+  receipt_descriptor="/proc/self/fd/$receipt_fd"
+  registered_descriptors[registration_index]="$receipt_descriptor"
+  receipt_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "$receipt_descriptor")" || return $?
+  [[ "$receipt_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:600:1$ &&
+    "$receipt_candidate" -ef "$receipt_descriptor" ]] || return 1
+  registered_identities[registration_index]="$receipt_identity"
+  capture_registration_in_progress=false
+  ((capture_signal_status == 0)) || return "$capture_signal_status"
+  jq -cS -n --argjson cycle "$cycle" \
+    --argjson command_status "$command_status" \
+    --argjson capture_status "$capture_status" \
+    --argjson cleanup_status "$cleanup_status" \
+    --arg parent_identity "$parent_identity" \
+    --arg stdout_identity "${stdout_identity%:1}" \
+    --arg stdout_sha256 "$stdout_sha256" \
+    --arg stderr_identity "${stderr_identity%:1}" \
+    --arg stderr_sha256 "$stderr_sha256" \
+    --argjson stdout_bytes "$stdout_bytes" \
+    --argjson stderr_bytes "$stderr_bytes" '
+      {schema:"obi-benchmark-pressure-client-failure-v2",status:"failed",
+       kind:"failure_triplet",cycle:$cycle,parent_identity:$parent_identity,
+       member_count:2,command_status:$command_status,
+       capture_status:$capture_status,cleanup_status:$cleanup_status,
+       members:[
+         {role:"benchmark_failure_stderr",name:"benchmark.failure.stderr.log",
+          identity:$stderr_identity,sha256:$stderr_sha256,size_bytes:$stderr_bytes},
+         {role:"benchmark_failure_stdout",name:"benchmark.failure.stdout.log",
+          identity:$stdout_identity,sha256:$stdout_sha256,size_bytes:$stdout_bytes}
+       ]}
+    ' >"$receipt_descriptor" || return $?
+  receipt_sha256="$(sha256sum -- "$receipt_descriptor")" || return $?
+  receipt_sha256="${receipt_sha256%% *}"
+  [[ "$(stat -Lc '%d:%i:%u:%a:%h' -- "$receipt_descriptor")" == \
+      "$receipt_identity" &&
+    "$receipt_sha256" =~ ^[0-9a-f]{64}$ &&
+    "$receipt_candidate" -ef "$receipt_descriptor" ]] || return 1
+  registered_digests[registration_index]="$receipt_sha256"
+  benchmark_pressure_publish_owned_file_set \
+    "$lexical_parent" "$parent_descriptor" "$parent_identity" 3 \
+    "${stdout_candidate##*/}" "${stdout_target##*/}" \
+      "$stdout_identity" "$stdout_sha256" \
+    "${stderr_candidate##*/}" "${stderr_target##*/}" \
+      "$stderr_identity" "$stderr_sha256" \
+    "${receipt_candidate##*/}" "${receipt_target##*/}" \
+      "$receipt_identity" "$receipt_sha256" || return $?
+}
+
+benchmark_pressure_marker_prefix_for() {
+  local -r session="$1"
+  local -r cycle="$2"
+  local tag=""
+
+  [[ "$cycle" =~ ^([1-9]|10)$ &&
+    "$session" =~ ^[0-9a-f]{32}$ ]] || return 1
+  printf -v tag '%02d' "$cycle"
+  printf 'pressure-%s-cycle-%s\n' "$session" "$tag"
+}
+
+benchmark_pressure_validate_client_commit_images() (
+  local -r expected_kind="$1"
+  local -r expected_cycle="$2"
+  local -r expected_parent_identity="$3"
+  local -r receipt="$4"
+  local -r stdout_image="$5"
+  local -r stderr_image="$6"
+  local -r stdout_source_identity="$7"
+  local -r stderr_source_identity="$8"
+  local -r receipt_source_identity="$9"
+  local expected_schema=""
+  local expected_status=""
+  local stdout_role=""
+  local stderr_role=""
+  local stdout_name=""
+  local stderr_name=""
+  local stdout_identity=""
+  local stderr_identity=""
+  local stdout_sha256=""
+  local stderr_sha256=""
+  local stdout_size=""
+  local stderr_size=""
+  local marker_prefix=""
+
+  case "$expected_kind" in
+    success_pair)
+      expected_schema=obi-benchmark-pressure-client-commit-v1
+      expected_status=committed
+      stdout_role=benchmark_result
+      stderr_role=benchmark_stderr
+      stdout_name=benchmark-result.json
+      stderr_name=benchmark.stderr.log
+      ;;
+    failure_triplet)
+      expected_schema=obi-benchmark-pressure-client-failure-v2
+      expected_status=failed
+      stdout_role=benchmark_failure_stdout
+      stderr_role=benchmark_failure_stderr
+      stdout_name=benchmark.failure.stdout.log
+      stderr_name=benchmark.failure.stderr.log
+      ;;
+    *) return 1 ;;
+  esac
+  [[ "$expected_cycle" =~ ^([1-9]|10)$ &&
+    "$expected_parent_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:700$ &&
+    "$stdout_source_identity" =~ \
+      ^[0-9]+:[1-9][0-9]*:$EUID:600:1:(0|[1-9][0-9]*)$ &&
+    "$stderr_source_identity" =~ \
+      ^[0-9]+:[1-9][0-9]*:$EUID:600:1:(0|[1-9][0-9]*)$ &&
+    "$receipt_source_identity" =~ \
+      ^[0-9]+:[1-9][0-9]*:$EUID:600:1:[1-9][0-9]*$ ]] || return 1
+  stdout_identity="${stdout_source_identity%:*}"
+  stdout_identity="${stdout_identity%:1}"
+  stderr_identity="${stderr_source_identity%:*}"
+  stderr_identity="${stderr_identity%:1}"
+  stdout_sha256="$(sha256sum -- "$stdout_image")" || return $?
+  stdout_sha256="${stdout_sha256%% *}"
+  stderr_sha256="$(sha256sum -- "$stderr_image")" || return $?
+  stderr_sha256="${stderr_sha256%% *}"
+  stdout_size="$(stat -Lc '%s' -- "$stdout_image")" || return $?
+  stderr_size="$(stat -Lc '%s' -- "$stderr_image")" || return $?
+  [[ "$stdout_size" == "${stdout_source_identity##*:}" &&
+    "$stderr_size" == "${stderr_source_identity##*:}" ]] || return 1
+  bounded_evidence_file "$receipt" \
+    "$BENCHMARK_PRESSURE_CLIENT_COMMIT_MAX_BYTES" 1 || return $?
+  benchmark_pressure_json_has_unique_object_keys \
+    "$receipt" "$BENCHMARK_PRESSURE_CLIENT_COMMIT_MAX_BYTES" || return $?
+  jq -e \
+    --arg schema "$expected_schema" --arg status "$expected_status" \
+    --arg kind "$expected_kind" --argjson cycle "$expected_cycle" \
+    --arg parent_identity "$expected_parent_identity" \
+    --arg stdout_role "$stdout_role" --arg stdout_name "$stdout_name" \
+    --arg stdout_identity "$stdout_identity" \
+    --arg stdout_sha256 "$stdout_sha256" --argjson stdout_size "$stdout_size" \
+    --arg stderr_role "$stderr_role" --arg stderr_name "$stderr_name" \
+    --arg stderr_identity "$stderr_identity" \
+    --arg stderr_sha256 "$stderr_sha256" --argjson stderr_size "$stderr_size" '
+      def member($role;$name;$identity;$sha256;$size):
+        {role:$role,name:$name,identity:$identity,sha256:$sha256,size_bytes:$size};
+      .schema == $schema and .status == $status and .kind == $kind and
+      .cycle == $cycle and .parent_identity == $parent_identity and
+      .member_count == 2 and
+      .members ==
+        (if $kind == "failure_triplet" then
+          [member($stderr_role;$stderr_name;$stderr_identity;$stderr_sha256;$stderr_size),
+           member($stdout_role;$stdout_name;$stdout_identity;$stdout_sha256;$stdout_size)]
+        else
+          [member($stdout_role;$stdout_name;$stdout_identity;$stdout_sha256;$stdout_size),
+           member($stderr_role;$stderr_name;$stderr_identity;$stderr_sha256;$stderr_size)]
+        end) and
+      if $kind == "success_pair" then
+        keys == ["cycle","kind","member_count","members","parent_identity",
+          "schema","status"]
+      else
+        keys == ["capture_status","cleanup_status","command_status","cycle",
+          "kind","member_count","members","parent_identity","schema","status"] and
+        all([.command_status,.capture_status,.cleanup_status][];
+          type == "number" and floor == . and . >= 0 and . <= 255)
+      end
+    ' "$receipt" >/dev/null || return $?
+  if [[ "$expected_kind" == success_pair ]]; then
+    bounded_evidence_file "$stdout_image" \
+      "$BENCHMARK_PRESSURE_RESULT_MAX_BYTES" 1 || return $?
+    marker_prefix="$(benchmark_pressure_marker_prefix_for \
+      "$PRESSURE_CONTROL_SESSION" "$expected_cycle")" || return $?
+    validate_benchmark_pressure_result "$stdout_image" "$marker_prefix" || return $?
+  else
+    bounded_evidence_file "$stdout_image" \
+      "$BENCHMARK_PRESSURE_RESULT_MAX_BYTES" 1 || return $?
+  fi
+  bounded_evidence_file "$stderr_image" "$BENCHMARK_PRESSURE_STDERR_MAX_BYTES" \
+    "$BENCHMARK_PRESSURE_STDERR_MAX_LINES"
+)
+
+benchmark_pressure_hold_client_commit_bundle() {
+  local -r cycle_dir="$1"
+  local -r expected_cycle="$2"
+  local -r expected_kind="$3"
+  local -r output_stdout_fd_name="$4"
+  local -r output_stderr_fd_name="$5"
+  local -r output_receipt_fd_name="$6"
+  local stdout_leaf=""
+  local stderr_leaf=""
+  local receipt_leaf=""
+  local parent_fd=""
+  local parent_descriptor=""
+  local parent_identity=""
+  local lexical_parent_identity=""
+  local stdout_path=""
+  local stderr_path=""
+  local receipt_path=""
+  local lexical_stdout_path=""
+  local lexical_stderr_path=""
+  local lexical_receipt_path=""
+  local stdout_source_identity=""
+  local stderr_source_identity=""
+  local receipt_source_identity=""
+  local stdout_snapshot_fd=""
+  local stderr_snapshot_fd=""
+  local receipt_snapshot_fd=""
+  local stdout_sha256=""
+  local stderr_sha256=""
+  local receipt_sha256=""
+  local stdout_size=""
+  local stderr_size=""
+  local receipt_size=""
+  local final_stdout_fd=""
+  local final_stderr_fd=""
+  local final_receipt_fd=""
+  local capture_specification=$'V\t1\n'
+
+  case "$expected_kind" in
+    success_pair)
+      stdout_leaf=benchmark-result.json
+      stderr_leaf=benchmark.stderr.log
+      receipt_leaf=benchmark-client-commit.json
+      ;;
+    failure_triplet)
+      stdout_leaf=benchmark.failure.stdout.log
+      stderr_leaf=benchmark.failure.stderr.log
+      receipt_leaf=benchmark-client-failure.json
+      ;;
+    *) return 1 ;;
+  esac
+  [[ "$expected_cycle" =~ ^([1-9]|10)$ &&
+    "$output_stdout_fd_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+    "$output_stderr_fd_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+    "$output_receipt_fd_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+    "$output_stdout_fd_name" != "$output_stderr_fd_name" &&
+    "$output_stdout_fd_name" != "$output_receipt_fd_name" &&
+    "$output_stderr_fd_name" != "$output_receipt_fd_name" &&
+    ! -L "$cycle_dir" && -d "$cycle_dir" ]] || return 1
+  exec {parent_fd}<"$cycle_dir" || return $?
+  parent_descriptor="/proc/self/fd/$parent_fd"
+  parent_identity="$(stat -Lc '%d:%i:%u:%a' -- "$parent_descriptor")" ||
+    return $?
+  lexical_parent_identity="$(stat -Lc '%d:%i:%u:%a' -- "$cycle_dir")" ||
+    return $?
+  [[ "$parent_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:700$ &&
+    "$lexical_parent_identity" == "$parent_identity" &&
+    "$cycle_dir" -ef "$parent_descriptor" ]] || return 1
+  stdout_path="$parent_descriptor/$stdout_leaf"
+  stderr_path="$parent_descriptor/$stderr_leaf"
+  receipt_path="$parent_descriptor/$receipt_leaf"
+  lexical_stdout_path="$cycle_dir/$stdout_leaf"
+  lexical_stderr_path="$cycle_dir/$stderr_leaf"
+  lexical_receipt_path="$cycle_dir/$receipt_leaf"
+  if [[ "$expected_kind" == success_pair ]]; then
+    [[ ! -L "$parent_descriptor/benchmark-client-failure.json" &&
+      ! -e "$parent_descriptor/benchmark-client-failure.json" &&
+      ! -L "$cycle_dir/benchmark-client-failure.json" &&
+      ! -e "$cycle_dir/benchmark-client-failure.json" &&
+      ! -L "$parent_descriptor/benchmark.failure.stdout.log" &&
+      ! -e "$parent_descriptor/benchmark.failure.stdout.log" &&
+      ! -L "$cycle_dir/benchmark.failure.stdout.log" &&
+      ! -e "$cycle_dir/benchmark.failure.stdout.log" &&
+      ! -L "$parent_descriptor/benchmark.failure.stderr.log" &&
+      ! -e "$parent_descriptor/benchmark.failure.stderr.log" &&
+      ! -L "$cycle_dir/benchmark.failure.stderr.log" &&
+      ! -e "$cycle_dir/benchmark.failure.stderr.log" ]] || return 1
+  else
+    [[ ! -L "$parent_descriptor/benchmark-client-commit.json" &&
+      ! -e "$parent_descriptor/benchmark-client-commit.json" &&
+      ! -L "$cycle_dir/benchmark-client-commit.json" &&
+      ! -e "$cycle_dir/benchmark-client-commit.json" &&
+      ! -L "$parent_descriptor/benchmark-result.json" &&
+      ! -e "$parent_descriptor/benchmark-result.json" &&
+      ! -L "$cycle_dir/benchmark-result.json" &&
+      ! -e "$cycle_dir/benchmark-result.json" &&
+      ! -L "$parent_descriptor/benchmark.stderr.log" &&
+      ! -e "$parent_descriptor/benchmark.stderr.log" &&
+      ! -L "$cycle_dir/benchmark.stderr.log" &&
+      ! -e "$cycle_dir/benchmark.stderr.log" ]] || return 1
+  fi
+  [[ ! -L "$parent_descriptor/.benchmark-result.capture" &&
+    ! -e "$parent_descriptor/.benchmark-result.capture" &&
+    ! -L "$parent_descriptor/.benchmark-stderr.capture" &&
+    ! -e "$parent_descriptor/.benchmark-stderr.capture" &&
+    ! -L "$parent_descriptor/.benchmark-status.capture" &&
+    ! -e "$parent_descriptor/.benchmark-status.capture" &&
+    ! -L "$parent_descriptor/.benchmark-client-commit.capture" &&
+    ! -e "$parent_descriptor/.benchmark-client-commit.capture" &&
+    ! -L "$parent_descriptor/.benchmark-client-failure.capture" &&
+    ! -e "$parent_descriptor/.benchmark-client-failure.capture" ]] || return 1
+
+  # Each public leaf is acquired through the retained parent with O_NOFOLLOW
+  # and copied into a write-sealed descriptor.  A symlink to the exact owned
+  # inode is still an invalid public name and is never followed.
+  [[ ! -L "$receipt_path" && ! -L "$lexical_receipt_path" &&
+    ! -L "$stdout_path" && ! -L "$lexical_stdout_path" &&
+    ! -L "$stderr_path" && ! -L "$lexical_stderr_path" ]] || return 1
+  benchmark_pressure_hold_file_snapshot "$receipt_path" \
+    "$BENCHMARK_PRESSURE_CLIENT_COMMIT_MAX_BYTES" receipt_snapshot_fd \
+    receipt_source_identity receipt_sha256 receipt_size || return $?
+  benchmark_pressure_hold_file_snapshot "$stdout_path" \
+    "$BENCHMARK_PRESSURE_RESULT_MAX_BYTES" stdout_snapshot_fd \
+    stdout_source_identity stdout_sha256 stdout_size || return $?
+  benchmark_pressure_hold_file_snapshot "$stderr_path" \
+    "$BENCHMARK_PRESSURE_STDERR_MAX_BYTES" stderr_snapshot_fd \
+    stderr_source_identity stderr_sha256 stderr_size || return $?
+  [[ ! -L "$receipt_path" && ! -L "$lexical_receipt_path" &&
+    ! -L "$stdout_path" && ! -L "$lexical_stdout_path" &&
+    ! -L "$stderr_path" && ! -L "$lexical_stderr_path" &&
+    "$receipt_source_identity" =~ \
+      ^[0-9]+:[1-9][0-9]*:$EUID:600:1:[1-9][0-9]*$ &&
+    "$stdout_source_identity" =~ \
+      ^[0-9]+:[1-9][0-9]*:$EUID:600:1:(0|[1-9][0-9]*)$ &&
+    "$stderr_source_identity" =~ \
+      ^[0-9]+:[1-9][0-9]*:$EUID:600:1:(0|[1-9][0-9]*)$ &&
+    "$receipt_size" == "${receipt_source_identity##*:}" &&
+    "$stdout_size" == "${stdout_source_identity##*:}" &&
+    "$stderr_size" == "${stderr_source_identity##*:}" &&
+    "$lexical_receipt_path" -ef "$receipt_path" &&
+    "$lexical_stdout_path" -ef "$stdout_path" &&
+    "$lexical_stderr_path" -ef "$stderr_path" ]] || return 1
+  benchmark_pressure_validate_client_commit_images \
+    "$expected_kind" "$expected_cycle" "$parent_identity" \
+    "/proc/self/fd/$receipt_snapshot_fd" "/proc/self/fd/$stdout_snapshot_fd" \
+    "/proc/self/fd/$stderr_snapshot_fd" "$stdout_source_identity" \
+    "$stderr_source_identity" "$receipt_source_identity" || return $?
+  lexical_parent_identity="$(stat -Lc '%d:%i:%u:%a' -- "$cycle_dir")" ||
+    return $?
+  [[ "$lexical_parent_identity" == "$parent_identity" &&
+    "$cycle_dir" -ef "$parent_descriptor" &&
+    ! -L "$receipt_path" && ! -L "$lexical_receipt_path" &&
+    ! -L "$stdout_path" && ! -L "$lexical_stdout_path" &&
+    ! -L "$stderr_path" && ! -L "$lexical_stderr_path" ]] || return 1
+
+  # The broker's one bounded capture is the terminal semantic authority.  Its
+  # public openat(O_NOFOLLOW) set is bound to the already-validated receipt and
+  # bytes, includes every known absent transaction leaf, and returns only
+  # write-sealed coherent images.  No caller reopens a public name afterward.
+  printf -v capture_specification '%sP\t0\t%s\t%s\t%s\trelevant\n' \
+    "$capture_specification" "$parent_fd" "$cycle_dir" "$parent_identity"
+  printf -v capture_specification '%sC\t0\t%s\t%s\t%s\n' \
+    "$capture_specification" "$stdout_leaf" "$stdout_source_identity" \
+    "$stdout_sha256"
+  printf -v capture_specification '%sC\t0\t%s\t%s\t%s\n' \
+    "$capture_specification" "$stderr_leaf" "$stderr_source_identity" \
+    "$stderr_sha256"
+  printf -v capture_specification '%sC\t0\t%s\t%s\t%s\n' \
+    "$capture_specification" "$receipt_leaf" "$receipt_source_identity" \
+    "$receipt_sha256"
+  printf -v capture_specification \
+    '%sA\t0\t%s\nA\t0\t%s\nA\t0\t%s\nA\t0\t%s\nA\t0\t%s\n' \
+    "$capture_specification" .benchmark-result.capture \
+    .benchmark-stderr.capture .benchmark-status.capture \
+    .benchmark-client-commit.capture .benchmark-client-failure.capture
+  if [[ "$expected_kind" == success_pair ]]; then
+    printf -v capture_specification \
+      '%sA\t0\t%s\nA\t0\t%s\nA\t0\t%s\n' "$capture_specification" \
+      benchmark.failure.stdout.log benchmark.failure.stderr.log \
+      benchmark-client-failure.json
+  else
+    printf -v capture_specification \
+      '%sA\t0\t%s\nA\t0\t%s\nA\t0\t%s\n' "$capture_specification" \
+      benchmark-result.json benchmark.stderr.log benchmark-client-commit.json
+  fi
+  benchmark_pressure_coherent_file_set capture3 "$capture_specification" \
+    final_stdout_fd final_stderr_fd final_receipt_fd || return $?
+  printf -v "$output_stdout_fd_name" '%s' "$final_stdout_fd"
+  printf -v "$output_stderr_fd_name" '%s' "$final_stderr_fd"
+  printf -v "$output_receipt_fd_name" '%s' "$final_receipt_fd"
+  exec {receipt_snapshot_fd}<&-
+  exec {stdout_snapshot_fd}<&-
+  exec {stderr_snapshot_fd}<&-
+  exec {parent_fd}<&-
+}
+
+benchmark_pressure_client_bundle_images_for_consumer() {
+  local -r supplied_result="$1"
+  local -r expected_cycle="$2"
+  local -r output_result_path_name="$3"
+  local -r output_stderr_path_name="$4"
+  local -r output_receipt_path_name="$5"
+  local held_result_fd=""
+  local held_stderr_fd=""
+  local held_receipt_fd=""
+  local held_result_path=""
+  local held_stderr_path=""
+  local held_receipt_path=""
+
+  [[ "$expected_cycle" =~ ^([1-9]|10)$ &&
+    "$output_result_path_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+    "$output_stderr_path_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+    "$output_receipt_path_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+  if [[ "${BENCHMARK_PRESSURE_CLIENT_BUNDLE_VALIDATED:-}" == true ]]; then
+    declare -p BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS >/dev/null 2>&1 ||
+      return 1
+    held_result_path="${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[benchmark]:-}"
+    held_stderr_path="${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[benchmark_stderr]:-}"
+    held_receipt_path="${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[benchmark_client_commit]:-}"
+    [[ -n "$held_result_path" && -n "$held_stderr_path" &&
+      -n "$held_receipt_path" && "$supplied_result" == "$held_result_path" ]] ||
+      return 1
+  else
+    [[ "${supplied_result##*/}" == benchmark-result.json ]] || return 1
+    benchmark_pressure_hold_client_commit_bundle "${supplied_result%/*}" \
+      "$expected_cycle" success_pair held_result_fd held_stderr_fd \
+      held_receipt_fd || return $?
+    held_result_path="/proc/self/fd/$held_result_fd"
+    held_stderr_path="/proc/self/fd/$held_stderr_fd"
+    held_receipt_path="/proc/self/fd/$held_receipt_fd"
+  fi
+  printf -v "$output_result_path_name" '%s' "$held_result_path"
+  printf -v "$output_stderr_path_name" '%s' "$held_stderr_path"
+  printf -v "$output_receipt_path_name" '%s' "$held_receipt_path"
+}
+
+run_benchmark_pressure_client() {
+  local -r cycle="$1"
+  local -r cycle_dir="$2"
+  local tag=""
+  local container_name=""
+  local candidate=""
+  local stderr_candidate=""
+  local status_candidate=""
+  local client_result_target="$cycle_dir/benchmark-result.json"
+  local client_stderr_target="$cycle_dir/benchmark.stderr.log"
+  local marker_prefix=""
+  local bundle_stdout_fd=""
+  local bundle_stderr_fd=""
+  local bundle_receipt_fd=""
+  local BENCHMARK_PRESSURE_CLIENT_CAPTURE_CALLBACK=\
+benchmark_pressure_finalize_client_capture
+
+  [[ "$cycle" =~ ^([1-9]|10)$ && -d "$cycle_dir" && ! -L "$cycle_dir" &&
+    ! -e "$client_result_target" && ! -L "$client_result_target" &&
+    ! -e "$client_stderr_target" && ! -L "$client_stderr_target" &&
+    ! -e "$cycle_dir/benchmark-client-commit.json" &&
+    ! -L "$cycle_dir/benchmark-client-commit.json" &&
+    ! -e "$cycle_dir/benchmark.failure.stdout.log" &&
+    ! -L "$cycle_dir/benchmark.failure.stdout.log" &&
+    ! -e "$cycle_dir/benchmark.failure.stderr.log" &&
+    ! -L "$cycle_dir/benchmark.failure.stderr.log" &&
+    ! -e "$cycle_dir/benchmark-client-failure.json" &&
+    ! -L "$cycle_dir/benchmark-client-failure.json" &&
+    ! -e "$cycle_dir/.benchmark-client-failure.capture" &&
+    ! -L "$cycle_dir/.benchmark-client-failure.capture" &&
+    ! -e "$cycle_dir/.benchmark-client-commit.capture" &&
+    ! -L "$cycle_dir/.benchmark-client-commit.capture" ]] || return 1
+  printf -v tag '%02d' "$cycle"
+  container_name="${PROJECT_NAME}-benchmark-pressure-$tag-${PRESSURE_CONTROL_SESSION:0:12}"
+  [[ "$container_name" =~ ^[a-z0-9][a-z0-9_.-]{0,126}$ ]] || return 1
+  benchmark_pressure_client_absent "$container_name" false || return $?
+  candidate="$cycle_dir/.benchmark-result.capture"
+  stderr_candidate="$cycle_dir/.benchmark-stderr.capture"
+  status_candidate="$cycle_dir/.benchmark-status.capture"
+  [[ ! -e "$candidate" && ! -L "$candidate" &&
+    ! -e "$stderr_candidate" && ! -L "$stderr_candidate" &&
+    ! -e "$status_candidate" && ! -L "$status_candidate" ]] || return 1
+  marker_prefix="$(benchmark_pressure_marker_prefix_for \
+    "$PRESSURE_CONTROL_SESSION" "$cycle")" || return $?
+  benchmark_pressure_run_client_captured \
+    "$candidate" "$stderr_candidate" "$status_candidate" \
+    "$BENCHMARK_PRESSURE_CLIENT_TIMEOUT_SECONDS" \
+    "${COMPOSE[@]}" run --rm --no-deps --no-TTY --interactive=false \
+      --name "$container_name" benchmark \
+      --base-url "$BENCHMARK_PRESSURE_BASE_URL" \
+      --path "$BENCHMARK_PRESSURE_PATH" \
+      --connection-mode "$BENCHMARK_PRESSURE_CONNECTION_MODE" \
+      --duration "${BENCHMARK_PRESSURE_LOAD_SECONDS}s" \
+      --request-timeout "${BENCHMARK_PRESSURE_REQUEST_TIMEOUT_SECONDS}s" \
+      --concurrency "$BENCHMARK_PRESSURE_CONCURRENCY" \
+      --request-limit "$BENCHMARK_PRESSURE_REQUEST_LIMIT" \
+      --seed 0 --w3c=false --marker-prefix "$marker_prefix" || return $?
+  benchmark_pressure_hold_client_commit_bundle \
+    "$cycle_dir" "$cycle" success_pair bundle_stdout_fd bundle_stderr_fd \
+    bundle_receipt_fd || return $?
+  exec {bundle_stdout_fd}<&-
+  exec {bundle_stderr_fd}<&-
+  exec {bundle_receipt_fd}<&-
+}
+
+validate_benchmark_pressure_stats_rows() (
+  local input="$1"
+  local input_fd=""
+  local row_file=""
+  local row=""
+  local rows=0
+
+  benchmark_pressure_trusted_regular_path "$input" || return $?
+  benchmark_pressure_hold_file_snapshot \
+    "$input" "$BENCHMARK_PRESSURE_STATS_MAX_BYTES" input_fd || return $?
+  input="/proc/self/fd/$input_fd"
+  bounded_evidence_file "$input" "$BENCHMARK_PRESSURE_STATS_MAX_BYTES" \
+    "$BENCHMARK_PRESSURE_STATS_MAX_LINES" || return $?
+  row_file="$(mktemp -p /tmp obi-pressure-resource-row.XXXXXX)" || return $?
+  trap 'rm -f -- "$row_file"' EXIT
+  chmod 0600 -- "$row_file" || return $?
+  while IFS= read -r row; do
+    ((rows += 1))
+    ((rows <= BENCHMARK_PRESSURE_STATS_MAX_LINES && ${#row} > 0 &&
+      ${#row} <= BENCHMARK_PRESSURE_STATS_ROW_MAX_BYTES)) || return 1
+    printf '%s\n' "$row" >"$row_file" || return $?
+    benchmark_pressure_json_has_unique_object_keys \
+      "$row_file" "$BENCHMARK_PRESSURE_STATS_ROW_MAX_BYTES" || return $?
+    jq -e '
+      keys == ["BlockIO","CPUPerc","Container","ID","MemPerc","MemUsage",
+        "Name","NetIO","PIDs"] and
+      all([.BlockIO,.CPUPerc,.Container,.ID,.MemPerc,.MemUsage,.Name,.NetIO,
+        .PIDs][]; type == "string" and length >= 1 and length <= 128) and
+      (.ID | test("^[0-9a-f]{64}$")) and
+      (.Name | test("^[a-z0-9][a-z0-9_.-]{0,126}$")) and
+      (.Container == .ID or .Container == .Name) and
+      (.CPUPerc | test("^[0-9]+(?:\\.[0-9]+)?%$")) and
+      (.MemPerc | test("^[0-9]+(?:\\.[0-9]+)?%$")) and
+      (.PIDs | test("^(0|[1-9][0-9]*)$")) and
+      (.MemUsage | test("^[0-9]+(?:\\.[0-9]+)?[A-Za-z]*B / [0-9]+(?:\\.[0-9]+)?[A-Za-z]*B$")) and
+      (.NetIO | test("^[0-9]+(?:\\.[0-9]+)?[A-Za-z]*B / [0-9]+(?:\\.[0-9]+)?[A-Za-z]*B$")) and
+      (.BlockIO | test("^[0-9]+(?:\\.[0-9]+)?[A-Za-z]*B / [0-9]+(?:\\.[0-9]+)?[A-Za-z]*B$"))
+    ' "$row_file" >/dev/null || return $?
+  done <"$input"
+  ((rows == BENCHMARK_PRESSURE_STATS_MAX_LINES))
+)
+
+# Capture two producer streams through bounded readers.  The output leaves are
+# opened before the producer starts and all later reads use those descriptors,
+# so a same-UID pathname replacement cannot redirect, validate, or clean up
+# foreign bytes.  A cap violation intentionally records at most cap+1 bytes and
+# fails with 125 after the complete producer process group has been reaped.
+benchmark_pressure_run_role_captured() (
+  local -r stdout_output="$1"
+  local -r stdout_maximum_bytes="$2"
+  local -r stdout_maximum_lines="$3"
+  local -r stderr_output="$4"
+  local -r stderr_maximum_bytes="$5"
+  local -r stderr_maximum_lines="$6"
+  local -r timeout_seconds="$7"
+  shift 7
+  local stdout_fd=""
+  local stderr_fd=""
+  local stdout_descriptor=""
+  local stderr_descriptor=""
+  local stdout_identity=""
+  local stderr_identity=""
+  local observed_identity=""
+  local capture_dir=""
+  local capture_dir_fd=""
+  local capture_descriptor=""
+  local capture_identity=""
+  local stdout_fifo=""
+  local stderr_fifo=""
+  local stdout_pid=""
+  local stderr_pid=""
+  local command_pid=""
+  local command_pgid=""
+  local command_status=0
+  local stdout_status=0
+  local stderr_status=0
+  local capture_status=0
+  local size=""
+  local lines=""
+  local attempt=0
+
+  benchmark_pressure_role_capture_cleanup() {
+    local -r saved_status="$?"
+    local pid=""
+
+    trap - EXIT HUP INT TERM
+    set +e
+    set +m 2>/dev/null
+    if [[ "$command_pgid" =~ ^[1-9][0-9]*$ &&
+      "$command_pgid" != "$BASHPID" ]]; then
+      kill -TERM -- "-$command_pgid" 2>/dev/null
+      for ((attempt = 0; attempt < 20; attempt++)); do
+        kill -0 -- "-$command_pgid" 2>/dev/null || break
+        sleep 0.05
+      done
+      if kill -0 -- "-$command_pgid" 2>/dev/null; then
+        kill -KILL -- "-$command_pgid" 2>/dev/null
+      fi
+    fi
+    for pid in "$stdout_pid" "$stderr_pid"; do
+      if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$pid" 2>/dev/null; then
+        kill -TERM "$pid" 2>/dev/null
+      fi
+    done
+    for pid in "$command_pid" "$stdout_pid" "$stderr_pid"; do
+      if [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
+        wait "$pid" 2>/dev/null
+      fi
+    done
+    if [[ -n "$capture_descriptor" ]]; then
+      [[ ! -e "$stdout_fifo" || -p "$stdout_fifo" ]] && rm -f -- "$stdout_fifo"
+      [[ ! -e "$stderr_fifo" || -p "$stderr_fifo" ]] && rm -f -- "$stderr_fifo"
+    fi
+    if [[ "$capture_dir_fd" =~ ^[0-9]+$ ]]; then
+      exec {capture_dir_fd}>&-
+    fi
+    if [[ -n "$capture_dir" && -d "$capture_dir" && ! -L "$capture_dir" &&
+      "$(stat -Lc '%d:%i:%u:%a' -- "$capture_dir" 2>/dev/null)" == "$capture_identity" ]]; then
+      rmdir -- "$capture_dir" 2>/dev/null
+    fi
+    exit "$saved_status"
+  }
+  trap benchmark_pressure_role_capture_cleanup EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  [[ "$stdout_maximum_bytes" =~ ^[1-9][0-9]*$ &&
+    "$stdout_maximum_lines" =~ ^[1-9][0-9]*$ &&
+    "$stderr_maximum_bytes" =~ ^[1-9][0-9]*$ &&
+    "$stderr_maximum_lines" =~ ^[1-9][0-9]*$ &&
+    "$timeout_seconds" =~ ^[1-9][0-9]*$ && $# -gt 0 &&
+    -f "$stdout_output" && ! -L "$stdout_output" &&
+    -f "$stderr_output" && ! -L "$stderr_output" &&
+    "$(stat -Lc '%u:%a:%h:%s' -- "$stdout_output")" == "$EUID:600:1:0" &&
+    "$(stat -Lc '%u:%a:%h:%s' -- "$stderr_output")" == "$EUID:600:1:0" ]] ||
+    return 1
+  exec {stdout_fd}<>"$stdout_output" || return $?
+  exec {stderr_fd}<>"$stderr_output" || return $?
+  stdout_descriptor="/proc/self/fd/$stdout_fd"
+  stderr_descriptor="/proc/self/fd/$stderr_fd"
+  stdout_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$stdout_descriptor")" ||
+    return $?
+  stderr_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$stderr_descriptor")" ||
+    return $?
+  [[ "$stdout_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:600:1$ &&
+    "$stderr_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:600:1$ &&
+    "$stdout_output" -ef "$stdout_descriptor" &&
+    "$stderr_output" -ef "$stderr_descriptor" ]] || return 1
+
+  capture_dir="$(mktemp -d "${stdout_output%/*}/.role-capture.XXXXXX")" ||
+    return $?
+  chmod 0700 -- "$capture_dir" || return $?
+  capture_identity="$(stat -Lc '%d:%i:%u:%a' -- "$capture_dir")" || return $?
+  [[ "$capture_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:700$ ]] || return 1
+  exec {capture_dir_fd}<"$capture_dir" || return $?
+  capture_descriptor="/proc/self/fd/$capture_dir_fd"
+  [[ "$(stat -Lc '%d:%i:%u:%a' -- "$capture_descriptor")" == "$capture_identity" &&
+    "$capture_dir" -ef "$capture_descriptor" ]] || return 1
+  stdout_fifo="$capture_descriptor/stdout"
+  stderr_fifo="$capture_descriptor/stderr"
+  mkfifo -m 0600 -- "$stdout_fifo" "$stderr_fifo" || return $?
+  LC_ALL=C head -c "$((stdout_maximum_bytes + 1))" \
+    -- "$stdout_fifo" >"$stdout_descriptor" &
+  stdout_pid=$!
+  LC_ALL=C head -c "$((stderr_maximum_bytes + 1))" \
+    -- "$stderr_fifo" >"$stderr_descriptor" &
+  stderr_pid=$!
+  set -m
+  run_bounded_foreground_group "$timeout_seconds" "$@" \
+    >"$stdout_fifo" 2>"$stderr_fifo" &
+  command_pid=$!
+  command_pgid="$command_pid"
+  if wait "$command_pid" 2>/dev/null; then
+    command_status=0
+  else
+    command_status=$?
+  fi
+  command_pid=""
+  set +m 2>/dev/null
+  if kill -0 -- "-$command_pgid" 2>/dev/null; then
+    capture_status=125
+    kill -TERM -- "-$command_pgid" 2>/dev/null || true
+    for ((attempt = 0; attempt < 20; attempt++)); do
+      kill -0 -- "-$command_pgid" 2>/dev/null || break
+      sleep 0.05
+    done
+    if kill -0 -- "-$command_pgid" 2>/dev/null; then
+      kill -KILL -- "-$command_pgid" 2>/dev/null || true
+    fi
+  fi
+  command_pgid=""
+  if wait "$stdout_pid"; then :; else stdout_status=$?; fi
+  stdout_pid=""
+  if wait "$stderr_pid"; then :; else stderr_status=$?; fi
+  stderr_pid=""
+
+  for observed_identity in stdout stderr; do
+    if [[ "$observed_identity" == stdout ]]; then
+      size="$(stat -Lc '%s' -- "$stdout_descriptor")" || return $?
+      lines="$(awk 'END { print NR + 0 }' "$stdout_descriptor")" || return $?
+      [[ "$(stat -Lc '%d:%i:%u:%a:%h' -- "$stdout_descriptor")" == "$stdout_identity" &&
+        "$stdout_output" -ef "$stdout_descriptor" ]] ||
+        capture_status=125
+      if ((size > stdout_maximum_bytes || lines > stdout_maximum_lines)); then
+        capture_status=125
+      fi
+    else
+      size="$(stat -Lc '%s' -- "$stderr_descriptor")" || return $?
+      lines="$(awk 'END { print NR + 0 }' "$stderr_descriptor")" || return $?
+      [[ "$(stat -Lc '%d:%i:%u:%a:%h' -- "$stderr_descriptor")" == "$stderr_identity" &&
+        "$stderr_output" -ef "$stderr_descriptor" ]] ||
+        capture_status=125
+      if ((size > stderr_maximum_bytes || lines > stderr_maximum_lines)); then
+        capture_status=125
+      fi
+    fi
+    [[ "$size" =~ ^(0|[1-9][0-9]*)$ &&
+      "$lines" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+  done
+  ((stdout_status == 0 && stderr_status == 0)) || capture_status=125
+  rm -- "$stdout_fifo" "$stderr_fifo" || return $?
+  stdout_fifo=""
+  stderr_fifo=""
+  exec {capture_dir_fd}>&-
+  capture_dir_fd=""
+  rmdir -- "$capture_dir" || return $?
+  capture_dir=""
+  capture_descriptor=""
+  ((capture_status == 0)) || return "$capture_status"
+  return "$command_status"
+)
+
+benchmark_pressure_cleanup_owned_candidate() (
+  local -r path="$1"
+  local -r expected_base_identity="$2"
+  local -r expected_links="${3:-1}"
+  local candidate_fd=""
+  local descriptor=""
+  local observed_identity=""
+  local observed_links=""
+  local digest=""
+
+  [[ "$expected_base_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:600$ &&
+    "$expected_links" =~ ^(1|2|any)$ ]] || return 1
+  [[ -e "$path" || -L "$path" ]] || return 0
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  exec {candidate_fd}<"$path" || return $?
+  descriptor="/proc/self/fd/$candidate_fd"
+  observed_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$descriptor")" ||
+    return $?
+  observed_links="${observed_identity##*:}"
+  [[ "$observed_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:600:[12]$ &&
+    "${observed_identity%:*}" == "$expected_base_identity" &&
+    ( "$expected_links" == any || "$observed_links" == "$expected_links" ) &&
+    "$path" -ef "$descriptor" ]] || return 1
+  digest="$(sha256sum -- "$descriptor")" || return $?
+  digest="${digest%% *}"
+  benchmark_pressure_quarantine_exact_file \
+    "$path" "$expected_base_identity" "$observed_links" "$digest"
+)
+
+# Remove one transaction leaf only when it is exactly one member of the
+# registered inode+byte-image set.  Role names are deliberately not
+# authoritative during rollback: owned leaves may have been permuted, while
+# an unknown replacement at any fixed name must remain untouched.
+benchmark_pressure_cleanup_owned_set_leaf() (
+  local -r path="$1"
+  shift
+  local -a expected_members=("$@")
+  local candidate_fd=""
+  local descriptor=""
+  local identity=""
+  local base_identity=""
+  local links=""
+  local digest=""
+  local expected_base_identity=""
+  local expected_sha256=""
+  local matched=false
+  local index=0
+
+  ((${#expected_members[@]} >= 2 && ${#expected_members[@]} % 2 == 0)) ||
+    return 1
+  for ((index = 0; index < ${#expected_members[@]}; index += 2)); do
+    expected_base_identity="${expected_members[index]}"
+    expected_sha256="${expected_members[index + 1]}"
+    [[ "$expected_base_identity" =~ \
+        ^[0-9]+:[1-9][0-9]*:$EUID:(600|644)$ &&
+      "$expected_sha256" =~ ^[0-9a-f]{64}$ ]] || return 1
+  done
+  [[ -e "$path" || -L "$path" ]] || return 0
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  exec {candidate_fd}<"$path" || return $?
+  descriptor="/proc/self/fd/$candidate_fd"
+  identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$descriptor")" || return $?
+  [[ "$identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:(600|644):[12]$ &&
+    "$path" -ef "$descriptor" ]] || return 1
+  links="${identity##*:}"
+  base_identity="${identity%:*}"
+  digest="$(sha256sum -- "$descriptor")" || return $?
+  digest="${digest%% *}"
+  for ((index = 0; index < ${#expected_members[@]}; index += 2)); do
+    if [[ "$base_identity" == "${expected_members[index]}" &&
+      "$digest" == "${expected_members[index + 1]}" ]]; then
+      matched=true
+      break
+    fi
+  done
+  [[ "$matched" == true ]] || return 1
+  benchmark_pressure_quarantine_exact_file \
+    "$path" "$base_identity" "$links" "$digest"
+)
+
+# Compatibility wrapper for the independently audited Java two-leaf
+# transaction.  The generic set classifier above is also used by client
+# capture/publication, including stdout/stderr/status role permutations.
+benchmark_pressure_cleanup_java_pair_leaf() (
+  local -r path="$1"
+  local -r stdout_base_identity="$2"
+  local -r stdout_sha256="$3"
+  local -r stderr_base_identity="$4"
+  local -r stderr_sha256="$5"
+
+  benchmark_pressure_cleanup_owned_set_leaf \
+    "$path" "$stdout_base_identity" "$stdout_sha256" \
+    "$stderr_base_identity" "$stderr_sha256"
+)
+
+# Publish a fixed set of owner-private files as one descriptor-pinned
+# transaction.  Every source is registered before the first link.  Until the
+# final isolated marker-link broker acquires the enclosing capture owner's
+# irrevocable publication_sealed lease, that one owner removes every recognizable
+# source or target irrespective of role; unknown replacements are preserved.
+# The marker link is live-atomic, but deliberately not advertised as
+# crash-durable: a post-link failure is ambiguous and never authorizes rollback.
+benchmark_pressure_publish_owned_file_set() {
+  local -r lexical_parent="$1"
+  local -r supplied_parent_descriptor="$2"
+  local -r required_parent_identity="$3"
+  local -r member_count="$4"
+  shift 4
+  local parent_fd=""
+  local parent_descriptor=""
+  local parent_identity=""
+  local lexical_parent_identity=""
+  local member_fd=""
+  local observed_identity=""
+  local observed_sha256=""
+  local observed_size=""
+  local index=0
+  local data_member_count=0
+  local transaction_kind=""
+  local linearization_status=0
+  # Test hooks consume this through dynamic scope.
+  # shellcheck disable=SC2034
+  local publication_owner_bashpid="$BASHPID"
+  local coherent_specification=$'V\t1\n'
+  local -a source_leaves=()
+  local -a target_leaves=()
+  local -a required_identities=()
+  local -a required_sha256s=()
+  local -a pinned_sources=()
+  local -a pinned_targets=()
+  local -a source_fds=()
+  local -a source_descriptors=()
+  local -a source_sizes=()
+  local -a owned_members=()
+  local -A seen_leaves=()
+
+  [[ "$supplied_parent_descriptor" =~ ^/proc/self/fd/[1-9][0-9]*$ &&
+    -d "$supplied_parent_descriptor" &&
+    "$required_parent_identity" =~ \
+      ^[0-9]+:[1-9][0-9]*:$EUID:700$ &&
+    "$member_count" == 3 && $# -eq $((member_count * 4)) &&
+    ! -L "$lexical_parent" && -d "$lexical_parent" ]] || return 1
+  exec {parent_fd}<"$supplied_parent_descriptor" || return $?
+  parent_descriptor="/proc/self/fd/$parent_fd"
+  parent_identity="$(stat -Lc '%d:%i:%u:%a' -- "$parent_descriptor")" ||
+    return $?
+  lexical_parent_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "$lexical_parent")" || return $?
+  [[ "$parent_identity" == "$required_parent_identity" &&
+    "$lexical_parent_identity" == "$required_parent_identity" &&
+    "$lexical_parent" -ef "$parent_descriptor" ]] || return 1
+
+  for ((index = 0; index < member_count; index++)); do
+    source_leaves[index]="$1"
+    target_leaves[index]="$2"
+    required_identities[index]="$3"
+    required_sha256s[index]="$4"
+    shift 4
+    [[ "${source_leaves[index]}" =~ ^[A-Za-z0-9._-]+$ &&
+      "${target_leaves[index]}" =~ ^[A-Za-z0-9._-]+$ &&
+      "${source_leaves[index]}" != "${target_leaves[index]}" &&
+      "${required_identities[index]}" =~ \
+        ^[0-9]+:[1-9][0-9]*:$EUID:600:1$ &&
+      "${required_sha256s[index]}" =~ ^[0-9a-f]{64}$ &&
+      -z "${seen_leaves[${source_leaves[index]}]:-}" &&
+      -z "${seen_leaves[${target_leaves[index]}]:-}" ]] || return 1
+    seen_leaves["${source_leaves[index]}"]=1
+    seen_leaves["${target_leaves[index]}"]=1
+    pinned_sources[index]="$parent_descriptor/${source_leaves[index]}"
+    pinned_targets[index]="$parent_descriptor/${target_leaves[index]}"
+  done
+  data_member_count="$((member_count - 1))"
+  if [[ "${source_leaves[0]}" == .benchmark-result.capture &&
+    "${source_leaves[1]}" == .benchmark-stderr.capture &&
+    "${source_leaves[2]}" == .benchmark-client-commit.capture &&
+    "${target_leaves[0]}" == benchmark-result.json &&
+    "${target_leaves[1]}" == benchmark.stderr.log &&
+    "${target_leaves[2]}" == benchmark-client-commit.json ]]; then
+    transaction_kind=success_pair
+  elif [[ "${source_leaves[0]}" == .benchmark-result.capture &&
+    "${source_leaves[1]}" == .benchmark-stderr.capture &&
+    "${source_leaves[2]}" == .benchmark-client-failure.capture &&
+    "${target_leaves[0]}" == benchmark.failure.stdout.log &&
+    "${target_leaves[1]}" == benchmark.failure.stderr.log &&
+    "${target_leaves[2]}" == benchmark-client-failure.json ]]; then
+    transaction_kind=failure_triplet
+  else
+    return 1
+  fi
+
+  # Register every candidate FD, identity, and digest before publication.
+  for ((index = 0; index < member_count; index++)); do
+    [[ ! -L "${pinned_sources[index]}" &&
+      -f "${pinned_sources[index]}" &&
+      ! -L "$lexical_parent/${source_leaves[index]}" &&
+      "$lexical_parent/${source_leaves[index]}" -ef \
+        "${pinned_sources[index]}" &&
+      ! -L "${pinned_targets[index]}" &&
+      ! -e "${pinned_targets[index]}" &&
+      ! -L "$lexical_parent/${target_leaves[index]}" &&
+      ! -e "$lexical_parent/${target_leaves[index]}" ]] || return 1
+    member_fd=""
+    exec {member_fd}<"${pinned_sources[index]}" || return $?
+    source_fds[index]="$member_fd"
+    source_descriptors[index]="/proc/self/fd/${source_fds[index]}"
+    observed_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+      "${source_descriptors[index]}")" || return $?
+    observed_sha256="$(sha256sum -- "${source_descriptors[index]}")" ||
+      return $?
+    observed_sha256="${observed_sha256%% *}"
+    observed_size="$(stat -Lc '%s' -- "${source_descriptors[index]}")" ||
+      return $?
+    [[ ! -L "${pinned_sources[index]}" &&
+      ! -L "$lexical_parent/${source_leaves[index]}" &&
+      "$observed_identity" == "${required_identities[index]}" &&
+      "$observed_sha256" == "${required_sha256s[index]}" &&
+      "$observed_size" =~ ^(0|[1-9][0-9]*)$ &&
+      "${pinned_sources[index]}" -ef "${source_descriptors[index]}" ]] ||
+      return 1
+    source_sizes[index]="$observed_size"
+    owned_members+=("${required_identities[index]%:1}" \
+      "${required_sha256s[index]}")
+  done
+
+  lexical_parent_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "$lexical_parent")" || return $?
+  [[ "$lexical_parent_identity" == "$parent_identity" &&
+    "$lexical_parent" -ef "$parent_descriptor" ]] || return 1
+
+  # Data leaves become visible first, but are not committed without the final
+  # receipt name.  The receipt candidate was registered with the same owned
+  # set before this first link.
+  for ((index = 0; index < data_member_count; index++)); do
+    ln -T -- "${pinned_sources[index]}" "${pinned_targets[index]}" ||
+      return $?
+    [[ ! -L "${pinned_targets[index]}" &&
+      ! -L "$lexical_parent/${target_leaves[index]}" ]] || return 1
+    observed_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+      "${source_descriptors[index]}")" || return $?
+    [[ ! -L "${pinned_targets[index]}" &&
+      ! -L "$lexical_parent/${target_leaves[index]}" &&
+      "$observed_identity" == \
+        "${required_identities[index]%:1}:2" &&
+      "${pinned_sources[index]}" -ef "${source_descriptors[index]}" &&
+      "${pinned_targets[index]}" -ef "${source_descriptors[index]}" ]] ||
+      return 1
+  done
+
+  # Retire every source name, including the receipt candidate, before sync and
+  # the coherent broker.  The exact marker bytes remain pinned by their held
+  # descriptor with nlink=0; the public marker name stays absent until the
+  # broker's final linkat(AT_EMPTY_PATH).
+  for ((index = 0; index < member_count; index++)); do
+    benchmark_pressure_cleanup_owned_set_leaf \
+      "${pinned_sources[index]}" "${owned_members[@]}" || return $?
+  done
+
+  sync -f "$parent_descriptor" || return $?
+  lexical_parent_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "$lexical_parent")" || return $?
+  [[ "$lexical_parent_identity" == "$parent_identity" &&
+    "$lexical_parent" -ef "$parent_descriptor" ]] || return 1
+  for ((index = 0; index < data_member_count; index++)); do
+    [[ ! -L "${pinned_targets[index]}" &&
+      ! -L "$lexical_parent/${target_leaves[index]}" ]] || return 1
+    observed_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+      "${source_descriptors[index]}")" || return $?
+    observed_sha256="$(sha256sum -- "${source_descriptors[index]}")" ||
+      return $?
+    observed_sha256="${observed_sha256%% *}"
+    [[ ! -L "${pinned_targets[index]}" &&
+      ! -L "$lexical_parent/${target_leaves[index]}" &&
+      ! -L "${pinned_sources[index]}" &&
+      ! -L "$lexical_parent/${source_leaves[index]}" &&
+      "$observed_identity" == \
+        "${required_identities[index]%:1}:1" &&
+      "$observed_sha256" == "${required_sha256s[index]}" &&
+      "${pinned_targets[index]}" -ef "${source_descriptors[index]}" &&
+      "$lexical_parent/${target_leaves[index]}" -ef \
+        "${source_descriptors[index]}" &&
+      ! -e "${pinned_sources[index]}" &&
+      ! -e "$lexical_parent/${source_leaves[index]}" ]] || return 1
+  done
+  index="$data_member_count"
+  observed_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "${source_descriptors[index]}")" || return $?
+  observed_sha256="$(sha256sum -- "${source_descriptors[index]}")" ||
+    return $?
+  observed_sha256="${observed_sha256%% *}"
+  [[ "$observed_identity" == "${required_identities[index]%:1}:0" &&
+    "$observed_sha256" == "${required_sha256s[index]}" &&
+    ! -L "${pinned_sources[index]}" &&
+    ! -e "${pinned_sources[index]}" &&
+    ! -L "$lexical_parent/${source_leaves[index]}" &&
+    ! -e "$lexical_parent/${source_leaves[index]}" &&
+    ! -L "${pinned_targets[index]}" &&
+    ! -e "${pinned_targets[index]}" &&
+    ! -L "$lexical_parent/${target_leaves[index]}" &&
+    ! -e "$lexical_parent/${target_leaves[index]}" ]] || return 1
+  printf -v coherent_specification '%sP\t0\t%s\t%s\t%s\trelevant\n' \
+    "$coherent_specification" "$parent_fd" "$lexical_parent" \
+    "$parent_identity"
+  for ((index = 0; index < data_member_count; index++)); do
+    printf -v coherent_specification '%sA\t0\t%s\n' \
+      "$coherent_specification" "${source_leaves[index]}"
+    printf -v coherent_specification '%sF\t0\t%s\t%s\t%s:%s\t%s\n' \
+      "$coherent_specification" "${target_leaves[index]}" \
+      "${source_fds[index]}" "${required_identities[index]%:1}:1" \
+      "${source_sizes[index]}" "${required_sha256s[index]}"
+  done
+  index="$data_member_count"
+  printf -v coherent_specification '%sA\t0\t%s\n' \
+    "$coherent_specification" "${source_leaves[index]}"
+  printf -v coherent_specification '%sM\t0\t%s\t%s\t%s:0:%s\t%s\n' \
+    "$coherent_specification" "${target_leaves[index]}" \
+    "${source_fds[index]}" "${required_identities[index]%:1}" \
+    "${source_sizes[index]}" "${required_sha256s[index]}"
+  printf -v coherent_specification '%sA\t0\t%s\n' \
+    "$coherent_specification" .benchmark-status.capture
+  if [[ "$transaction_kind" == success_pair ]]; then
+    printf -v coherent_specification \
+      '%sA\t0\t%s\nA\t0\t%s\nA\t0\t%s\nA\t0\t%s\n' \
+      "$coherent_specification" .benchmark-client-failure.capture \
+      benchmark.failure.stdout.log benchmark.failure.stderr.log \
+      benchmark-client-failure.json
+  else
+    printf -v coherent_specification \
+      '%sA\t0\t%s\nA\t0\t%s\nA\t0\t%s\nA\t0\t%s\n' \
+      "$coherent_specification" .benchmark-client-commit.capture \
+      benchmark-result.json benchmark.stderr.log benchmark-client-commit.json
+  fi
+  # Signal handling is deferred across the broker return/latch gap.  A broker
+  # success means the public marker exists and must never be rolled back, even
+  # though its directory entry is not promised crash-durable.
+  publication_linearization_in_progress=true
+  publication_broker_active=true
+  if benchmark_pressure_coherent_file_set publish_marker \
+    "$coherent_specification" "" "" "" publication_sealed; then
+    linearization_status=0
+  else
+    linearization_status=$?
+  fi
+  publication_broker_active=false
+  # Once the lease is surrendered, the enclosing capture cleanup owner preserves
+  # the entire registered set.  A nonzero broker result is bounded ambiguity,
+  # never rollback authority over data that may already have a public marker.
+  if [[ "$publication_sealed" == true ]]; then
+    ((linearization_status == 0)) ||
+    return "$BENCHMARK_PRESSURE_PUBLICATION_AMBIGUOUS_STATUS"
+    return 0
+  fi
+  # Dynamic outer capture latch and deterministic signal-test hook.
+  # shellcheck disable=SC2034
+  publication_linearization_in_progress=false
+  ((capture_signal_status == 0)) || return "$capture_signal_status"
+  return "$linearization_status"
+}
+
+capture_benchmark_pressure_resources() (
+  local -r identity_file="$1"
+  local -r output="$2"
+  local stats_candidate=""
+  local stderr_candidate=""
+  local output_candidate=""
+  local stats_identity=""
+  local stderr_identity=""
+  local output_identity=""
+  local captured=""
+  local container_id_lines=""
+  local status=0
+  local cleanup_status=0
+  local -a container_ids=()
+
+  benchmark_pressure_resource_capture_cleanup() {
+    local -r saved_status="$?"
+    local candidate=""
+    local identity=""
+
+    trap - EXIT HUP INT TERM
+    set +e
+    for candidate in "$stats_candidate" "$stderr_candidate" "$output_candidate"; do
+      [[ -n "$candidate" ]] || continue
+      case "$candidate" in
+        "$stats_candidate") identity="$stats_identity" ;;
+        "$stderr_candidate") identity="$stderr_identity" ;;
+        "$output_candidate") identity="$output_identity" ;;
+      esac
+      [[ -n "$identity" ]] || continue
+      benchmark_pressure_cleanup_owned_candidate "$candidate" "$identity" ||
+        cleanup_status=$?
+    done
+    if ((saved_status == 0 && cleanup_status != 0)); then
+      exit "$cleanup_status"
+    fi
+    exit "$saved_status"
+  }
+  trap benchmark_pressure_resource_capture_cleanup EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  [[ -f "$identity_file" && ! -L "$identity_file" &&
+    ! -e "$output" && ! -L "$output" ]] || return 1
+  container_id_lines="$(jq -er '.[].container_id' "$identity_file")" || return $?
+  mapfile -t container_ids <<<"$container_id_lines" || return $?
+  ((${#container_ids[@]} == 3)) || return 1
+  stats_candidate="$(mktemp "${output%/*}/.resource-stats.XXXXXX")" || return $?
+  stderr_candidate="$(mktemp "${output%/*}/.resource-stats-stderr.XXXXXX")" ||
+    return $?
+  output_candidate="$(mktemp "${output%/*}/.resource.XXXXXX")" || return $?
+  chmod 0600 -- "$stats_candidate" "$stderr_candidate" "$output_candidate" ||
+    return $?
+  stats_identity="$(stat -Lc '%d:%i:%u:%a' -- "$stats_candidate")" || return $?
+  stderr_identity="$(stat -Lc '%d:%i:%u:%a' -- "$stderr_candidate")" || return $?
+  output_identity="$(stat -Lc '%d:%i:%u:%a' -- "$output_candidate")" || return $?
+  validate_benchmark_pressure_stack_identity_file "$identity_file" || return $?
+  if benchmark_pressure_run_role_captured \
+    "$stats_candidate" "$BENCHMARK_PRESSURE_STATS_MAX_BYTES" \
+    "$BENCHMARK_PRESSURE_STATS_MAX_LINES" \
+    "$stderr_candidate" "$BENCHMARK_PRESSURE_STDERR_MAX_BYTES" \
+    "$BENCHMARK_PRESSURE_STDERR_MAX_LINES" 20 \
+    docker stats --no-stream --no-trunc --format '{{json .}}' \
+    "${container_ids[@]}"; then :
+  else
+    status=$?
+    return "$status"
+  fi
+  [[ ! -s "$stderr_candidate" ]] || return 1
+  bounded_evidence_file "$stats_candidate" \
+    "$BENCHMARK_PRESSURE_STATS_MAX_BYTES" \
+    "$BENCHMARK_PRESSURE_STATS_MAX_LINES" || return $?
+  validate_benchmark_pressure_stats_rows "$stats_candidate" || return $?
+  captured="$(benchmark_pressure_monotonic_centiseconds)" || return $?
+  jq -cS -e -n \
+    --argjson captured_monotonic_centiseconds "$captured" \
+    --slurpfile stack "$identity_file" \
+    --slurpfile stats "$stats_candidate" '
+      select(($stack | length) == 1 and ($stack[0] | length) == 3 and
+        ($stats | length) == 3) |
+      select(($stats | map(.ID)) == ($stack[0] | map(.container_id))) |
+      select(($stats | map(.Name)) == ($stack[0] | map(.container_name))) |
+      select(($stats | map(.ID) | unique | length) == 3 and
+        ($stats | map(.Name) | unique | length) == 3) |
+      {schema:"obi-benchmark-pressure-resources-v1",
+       captured_monotonic_centiseconds:$captured_monotonic_centiseconds,
+       stack:$stack[0],stats:$stats}
+    ' >"$output_candidate" || return $?
+  benchmark_pressure_cleanup_owned_candidate \
+    "$stats_candidate" "$stats_identity" || return $?
+  stats_candidate=""
+  stats_identity=""
+  benchmark_pressure_cleanup_owned_candidate \
+    "$stderr_candidate" "$stderr_identity" || return $?
+  stderr_candidate=""
+  stderr_identity=""
+  benchmark_pressure_publish_validated_file \
+    "$output_candidate" "$output" 600 \
+    validate_benchmark_pressure_resources "$identity_file" || return $?
+  output_candidate=""
+  output_identity=""
+)
+
+validate_benchmark_pressure_resources() (
+  local input="$1"
+  local identity_file="$2"
+  local input_fd=""
+  local identity_fd=""
+
+  benchmark_pressure_trusted_regular_path "$input" || return $?
+  benchmark_pressure_trusted_regular_path "$identity_file" || return $?
+  benchmark_pressure_hold_file_snapshot \
+    "$input" "$BENCHMARK_PRESSURE_RESOURCE_MAX_BYTES" input_fd || return $?
+  benchmark_pressure_hold_file_snapshot \
+    "$identity_file" "$BENCHMARK_PRESSURE_STACK_MAX_BYTES" identity_fd || return $?
+  input="/proc/self/fd/$input_fd"
+  identity_file="/proc/self/fd/$identity_fd"
+  bounded_evidence_file "$input" "$BENCHMARK_PRESSURE_RESOURCE_MAX_BYTES" \
+    "$BENCHMARK_PRESSURE_RESOURCE_MAX_LINES" || return $?
+  validate_benchmark_pressure_stack_identity_file "$identity_file" || return $?
+  benchmark_pressure_json_has_unique_object_keys \
+    "$input" "$BENCHMARK_PRESSURE_RESOURCE_MAX_BYTES" || return $?
+  jq -e --slurpfile expected "$identity_file" '
+    keys == ["captured_monotonic_centiseconds","schema","stack","stats"] and
+    .schema == "obi-benchmark-pressure-resources-v1" and
+    (.captured_monotonic_centiseconds | type == "number" and floor == . and . >= 0) and
+    ($expected | length) == 1 and .stack == $expected[0] and
+    (.stats | type == "array" and length == 3) and
+    all(.stats[];
+      keys == ["BlockIO","CPUPerc","Container","ID","MemPerc","MemUsage",
+        "Name","NetIO","PIDs"] and
+      all([.BlockIO,.CPUPerc,.Container,.ID,.MemPerc,.MemUsage,.Name,.NetIO,
+        .PIDs][]; type == "string" and length >= 1 and length <= 128) and
+      (.ID | test("^[0-9a-f]{64}$")) and
+      (.Name | test("^[a-z0-9][a-z0-9_.-]{0,126}$")) and
+      (.Container == .ID or .Container == .Name) and
+      (.CPUPerc | test("^[0-9]+(?:\\.[0-9]+)?%$")) and
+      (.MemPerc | test("^[0-9]+(?:\\.[0-9]+)?%$")) and
+      (.PIDs | test("^(0|[1-9][0-9]*)$")) and
+      (.MemUsage | test("^[0-9]+(?:\\.[0-9]+)?[A-Za-z]*B / [0-9]+(?:\\.[0-9]+)?[A-Za-z]*B$")) and
+      (.NetIO | test("^[0-9]+(?:\\.[0-9]+)?[A-Za-z]*B / [0-9]+(?:\\.[0-9]+)?[A-Za-z]*B$")) and
+      (.BlockIO | test("^[0-9]+(?:\\.[0-9]+)?[A-Za-z]*B / [0-9]+(?:\\.[0-9]+)?[A-Za-z]*B$"))) and
+    (.stats | map(.ID)) == (.stack | map(.container_id)) and
+    (.stats | map(.Name)) == (.stack | map(.container_name)) and
+    ([.stats[].ID] | unique | length) == 3 and
+    ([.stats[].Name] | unique | length) == 3
+  ' "$input" >/dev/null
+)
+
+validate_benchmark_pressure_trace_reset() (
+  local input="$1"
+  local input_fd=""
+
+  benchmark_pressure_trusted_regular_path "$input" || return $?
+  benchmark_pressure_hold_file_snapshot \
+    "$input" "$BENCHMARK_PRESSURE_TRACE_RESET_MAX_BYTES" input_fd || return $?
+  input="/proc/self/fd/$input_fd"
+  bounded_evidence_file "$input" "$BENCHMARK_PRESSURE_TRACE_RESET_MAX_BYTES" 1 ||
+    return $?
+  benchmark_pressure_json_has_unique_object_keys \
+    "$input" "$BENCHMARK_PRESSURE_TRACE_RESET_MAX_BYTES" || return $?
+  jq -se '
+    length == 1 and (.[0] |
+      keys == ["receiver_instance_id","reset_generation","status"] and
+      .status == "reset" and
+      (.receiver_instance_id | type == "string" and
+        test("^[A-Za-z0-9_-]{16,128}$")) and
+      (.reset_generation | type == "number" and floor == . and . >= 0 and
+        . <= 9007199254740991))
+  ' "$input" >/dev/null
+)
+
+reset_benchmark_pressure_trace_receiver() {
+  local -r output="$1"
+  local candidate=""
+  local size=""
+
+  [[ ! -e "$output" && ! -L "$output" ]] || return 1
+  candidate="$(mktemp "${output%/*}/.trace-reset.XXXXXX")" || return $?
+  if run_bounded 10 curl --fail --silent --show-error --max-time 8 \
+    --request POST "http://127.0.0.1:14318/reset" |
+    (
+      LC_ALL=C head -c "$((BENCHMARK_PRESSURE_TRACE_RESET_MAX_BYTES + 1))" \
+        >"$candidate" || exit $?
+      command cat >/dev/null
+    ); then :
+  else return $?
+  fi
+  chmod 0600 -- "$candidate" || return $?
+  size="$(stat -Lc '%s' -- "$candidate")" || return $?
+  ((size <= BENCHMARK_PRESSURE_TRACE_RESET_MAX_BYTES)) || return 1
+  benchmark_pressure_publish_validated_file \
+    "$candidate" "$output" 600 validate_benchmark_pressure_trace_reset
+}
+
+validate_benchmark_pressure_java_snapshot() {
+  local -r input="$1"
+
+  benchmark_pressure_trusted_regular_path "$input" || return $?
+  bounded_evidence_file "$input" "$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES" \
+    "$TERMINAL_JAVA_DIAGNOSTICS_MAX_LINES" || return $?
+  assert_sanitized_java_diagnostics "$input"
+}
+
+# Publish the diagnostics body and its stderr as one two-leaf transaction.  A
+# successful return proves both candidates, both immutable bytes, and the
+# owner-private parent survived one coherent descriptor-pinned last check.
+# Failure cleanup authenticates before quarantine, so an attacker-controlled
+# replacement is never deleted or moved under the campaign's authority.
+benchmark_pressure_publish_java_diagnostics_pair() (
+  local -r stdout_source="$1"
+  local -r stderr_source="$2"
+  local -r stdout_target="$3"
+  local -r stderr_target="$4"
+  local parent="${stdout_target%/*}"
+  local stdout_source_leaf="${stdout_source##*/}"
+  local stderr_source_leaf="${stderr_source##*/}"
+  local stdout_target_leaf="${stdout_target##*/}"
+  local stderr_target_leaf="${stderr_target##*/}"
+  local parent_fd=""
+  local parent_descriptor=""
+  local parent_identity=""
+  local lexical_parent_identity=""
+  local stdout_source_fd=""
+  local stderr_source_fd=""
+  local stdout_source_descriptor=""
+  local stderr_source_descriptor=""
+  local pinned_stdout_source=""
+  local pinned_stderr_source=""
+  local pinned_stdout_target=""
+  local pinned_stderr_target=""
+  local stdout_base_identity=""
+  local stderr_base_identity=""
+  local stdout_identity=""
+  local stderr_identity=""
+  local observed_stdout_identity=""
+  local observed_stderr_identity=""
+  local stdout_sha256=""
+  local stderr_sha256=""
+  local stdout_size=""
+  local stderr_size=""
+  local observed_stdout_sha256=""
+  local observed_stderr_sha256=""
+  local cleanup_status=0
+  local completed=false
+  local rollback_surrendered=false
+  local linearization_in_progress=false
+  local linearization_status=0
+  local publication_signal_status=0
+  # Test hooks consume this through dynamic scope.
+  # shellcheck disable=SC2034
+  local publication_owner_bashpid="$BASHPID"
+  local coherent_specification=$'V\t1\n'
+
+  benchmark_pressure_java_pair_signal() {
+    publication_signal_status="$1"
+    if [[ "$linearization_in_progress" != true ]]; then
+      [[ "$completed" != true ]] || exit 0
+      [[ "$rollback_surrendered" != true ]] ||
+        exit "$BENCHMARK_PRESSURE_PUBLICATION_AMBIGUOUS_STATUS"
+      exit "$publication_signal_status"
+    fi
+  }
+
+  benchmark_pressure_java_pair_cleanup() {
+    local -r saved_status="$?"
+    local cleanup_path=""
+
+    trap - EXIT HUP INT TERM
+    set +e
+    if [[ "$completed" != true && "$rollback_surrendered" != true &&
+      "$stdout_base_identity" =~ \
+        ^[0-9]+:[1-9][0-9]*:$EUID:600$ &&
+      "$stderr_base_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:600$ &&
+      "$stdout_sha256" =~ ^[0-9a-f]{64}$ &&
+      "$stderr_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+      for cleanup_path in "$pinned_stdout_source" "$pinned_stderr_source"; do
+        [[ -n "$cleanup_path" ]] || continue
+        benchmark_pressure_cleanup_java_pair_leaf \
+          "$cleanup_path" "$stdout_base_identity" "$stdout_sha256" \
+          "$stderr_base_identity" "$stderr_sha256" || cleanup_status=$?
+      done
+      for cleanup_path in "$pinned_stdout_target" "$pinned_stderr_target"; do
+        [[ -n "$cleanup_path" ]] || continue
+        benchmark_pressure_cleanup_java_pair_leaf \
+          "$cleanup_path" "$stdout_base_identity" "$stdout_sha256" \
+          "$stderr_base_identity" "$stderr_sha256" || cleanup_status=$?
+      done
+    fi
+    if ((saved_status == 0 && cleanup_status != 0)); then
+      exit "$cleanup_status"
+    fi
+    exit "$saved_status"
+  }
+  trap benchmark_pressure_java_pair_cleanup EXIT
+  trap 'benchmark_pressure_java_pair_signal 129' HUP
+  trap 'benchmark_pressure_java_pair_signal 130' INT
+  trap 'benchmark_pressure_java_pair_signal 143' TERM
+
+  [[ "${stderr_target%/*}" == "$parent" &&
+    "${stdout_source%/*}" == "$parent" &&
+    "${stderr_source%/*}" == "$parent" &&
+    "$stdout_source_leaf" =~ ^[A-Za-z0-9._-]+$ &&
+    "$stderr_source_leaf" =~ ^[A-Za-z0-9._-]+$ &&
+    "$stdout_target_leaf" =~ ^[A-Za-z0-9._-]+$ &&
+    "$stderr_target_leaf" =~ ^[A-Za-z0-9._-]+$ &&
+    "$stdout_source_leaf" != "$stderr_source_leaf" &&
+    "$stdout_target_leaf" != "$stderr_target_leaf" &&
+    "$stdout_source_leaf" != "$stdout_target_leaf" &&
+    "$stdout_source_leaf" != "$stderr_target_leaf" &&
+    "$stderr_source_leaf" != "$stdout_target_leaf" &&
+    "$stderr_source_leaf" != "$stderr_target_leaf" &&
+    ! -L "$parent" && -d "$parent" &&
+    ! -L "$stdout_source" && -f "$stdout_source" &&
+    ! -L "$stderr_source" && -f "$stderr_source" &&
+    ! -L "$stdout_target" && ! -e "$stdout_target" &&
+    ! -L "$stderr_target" && ! -e "$stderr_target" ]] || return 1
+  exec {parent_fd}<"$parent" || return $?
+  parent_descriptor="/proc/self/fd/$parent_fd"
+  parent_identity="$(stat -Lc '%d:%i:%u:%a' -- "$parent_descriptor")" ||
+    return $?
+  lexical_parent_identity="$(stat -Lc '%d:%i:%u:%a' -- "$parent")" ||
+    return $?
+  [[ "$parent_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:700$ &&
+    "$lexical_parent_identity" == "$parent_identity" &&
+    "$parent" -ef "$parent_descriptor" ]] || return 1
+  pinned_stdout_source="$parent_descriptor/$stdout_source_leaf"
+  pinned_stderr_source="$parent_descriptor/$stderr_source_leaf"
+  pinned_stdout_target="$parent_descriptor/$stdout_target_leaf"
+  pinned_stderr_target="$parent_descriptor/$stderr_target_leaf"
+  [[ ! -L "$pinned_stdout_source" && ! -L "$stdout_source" &&
+    ! -L "$pinned_stderr_source" && ! -L "$stderr_source" &&
+    "$stdout_source" -ef "$pinned_stdout_source" &&
+    "$stderr_source" -ef "$pinned_stderr_source" &&
+    ! -L "$pinned_stdout_target" && ! -e "$pinned_stdout_target" &&
+    ! -L "$pinned_stderr_target" && ! -e "$pinned_stderr_target" ]] || return 1
+
+  exec {stdout_source_fd}<"$pinned_stdout_source" || return $?
+  exec {stderr_source_fd}<"$pinned_stderr_source" || return $?
+  stdout_source_descriptor="/proc/self/fd/$stdout_source_fd"
+  stderr_source_descriptor="/proc/self/fd/$stderr_source_fd"
+  stdout_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "$stdout_source_descriptor")" || return $?
+  stderr_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "$stderr_source_descriptor")" || return $?
+  [[ "$stdout_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:600:1$ &&
+    "$stderr_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:600:1$ &&
+    ! -L "$pinned_stdout_source" && ! -L "$stdout_source" &&
+    ! -L "$pinned_stderr_source" && ! -L "$stderr_source" &&
+    "$pinned_stdout_source" -ef "$stdout_source_descriptor" &&
+    "$pinned_stderr_source" -ef "$stderr_source_descriptor" ]] || return 1
+  stdout_base_identity="${stdout_identity%:1}"
+  stderr_base_identity="${stderr_identity%:1}"
+  stdout_sha256="$(sha256sum -- "$stdout_source_descriptor")" || return $?
+  stdout_sha256="${stdout_sha256%% *}"
+  stderr_sha256="$(sha256sum -- "$stderr_source_descriptor")" || return $?
+  stderr_sha256="${stderr_sha256%% *}"
+  stdout_size="$(stat -Lc '%s' -- "$stdout_source_descriptor")" || return $?
+  stderr_size="$(stat -Lc '%s' -- "$stderr_source_descriptor")" || return $?
+  [[ "$stdout_size" =~ ^(0|[1-9][0-9]*)$ &&
+    "$stderr_size" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+  validate_benchmark_pressure_java_snapshot "$stdout_source_descriptor" ||
+    return $?
+  bounded_evidence_file "$stderr_source_descriptor" \
+    "$BENCHMARK_PRESSURE_STDERR_MAX_BYTES" \
+    "$BENCHMARK_PRESSURE_STDERR_MAX_LINES" || return $?
+  observed_stdout_sha256="$(sha256sum -- "$stdout_source_descriptor")" ||
+    return $?
+  observed_stdout_sha256="${observed_stdout_sha256%% *}"
+  observed_stderr_sha256="$(sha256sum -- "$stderr_source_descriptor")" ||
+    return $?
+  observed_stderr_sha256="${observed_stderr_sha256%% *}"
+  [[ "$(stat -Lc '%d:%i:%u:%a:%h' -- "$stdout_source_descriptor")" == \
+      "$stdout_identity" &&
+    "$(stat -Lc '%d:%i:%u:%a:%h' -- "$stderr_source_descriptor")" == \
+      "$stderr_identity" &&
+    "$observed_stdout_sha256" == "$stdout_sha256" &&
+    "$observed_stderr_sha256" == "$stderr_sha256" ]] || return 1
+
+  ln -T -- "$pinned_stdout_source" "$pinned_stdout_target" || return $?
+  [[ ! -L "$pinned_stdout_target" && ! -L "$stdout_target" ]] || return 1
+  observed_stdout_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "$pinned_stdout_target")" || return $?
+  [[ ! -L "$pinned_stdout_target" && ! -L "$stdout_target" &&
+    "$observed_stdout_identity" == "$stdout_base_identity:2" &&
+    "$(stat -Lc '%d:%i:%u:%a:%h' -- "$stdout_source_descriptor")" == \
+      "$stdout_base_identity:2" &&
+    "$pinned_stdout_source" -ef "$stdout_source_descriptor" &&
+    "$pinned_stdout_target" -ef "$stdout_source_descriptor" ]] || return 1
+  benchmark_pressure_cleanup_owned_candidate \
+    "$pinned_stdout_source" "$stdout_base_identity" 2 || return $?
+
+  ln -T -- "$pinned_stderr_source" "$pinned_stderr_target" || return $?
+  [[ ! -L "$pinned_stderr_target" && ! -L "$stderr_target" ]] || return 1
+  observed_stderr_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "$pinned_stderr_target")" || return $?
+  [[ ! -L "$pinned_stderr_target" && ! -L "$stderr_target" &&
+    "$observed_stderr_identity" == "$stderr_base_identity:2" &&
+    "$(stat -Lc '%d:%i:%u:%a:%h' -- "$stderr_source_descriptor")" == \
+      "$stderr_base_identity:2" &&
+    "$pinned_stderr_source" -ef "$stderr_source_descriptor" &&
+    "$pinned_stderr_target" -ef "$stderr_source_descriptor" ]] || return 1
+  benchmark_pressure_cleanup_owned_candidate \
+    "$pinned_stderr_source" "$stderr_base_identity" 2 || return $?
+
+  # The candidate descriptors still pin the exact two committed inodes after
+  # their source names are removed.  Perform every semantic and byte read on
+  # those descriptors, then prove both pinned and lexical target names still
+  # resolve to them before making the transaction visible to the caller.
+  [[ ! -L "$pinned_stdout_target" && ! -L "$stdout_target" &&
+    ! -L "$pinned_stderr_target" && ! -L "$stderr_target" ]] || return 1
+  validate_benchmark_pressure_java_snapshot "$stdout_source_descriptor" ||
+    return $?
+  bounded_evidence_file "$stderr_source_descriptor" \
+    "$BENCHMARK_PRESSURE_STDERR_MAX_BYTES" \
+    "$BENCHMARK_PRESSURE_STDERR_MAX_LINES" || return $?
+  observed_stdout_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "$stdout_source_descriptor")" || return $?
+  observed_stderr_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "$stderr_source_descriptor")" || return $?
+  observed_stdout_sha256="$(sha256sum -- "$stdout_source_descriptor")" ||
+    return $?
+  observed_stdout_sha256="${observed_stdout_sha256%% *}"
+  observed_stderr_sha256="$(sha256sum -- "$stderr_source_descriptor")" ||
+    return $?
+  observed_stderr_sha256="${observed_stderr_sha256%% *}"
+  lexical_parent_identity="$(stat -Lc '%d:%i:%u:%a' -- "$parent")" ||
+    return $?
+  [[ ! -L "$pinned_stdout_target" && ! -L "$stdout_target" &&
+    ! -L "$pinned_stderr_target" && ! -L "$stderr_target" &&
+    "$observed_stdout_identity" == "$stdout_base_identity:1" &&
+    "$observed_stderr_identity" == "$stderr_base_identity:1" &&
+    "$observed_stdout_sha256" == "$stdout_sha256" &&
+    "$observed_stderr_sha256" == "$stderr_sha256" &&
+    "$lexical_parent_identity" == "$parent_identity" &&
+    "$parent" -ef "$parent_descriptor" &&
+    "$pinned_stdout_target" -ef "$stdout_source_descriptor" &&
+    "$pinned_stderr_target" -ef "$stderr_source_descriptor" &&
+    "$stdout_target" -ef "$stdout_source_descriptor" &&
+    "$stderr_target" -ef "$stderr_source_descriptor" &&
+    ! -L "$stdout_source" && ! -e "$stdout_source" &&
+    ! -L "$stderr_source" && ! -e "$stderr_source" ]] || return 1
+  printf -v coherent_specification '%sP\t0\t%s\t%s\t%s\trelevant\n' \
+    "$coherent_specification" "$parent_fd" "$parent" "$parent_identity"
+  printf -v coherent_specification \
+    '%sA\t0\t%s\nA\t0\t%s\n' "$coherent_specification" \
+    "$stdout_source_leaf" "$stderr_source_leaf"
+  printf -v coherent_specification '%sF\t0\t%s\t%s\t%s:1:%s\t%s\n' \
+    "$coherent_specification" "$stdout_target_leaf" "$stdout_source_fd" \
+    "$stdout_base_identity" "$stdout_size" "$stdout_sha256"
+  printf -v coherent_specification '%sF\t0\t%s\t%s\t%s:1:%s\t%s\n' \
+    "$coherent_specification" "$stderr_target_leaf" "$stderr_source_fd" \
+    "$stderr_base_identity" "$stderr_size" "$stderr_sha256"
+  linearization_in_progress=true
+  if benchmark_pressure_coherent_file_set verify "$coherent_specification" \
+    "" "" "" rollback_surrendered; then
+    linearization_status=0
+  else
+    linearization_status=$?
+  fi
+  if ((linearization_status == 0)) && [[ "$rollback_surrendered" == true ]]; then
+    completed=true
+    return 0
+  fi
+  [[ "$rollback_surrendered" != true ]] ||
+    return "$BENCHMARK_PRESSURE_PUBLICATION_AMBIGUOUS_STATUS"
+  linearization_in_progress=false
+  ((publication_signal_status == 0)) || return "$publication_signal_status"
+  return "$linearization_status"
+)
+
+capture_benchmark_pressure_java_diagnostics() (
+  local -r output="$1"
+  local -r stderr_output="$2"
+  local candidate=""
+  local stderr_candidate=""
+  local candidate_identity=""
+  local stderr_candidate_identity=""
+  local status=0
+  local cleanup_status=0
+
+  benchmark_pressure_java_capture_cleanup() {
+    local -r saved_status="$?"
+    local candidate_path=""
+    local candidate_base=""
+
+    trap - EXIT HUP INT TERM
+    set +e
+    for candidate_path in "$candidate" "$stderr_candidate"; do
+      [[ -n "$candidate_path" ]] || continue
+      if [[ "$candidate_path" == "$candidate" ]]; then
+        candidate_base="$candidate_identity"
+      else
+        candidate_base="$stderr_candidate_identity"
+      fi
+      [[ -n "$candidate_base" ]] || continue
+      benchmark_pressure_cleanup_owned_candidate \
+        "$candidate_path" "$candidate_base" || cleanup_status=$?
+    done
+    if ((saved_status == 0 && cleanup_status != 0)); then
+      exit "$cleanup_status"
+    fi
+    exit "$saved_status"
+  }
+  trap benchmark_pressure_java_capture_cleanup EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  [[ ! -e "$output" && ! -L "$output" &&
+    ! -e "$stderr_output" && ! -L "$stderr_output" ]] || return 1
+  candidate="$(mktemp "${output%/*}/.java-diagnostics.XXXXXX")" || return $?
+  stderr_candidate="$(mktemp "${output%/*}/.java-diagnostics-stderr.XXXXXX")" ||
+    return $?
+  chmod 0600 -- "$candidate" "$stderr_candidate" || return $?
+  candidate_identity="$(stat -Lc '%d:%i:%u:%a' -- "$candidate")" || return $?
+  stderr_candidate_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "$stderr_candidate")" || return $?
+  if benchmark_pressure_run_role_captured \
+    "$candidate" "$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES" \
+    "$TERMINAL_JAVA_DIAGNOSTICS_MAX_LINES" \
+    "$stderr_candidate" "$BENCHMARK_PRESSURE_STDERR_MAX_BYTES" \
+    "$BENCHMARK_PRESSURE_STDERR_MAX_LINES" 8 \
+    curl --fail --silent --show-error --max-time 5 \
+    --cacert "$CERT_DIR/ca.crt" \
+    "https://127.0.0.1:18443/obi-diagnostics"; then :
+  else
+    status=$?
+    return "$status"
+  fi
+  bounded_evidence_file "$stderr_candidate" \
+    "$BENCHMARK_PRESSURE_STDERR_MAX_BYTES" \
+    "$BENCHMARK_PRESSURE_STDERR_MAX_LINES" || return $?
+  validate_benchmark_pressure_java_snapshot "$candidate" || return $?
+  benchmark_pressure_publish_java_diagnostics_pair \
+    "$candidate" "$stderr_candidate" "$output" "$stderr_output" || return $?
+  candidate=""
+  candidate_identity=""
+  stderr_candidate=""
+  stderr_candidate_identity=""
+)
+
+benchmark_pressure_trace_projection() (
+  local snapshot="$1"
+  local result="$2"
+  local reset="$3"
+  local -r expected_cycle="$4"
+  local snapshot_fd=""
+  local reset_fd=""
+  local committed_result=""
+  local committed_stderr=""
+  local committed_receipt=""
+  local marker_prefix=""
+  local expected_requests=""
+  local receiver_instance_id=""
+  local reset_generation=""
+
+  benchmark_pressure_trusted_regular_path "$snapshot" || return $?
+  benchmark_pressure_trusted_regular_path "$reset" || return $?
+  benchmark_pressure_client_bundle_images_for_consumer \
+    "$result" "$expected_cycle" committed_result committed_stderr \
+    committed_receipt || return $?
+  benchmark_pressure_hold_file_snapshot \
+    "$snapshot" "$BENCHMARK_PRESSURE_TRACE_SNAPSHOT_MAX_BYTES" snapshot_fd ||
+    return $?
+  benchmark_pressure_hold_file_snapshot \
+    "$reset" "$BENCHMARK_PRESSURE_TRACE_RESET_MAX_BYTES" reset_fd || return $?
+  snapshot="/proc/self/fd/$snapshot_fd"
+  result="$committed_result"
+  reset="/proc/self/fd/$reset_fd"
+  bounded_evidence_file "$snapshot" \
+    "$BENCHMARK_PRESSURE_TRACE_SNAPSHOT_MAX_BYTES" 1 || return $?
+  benchmark_pressure_json_has_unique_object_keys \
+    "$snapshot" "$BENCHMARK_PRESSURE_TRACE_SNAPSHOT_MAX_BYTES" || return $?
+  validate_benchmark_pressure_trace_reset "$reset" || return $?
+  marker_prefix="$(jq -er '.marker_prefix' "$result")" || return $?
+  validate_benchmark_pressure_result "$result" "$marker_prefix" || return $?
+  expected_requests="$(jq -er '.successful_requests' "$result")" || return $?
+  receiver_instance_id="$(jq -er '.receiver_instance_id' "$reset")" || return $?
+  reset_generation="$(jq -er '.reset_generation' "$reset")" || return $?
+  jq -cSe \
+    --arg prefix "$marker_prefix" \
+    --arg receiver_instance_id "$receiver_instance_id" \
+    --argjson reset_generation "$reset_generation" \
+    --argjson expected "$expected_requests" \
+    --arg encoding "$BENCHMARK_PRESSURE_MARKER_ENCODING" \
+    --arg endpoint "/api/echo" \
+    --argjson spans_per_request "$BENCHMARK_PRESSURE_TRACE_SPANS_PER_REQUEST" \
+    --argjson max_spans "$BENCHMARK_PRESSURE_TRACE_MAX_SPANS" \
+    --argjson max_retained "$BENCHMARK_PRESSURE_TRACE_MAX_RETAINED_BYTES" \
+    --argjson max_value "$BENCHMARK_PRESSURE_TRACE_MAX_VALUE_BYTES" '
+      def integer: type == "number" and floor == . and . >= 0 and
+        . <= 9007199254740991;
+      def marker_values:
+        [(.attributes // {}) | to_entries[] |
+          select((.key | ascii_downcase) ==
+            "http.request.header.x-obi-demo-id" or
+            (.key | ascii_downcase) ==
+            "http.request.header.x_obi_demo_id") | .value] | unique;
+      def marker: marker_values as $markers |
+        if ($markers | length) == 1 then $markers[0] else null end;
+      def padded($ordinal):
+        ($ordinal | tostring) as $raw | ("0000000" + $raw)[-7:];
+      def endpoint_matches:
+        ((.attributes // {}) as $attributes |
+          $attributes["http.route"] == $endpoint or
+          $attributes["url.path"] == $endpoint or
+          ($attributes["http.target"] // "" | startswith($endpoint + "?")) or
+          ($attributes["http.url"] // "" | contains($endpoint + "?")) or
+          ($attributes["url.full"] // "" | contains($endpoint + "?")));
+      def remote_known: (((.flags / 256) | floor) % 2) == 1;
+      def remote: (((.flags / 512) | floor) % 2) == 1;
+      def trace_flags: .flags % 256;
+      # Mirror tracecheck.spanRetainedBytes exactly.  The receiver counter is
+      # authoritative only when every retained span is present and no drop
+      # counter advanced, so keep this byte accounting beside those gates.
+      def retained_span_bytes:
+        ([.trace_id,.span_id,(.parent_span_id // ""),.service_name,
+          (.scope_name // ""),.name,.kind] +
+          [(.attributes // {}) | to_entries[] | .key,.value]) |
+        map(utf8bytelength) | add;
+      def valid_span:
+        . as $span |
+        type == "object" and
+        ((keys - ["attributes","end_unix_nano","flags","kind","name",
+          "parent_span_id","received_unix_milli","scope_name","service_name",
+          "span_id","start_unix_nano","trace_id"]) | length) == 0 and
+        all(["end_unix_nano","flags","kind","name","received_unix_milli",
+          "service_name","span_id","start_unix_nano","trace_id"][];
+          . as $key | $span | has($key)) and
+        (.trace_id | type == "string" and test("^[0-9a-f]{32}$") and
+          test("^0+$") == false) and
+        (.span_id | type == "string" and test("^[0-9a-f]{16}$") and
+          test("^0+$") == false) and
+        ((.parent_span_id // "") | type == "string" and
+          test("^$|^[0-9a-f]{16}$")) and
+        (.flags | integer and . <= 1023) and
+        (.kind | type == "string" and test("^(SERVER|CLIENT)$")) and
+        (.service_name | type == "string" and
+          test("^(apache-proxy|java-backend)$")) and
+        (.name | type == "string" and length >= 1 and length <= 512) and
+        (.start_unix_nano | integer and . >= 1) and
+        (.end_unix_nano | integer) and
+        .end_unix_nano >= .start_unix_nano and
+        (.received_unix_milli | integer and . >= 1) and
+        ((.scope_name // "") | type == "string" and length <= 512) and
+        ((.attributes // {}) | type == "object" and
+          all(to_entries[];
+            (.key | IN("http.request.header.x-obi-demo-id",
+              "http.request.header.x_obi_demo_id","http.request.method",
+              "http.response.status_code","http.route","http.target",
+              "http.url","url.full","url.path","server.address",
+              "server.port","network.protocol.name","network.protocol.version",
+              "tls.protocol.version","tls.cipher.name")) and
+            (.value | type == "string" and length <= $max_value)));
+      . as $snapshot |
+      keys as $keys |
+      select(([$keys[] | select(IN("ambiguous_related_spans",
+        "dropped_count_spans","dropped_retained_limit_spans","dropped_spans",
+        "dropped_value_limit_spans","marker","max_retained_bytes",
+        "max_value_bytes","omitted_related_spans","received_batches",
+        "received_spans","receiver_instance_id","related_spans",
+        "reset_generation","retained_bytes","spans") | not)] | length) == 0) |
+      select(.receiver_instance_id == $receiver_instance_id and
+        .reset_generation == $reset_generation and
+        (.marker // "") == "" and
+        (.received_batches | integer) and .received_batches >= 1 and
+        (.received_spans | integer) and .received_spans >= 1 and
+        .received_batches <= .received_spans and
+        (.dropped_spans | integer and . == 0) and
+        (.dropped_count_spans | integer and . == 0) and
+        (.dropped_value_limit_spans | integer and . == 0) and
+        (.dropped_retained_limit_spans | integer and . == 0) and
+        (.retained_bytes | integer and . >= 1 and . <= $max_retained) and
+        .max_retained_bytes == $max_retained and .max_value_bytes == $max_value and
+        (.omitted_related_spans // 0) == 0 and
+        (.ambiguous_related_spans // 0) == 0 and
+        ((.related_spans // []) | length) == 0 and
+        (.spans | type == "array" and length <= $max_spans and
+          all(.[]; valid_span)) and
+        .received_spans == (.spans | length) and
+        .received_spans == ($expected * $spans_per_request) and
+        ([.spans[] | [.trace_id,.span_id] | @tsv] |
+          length == (unique | length)) and
+        ([.spans[] | retained_span_bytes] | add // 0) == .retained_bytes) |
+      [.spans[] | select((marker // "") | startswith($prefix + "-"))] as $ours |
+      select($spans_per_request == 3 and
+        ($ours | length) == ($expected * $spans_per_request) and
+        ($ours | length) == ($snapshot.spans | length)) |
+      (reduce range(1; $expected + 1) as $ordinal
+        ({exact_hit_count:0,explicit_root_count:0,wrong_parent_count:0,
+          unresolved_count:0};
+          ($prefix + "-" + padded($ordinal)) as $wanted |
+          [$ours[] | select(marker == $wanted)] as $group |
+          [$group[] | select(.service_name == "apache-proxy" and
+            .kind == "SERVER" and endpoint_matches)] as $apache_servers |
+          [$group[] | select(.service_name == "apache-proxy" and
+            .kind == "CLIENT" and endpoint_matches)] as $apache_clients |
+          [$group[] | select(.service_name == "java-backend" and
+            .kind == "SERVER" and endpoint_matches)] as $java_servers |
+          if (($group | length) != 3 or
+            ([$group[] | [.trace_id,.span_id] | @tsv] | unique | length) != 3 or
+            ($apache_servers | length) != 1 or
+            ($apache_clients | length) != 1 or ($java_servers | length) != 1)
+          then .unresolved_count += 1
+          else
+            ($apache_servers[0]) as $server |
+            ($apache_clients[0]) as $client |
+            ($java_servers[0]) as $java |
+            if (($server.parent_span_id // "") != "" or
+              $client.trace_id != $server.trace_id or
+              $client.parent_span_id != $server.span_id)
+            then .wrong_parent_count += 1
+            elif (($java.parent_span_id // "") == "" and
+              ($java | remote | not) and $java.trace_id != $client.trace_id)
+            then .explicit_root_count += 1
+            elif ($java.trace_id == $client.trace_id and
+              $java.parent_span_id == $client.span_id and
+              ($java | remote_known) and ($java | remote) and
+              ($java | trace_flags) == ($client | trace_flags))
+            then .exact_hit_count += 1
+            else .wrong_parent_count += 1
+            end
+          end)) as $counts |
+      select($counts.wrong_parent_count == 0 and
+        $counts.unresolved_count == 0 and
+        $counts.explicit_root_count >= 1 and
+        $counts.exact_hit_count + $counts.explicit_root_count == $expected) |
+      {schema:"obi-benchmark-pressure-trace-projection-v1",
+       receiver_instance_id:.receiver_instance_id,
+       reset_generation:.reset_generation,marker_prefix:$prefix,
+       marker_encoding:$encoding,first_request_ordinal:1,
+       last_request_ordinal:$expected,request_count:$expected,
+       received_batches:.received_batches,received_spans:.received_spans,
+       retained_span_count:(.spans | length),retained_bytes:.retained_bytes,
+       exact_hit_count:$counts.exact_hit_count,
+       explicit_root_count:$counts.explicit_root_count,
+       wrong_parent_count:$counts.wrong_parent_count,
+       unresolved_count:$counts.unresolved_count,dropped_spans:0,
+       omitted_related_spans:0,ambiguous_related_spans:0}
+    ' "$snapshot"
+)
+
+fetch_benchmark_pressure_trace_snapshot() {
+  local -r output="$1"
+  local candidate=""
+  local size=""
+
+  candidate="$(mktemp "${output%/*}/.trace-snapshot.XXXXXX")" || return $?
+  if run_bounded 12 curl --fail --silent --show-error --max-time 10 \
+    "http://127.0.0.1:14318/snapshot" |
+    (
+      LC_ALL=C head -c "$((BENCHMARK_PRESSURE_TRACE_SNAPSHOT_MAX_BYTES + 1))" \
+        >"$candidate" || exit $?
+      command cat >/dev/null
+    ); then :
+  else return $?
+  fi
+  chmod 0600 -- "$candidate" || return $?
+  size="$(stat -Lc '%s' -- "$candidate")" || return $?
+  ((size <= BENCHMARK_PRESSURE_TRACE_SNAPSHOT_MAX_BYTES)) || return 1
+  benchmark_pressure_json_has_unique_object_keys \
+    "$candidate" "$BENCHMARK_PRESSURE_TRACE_SNAPSHOT_MAX_BYTES" || return $?
+  printf '%s\n' "$candidate"
+}
+
+wait_for_benchmark_pressure_trace_snapshot() {
+  local -r output="$1"
+  local -r result="$2"
+  local -r reset="$3"
+  local -r cycle="$4"
+  local deadline="$((SECONDS + BENCHMARK_PRESSURE_TRACE_SETTLEMENT_TIMEOUT_SECONDS))"
+  local candidate=""
+  local projection=""
+  local projection_sha256=""
+  local previous_sha256=""
+  local candidate_parent_identity=""
+  local candidate_identity=""
+  local candidate_sha256=""
+  local consecutive=0
+
+  [[ ! -e "$output" && ! -L "$output" ]] || return 1
+  while ((SECONDS < deadline)); do
+    candidate="$(fetch_benchmark_pressure_trace_snapshot "$output")" || return $?
+    if projection="$(benchmark_pressure_trace_projection \
+      "$candidate" "$result" "$reset" "$cycle" 2>/dev/null)"; then
+      projection_sha256="$(printf '%s\n' "$projection" | sha256sum)" || return $?
+      projection_sha256="${projection_sha256%% *}"
+      if [[ "$projection_sha256" == "$previous_sha256" ]]; then
+        ((consecutive += 1))
+      else
+        consecutive=1
+        previous_sha256="$projection_sha256"
+      fi
+      if ((consecutive == BENCHMARK_PRESSURE_TRACE_SETTLEMENT_SAMPLES)); then
+        benchmark_pressure_capture_candidate_authority \
+          "$candidate" 600 candidate_parent_identity candidate_identity \
+          candidate_sha256 || return $?
+        benchmark_pressure_commit_file_no_clobber \
+          "$candidate" "$output" 600 "$candidate_parent_identity" \
+          "$candidate_parent_identity" "$candidate_identity" \
+          "$candidate_sha256" || return $?
+        benchmark_pressure_trace_projection \
+          "$output" "$result" "$reset" "$cycle" >/dev/null
+        return $?
+      fi
+    else
+      consecutive=0
+      previous_sha256=""
+    fi
+    rm -f -- "$candidate" || return $?
+    sleep 1 || return $?
+  done
+  return 124
+}
+
+benchmark_pressure_admission_max_events() {
+  local -r requests="$1"
+
+  bounded_decimal "$requests" "$BENCHMARK_PRESSURE_MAX_SUCCESSFUL_REQUESTS" \
+    false >/dev/null || return 1
+  printf '%d\n' "$((requests * PRESSURE_ADMISSION_MAX_EVENTS_PER_REQUEST))"
+}
+
+prepare_benchmark_pressure_attribution() {
+  local -r cycle="$1"
+  local -r cycle_dir="$2"
+
+  [[ "$cycle" =~ ^([1-9]|10)$ && -d "$cycle_dir" && ! -L "$cycle_dir" ]] ||
+    return 1
+  capture_benchmark_pressure_java_diagnostics \
+    "$cycle_dir/java-diagnostics-before.txt" \
+    "$cycle_dir/java-diagnostics-before.stderr" || return $?
+  fetch_obi_metrics "$cycle_dir/obi-metrics-before.prom" 5 || return $?
+  chmod 0600 -- "$cycle_dir/obi-metrics-before.prom" || return $?
+  bounded_evidence_file "$cycle_dir/obi-metrics-before.prom" \
+    "$OBI_METRIC_SNAPSHOT_MAX_BYTES" "$OBI_METRIC_SNAPSHOT_MAX_LINES" ||
+    return $?
+  reset_benchmark_pressure_trace_receiver "$cycle_dir/trace-reset.json"
+}
+
+validate_benchmark_pressure_admission_receipt() (
+  local receipt="$1"
+  local -r expected_cycle="$2"
+  local -r cycle_dir="${3:-${receipt%/*}}"
+  local result="$cycle_dir/benchmark-result.json"
+  local reset="$cycle_dir/trace-reset.json"
+  local snapshot="$cycle_dir/trace-snapshot.json"
+  local projection_file="$cycle_dir/trace-projection.json"
+  local metrics_before="$cycle_dir/obi-metrics-before.prom"
+  local metrics_after="$cycle_dir/obi-metrics-after.prom"
+  local metrics_delta="$cycle_dir/obi-metrics.delta"
+  local bridge_file="$cycle_dir/bridge-reconciliation.json"
+  local java_before="$cycle_dir/java-diagnostics-before.txt"
+  local java_after="$cycle_dir/java-diagnostics-after.txt"
+  local java_delta="$cycle_dir/java-diagnostics.delta"
+  local fill="$cycle_dir/map-fill.json"
+  local verify="$cycle_dir/map-verify.json"
+  local marker_prefix=""
+  local requests=""
+  local hits=""
+  local roots=""
+  local maximum_admission=""
+  local expected_projection=""
+  local observed_projection=""
+  local expected_bridge=""
+  local observed_bridge=""
+  local recomputed_metrics=""
+  local recomputed_java=""
+  local digest=""
+  local role=""
+  local path=""
+  local expected_digest=""
+  local content_sha256=""
+  local canonical_expected_bridge=""
+  local snapshot_variable=""
+  local snapshot_maximum=""
+  local snapshot_input=""
+  local snapshot_fd=""
+  local committed_result=""
+  local committed_stderr=""
+  local committed_receipt=""
+  local -a admission_snapshot_fds=()
+
+  if declare -p BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS >/dev/null 2>&1; then
+    result="${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[benchmark]:-}"
+    reset="${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[trace_reset]:-}"
+    snapshot="${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[trace_snapshot]:-}"
+    projection_file="${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[trace_projection]:-}"
+    metrics_before="${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[metrics_before]:-}"
+    metrics_after="${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[metrics_after]:-}"
+    metrics_delta="${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[metrics_delta]:-}"
+    bridge_file="${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[bridge_reconciliation]:-}"
+    java_before="${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[java_before]:-}"
+    java_after="${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[java_after]:-}"
+    java_delta="${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[java_delta]:-}"
+    fill="${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[fill]:-}"
+    verify="${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[verify]:-}"
+  fi
+  benchmark_pressure_client_bundle_images_for_consumer \
+    "$result" "$expected_cycle" committed_result committed_stderr \
+    committed_receipt || return $?
+  result="$committed_result"
+
+  # Establish one immutable image of the receipt and every auxiliary source
+  # before the first parser or cross-file projection.  Subsequent helpers may
+  # duplicate these sealed descriptors, but never reopen mutable lexical data.
+  while read -r snapshot_variable snapshot_maximum; do
+    snapshot_input="${!snapshot_variable}"
+    benchmark_pressure_trusted_regular_path "$snapshot_input" || return $?
+    unset snapshot_fd
+    benchmark_pressure_hold_file_snapshot \
+      "$snapshot_input" "$snapshot_maximum" snapshot_fd || return $?
+    admission_snapshot_fds+=("$snapshot_fd")
+    printf -v "$snapshot_variable" '/proc/self/fd/%s' "$snapshot_fd"
+  done <<EOF
+receipt $BENCHMARK_PRESSURE_ADMISSION_RECEIPT_MAX_BYTES
+result $BENCHMARK_PRESSURE_RESULT_MAX_BYTES
+reset $BENCHMARK_PRESSURE_TRACE_RESET_MAX_BYTES
+snapshot $BENCHMARK_PRESSURE_TRACE_SNAPSHOT_MAX_BYTES
+projection_file 1048576
+metrics_before $OBI_METRIC_SNAPSHOT_MAX_BYTES
+metrics_after $OBI_METRIC_SNAPSHOT_MAX_BYTES
+metrics_delta $OBI_METRIC_SNAPSHOT_MAX_BYTES
+bridge_file 1048576
+java_before $TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES
+java_after $TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES
+java_delta 65536
+fill $PRESSURE_RESULT_MAX_BYTES
+verify $PRESSURE_RESULT_MAX_BYTES
+EOF
+
+  # Nested projections consume the immutable result image established above.
+  # Give their common bundle router the explicit scoped provenance rather than
+  # letting a command-substitution subshell reopen public leaf names.
+  local -A BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS=(
+    [benchmark]="$result"
+    [benchmark_stderr]="$committed_stderr"
+    [benchmark_client_commit]="$committed_receipt"
+  )
+  local BENCHMARK_PRESSURE_CLIENT_BUNDLE_VALIDATED=true
+
+  [[ "$expected_cycle" =~ ^([1-9]|10)$ &&
+    -d "$cycle_dir" && ! -L "$cycle_dir" ]] || return 1
+  benchmark_pressure_trusted_regular_path "$receipt" || return $?
+  for path in "$result" "$reset" "$snapshot" "$projection_file" \
+    "$metrics_before" "$metrics_after" "$metrics_delta" "$bridge_file" \
+    "$java_before" "$java_after" "$java_delta" "$fill" "$verify"; do
+    benchmark_pressure_trusted_regular_path "$path" || return $?
+  done
+  bounded_evidence_file "$receipt" \
+    "$BENCHMARK_PRESSURE_ADMISSION_RECEIPT_MAX_BYTES" 1 || return $?
+  benchmark_pressure_json_has_unique_object_keys \
+    "$receipt" "$BENCHMARK_PRESSURE_ADMISSION_RECEIPT_MAX_BYTES" || return $?
+  bounded_evidence_file "$projection_file" 1048576 1 || return $?
+  bounded_evidence_file "$bridge_file" 1048576 1 || return $?
+  benchmark_pressure_json_has_unique_object_keys \
+    "$projection_file" "$BENCHMARK_PRESSURE_ADMISSION_RECEIPT_MAX_BYTES" ||
+    return $?
+  benchmark_pressure_json_has_unique_object_keys \
+    "$bridge_file" "$BENCHMARK_PRESSURE_ADMISSION_RECEIPT_MAX_BYTES" ||
+    return $?
+  bounded_evidence_file "$metrics_before" "$OBI_METRIC_SNAPSHOT_MAX_BYTES" \
+    "$OBI_METRIC_SNAPSHOT_MAX_LINES" || return $?
+  bounded_evidence_file "$metrics_after" "$OBI_METRIC_SNAPSHOT_MAX_BYTES" \
+    "$OBI_METRIC_SNAPSHOT_MAX_LINES" || return $?
+  bounded_evidence_file "$metrics_delta" "$OBI_METRIC_SNAPSHOT_MAX_BYTES" \
+    "$OBI_METRIC_SNAPSHOT_MAX_LINES" || return $?
+  validate_benchmark_pressure_java_snapshot "$java_before" || return $?
+  validate_benchmark_pressure_java_snapshot "$java_after" || return $?
+  bounded_evidence_file "$java_delta" 65536 64 || return $?
+  bounded_evidence_file "$fill" "$PRESSURE_RESULT_MAX_BYTES" \
+    "$PRESSURE_RESULT_MAX_LINES" || return $?
+  bounded_evidence_file "$verify" "$PRESSURE_RESULT_MAX_BYTES" \
+    "$PRESSURE_RESULT_MAX_LINES" || return $?
+  marker_prefix="$(jq -er '.marker_prefix' "$result")" || return $?
+  validate_benchmark_pressure_result "$result" "$marker_prefix" || return $?
+  requests="$(jq -er '.successful_requests' "$result")" || return $?
+  expected_projection="$(benchmark_pressure_trace_projection \
+    "$snapshot" "$result" "$reset" "$expected_cycle")" || return $?
+  observed_projection="$(jq -cS . "$projection_file")" || return $?
+  [[ "$observed_projection" == "$expected_projection" ]] || return 1
+  hits="$(jq -er '.exact_hit_count' <<<"$expected_projection")" || return $?
+  roots="$(jq -er '.explicit_root_count' <<<"$expected_projection")" || return $?
+  maximum_admission="$(benchmark_pressure_admission_max_events "$requests")" ||
+    return $?
+  recomputed_metrics="$(mktemp -p /tmp obi-pressure-metrics-delta.XXXXXX)" ||
+    return $?
+  recomputed_java="$(mktemp -p /tmp obi-pressure-java-delta.XXXXXX)" || return $?
+  trap 'rm -f -- "$recomputed_metrics" "$recomputed_java"' EXIT
+  write_metrics_delta "$metrics_before" "$metrics_after" "$recomputed_metrics" ||
+    return $?
+  cmp -s -- "$recomputed_metrics" "$metrics_delta" || return 1
+  expected_bridge="$(pressure_bridge_reconciliation \
+    "$metrics_delta" getsockopt "$hits" "$roots" "$requests" \
+    "$maximum_admission")" || return $?
+  observed_bridge="$(jq -cS . "$bridge_file")" || return $?
+  canonical_expected_bridge="$(jq -cS . <<<"$expected_bridge")" || return $?
+  [[ "$observed_bridge" == "$canonical_expected_bridge" ]] || return 1
+  write_java_diagnostics_delta "$java_before" "$java_after" \
+    "$recomputed_java" || return $?
+  cmp -s -- "$recomputed_java" "$java_delta" || return 1
+  assert_java_diagnostics_delta \
+    "$java_delta" "$hits" 0 0 "$((roots + 1))" "$hits" 0 0 || return $?
+  pressure_result_has_contract "$fill" fill || return $?
+  pressure_result_has_contract "$verify" verify || return $?
+  content_sha256="$(pressure_result_hex "$fill" content_sha256)" || return $?
+  [[ "$(pressure_result_hex "$verify" content_sha256)" == "$content_sha256" &&
+    "$(pressure_result_uint "$verify" touched)" == 0 &&
+    "$(pressure_result_uint "$verify" verified_present_entries)" == \
+      "$PRESSURE_EXPECTED_MAP_CAPACITY" ]] || return 1
+  jq -e \
+    --argjson cycle "$expected_cycle" \
+    --arg marker_prefix "$marker_prefix" \
+    --arg marker_encoding "$BENCHMARK_PRESSURE_MARKER_ENCODING" \
+    --argjson requests "$requests" \
+    --argjson hits "$hits" \
+    --argjson roots "$roots" \
+    --argjson maximum_admission "$maximum_admission" \
+    --argjson trace "$expected_projection" \
+    --argjson bridge "$expected_bridge" '
+      . as $document |
+      keys == ["admission","bridge","conservation","cycle","digests","java",
+        "marker","schema","status","trace"] and
+      .schema == "obi-benchmark-pressure-admission-v1" and
+      .status == "passed" and .cycle == $cycle and
+      .marker == {admitted_requests:$requests,encoding:$marker_encoding,
+        first_request_ordinal:1,last_request_ordinal:$requests,
+        prefix:$marker_prefix} and
+      .trace == $trace and .bridge == $bridge and
+      .java == {attributable_absence_count:$roots,
+        diagnostic_self_miss_count:1,take_valid_count:$hits} and
+      .conservation == {hit_plus_root_requests:$requests,
+        java_attributable_requests:$requests,
+        successful_requests:$requests,
+        upstream_plus_retrieval_failures:$roots} and
+      .admission == {
+        ambiguous:0,maximum:$maximum_admission,
+        overload:$bridge.handoff_admission_outcome_counts.overload,
+        unexpected_evictions:0} and
+      (.admission.overload | type == "number" and floor == . and . >= 1 and
+        . <= $document.admission.maximum) and
+      (.digests | keys) == ["benchmark_result","bridge_reconciliation","fill",
+        "java_after","java_before","java_delta","metrics_after",
+        "metrics_before","metrics_delta","trace_projection","trace_reset",
+        "trace_snapshot","verify"] and
+      all(.digests[]; type == "string" and test("^[0-9a-f]{64}$"))
+  ' "$receipt" >/dev/null || return $?
+  for role in benchmark_result bridge_reconciliation fill java_after java_before \
+    java_delta metrics_after metrics_before metrics_delta trace_projection \
+    trace_reset trace_snapshot verify; do
+    case "$role" in
+      benchmark_result) path="$result" ;;
+      bridge_reconciliation) path="$bridge_file" ;;
+      fill) path="$fill" ;;
+      java_after) path="$java_after" ;;
+      java_before) path="$java_before" ;;
+      java_delta) path="$java_delta" ;;
+      metrics_after) path="$metrics_after" ;;
+      metrics_before) path="$metrics_before" ;;
+      metrics_delta) path="$metrics_delta" ;;
+      trace_projection) path="$projection_file" ;;
+      trace_reset) path="$reset" ;;
+      trace_snapshot) path="$snapshot" ;;
+      verify) path="$verify" ;;
+      *) return 1 ;;
+    esac
+    digest="$(sha256sum -- "$path")" || return $?
+    digest="${digest%% *}"
+    expected_digest="$(jq -er --arg role "$role" '.digests[$role]' \
+      "$receipt")" || return $?
+    [[ "$digest" == "$expected_digest" ]] || return 1
+  done
+)
+
+write_benchmark_pressure_admission_receipt() {
+  local -r cycle="$1"
+  local -r cycle_dir="$2"
+  local target="$cycle_dir/admission-receipt.json"
+  local candidate=""
+  local result="$cycle_dir/benchmark-result.json"
+  local projection_file="$cycle_dir/trace-projection.json"
+  local bridge_file="$cycle_dir/bridge-reconciliation.json"
+  local marker_prefix=""
+  local requests=""
+  local hits=""
+  local roots=""
+  local maximum_admission=""
+  local admission_overload=""
+  local projection=""
+  local bridge=""
+  local digests='{}'
+  local role=""
+  local path=""
+  local digest=""
+  local committed_result=""
+  local committed_stderr=""
+  local committed_receipt=""
+
+  [[ "$cycle" =~ ^([1-9]|10)$ && ! -e "$target" && ! -L "$target" ]] ||
+    return 1
+  benchmark_pressure_client_bundle_images_for_consumer \
+    "$result" "$cycle" committed_result committed_stderr committed_receipt ||
+    return $?
+  result="$committed_result"
+  marker_prefix="$(jq -er '.marker_prefix' "$result")" || return $?
+  requests="$(jq -er '.successful_requests' "$result")" || return $?
+  projection="$(jq -cS . "$projection_file")" || return $?
+  bridge="$(jq -cS . "$bridge_file")" || return $?
+  hits="$(jq -er '.exact_hit_count' <<<"$projection")" || return $?
+  roots="$(jq -er '.explicit_root_count' <<<"$projection")" || return $?
+  maximum_admission="$(benchmark_pressure_admission_max_events "$requests")" ||
+    return $?
+  admission_overload="$(jq -er \
+    '.handoff_admission_outcome_counts.overload' <<<"$bridge")" || return $?
+  for role in benchmark_result bridge_reconciliation fill java_after java_before \
+    java_delta metrics_after metrics_before metrics_delta trace_projection \
+    trace_reset trace_snapshot verify; do
+    case "$role" in
+      benchmark_result) path="$result" ;;
+      bridge_reconciliation) path="$bridge_file" ;;
+      fill) path="$cycle_dir/map-fill.json" ;;
+      java_after) path="$cycle_dir/java-diagnostics-after.txt" ;;
+      java_before) path="$cycle_dir/java-diagnostics-before.txt" ;;
+      java_delta) path="$cycle_dir/java-diagnostics.delta" ;;
+      metrics_after) path="$cycle_dir/obi-metrics-after.prom" ;;
+      metrics_before) path="$cycle_dir/obi-metrics-before.prom" ;;
+      metrics_delta) path="$cycle_dir/obi-metrics.delta" ;;
+      trace_projection) path="$projection_file" ;;
+      trace_reset) path="$cycle_dir/trace-reset.json" ;;
+      trace_snapshot) path="$cycle_dir/trace-snapshot.json" ;;
+      verify) path="$cycle_dir/map-verify.json" ;;
+      *) return 1 ;;
+    esac
+    digest="$(sha256sum -- "$path")" || return $?
+    digest="${digest%% *}"
+    digests="$(jq -cS --arg role "$role" --arg digest "$digest" \
+      '. + {($role):$digest}' <<<"$digests")" || return $?
+  done
+  candidate="$(mktemp "$cycle_dir/.admission-receipt.XXXXXX")" || return $?
+  jq -cS -n \
+    --argjson cycle "$cycle" --arg marker_prefix "$marker_prefix" \
+    --arg marker_encoding "$BENCHMARK_PRESSURE_MARKER_ENCODING" \
+    --argjson requests "$requests" --argjson hits "$hits" \
+    --argjson roots "$roots" --argjson maximum "$maximum_admission" \
+    --argjson overload "$admission_overload" \
+    --argjson trace "$projection" --argjson bridge "$bridge" \
+    --argjson digests "$digests" '
+      {schema:"obi-benchmark-pressure-admission-v1",status:"passed",cycle:$cycle,
+       marker:{prefix:$marker_prefix,encoding:$marker_encoding,
+         admitted_requests:$requests,first_request_ordinal:1,
+         last_request_ordinal:$requests},trace:$trace,bridge:$bridge,
+       java:{take_valid_count:$hits,attributable_absence_count:$roots,
+         diagnostic_self_miss_count:1},
+       conservation:{successful_requests:$requests,
+         hit_plus_root_requests:($hits+$roots),
+         upstream_plus_retrieval_failures:
+           ($bridge.upstream_failure_count+$bridge.retrieval_failure_count),
+         java_attributable_requests:($hits+$roots)},
+       admission:{overload:$overload,ambiguous:0,maximum:$maximum,
+         unexpected_evictions:0},digests:$digests}
+    ' >"$candidate" || return $?
+  chmod 0600 -- "$candidate" || return $?
+  benchmark_pressure_publish_validated_file \
+    "$candidate" "$target" 600 validate_benchmark_pressure_admission_receipt \
+    "$cycle" "$cycle_dir"
+}
+
+finish_benchmark_pressure_attribution() {
+  local -r cycle="$1"
+  local -r cycle_dir="$2"
+  local -r label="$3"
+  local projection=""
+  local bridge=""
+  local requests=""
+  local hits=""
+  local roots=""
+  local before_success=""
+  local before_stage=""
+  local maximum_admission=""
+  local candidate=""
+  local candidate_parent_identity=""
+  local candidate_identity=""
+  local candidate_sha256=""
+
+  wait_for_benchmark_pressure_trace_snapshot \
+    "$cycle_dir/trace-snapshot.json" "$cycle_dir/benchmark-result.json" \
+    "$cycle_dir/trace-reset.json" "$cycle" || return $?
+  projection="$(benchmark_pressure_trace_projection \
+    "$cycle_dir/trace-snapshot.json" "$cycle_dir/benchmark-result.json" \
+    "$cycle_dir/trace-reset.json" "$cycle")" || return $?
+  candidate="$(mktemp "$cycle_dir/.trace-projection.XXXXXX")" || return $?
+  printf '%s\n' "$projection" >"$candidate" || return $?
+  chmod 0600 -- "$candidate" || return $?
+  benchmark_pressure_capture_candidate_authority \
+    "$candidate" 600 candidate_parent_identity candidate_identity \
+    candidate_sha256 || return $?
+  benchmark_pressure_commit_file_no_clobber \
+    "$candidate" "$cycle_dir/trace-projection.json" 600 \
+    "$candidate_parent_identity" "$candidate_parent_identity" \
+    "$candidate_identity" "$candidate_sha256" || return $?
+  requests="$(jq -er '.request_count' <<<"$projection")" || return $?
+  hits="$(jq -er '.exact_hit_count' <<<"$projection")" || return $?
+  roots="$(jq -er '.explicit_root_count' <<<"$projection")" || return $?
+  before_success="$(bridge_success_total \
+    "$cycle_dir/obi-metrics-before.prom")" || return $?
+  before_stage="$(bridge_stage_total \
+    "$cycle_dir/obi-metrics-before.prom")" || return $?
+  wait_for_bridge_metrics_quiescent \
+    "$((before_success + hits))" "$((before_stage + hits))" \
+    "$cycle_dir/obi-metrics-after.prom" \
+    "$label benchmark pressure bridge operations" || return $?
+  chmod 0600 -- "$cycle_dir/obi-metrics-after.prom" || return $?
+  write_metrics_delta "$cycle_dir/obi-metrics-before.prom" \
+    "$cycle_dir/obi-metrics-after.prom" "$cycle_dir/obi-metrics.delta" ||
+    return $?
+  chmod 0600 -- "$cycle_dir/obi-metrics.delta" || return $?
+  maximum_admission="$(benchmark_pressure_admission_max_events "$requests")" ||
+    return $?
+  bridge="$(pressure_bridge_reconciliation \
+    "$cycle_dir/obi-metrics.delta" getsockopt "$hits" "$roots" "$requests" \
+    "$maximum_admission")" || return $?
+  candidate="$(mktemp "$cycle_dir/.bridge-reconciliation.XXXXXX")" || return $?
+  printf '%s\n' "$bridge" | jq -cS . >"$candidate" || return $?
+  chmod 0600 -- "$candidate" || return $?
+  benchmark_pressure_capture_candidate_authority \
+    "$candidate" 600 candidate_parent_identity candidate_identity \
+    candidate_sha256 || return $?
+  benchmark_pressure_commit_file_no_clobber \
+    "$candidate" "$cycle_dir/bridge-reconciliation.json" 600 \
+    "$candidate_parent_identity" "$candidate_parent_identity" \
+    "$candidate_identity" "$candidate_sha256" || return $?
+  capture_benchmark_pressure_java_diagnostics \
+    "$cycle_dir/java-diagnostics-after.txt" \
+    "$cycle_dir/java-diagnostics-after.stderr" || return $?
+  write_java_diagnostics_delta "$cycle_dir/java-diagnostics-before.txt" \
+    "$cycle_dir/java-diagnostics-after.txt" \
+    "$cycle_dir/java-diagnostics.delta" || return $?
+  chmod 0600 -- "$cycle_dir/java-diagnostics.delta" || return $?
+  assert_java_diagnostics_delta "$cycle_dir/java-diagnostics.delta" \
+    "$hits" 0 0 "$((roots + 1))" "$hits" 0 0 || return $?
+  write_benchmark_pressure_admission_receipt "$cycle" "$cycle_dir"
+}
+
+write_benchmark_pressure_barrier_receipt() {
+  local -r cycle="$1"
+  local -r cycle_dir="$2"
+  local benchmark_result="$cycle_dir/benchmark-result.json"
+  local -r fill="$RESULT_DIR/map-pressure-pressure-run-$(printf '%02d' "$cycle")-fill.json"
+  local -r verify="$RESULT_DIR/map-pressure-pressure-run-$(printf '%02d' "$cycle")-verify.json"
+  local target="$cycle_dir/barrier-receipt.json"
+  local candidate=""
+  local ready="$PRESSURE_CONTROL_LIVE_DIR/$PRESSURE_CONTROL_READY_FILE"
+  local release="$PRESSURE_CONTROL_LIVE_DIR/$PRESSURE_CONTROL_RELEASE_FILE"
+  local ready_sha256=""
+  local release_sha256=""
+  local fill_sha256=""
+  local verify_sha256=""
+  local result_sha256=""
+  local deadline="$((SECONDS + PRESSURE_TRAFFIC_FINALIZATION_TIMEOUT_SECONDS))"
+  local observed_ready_identity=""
+  local observed_release_identity=""
+  local committed_result=""
+  local committed_stderr=""
+  local committed_receipt=""
+
+  [[ "$PRESSURE_BARRIER_RUNTIME_STATUS" == released &&
+    "$PRESSURE_VERIFY_STATUS" == passed &&
+    "$PRESSURE_CONTROL_SESSION" =~ ^[0-9a-f]{32}$ &&
+    ! -e "$target" && ! -L "$target" ]] || return 1
+  benchmark_pressure_client_bundle_images_for_consumer \
+    "$benchmark_result" "$cycle" committed_result committed_stderr \
+    committed_receipt || return $?
+  benchmark_result="$committed_result"
+  observed_ready_identity="$(pressure_control_live_file_identity \
+    "$PRESSURE_CONTROL_READY_FILE" "$deadline")" || return $?
+  observed_release_identity="$(pressure_control_live_file_identity \
+    "$PRESSURE_CONTROL_RELEASE_FILE" "$deadline")" || return $?
+  [[ "$observed_ready_identity" == "$PRESSURE_CONTROL_READY_IDENTITY" &&
+    "$observed_release_identity" == "$PRESSURE_CONTROL_RELEASE_IDENTITY" ]] ||
+    return 1
+  ready_sha256="$(sha256_file "$ready" "$deadline")" || return $?
+  release_sha256="$(sha256_file "$release" "$deadline")" || return $?
+  ready_payload="$(pressure_control_payload "$PRESSURE_CONTROL_READY_FILE")" ||
+    return $?
+  release_payload="$(pressure_control_payload "$PRESSURE_CONTROL_RELEASE_FILE")" ||
+    return $?
+  fill_sha256="$(sha256_file "$fill" "$deadline")" || return $?
+  verify_sha256="$(sha256_file "$verify" "$deadline")" || return $?
+  result_sha256="$(sha256_file "$benchmark_result" "$deadline")" || return $?
+  candidate="$(mktemp "$cycle_dir/.barrier-receipt.XXXXXX")" || return $?
+  jq -cS -n \
+    --argjson cycle "$cycle" \
+    --arg session "$PRESSURE_CONTROL_SESSION" \
+    --arg ready_identity "$PRESSURE_CONTROL_READY_IDENTITY" \
+    --arg ready_payload "$ready_payload" \
+    --arg ready_sha256 "$ready_sha256" \
+    --arg release_identity "$PRESSURE_CONTROL_RELEASE_IDENTITY" \
+    --arg release_payload "$release_payload" \
+    --arg release_sha256 "$release_sha256" \
+    --arg map_id "$PRESSURE_MAP_ID" \
+    --arg max_entries "$PRESSURE_MAP_MAX_ENTRIES" \
+    --arg token_base "$PRESSURE_TOKEN_BASE" \
+    --arg content_sha256 "$PRESSURE_CONTENT_SHA256" \
+    --arg fill_sha256 "$fill_sha256" \
+    --arg verify_sha256 "$verify_sha256" \
+    --arg result_sha256 "$result_sha256" '
+      {schema:"obi-benchmark-pressure-host-barrier-v1",status:"passed",
+       cycle:$cycle,session:$session,
+       sequence:["host_ready_after_capacity_proof","benchmark_completed",
+         "host_release_published","postload_content_verified"],
+       ready:{identity:$ready_identity,payload:$ready_payload,sha256:$ready_sha256},
+       release:{identity:$release_identity,payload:$release_payload,
+         sha256:$release_sha256},
+       map:{map_id:$map_id,max_entries:$max_entries,token_base:$token_base,
+         content_sha256:$content_sha256,fill_sha256:$fill_sha256,
+         verify_sha256:$verify_sha256},
+       benchmark_result_sha256:$result_sha256}
+    ' >"$candidate" || return $?
+  chmod 0600 -- "$candidate" || return $?
+  jq -e --argjson cycle "$cycle" '
+    keys == ["benchmark_result_sha256","cycle","map","ready","release",
+      "schema","sequence","session","status"] and
+    .schema == "obi-benchmark-pressure-host-barrier-v1" and
+    .status == "passed" and .cycle == $cycle and
+    (.session | test("^[0-9a-f]{32}$")) and
+    .sequence == ["host_ready_after_capacity_proof","benchmark_completed",
+      "host_release_published","postload_content_verified"] and
+    (.ready | keys) == ["identity","payload","sha256"] and
+    (.release | keys) == ["identity","payload","sha256"] and
+    (.ready.identity | test("^[0-9]+:[0-9]+:[0-9]+:600:1:[1-9][0-9]*$")) and
+    (.release.identity | test("^[0-9]+:[0-9]+:[0-9]+:600:1:[1-9][0-9]*$")) and
+    all([.ready.sha256,.release.sha256,.map.content_sha256,.map.fill_sha256,
+      .map.verify_sha256,.benchmark_result_sha256][];
+      type == "string" and test("^[0-9a-f]{64}$"))
+  ' "$candidate" >/dev/null || return $?
+  benchmark_pressure_publish_validated_file \
+    "$candidate" "$target" 600 validate_benchmark_pressure_barrier_receipt \
+    "$cycle" "$fill" "$verify" "$benchmark_result"
+}
+
+validate_benchmark_pressure_barrier_receipt() (
+  local receipt="$1"
+  local -r cycle="$2"
+  local fill="$3"
+  local verify="$4"
+  local benchmark_result="$5"
+  local receipt_fd=""
+  local fill_fd=""
+  local verify_fd=""
+  local benchmark_result_fd=""
+  local session=""
+  local expected_ready=""
+  local expected_release=""
+  local observed=""
+  local expected=""
+  local field=""
+  local fill_sha256=""
+  local verify_sha256=""
+  local benchmark_sha256=""
+  local content_sha256=""
+  local fill_max_entries=""
+  local fill_touched=""
+  local fill_capacity_rejected=""
+  local fill_verified_absent=""
+  local verify_touched=""
+  local marker_prefix=""
+  local committed_result=""
+  local committed_stderr=""
+  local committed_receipt=""
+
+  [[ "$cycle" =~ ^([1-9]|10)$ ]] || return 1
+  benchmark_pressure_trusted_regular_path "$receipt" || return $?
+  benchmark_pressure_trusted_regular_path "$fill" || return $?
+  benchmark_pressure_trusted_regular_path "$verify" || return $?
+  benchmark_pressure_client_bundle_images_for_consumer \
+    "$benchmark_result" "$cycle" committed_result committed_stderr \
+    committed_receipt || return $?
+  benchmark_result="$committed_result"
+  benchmark_pressure_hold_file_snapshot \
+    "$receipt" "$BENCHMARK_PRESSURE_ADMISSION_RECEIPT_MAX_BYTES" \
+    receipt_fd || return $?
+  benchmark_pressure_hold_file_snapshot \
+    "$fill" "$PRESSURE_RESULT_MAX_BYTES" fill_fd || return $?
+  benchmark_pressure_hold_file_snapshot \
+    "$verify" "$PRESSURE_RESULT_MAX_BYTES" verify_fd || return $?
+  benchmark_pressure_hold_file_snapshot \
+    "$benchmark_result" "$BENCHMARK_PRESSURE_RESULT_MAX_BYTES" \
+    benchmark_result_fd || return $?
+  receipt="/proc/self/fd/$receipt_fd"
+  fill="/proc/self/fd/$fill_fd"
+  verify="/proc/self/fd/$verify_fd"
+  benchmark_result="/proc/self/fd/$benchmark_result_fd"
+  bounded_evidence_file "$receipt" 1048576 1 || return $?
+  benchmark_pressure_json_has_unique_object_keys \
+    "$receipt" "$BENCHMARK_PRESSURE_ADMISSION_RECEIPT_MAX_BYTES" || return $?
+  pressure_result_has_contract "$fill" fill || return $?
+  pressure_result_has_contract "$verify" verify || return $?
+  session="$(jq -er '.session' "$receipt")" || return $?
+  [[ "$session" =~ ^[0-9a-f]{32}$ ]] || return 1
+  marker_prefix="$(benchmark_pressure_marker_prefix_for \
+    "$session" "$cycle")" || return $?
+  validate_benchmark_pressure_result \
+    "$benchmark_result" "$marker_prefix" || return $?
+  expected_ready="pressure-ready-v1:$session"
+  expected_release="pressure-release-v1:$session"
+  fill_sha256="$(sha256sum -- "$fill")" || return $?
+  fill_sha256="${fill_sha256%% *}"
+  verify_sha256="$(sha256sum -- "$verify")" || return $?
+  verify_sha256="${verify_sha256%% *}"
+  benchmark_sha256="$(sha256sum -- "$benchmark_result")" || return $?
+  benchmark_sha256="${benchmark_sha256%% *}"
+  content_sha256="$(pressure_result_hex "$fill" content_sha256)" || return $?
+  [[ "$(pressure_result_hex "$verify" content_sha256)" == "$content_sha256" ]] ||
+    return 1
+  for field in map_id max_entries process_map_id process_pid process_namespace \
+    token_base verified_present_entries verified_absent_entries; do
+    observed="$(pressure_result_uint "$verify" "$field")" || return $?
+    expected="$(pressure_result_uint "$fill" "$field")" || return $?
+    [[ "$observed" == "$expected" ]] || return 1
+  done
+  fill_max_entries="$(pressure_result_uint "$fill" max_entries)" || return $?
+  fill_touched="$(pressure_result_uint "$fill" touched)" || return $?
+  fill_capacity_rejected="$(pressure_result_uint \
+    "$fill" capacity_rejected_entries)" || return $?
+  fill_verified_absent="$(pressure_result_uint \
+    "$fill" verified_absent_entries)" || return $?
+  verify_touched="$(pressure_result_uint "$verify" touched)" || return $?
+  [[ "$fill_max_entries" == "$PRESSURE_EXPECTED_MAP_CAPACITY" &&
+    "$fill_touched" == "$PRESSURE_EXPECTED_MAP_CAPACITY" &&
+    "$fill_capacity_rejected" == 1 && "$fill_verified_absent" == 1 &&
+    "$verify_touched" == 0 ]] || return 1
+  jq -e \
+    --argjson cycle "$cycle" \
+    --argjson owner "$EUID" \
+    --arg ready_payload "$expected_ready" \
+    --arg release_payload "$expected_release" \
+    --arg ready_sha256 "$(printf '%s\n' "$expected_ready" | sha256sum | awk '{print $1}')" \
+    --arg release_sha256 "$(printf '%s\n' "$expected_release" | sha256sum | awk '{print $1}')" \
+    --arg fill_sha256 "$fill_sha256" \
+    --arg verify_sha256 "$verify_sha256" \
+    --arg benchmark_sha256 "$benchmark_sha256" \
+    --arg map_id "$(pressure_result_uint "$fill" map_id)" \
+    --arg max_entries "$(pressure_result_uint "$fill" max_entries)" \
+    --arg token_base "$(pressure_result_uint "$fill" token_base)" \
+    --arg content_sha256 "$content_sha256" '
+      keys == ["benchmark_result_sha256","cycle","map","ready","release",
+        "schema","sequence","session","status"] and
+      .schema == "obi-benchmark-pressure-host-barrier-v1" and
+      .status == "passed" and .cycle == $cycle and
+      .sequence == ["host_ready_after_capacity_proof","benchmark_completed",
+        "host_release_published","postload_content_verified"] and
+      .ready.payload == $ready_payload and .ready.sha256 == $ready_sha256 and
+      (.ready.identity | split(":")[2]) == ($owner | tostring) and
+      .release.payload == $release_payload and
+      .release.sha256 == $release_sha256 and
+      (.release.identity | split(":")[2]) == ($owner | tostring) and
+      .map == {content_sha256:$content_sha256,fill_sha256:$fill_sha256,
+        map_id:$map_id,max_entries:$max_entries,token_base:$token_base,
+        verify_sha256:$verify_sha256} and
+      .benchmark_result_sha256 == $benchmark_sha256
+  ' "$receipt" >/dev/null
+)
+
+benchmark_pressure_copy_private_evidence() {
+  local -r source="$1"
+  local -r target="$2"
+  local candidate=""
+  local candidate_parent_identity=""
+  local candidate_identity=""
+  local candidate_sha256=""
+
+  [[ -f "$source" && ! -L "$source" && ! -e "$target" && ! -L "$target" ]] ||
+    return 1
+  candidate="$(mktemp "${target%/*}/.${target##*/}.XXXXXX")" || return $?
+  cp --no-preserve=mode,ownership,timestamps -- "$source" "$candidate" || return $?
+  chmod 0600 -- "$candidate" || return $?
+  benchmark_pressure_capture_candidate_authority \
+    "$candidate" 600 candidate_parent_identity candidate_identity \
+    candidate_sha256 || return $?
+  benchmark_pressure_commit_file_no_clobber \
+    "$candidate" "$target" 600 "$candidate_parent_identity" \
+    "$candidate_parent_identity" "$candidate_identity" "$candidate_sha256"
+}
+
+# Parse the bounded raw bytes before jq gets an opportunity to collapse object
+# members.  jq --stream exposes scalar/empty-container paths, but cannot
+# distinguish {"a":{"b":1},"a":{"c":2}} from one object containing both
+# children.  This incremental parser registers each decoded member name before
+# parsing its value, so scalar, non-empty container, and empty container values
+# have the same duplicate-key authority at every depth.
+benchmark_pressure_json_has_unique_object_keys() (
+  local -r input="$1"
+  local -r maximum_bytes="$2"
+  local -r expected_identity="${3:-}"
+  local json_snapshot_fd=""
+  local descriptor=""
+  local json_source_identity=""
+  local json_source_sha256=""
+  local initial_identity=""
+  local observed_identity=""
+  local json_input_size=""
+  local observed_size=""
+  local parser_status=0
+
+  [[ "$maximum_bytes" =~ ^[1-9][0-9]*$ &&
+    "$maximum_bytes" -le "$BENCHMARK_PRESSURE_TRACE_SNAPSHOT_MAX_BYTES" ]] ||
+    return 1
+  benchmark_pressure_hold_file_snapshot \
+    "$input" "$maximum_bytes" json_snapshot_fd json_source_identity \
+    json_source_sha256 json_input_size || return $?
+  descriptor="/proc/self/fd/$json_snapshot_fd"
+  initial_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$descriptor")" ||
+    return $?
+  [[ "$initial_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:(600|644):0$ &&
+    "$json_input_size" =~ ^[1-9][0-9]*$ &&
+    "$json_input_size" -le "$maximum_bytes" &&
+    "$json_source_sha256" =~ ^[0-9a-f]{64}$ ]] || return 1
+  if [[ -n "$expected_identity" ]]; then
+    [[ "$expected_identity" =~ \
+      ^[0-9]+:[1-9][0-9]*:$EUID:(600|644):(0|1)$ &&
+      "${json_source_identity%:*}" == "$expected_identity" ]] || return 1
+  fi
+  if (
+    benchmark_pressure_clean_broker_exec \
+      "$BENCHMARK_PRESSURE_ENV_EXECUTABLE" -i LC_ALL=C LANG=C \
+      PATH=/usr/bin:/bin \
+      "$BENCHMARK_PRESSURE_TIMEOUT_EXECUTABLE" --signal=TERM \
+      --kill-after="${BENCHMARK_PRESSURE_BROKER_KILL_GRACE_SECONDS}s" \
+      "${BENCHMARK_PRESSURE_BROKER_TIMEOUT_SECONDS}s" \
+      "$BENCHMARK_PRESSURE_PYTHON_EXECUTABLE" -I /dev/fd/3 \
+      "$descriptor" "$maximum_bytes" "$BENCHMARK_PRESSURE_JSON_MAX_DEPTH" \
+      "$json_input_size" "$BENCHMARK_PRESSURE_PYTHON_EXECUTABLE" \
+      "$BENCHMARK_PRESSURE_TIMEOUT_EXECUTABLE" \
+      "$BENCHMARK_PRESSURE_ENV_EXECUTABLE" 3<<'PY'
+import json
+import os
+import stat
+import sys
+
+
+def invalid_runtime():
+    raise SystemExit(1)
+
+
+def trusted_root_path(path):
+    resolved = os.path.realpath(path)
+    if not resolved.startswith("/"):
+        invalid_runtime()
+    value = os.stat(resolved, follow_symlinks=False)
+    if (not stat.S_ISREG(value.st_mode) or value.st_uid != 0 or
+            value.st_gid != 0 or stat.S_IMODE(value.st_mode) & 0o022):
+        invalid_runtime()
+    parent = os.path.dirname(resolved)
+    while True:
+        value = os.stat(parent, follow_symlinks=False)
+        if (not stat.S_ISDIR(value.st_mode) or value.st_uid != 0 or
+                value.st_gid != 0 or stat.S_IMODE(value.st_mode) & 0o022):
+            invalid_runtime()
+        if parent == "/":
+            break
+        parent = os.path.dirname(parent)
+
+
+def authenticate_runtime(expected_executable, expected_parent):
+    if dict(os.environ) != {
+            "LC_ALL": "C", "LANG": "C", "PATH": "/usr/bin:/bin"}:
+        invalid_runtime()
+    paths = {"/proc/self/exe"}
+    for module in tuple(sys.modules.values()):
+        path = getattr(module, "__file__", "")
+        if path and path != "/dev/fd/3":
+            paths.add(path)
+    with open("/proc/self/maps", "r", encoding="ascii") as mappings:
+        for row in mappings:
+            fields = row.rstrip("\n").split(None, 5)
+            if len(fields) == 6 and fields[5].startswith("/"):
+                if fields[5].endswith(" (deleted)"):
+                    invalid_runtime()
+                paths.add(fields[5])
+    for path in paths:
+        trusted_root_path(path)
+    if (os.path.realpath("/proc/self/exe") !=
+            os.path.realpath(expected_executable) or
+            os.path.realpath(f"/proc/{os.getppid()}/exe") !=
+            os.path.realpath(expected_parent)):
+        invalid_runtime()
+
+
+expected_executable = sys.argv[5]
+expected_parent = sys.argv[6]
+expected_environment = sys.argv[7]
+if (expected_executable != "/usr/bin/python3" or
+        expected_parent != "/usr/bin/timeout" or
+        expected_environment != "/usr/bin/env"):
+    invalid_runtime()
+authenticate_runtime(expected_executable, expected_parent)
+trusted_root_path(expected_environment)
+
+
+class InvalidJSON(Exception):
+    pass
+
+
+class BoundedStream:
+    def __init__(self, source, maximum):
+        self.source = source
+        self.maximum = maximum
+        self.buffer = b""
+        self.offset = 0
+        self.total = 0
+
+    def _fill(self):
+        if self.offset < len(self.buffer):
+            return True
+        chunk = self.source.read(65536)
+        if not chunk:
+            self.buffer = b""
+            self.offset = 0
+            return False
+        self.total += len(chunk)
+        if self.total > self.maximum:
+            raise InvalidJSON()
+        self.buffer = chunk
+        self.offset = 0
+        return True
+
+    def peek(self):
+        if not self._fill():
+            return None
+        return self.buffer[self.offset]
+
+    def take(self):
+        value = self.peek()
+        if value is None:
+            raise InvalidJSON()
+        self.offset += 1
+        return value
+
+
+class UniqueObjectKeyParser:
+    whitespace = frozenset((0x20, 0x09, 0x0A, 0x0D))
+
+    def __init__(self, stream, maximum_depth, maximum_members):
+        self.stream = stream
+        self.maximum_depth = maximum_depth
+        self.maximum_members = maximum_members
+        self.members = 0
+
+    def parse(self):
+        self._space()
+        self._value(0)
+        self._space()
+        if self.stream.peek() is not None:
+            raise InvalidJSON()
+
+    def _space(self):
+        while self.stream.peek() in self.whitespace:
+            self.stream.take()
+
+    def _value(self, depth):
+        token = self.stream.peek()
+        if token == 0x7B:
+            self._object(depth + 1)
+        elif token == 0x5B:
+            self._array(depth + 1)
+        elif token == 0x22:
+            self._string(False)
+        elif token == 0x74:
+            self._literal(b"true")
+        elif token == 0x66:
+            self._literal(b"false")
+        elif token == 0x6E:
+            self._literal(b"null")
+        elif token == 0x2D or (token is not None and 0x30 <= token <= 0x39):
+            self._number()
+        else:
+            raise InvalidJSON()
+
+    def _object(self, depth):
+        if depth > self.maximum_depth:
+            raise InvalidJSON()
+        self.stream.take()
+        self._space()
+        keys = set()
+        if self.stream.peek() == 0x7D:
+            self.stream.take()
+            return
+        while True:
+            if self.stream.peek() != 0x22:
+                raise InvalidJSON()
+            key = self._string(True)
+            self.members += 1
+            if self.members > self.maximum_members or key in keys:
+                raise InvalidJSON()
+            keys.add(key)
+            self._space()
+            if self.stream.take() != 0x3A:
+                raise InvalidJSON()
+            self._space()
+            self._value(depth)
+            self._space()
+            separator = self.stream.take()
+            if separator == 0x7D:
+                return
+            if separator != 0x2C:
+                raise InvalidJSON()
+            self._space()
+
+    def _array(self, depth):
+        if depth > self.maximum_depth:
+            raise InvalidJSON()
+        self.stream.take()
+        self._space()
+        if self.stream.peek() == 0x5D:
+            self.stream.take()
+            return
+        while True:
+            self._value(depth)
+            self._space()
+            separator = self.stream.take()
+            if separator == 0x5D:
+                return
+            if separator != 0x2C:
+                raise InvalidJSON()
+            self._space()
+
+    def _string(self, retain):
+        raw = bytearray((self.stream.take(),))
+        while True:
+            value = self.stream.take()
+            raw.append(value)
+            if value == 0x22:
+                break
+            if value < 0x20:
+                raise InvalidJSON()
+            if value == 0x5C:
+                escaped = self.stream.take()
+                raw.append(escaped)
+                if escaped == 0x75:
+                    for _ in range(4):
+                        digit = self.stream.take()
+                        raw.append(digit)
+                        if not (0x30 <= digit <= 0x39 or
+                                0x41 <= digit <= 0x46 or
+                                0x61 <= digit <= 0x66):
+                            raise InvalidJSON()
+                elif escaped not in b'"\\/bfnrt':
+                    raise InvalidJSON()
+        try:
+            decoded = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise InvalidJSON() from None
+        if not isinstance(decoded, str):
+            raise InvalidJSON()
+        return decoded if retain else None
+
+    def _literal(self, expected):
+        for byte in expected:
+            if self.stream.take() != byte:
+                raise InvalidJSON()
+
+    def _digits(self):
+        count = 0
+        while True:
+            value = self.stream.peek()
+            if value is None or not 0x30 <= value <= 0x39:
+                return count
+            self.stream.take()
+            count += 1
+
+    def _number(self):
+        if self.stream.peek() == 0x2D:
+            self.stream.take()
+        first = self.stream.peek()
+        if first == 0x30:
+            self.stream.take()
+            following = self.stream.peek()
+            if following is not None and 0x30 <= following <= 0x39:
+                raise InvalidJSON()
+        elif first is not None and 0x31 <= first <= 0x39:
+            self._digits()
+        else:
+            raise InvalidJSON()
+        if self.stream.peek() == 0x2E:
+            self.stream.take()
+            if self._digits() == 0:
+                raise InvalidJSON()
+        if self.stream.peek() in (0x65, 0x45):
+            self.stream.take()
+            if self.stream.peek() in (0x2B, 0x2D):
+                self.stream.take()
+            if self._digits() == 0:
+                raise InvalidJSON()
+
+
+def main():
+    path = sys.argv[1]
+    maximum = int(sys.argv[2])
+    maximum_depth = int(sys.argv[3])
+    expected_size = int(sys.argv[4])
+    if maximum < 1 or maximum_depth < 1 or expected_size < 1:
+        raise InvalidJSON()
+    with open(path, "rb", buffering=0) as source:
+        before = os.fstat(source.fileno())
+        if before.st_size != expected_size or before.st_size > maximum:
+            raise InvalidJSON()
+        stream = BoundedStream(source, maximum)
+        UniqueObjectKeyParser(stream, maximum_depth, maximum).parse()
+        after = os.fstat(source.fileno())
+        if (after.st_dev != before.st_dev or after.st_ino != before.st_ino or
+                after.st_size != before.st_size or stream.total != expected_size):
+            raise InvalidJSON()
+
+
+try:
+    main()
+except (InvalidJSON, OSError, ValueError, RecursionError):
+    sys.exit(1)
+PY
+  )
+  then :
+  else
+    parser_status=$?
+    return "$parser_status"
+  fi
+  observed_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$descriptor")" ||
+    return $?
+  observed_size="$(stat -Lc '%s' -- "$descriptor")" || return $?
+  [[ "$observed_identity" == "$initial_identity" &&
+    "$observed_size" == "$json_input_size" ]]
+)
+
+validate_benchmark_pressure_phase_boundaries() (
+  local input="$1"
+  local -r expected_cycle="$2"
+  local benchmark_result="$3"
+  local input_fd=""
+  local benchmark_result_fd=""
+  local marker_prefix=""
+  local traffic_elapsed_nanos=""
+  local committed_result=""
+  local committed_stderr=""
+  local committed_receipt=""
+
+  [[ "$expected_cycle" =~ ^([1-9]|10)$ ]] || return 1
+  benchmark_pressure_trusted_regular_path "$input" || return $?
+  benchmark_pressure_client_bundle_images_for_consumer \
+    "$benchmark_result" "$expected_cycle" committed_result committed_stderr \
+    committed_receipt || return $?
+  benchmark_result="$committed_result"
+  benchmark_pressure_hold_file_snapshot \
+    "$input" "$BENCHMARK_PRESSURE_ADMISSION_RECEIPT_MAX_BYTES" input_fd ||
+    return $?
+  benchmark_pressure_hold_file_snapshot \
+    "$benchmark_result" "$BENCHMARK_PRESSURE_RESULT_MAX_BYTES" \
+    benchmark_result_fd || return $?
+  input="/proc/self/fd/$input_fd"
+  benchmark_result="/proc/self/fd/$benchmark_result_fd"
+  bounded_evidence_file "$input" 1048576 1 || return $?
+  benchmark_pressure_json_has_unique_object_keys \
+    "$input" "$BENCHMARK_PRESSURE_ADMISSION_RECEIPT_MAX_BYTES" || return $?
+  marker_prefix="$(jq -er '.marker_prefix' "$benchmark_result")" || return $?
+  validate_benchmark_pressure_result "$benchmark_result" "$marker_prefix" ||
+    return $?
+  traffic_elapsed_nanos="$(jq -er '.traffic_elapsed_nanos' \
+    "$benchmark_result")" || return $?
+  jq -e --argjson cycle "$expected_cycle" \
+    --argjson load_seconds "$BENCHMARK_PRESSURE_LOAD_SECONDS" \
+    --argjson idle_seconds "$BENCHMARK_PRESSURE_IDLE_SECONDS" \
+    --argjson traffic_elapsed_nanos "$traffic_elapsed_nanos" '
+      def integer: type == "number" and floor == .;
+      . as $document |
+      keys == ["cycle","idle_elapsed_centiseconds","idle_requested_seconds",
+        "load_elapsed_centiseconds","load_requested_seconds","phases","schema"] and
+      .schema == "obi-benchmark-pressure-phase-boundaries-v1" and
+      .cycle == $cycle and .load_requested_seconds == $load_seconds and
+      .idle_requested_seconds == $idle_seconds and
+      (.load_elapsed_centiseconds | integer and
+        . >= ($load_seconds * 100) and
+        . < (($load_seconds + 1) * 100)) and
+      (.idle_elapsed_centiseconds | integer and
+        . >= ($idle_seconds * 100) and
+        . < (($idle_seconds + 1) * 100)) and
+      (.phases | type == "array" and length == 13) and
+      (.phases | map(.name)) == ["baseline_resources_captured",
+        "prepare_started","capacity_ready","load_started","load_finished",
+        "release_published","content_verified","postload_resources_captured",
+        "attribution_reconciled","cleanup_absent","idle_started","idle_finished",
+        "postidle_resources_captured"] and
+      all(.phases[];
+        keys == ["evidence_sha256","monotonic_centiseconds","name"] and
+        (.evidence_sha256 | test("^[0-9a-f]{64}$")) and
+        (.monotonic_centiseconds | integer and . >= 0)) and
+      all(range(1;13);
+        $document.phases[. - 1].monotonic_centiseconds <=
+          $document.phases[.].monotonic_centiseconds) and
+      (.phases[4].monotonic_centiseconds -
+        .phases[3].monotonic_centiseconds) == .load_elapsed_centiseconds and
+      $traffic_elapsed_nanos >= ($load_seconds * 1000000000) and
+      $traffic_elapsed_nanos < (($load_seconds + 1) * 1000000000) and
+      $traffic_elapsed_nanos <
+        ((.load_elapsed_centiseconds + 1) * 10000000) and
+      (.phases[11].monotonic_centiseconds -
+        .phases[10].monotonic_centiseconds) == .idle_elapsed_centiseconds
+  ' "$input" >/dev/null
+)
+
+benchmark_pressure_role_limits() {
+  local -r role="$1"
+
+  case "$role" in
+    benchmark)
+      printf '%d %d\n' "$BENCHMARK_PRESSURE_RESULT_MAX_BYTES" 1
+      ;;
+    benchmark_client_commit)
+      printf '%d %d\n' "$BENCHMARK_PRESSURE_CLIENT_COMMIT_MAX_BYTES" 1
+      ;;
+    benchmark_stderr|java_after_stderr|java_before_stderr)
+      printf '%d %d\n' "$BENCHMARK_PRESSURE_STDERR_MAX_BYTES" \
+        "$BENCHMARK_PRESSURE_STDERR_MAX_LINES"
+      ;;
+    resources_baseline|resources_postload|resources_postidle)
+      printf '%d %d\n' "$BENCHMARK_PRESSURE_RESOURCE_MAX_BYTES" \
+        "$BENCHMARK_PRESSURE_RESOURCE_MAX_LINES"
+      ;;
+    stack_identity)
+      printf '%d %d\n' "$BENCHMARK_PRESSURE_STACK_MAX_BYTES" 1
+      ;;
+    trace_reset)
+      printf '%d %d\n' "$BENCHMARK_PRESSURE_TRACE_RESET_MAX_BYTES" 1
+      ;;
+    trace_snapshot)
+      printf '%d %d\n' "$BENCHMARK_PRESSURE_TRACE_SNAPSHOT_MAX_BYTES" 1
+      ;;
+    admission)
+      printf '%d %d\n' "$BENCHMARK_PRESSURE_ADMISSION_RECEIPT_MAX_BYTES" 1
+      ;;
+    barrier|bridge_reconciliation|phase_boundaries|trace_projection)
+      printf '%d %d\n' 1048576 1
+      ;;
+    java_after|java_before)
+      printf '%d %d\n' "$TERMINAL_JAVA_DIAGNOSTICS_MAX_BYTES" \
+        "$TERMINAL_JAVA_DIAGNOSTICS_MAX_LINES"
+      ;;
+    java_delta)
+      printf '%d %d\n' 65536 64
+      ;;
+    metrics_after|metrics_before|metrics_delta|map_baseline|cleanup_recovery|\
+    idle_before|idle_after|recovery_1|recovery_2)
+      printf '%d %d\n' "$OBI_METRIC_SNAPSHOT_MAX_BYTES" \
+        "$OBI_METRIC_SNAPSHOT_MAX_LINES"
+      ;;
+    prepare|fill|verify|cleanup)
+      printf '%d %d\n' "$PRESSURE_RESULT_MAX_BYTES" "$PRESSURE_RESULT_MAX_LINES"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+benchmark_pressure_bounded_directory_roster() {
+  local -r directory="$1"
+  local -r output_name="$2"
+  local roster=""
+
+  [[ "$output_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ &&
+    ${#directory} -le 4096 ]] || return 1
+  roster="$({
+    benchmark_pressure_clean_broker_exec \
+      "$BENCHMARK_PRESSURE_ENV_EXECUTABLE" -i LC_ALL=C LANG=C \
+      PATH=/usr/bin:/bin \
+      "$BENCHMARK_PRESSURE_TIMEOUT_EXECUTABLE" --signal=TERM \
+      --kill-after="${BENCHMARK_PRESSURE_BROKER_KILL_GRACE_SECONDS}s" \
+      "${BENCHMARK_PRESSURE_BROKER_TIMEOUT_SECONDS}s" \
+      "$BENCHMARK_PRESSURE_PYTHON_EXECUTABLE" -I /dev/fd/3 \
+      "$directory" "$EUID" \
+      "$BENCHMARK_PRESSURE_COHERENT_MAX_DIRECTORY_ENTRIES" \
+      "$BENCHMARK_PRESSURE_COHERENT_MAX_DIRECTORY_NAME_BYTES" \
+      "$BENCHMARK_PRESSURE_PYTHON_EXECUTABLE" \
+      "$BENCHMARK_PRESSURE_TIMEOUT_EXECUTABLE" \
+      "$BENCHMARK_PRESSURE_ENV_EXECUTABLE" 3<<'PY'
+import os
+import re
+import stat
+import sys
+
+
+def fail():
+    raise SystemExit(1)
+
+
+def trusted_root_path(path):
+    resolved = os.path.realpath(path)
+    if not resolved.startswith("/"):
+        fail()
+    value = os.stat(resolved, follow_symlinks=False)
+    if (not stat.S_ISREG(value.st_mode) or value.st_uid != 0 or
+            value.st_gid != 0 or stat.S_IMODE(value.st_mode) & 0o022):
+        fail()
+    parent = os.path.dirname(resolved)
+    while True:
+        value = os.stat(parent, follow_symlinks=False)
+        if (not stat.S_ISDIR(value.st_mode) or value.st_uid != 0 or
+                value.st_gid != 0 or stat.S_IMODE(value.st_mode) & 0o022):
+            fail()
+        if parent == "/":
+            break
+        parent = os.path.dirname(parent)
+
+
+def authenticate_runtime(expected_executable, expected_parent):
+    if dict(os.environ) != {
+            "LC_ALL": "C", "LANG": "C", "PATH": "/usr/bin:/bin"}:
+        fail()
+    paths = {"/proc/self/exe"}
+    for module in tuple(sys.modules.values()):
+        path = getattr(module, "__file__", "")
+        if path and path != "/dev/fd/3":
+            paths.add(path)
+    with open("/proc/self/maps", "r", encoding="ascii") as mappings:
+        for row in mappings:
+            fields = row.rstrip("\n").split(None, 5)
+            if len(fields) == 6 and fields[5].startswith("/"):
+                if fields[5].endswith(" (deleted)"):
+                    fail()
+                paths.add(fields[5])
+    for path in paths:
+        trusted_root_path(path)
+    if (os.path.realpath("/proc/self/exe") !=
+            os.path.realpath(expected_executable) or
+            os.path.realpath(f"/proc/{os.getppid()}/exe") !=
+            os.path.realpath(expected_parent)):
+        fail()
+
+
+def signature(value):
+    return (value.st_dev, value.st_ino, value.st_uid,
+            stat.S_IMODE(value.st_mode), value.st_nlink, value.st_size,
+            value.st_mtime_ns, value.st_ctime_ns)
+
+
+path = sys.argv[1]
+owner = int(sys.argv[2])
+maximum_entries = int(sys.argv[3])
+maximum_name_bytes = int(sys.argv[4])
+expected_executable = sys.argv[5]
+expected_parent = sys.argv[6]
+expected_environment = sys.argv[7]
+if (owner != os.geteuid() or maximum_entries < 1 or
+        maximum_entries > 8192 or maximum_name_bytes < 255 or
+        maximum_name_bytes > 1_048_576 or
+        expected_executable != "/usr/bin/python3" or
+        expected_parent != "/usr/bin/timeout" or
+        expected_environment != "/usr/bin/env"):
+    fail()
+authenticate_runtime(expected_executable, expected_parent)
+trusted_root_path(expected_environment)
+descriptor = re.fullmatch(r"/proc/self/fd/[1-9][0-9]*(?:/\.)?", path)
+if not descriptor and (not path.startswith("/") or "\n" in path or "\t" in path):
+    fail()
+flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NONBLOCK
+if not descriptor:
+    flags |= os.O_NOFOLLOW
+directory_fd = os.open(path, flags)
+try:
+    before = os.fstat(directory_fd)
+    if (not stat.S_ISDIR(before.st_mode) or before.st_uid != owner or
+            stat.S_IMODE(before.st_mode) & 0o022):
+        fail()
+    scan_fd = os.open(
+        ".", os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NONBLOCK |
+        os.O_NOFOLLOW, dir_fd=directory_fd)
+    rows = []
+    count = 0
+    name_bytes = 0
+    try:
+        with os.scandir(scan_fd) as iterator:
+            for entry in iterator:
+                count += 1
+                name_bytes += len(os.fsencode(entry.name))
+                if count > maximum_entries or name_bytes > maximum_name_bytes:
+                    fail()
+                if (entry.name in (".", "..") or
+                        not re.fullmatch(r"[A-Za-z0-9._-]+", entry.name)):
+                    fail()
+                value = entry.stat(follow_symlinks=False)
+                if stat.S_ISREG(value.st_mode):
+                    kind = "f"
+                elif stat.S_ISDIR(value.st_mode):
+                    kind = "d"
+                elif stat.S_ISLNK(value.st_mode):
+                    kind = "l"
+                else:
+                    kind = "o"
+                rows.append((entry.name, kind))
+    finally:
+        os.close(scan_fd)
+    if signature(os.fstat(directory_fd)) != signature(before):
+        fail()
+    terminal_fd = os.open(path, flags)
+    try:
+        if signature(os.fstat(terminal_fd)) != signature(before):
+            fail()
+    finally:
+        os.close(terminal_fd)
+    encoded = "".join(f"{name}:{kind}\n" for name, kind in sorted(rows))
+    if len(encoded.encode("ascii")) > maximum_name_bytes + 3 * maximum_entries:
+        fail()
+    sys.stdout.write(encoded)
+finally:
+    os.close(directory_fd)
+PY
+  })" || return $?
+  ((${#roster} <= BENCHMARK_PRESSURE_COHERENT_MAX_DIRECTORY_NAME_BYTES +
+    3 * BENCHMARK_PRESSURE_COHERENT_MAX_DIRECTORY_ENTRIES)) || return 1
+  printf -v "$output_name" '%s' "$roster"
+}
+
+benchmark_pressure_cycle_directory_roster_matches() {
+  local -r manifest="$1"
+  local -r expected_file_count="$2"
+  local manifest_dir="${3:-${manifest%/*}}"
+  local manifest_basename="${4:-${manifest##*/}}"
+  local directory_entries=""
+  local directory_name=""
+  local directory_type=""
+  local directory_extra=""
+  local directory_rows=0
+  local manifest_rows=0
+
+  [[ "$expected_file_count" =~ ^[1-9][0-9]*$ &&
+    ( "$manifest_basename" == private-manifest.json ||
+      "$manifest_basename" =~ ^\.private-manifest\.[A-Za-z0-9]+$ ) ]] || return 1
+  benchmark_pressure_bounded_directory_roster \
+    "$manifest_dir" directory_entries || return $?
+  ((${#directory_entries} <= 4096)) || return 1
+  while IFS=: read -r directory_name directory_type directory_extra; do
+    ((directory_rows += 1))
+    [[ -z "$directory_extra" && "$directory_type" == f ]] || return 1
+    if [[ "$directory_name" == "$manifest_basename" ]]; then
+      ((manifest_rows += 1))
+    else
+      jq -e --arg name "$directory_name" \
+        'any(.files[]; .name == $name)' "$manifest" >/dev/null || return $?
+    fi
+  done <<<"$directory_entries"
+  ((directory_rows == expected_file_count + 1 && manifest_rows == 1))
+}
+
+validate_benchmark_pressure_private_manifest() (
+  local -r manifest_input="$1"
+  local -r expected_cycle="$2"
+  local -r supplied_private_root="${3:-}"
+  local -r supplied_manifest_dir="${4:-}"
+  local manifest_lexical_input="${BENCHMARK_PRESSURE_PUBLICATION_SOURCE_LEXICAL_PATH:-$manifest_input}"
+  local manifest=""
+  local manifest_leaf="${manifest_lexical_input##*/}"
+  local manifest_path=""
+  local manifest_fd=""
+  local manifest_snapshot_fd=""
+  local manifest_original=""
+  local manifest_snapshot_source_identity=""
+  local manifest_input_identity=""
+  local manifest_snapshot_sha256=""
+  local manifest_snapshot_size=""
+  local manifest_identity=""
+  local lexical_manifest_identity=""
+  local observed_manifest_identity=""
+  local manifest_sha256=""
+  local observed_manifest_sha256=""
+  local manifest_dir=""
+  local manifest_dir_lexical="${manifest_lexical_input%/*}"
+  local expected_cycle_name=""
+  local role=""
+  local name=""
+  local expected_sha256=""
+  local expected_size=""
+  local extra=""
+  local path=""
+  local identity=""
+  local observed_sha256=""
+  local limits=""
+  local maximum_bytes=""
+  local maximum_lines=""
+  local roster=""
+  local expected_rows=0
+  local observed_rows=0
+  local map_id=""
+  local map_entries=""
+  local resolved=""
+  local phase_sha256=""
+  local expected_phase_sha256=""
+  local stack_sha256=""
+  local manifest_stack_sha256=""
+  local load_started_sha256=""
+  local ready_sha256=""
+  local release_published_sha256=""
+  local release_sha256=""
+  local prepare_value=""
+  local fill_value=""
+  local verify_value=""
+  local cleanup_value=""
+  local manifest_value=""
+  local recovery_one_sha256=""
+  local recovery_two_sha256=""
+  local private_root=""
+  local private_root_lexical=""
+  local private_root_fd=""
+  local manifest_dir_fd=""
+  local private_root_identity=""
+  local manifest_dir_identity=""
+  local observed_private_root_identity=""
+  local observed_manifest_dir_identity=""
+  local lexical_private_root_identity=""
+  local lexical_manifest_dir_identity=""
+  local leaf_fd=""
+  local snapshot_fd=""
+  local pinned_path=""
+  local original_pinned_path=""
+  local pinned_identity=""
+  local pinned_sha256=""
+  local snapshot_source_identity=""
+  local snapshot_sha256=""
+  local snapshot_size=""
+  local pinned_key=""
+  local campaign_key=""
+  local campaign_snapshot=false
+  local -a BENCHMARK_PRESSURE_PINNED_EVIDENCE_FDS=()
+  local -a BENCHMARK_PRESSURE_SNAPSHOT_EVIDENCE_FDS=()
+  local -A BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS=()
+  local -A BENCHMARK_PRESSURE_ORIGINAL_EVIDENCE_PATHS=()
+  local -A BENCHMARK_PRESSURE_PINNED_EVIDENCE_NAMES=()
+  local -A BENCHMARK_PRESSURE_PINNED_EVIDENCE_IDENTITIES=()
+  local -A BENCHMARK_PRESSURE_PINNED_EVIDENCE_SHA256S=()
+
+  if [[ -n "$supplied_manifest_dir" ]]; then
+    [[ "$manifest_input" =~ ^/proc/self/fd/[1-9][0-9]*$ ]] || return 1
+    manifest_leaf=private-manifest.json
+    manifest_dir_lexical="$supplied_manifest_dir"
+    manifest_lexical_input="$supplied_manifest_dir/$manifest_leaf"
+  fi
+  [[ "$expected_cycle" =~ ^([1-9]|10)$ &&
+    ( "$manifest_leaf" == private-manifest.json ||
+      "$manifest_leaf" =~ ^\.private-manifest\.[A-Za-z0-9]+$ ) &&
+    -f "$manifest_input" && ! -L "$manifest_lexical_input" ]] || return 1
+  bounded_evidence_file "$manifest_input" "$BENCHMARK_PRESSURE_MANIFEST_MAX_BYTES" 1 ||
+    return $?
+  manifest_input_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+    "$manifest_input")" || return $?
+  [[ "$manifest_input_identity" =~ \
+    ^[0-9]+:[1-9][0-9]*:$EUID:600:(0|1):[1-9][0-9]*$ ]] || return 1
+  printf -v expected_cycle_name 'cycle-%02d' "$expected_cycle"
+  if [[ -n "$supplied_private_root" ]]; then
+    private_root_lexical="$supplied_private_root"
+  else
+    [[ "${manifest_dir_lexical##*/}" == "$expected_cycle_name" ]] || return 1
+    private_root_lexical="${manifest_dir_lexical%/*}"
+  fi
+  [[ -d "$private_root_lexical" && ! -L "$private_root_lexical" ]] || return 1
+  exec {private_root_fd}<"$private_root_lexical" || return $?
+  private_root="/proc/self/fd/$private_root_fd/."
+  private_root_identity="$(stat -Lc '%d:%i:%u:%a' -- "$private_root")" ||
+    return $?
+  lexical_private_root_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "$private_root_lexical")" || return $?
+  [[ "$lexical_private_root_identity" == "$private_root_identity" &&
+    "$private_root_lexical" -ef "$private_root" &&
+    -d "$private_root/$expected_cycle_name" &&
+    ! -L "$private_root/$expected_cycle_name" ]] || return 1
+  exec {manifest_dir_fd}<"$private_root/$expected_cycle_name" || return $?
+  manifest_dir="/proc/self/fd/$manifest_dir_fd/."
+  manifest_path="$manifest_dir/$manifest_leaf"
+  manifest_dir_identity="$(stat -Lc '%d:%i:%u:%a' -- "$manifest_dir")" ||
+    return $?
+  lexical_manifest_dir_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "$manifest_dir_lexical")" || return $?
+  [[ "$private_root_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:700$ &&
+    "$manifest_dir_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:700$ &&
+    "$lexical_manifest_dir_identity" == "$manifest_dir_identity" &&
+    "$manifest_dir_lexical" -ef "$manifest_dir" &&
+    "$manifest_lexical_input" -ef "$manifest_path" &&
+    -f "$manifest_path" && ! -L "$manifest_path" ]] || return 1
+  campaign_key="$expected_cycle"
+  if declare -p BENCHMARK_PRESSURE_CAMPAIGN_MANIFEST_PATHS \
+      BENCHMARK_PRESSURE_CAMPAIGN_MANIFEST_ORIGINAL_PATHS \
+      BENCHMARK_PRESSURE_CAMPAIGN_MANIFEST_IDENTITIES \
+      BENCHMARK_PRESSURE_CAMPAIGN_MANIFEST_SHA256S >/dev/null 2>&1 &&
+    [[ -n "${BENCHMARK_PRESSURE_CAMPAIGN_MANIFEST_PATHS[$campaign_key]:-}" &&
+      "$manifest_input" == \
+        "${BENCHMARK_PRESSURE_CAMPAIGN_MANIFEST_PATHS[$campaign_key]}" ]]; then
+    campaign_snapshot=true
+    manifest_original="${BENCHMARK_PRESSURE_CAMPAIGN_MANIFEST_ORIGINAL_PATHS[$campaign_key]}"
+  else
+    exec {manifest_fd}<"$manifest_path" || return $?
+    manifest_original="/proc/self/fd/$manifest_fd"
+  fi
+  manifest_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$manifest_original")" ||
+    return $?
+  lexical_manifest_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "$manifest_path")" || return $?
+  [[ "$manifest_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:600:1$ &&
+    "$lexical_manifest_identity" == "$manifest_identity" &&
+    "$manifest_path" -ef "$manifest_original" ]] || return 1
+  manifest_sha256="$(sha256sum -- "$manifest_original")" || return $?
+  manifest_sha256="${manifest_sha256%% *}"
+  if [[ "$campaign_snapshot" == true ]]; then
+    manifest="$manifest_input"
+    manifest_snapshot_source_identity="$manifest_input_identity"
+    manifest_snapshot_sha256="${BENCHMARK_PRESSURE_CAMPAIGN_MANIFEST_SHA256S[$campaign_key]}"
+    manifest_snapshot_size="$(stat -Lc '%s' -- "$manifest")" || return $?
+    [[ "$manifest_original" == \
+        "${BENCHMARK_PRESSURE_CAMPAIGN_MANIFEST_ORIGINAL_PATHS[$campaign_key]}" &&
+      "$manifest_identity:$(stat -Lc '%s' -- "$manifest_original")" == \
+        "${BENCHMARK_PRESSURE_CAMPAIGN_MANIFEST_IDENTITIES[$campaign_key]}" ]] ||
+      return 1
+  else
+    benchmark_pressure_hold_file_snapshot \
+      "$manifest_input" "$BENCHMARK_PRESSURE_MANIFEST_MAX_BYTES" \
+      manifest_snapshot_fd manifest_snapshot_source_identity \
+      manifest_snapshot_sha256 manifest_snapshot_size || return $?
+    manifest="/proc/self/fd/$manifest_snapshot_fd"
+  fi
+  [[ "$manifest_snapshot_source_identity" == "$manifest_input_identity" &&
+    "$manifest_snapshot_sha256" == "$manifest_sha256" &&
+    "$manifest_snapshot_size" == "$(stat -Lc '%s' -- "$manifest_original")" ]] ||
+    return 1
+  benchmark_pressure_json_has_unique_object_keys \
+    "$manifest" "$BENCHMARK_PRESSURE_MANIFEST_MAX_BYTES" || return $?
+  jq -e \
+    --argjson cycle "$expected_cycle" \
+    --argjson cycle_count "$BENCHMARK_PRESSURE_CYCLE_COUNT" \
+    --argjson load_seconds "$BENCHMARK_PRESSURE_LOAD_SECONDS" \
+    --argjson idle_seconds "$BENCHMARK_PRESSURE_IDLE_SECONDS" \
+    --argjson capacity "$PRESSURE_EXPECTED_MAP_CAPACITY" \
+    --argjson maximum_successful_requests "$BENCHMARK_PRESSURE_MAX_SUCCESSFUL_REQUESTS" \
+    --argjson trace_max_spans "$BENCHMARK_PRESSURE_TRACE_MAX_SPANS" \
+    --argjson trace_max_retained_bytes "$BENCHMARK_PRESSURE_TRACE_MAX_RETAINED_BYTES" \
+    --argjson trace_spans_per_request "$BENCHMARK_PRESSURE_TRACE_SPANS_PER_REQUEST" \
+    --arg histogram_encoding "$BENCHMARK_PRESSURE_HISTOGRAM_ENCODING" \
+    --arg marker_encoding "$BENCHMARK_PRESSURE_MARKER_ENCODING" '
+      def integer: type == "number" and floor == .;
+      def digest: type == "string" and test("^[0-9a-f]{64}$");
+      def expected_names:
+        {admission:"admission-receipt.json",
+         barrier:"barrier-receipt.json",benchmark:"benchmark-result.json",
+         benchmark_stderr:"benchmark.stderr.log",
+         benchmark_client_commit:"benchmark-client-commit.json",
+         prepare:"map-prepare.json",
+         fill:"map-fill.json",verify:"map-verify.json",cleanup:"map-cleanup.json",
+         bridge_reconciliation:"bridge-reconciliation.json",
+         cleanup_recovery:"map-recovered.prom",idle_before:"idle-before.prom",
+         idle_after:"idle-after.prom",
+         java_after:"java-diagnostics-after.txt",
+         java_after_stderr:"java-diagnostics-after.stderr",
+         java_before:"java-diagnostics-before.txt",
+         java_before_stderr:"java-diagnostics-before.stderr",
+         java_delta:"java-diagnostics.delta",
+         metrics_after:"obi-metrics-after.prom",
+         metrics_before:"obi-metrics-before.prom",
+         metrics_delta:"obi-metrics.delta",
+         resources_baseline:"resources-baseline.json",
+         resources_postload:"resources-postload.json",
+         resources_postidle:"resources-postidle.json",
+         stack_identity:"stack-identity.json",map_baseline:"map-baseline.prom",
+         phase_boundaries:"phase-boundaries.json",
+         trace_projection:"trace-projection.json",
+         trace_reset:"trace-reset.json",trace_snapshot:"trace-snapshot.json",
+         recovery_1:"recovery-01.prom",
+         recovery_2:"recovery-02.prom"};
+      . as $document |
+      keys == ["acceptance_eligible","attribution","cycle","files","identity",
+        "load","map","marker","phases","recovery","requested","schema",
+        "status","timing"] and
+      .schema == "obi-benchmark-pressure-private-manifest-v2" and
+      .status == "passed" and .acceptance_eligible == false and .cycle == $cycle and
+      .requested == {cycle_count:$cycle_count,load_seconds:$load_seconds,
+        idle_seconds:$idle_seconds} and
+      (.timing | keys) == ["idle_elapsed_centiseconds",
+        "load_elapsed_centiseconds"] and
+      (.timing.load_elapsed_centiseconds | integer and
+        . >= ($load_seconds * 100) and
+        . < (($load_seconds + 1) * 100)) and
+      (.timing.idle_elapsed_centiseconds | integer and
+        . >= ($idle_seconds * 100) and
+        . < (($idle_seconds + 1) * 100)) and
+      (.identity | keys) == ["process_map_id","process_namespace",
+        "process_pid","stack_identity_sha256"] and
+      (.identity.stack_identity_sha256 | digest) and
+      (.identity.process_map_id | test("^[1-9][0-9]*$")) and
+      (.identity.process_pid | test("^[1-9][0-9]*$")) and
+      (.identity.process_namespace | test("^[1-9][0-9]*$")) and
+      (.load | keys) == ["failed_requests","histogram_encoding",
+        "requested_duration_nanos","successful_requests","traffic_elapsed_nanos"] and
+      .load.histogram_encoding == $histogram_encoding and
+      .load.requested_duration_nanos == ($load_seconds * 1000000000) and
+      (.load.successful_requests | integer and . > 0 and
+        . <= $maximum_successful_requests) and
+      .load.failed_requests == 0 and
+      (.load.traffic_elapsed_nanos | integer and
+        . >= ($load_seconds * 1000000000) and
+        . < (($load_seconds + 1) * 1000000000)) and
+      (.marker | keys) == ["admitted_requests","encoding",
+        "first_request_ordinal","last_request_ordinal","prefix"] and
+      (.marker.prefix | test("^pressure-[0-9a-f]{32}-cycle-(0[1-9]|10)$")) and
+      .marker.encoding == $marker_encoding and
+      .marker.admitted_requests == .load.successful_requests and
+      .marker.first_request_ordinal == 1 and
+      .marker.last_request_ordinal == .load.successful_requests and
+      (.attribution | keys) == ["admission_receipt_sha256","ambiguous",
+        "exact_hit_count","explicit_root_count","overload","received_batches",
+        "received_spans","retained_bytes","retained_span_count",
+        "unexpected_evictions"] and
+      (.attribution.admission_receipt_sha256 | digest) and
+      .attribution.ambiguous == 0 and .attribution.unexpected_evictions == 0 and
+      (.attribution.overload | integer and . >= 1) and
+      (.attribution.received_batches | integer and . >= 1) and
+      (.attribution.received_spans | integer and . >= 1 and
+        . <= $trace_max_spans) and
+      .attribution.received_batches <= .attribution.received_spans and
+      .attribution.received_spans == .attribution.retained_span_count and
+      .attribution.received_spans ==
+        (.load.successful_requests * $trace_spans_per_request) and
+      (.attribution.retained_bytes | integer and . >= 1 and
+        . <= $trace_max_retained_bytes) and
+      (.attribution.exact_hit_count | integer and . >= 0) and
+      (.attribution.explicit_root_count | integer and . >= 1) and
+      (.attribution.exact_hit_count + .attribution.explicit_root_count) ==
+        .load.successful_requests and
+      (.map | keys) == ["baseline_entries","capacity_rejected_entries",
+        "cleanup_entries","content_sha256","filled_entries","map_id",
+        "max_entries","postload_content_sha256"] and
+      .map.baseline_entries == 0 and .map.max_entries == $capacity and
+      .map.filled_entries == $capacity and .map.capacity_rejected_entries == 1 and
+      .map.cleanup_entries == 0 and (.map.map_id | test("^[1-9][0-9]*$")) and
+      (.map.content_sha256 | digest) and
+      .map.postload_content_sha256 == .map.content_sha256 and
+      (.phases | type == "array" and length == 13) and
+      (.phases | map(.name)) == ["baseline_resources_captured",
+        "prepare_started","capacity_ready","load_started","load_finished",
+        "release_published","content_verified","postload_resources_captured",
+        "attribution_reconciled","cleanup_absent","idle_started","idle_finished",
+        "postidle_resources_captured"] and
+      all(.phases[];
+        keys == ["evidence_sha256","monotonic_centiseconds","name"] and
+        (.evidence_sha256 | digest) and
+        (.monotonic_centiseconds | integer and . >= 0)) and
+      all(range(1;13);
+        $document.phases[. - 1].monotonic_centiseconds <=
+          $document.phases[.].monotonic_centiseconds) and
+      (.phases[4].monotonic_centiseconds -
+        .phases[3].monotonic_centiseconds) ==
+          .timing.load_elapsed_centiseconds and
+      .load.traffic_elapsed_nanos <
+        ((.timing.load_elapsed_centiseconds + 1) * 10000000) and
+      (.phases[11].monotonic_centiseconds -
+        .phases[10].monotonic_centiseconds) == .timing.idle_elapsed_centiseconds and
+      (.files | type == "array" and
+        length == (if $cycle == 10 then 32 else 30 end)) and
+      ([.files[].role] | length == (unique | length)) and
+      ([.files[].name] | length == (unique | length)) and
+      all(.files[];
+        keys == ["name","role","sha256","size_bytes"] and
+        (.role | type == "string") and .name == expected_names[.role] and
+        (.name | test("^[a-z0-9][a-z0-9.-]*$")) and
+        (.sha256 | digest) and
+        (.size_bytes | integer and . >= 0 and . <= 100663296)) and
+      ([.files[].role] | sort) ==
+        ((["admission","barrier","benchmark","benchmark_stderr",
+          "benchmark_client_commit",
+          "bridge_reconciliation","cleanup","cleanup_recovery","fill",
+          "idle_after","idle_before","java_after","java_after_stderr",
+          "java_before","java_before_stderr","java_delta","metrics_after",
+          "metrics_before","metrics_delta","prepare","map_baseline",
+          "phase_boundaries","resources_baseline",
+          "resources_postidle","resources_postload","stack_identity","verify"] +
+          ["trace_projection","trace_reset","trace_snapshot"] +
+          (if $cycle == 10 then ["recovery_1","recovery_2"] else [] end)) | sort) and
+      (.recovery | keys) == ["captured_monotonic_centiseconds","consecutive",
+        "map_entries","required_samples","sample_sha256s"] and
+      if $cycle == 10 then
+        .recovery.required_samples == 2 and .recovery.consecutive == true and
+        .recovery.map_entries == [0,0] and
+        (.recovery.sample_sha256s | length == 2 and all(.[]; digest)) and
+        (.recovery.captured_monotonic_centiseconds | length == 2 and
+          all(.[]; integer and . >= 0)) and
+        .recovery.captured_monotonic_centiseconds[0] <=
+          .recovery.captured_monotonic_centiseconds[1] and
+        .recovery.captured_monotonic_centiseconds[0] >=
+          $document.phases[11].monotonic_centiseconds and
+        .recovery.captured_monotonic_centiseconds[1] <=
+          $document.phases[12].monotonic_centiseconds
+      else
+        .recovery == {captured_monotonic_centiseconds:[],consecutive:false,
+          map_entries:[],required_samples:0,sample_sha256s:[]}
+      end
+  ' "$manifest" >/dev/null || return $?
+  expected_rows="$(jq -er '.files | length' "$manifest")" || return $?
+  [[ "$expected_rows" =~ ^[1-9][0-9]*$ ]] || return 1
+  benchmark_pressure_cycle_directory_roster_matches \
+    "$manifest" "$expected_rows" "$manifest_dir" "$manifest_leaf" || return $?
+  roster="$(mktemp -p /tmp obi-pressure-manifest-roster.XXXXXX)" || return $?
+  trap 'rm -f -- "$roster"' EXIT
+  chmod 0600 -- "$roster" || return $?
+  jq -er '.files[] | [.role,.name,.sha256,.size_bytes] | @tsv' \
+    "$manifest" >"$roster" || return $?
+  bounded_evidence_file "$roster" 65536 32 || return $?
+  while IFS=$'\t' read -r role name expected_sha256 expected_size extra; do
+    ((observed_rows += 1))
+    [[ -z "$extra" && "$role" =~ ^[a-z0-9_]+$ &&
+      "$name" =~ ^[a-z0-9][a-z0-9.-]*$ &&
+      "$expected_sha256" =~ ^[0-9a-f]{64}$ &&
+      "$expected_size" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+    path="$manifest_dir/$name"
+    campaign_key="$expected_cycle:$role"
+    if [[ "$campaign_snapshot" == true ]]; then
+      declare -p BENCHMARK_PRESSURE_CAMPAIGN_LEAF_PATHS \
+        BENCHMARK_PRESSURE_CAMPAIGN_LEAF_ORIGINAL_PATHS \
+        BENCHMARK_PRESSURE_CAMPAIGN_LEAF_NAMES \
+        BENCHMARK_PRESSURE_CAMPAIGN_LEAF_IDENTITIES \
+        BENCHMARK_PRESSURE_CAMPAIGN_LEAF_SHA256S >/dev/null 2>&1 || return 1
+      pinned_path="${BENCHMARK_PRESSURE_CAMPAIGN_LEAF_PATHS[$campaign_key]:-}"
+      original_pinned_path="${BENCHMARK_PRESSURE_CAMPAIGN_LEAF_ORIGINAL_PATHS[$campaign_key]:-}"
+      pinned_identity="${BENCHMARK_PRESSURE_CAMPAIGN_LEAF_IDENTITIES[$campaign_key]:-}"
+      observed_sha256="${BENCHMARK_PRESSURE_CAMPAIGN_LEAF_SHA256S[$campaign_key]:-}"
+      [[ -n "$pinned_path" && -n "$original_pinned_path" &&
+        "${BENCHMARK_PRESSURE_CAMPAIGN_LEAF_NAMES[$campaign_key]:-}" == "$name" &&
+        "$path" -ef "$original_pinned_path" &&
+        "$pinned_identity" =~ \
+          ^[0-9]+:[1-9][0-9]*:$EUID:600:1:$expected_size$ &&
+        "$observed_sha256" == "$expected_sha256" ]] || return 1
+    else
+      [[ -f "$path" && ! -L "$path" ]] || return 1
+      unset leaf_fd
+      exec {leaf_fd}<"$path" || return $?
+      original_pinned_path="/proc/self/fd/$leaf_fd"
+      pinned_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+        "$original_pinned_path")" ||
+        return $?
+      [[ "$path" -ef "$original_pinned_path" &&
+        "$pinned_identity" =~ \
+          ^[0-9]+:[1-9][0-9]*:$EUID:600:1:$expected_size$ ]] || return 1
+    fi
+    limits="$(benchmark_pressure_role_limits "$role")" || return $?
+    IFS=' ' read -r maximum_bytes maximum_lines extra <<<"$limits" || return $?
+    [[ -z "$extra" && "$maximum_bytes" =~ ^[1-9][0-9]*$ &&
+      "$maximum_lines" =~ ^[1-9][0-9]*$ ]] || return 1
+    if [[ "$campaign_snapshot" == true ]]; then
+      bounded_evidence_file \
+        "$pinned_path" "$maximum_bytes" "$maximum_lines" || return $?
+      snapshot_source_identity="$pinned_identity"
+      snapshot_sha256="$(sha256sum -- "$pinned_path")" || return $?
+      snapshot_sha256="${snapshot_sha256%% *}"
+      snapshot_size="$(stat -Lc '%s' -- "$pinned_path")" || return $?
+    else
+      bounded_evidence_file \
+        "$original_pinned_path" "$maximum_bytes" "$maximum_lines" ||
+        return $?
+      observed_sha256="$(sha256sum -- "$original_pinned_path")" || return $?
+      observed_sha256="${observed_sha256%% *}"
+      [[ "$observed_sha256" == "$expected_sha256" ]] || return 1
+      unset snapshot_fd
+      benchmark_pressure_hold_file_snapshot \
+        "$original_pinned_path" "$maximum_bytes" snapshot_fd \
+        snapshot_source_identity snapshot_sha256 snapshot_size || return $?
+      pinned_path="/proc/self/fd/$snapshot_fd"
+      BENCHMARK_PRESSURE_PINNED_EVIDENCE_FDS+=("$leaf_fd")
+      BENCHMARK_PRESSURE_SNAPSHOT_EVIDENCE_FDS+=("$snapshot_fd")
+    fi
+    [[ "${snapshot_source_identity%:*}" == "${pinned_identity%:*}" &&
+      "$snapshot_size" == "$expected_size" &&
+      "$snapshot_sha256" == "$expected_sha256" ]] || return 1
+    BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS["$role"]="$pinned_path"
+    BENCHMARK_PRESSURE_ORIGINAL_EVIDENCE_PATHS["$role"]="$original_pinned_path"
+    BENCHMARK_PRESSURE_PINNED_EVIDENCE_NAMES["$role"]="$name"
+    BENCHMARK_PRESSURE_PINNED_EVIDENCE_IDENTITIES["$role"]="$pinned_identity"
+    BENCHMARK_PRESSURE_PINNED_EVIDENCE_SHA256S["$role"]="$observed_sha256"
+  done <"$roster"
+  ((observed_rows == expected_rows)) || return 1
+  benchmark_pressure_validate_client_commit_images success_pair \
+    "$expected_cycle" "$manifest_dir_identity" \
+    "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[benchmark_client_commit]}" \
+    "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[benchmark]}" \
+    "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[benchmark_stderr]}" \
+    "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_IDENTITIES[benchmark]}" \
+    "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_IDENTITIES[benchmark_stderr]}" \
+    "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_IDENTITIES[benchmark_client_commit]}" ||
+    return $?
+  local BENCHMARK_PRESSURE_CLIENT_BUNDLE_VALIDATED=true
+
+  validate_benchmark_pressure_result \
+    "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[benchmark]}" \
+    "$(jq -er '.marker.prefix' "$manifest")" || return $?
+  validate_benchmark_pressure_barrier_receipt \
+    "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[barrier]}" "$expected_cycle" \
+    "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[fill]}" \
+    "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[verify]}" \
+    "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[benchmark]}" || return $?
+  validate_benchmark_pressure_admission_receipt \
+    "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[admission]}" \
+    "$expected_cycle" "$manifest_dir" ||
+    return $?
+  pressure_result_has_contract \
+    "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[prepare]}" prepare || return $?
+  pressure_result_has_contract \
+    "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[cleanup]}" cleanup || return $?
+  for role in map_id max_entries process_map_id process_pid process_namespace \
+    token_base; do
+    prepare_value="$(pressure_result_uint \
+      "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[prepare]}" "$role")" || return $?
+    fill_value="$(pressure_result_uint \
+      "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[fill]}" "$role")" || return $?
+    verify_value="$(pressure_result_uint \
+      "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[verify]}" "$role")" || return $?
+    [[ "$prepare_value" == "$fill_value" &&
+      "$fill_value" == "$verify_value" ]] || return 1
+    case "$role" in
+      map_id|max_entries|process_pid|process_namespace|token_base)
+        cleanup_value="$(pressure_result_uint \
+          "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[cleanup]}" "$role")" ||
+          return $?
+        [[ "$cleanup_value" == "$fill_value" ]] || return 1
+        ;;
+    esac
+  done
+  for role in process_map_id process_pid process_namespace; do
+    manifest_value="$(jq -er --arg role "$role" '.identity[$role]' \
+      "$manifest")" || return $?
+    fill_value="$(pressure_result_uint \
+      "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[fill]}" "$role")" || return $?
+    [[ "$manifest_value" == "$fill_value" ]] || return 1
+  done
+  validate_benchmark_pressure_stack_identity_file \
+    "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[stack_identity]}" || return $?
+  for role in resources_baseline resources_postload resources_postidle; do
+    validate_benchmark_pressure_resources \
+      "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[$role]}" \
+      "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[stack_identity]}" || return $?
+  done
+  validate_benchmark_pressure_phase_boundaries \
+    "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[phase_boundaries]}" \
+    "$expected_cycle" \
+    "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[benchmark]}" || return $?
+  jq -e --slurpfile boundaries \
+    "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[phase_boundaries]}" '
+    ($boundaries | length) == 1 and
+    .phases == $boundaries[0].phases and
+    .timing.load_elapsed_centiseconds ==
+      $boundaries[0].load_elapsed_centiseconds and
+    .timing.idle_elapsed_centiseconds ==
+      $boundaries[0].idle_elapsed_centiseconds
+  ' "$manifest" >/dev/null || return $?
+  jq -e \
+    --slurpfile baseline "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[resources_baseline]}" \
+    --slurpfile postload "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[resources_postload]}" \
+    --slurpfile postidle "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[resources_postidle]}" '
+      ($baseline | length) == 1 and ($postload | length) == 1 and
+      ($postidle | length) == 1 and
+      ($baseline[0].stack == $postload[0].stack and
+        $postload[0].stack == $postidle[0].stack) and
+      (.phases[] | select(.name == "baseline_resources_captured") |
+        .monotonic_centiseconds) ==
+          $baseline[0].captured_monotonic_centiseconds and
+      (.phases[] | select(.name == "postload_resources_captured") |
+        .monotonic_centiseconds) ==
+          $postload[0].captured_monotonic_centiseconds and
+      (.phases[] | select(.name == "postidle_resources_captured") |
+        .monotonic_centiseconds) ==
+          $postidle[0].captured_monotonic_centiseconds and
+      $baseline[0].captured_monotonic_centiseconds <=
+        $postload[0].captured_monotonic_centiseconds and
+      $postload[0].captured_monotonic_centiseconds <=
+        $postidle[0].captured_monotonic_centiseconds
+  ' "$manifest" >/dev/null || return $?
+  jq -e \
+    --slurpfile result "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[benchmark]}" \
+    --slurpfile barrier "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[barrier]}" \
+    --slurpfile admission "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[admission]}" '
+      ($result | length) == 1 and ($barrier | length) == 1 and
+      ($admission | length) == 1 and
+      .load == {
+        failed_requests:$result[0].failed_requests,
+        histogram_encoding:$result[0].latency.histogram_encoding,
+        requested_duration_nanos:$result[0].requested_duration_nanos,
+        successful_requests:$result[0].successful_requests,
+        traffic_elapsed_nanos:$result[0].traffic_elapsed_nanos
+      } and
+      .marker == {admitted_requests:$result[0].admitted_requests,
+        encoding:$result[0].marker_encoding,
+        first_request_ordinal:$result[0].first_request_ordinal,
+        last_request_ordinal:$result[0].last_request_ordinal,
+        prefix:$result[0].marker_prefix} and
+      .attribution == {
+        admission_receipt_sha256:(.files[] |
+          select(.role == "admission") | .sha256),
+        ambiguous:$admission[0].admission.ambiguous,
+        exact_hit_count:$admission[0].trace.exact_hit_count,
+        explicit_root_count:$admission[0].trace.explicit_root_count,
+        overload:$admission[0].admission.overload,
+        received_batches:$admission[0].trace.received_batches,
+        received_spans:$admission[0].trace.received_spans,
+        retained_bytes:$admission[0].trace.retained_bytes,
+        retained_span_count:$admission[0].trace.retained_span_count,
+        unexpected_evictions:$admission[0].admission.unexpected_evictions} and
+      .map.map_id == $barrier[0].map.map_id and
+      .map.max_entries == ($barrier[0].map.max_entries | tonumber) and
+      .map.content_sha256 == $barrier[0].map.content_sha256 and
+      .map.postload_content_sha256 == $barrier[0].map.content_sha256
+  ' "$manifest" >/dev/null || return $?
+  stack_sha256="$(sha256sum -- \
+    "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[stack_identity]}")" || return $?
+  stack_sha256="${stack_sha256%% *}"
+  manifest_stack_sha256="$(jq -er \
+    '.identity.stack_identity_sha256' "$manifest")" || return $?
+  [[ "$stack_sha256" == "$manifest_stack_sha256" ]] || return 1
+
+  map_id="$(jq -er '.map.map_id' "$manifest")" || return $?
+  for role in map_baseline cleanup_recovery idle_before idle_after; do
+    path="${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[$role]}"
+    resolved="$(pressure_map_metric \
+      "$path" obi_bpf_map_entries_total "$map_id")" || return $?
+    [[ "${resolved%% *}" == "$map_id" ]] || return 1
+    map_entries="${resolved#* }"
+    [[ "$map_entries" == 0 ]] || return 1
+  done
+  if ((expected_cycle == BENCHMARK_PRESSURE_CYCLE_COUNT)); then
+    for role in recovery_1 recovery_2; do
+      path="${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[$role]}"
+      resolved="$(pressure_map_metric \
+        "$path" obi_bpf_map_entries_total "$map_id")" || return $?
+      [[ "${resolved%% *}" == "$map_id" && "${resolved#* }" == 0 ]] || return 1
+    done
+    recovery_one_sha256="$(sha256sum -- \
+      "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[recovery_1]}")" || return $?
+    recovery_one_sha256="${recovery_one_sha256%% *}"
+    recovery_two_sha256="$(sha256sum -- \
+      "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[recovery_2]}")" || return $?
+    recovery_two_sha256="${recovery_two_sha256%% *}"
+    jq -e --arg first "$recovery_one_sha256" \
+      --arg second "$recovery_two_sha256" '
+        .recovery.sample_sha256s == [$first,$second]
+      ' "$manifest" >/dev/null || return $?
+  fi
+  jq -e --slurpfile cleanup \
+    "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[cleanup]}" '
+    ($cleanup | length) == 1 and
+    $cleanup[0].cleanup_verified == true and
+    $cleanup[0].process_map_id == 0 and
+    $cleanup[0].touched == .map.max_entries and
+    $cleanup[0].verified_absent_entries == (.map.max_entries + 1) and
+    ($cleanup[0].map_id | tostring) == .map.map_id
+  ' "$manifest" >/dev/null || return $?
+
+  for role in resources_baseline stack_identity fill benchmark verify \
+    resources_postload admission cleanup idle_before idle_after resources_postidle; do
+    expected_phase_sha256="$(jq -er --arg role "$role" \
+      '.files[] | select(.role == $role) | .sha256' "$manifest")" || return $?
+    case "$role" in
+      resources_baseline) name=baseline_resources_captured ;;
+      stack_identity) name=prepare_started ;;
+      fill) name=capacity_ready ;;
+      benchmark) name=load_finished ;;
+      verify) name=content_verified ;;
+      resources_postload) name=postload_resources_captured ;;
+      admission) name=attribution_reconciled ;;
+      cleanup) name=cleanup_absent ;;
+      idle_before) name=idle_started ;;
+      idle_after) name=idle_finished ;;
+      resources_postidle) name=postidle_resources_captured ;;
+      *) return 1 ;;
+    esac
+    phase_sha256="$(jq -er --arg name "$name" \
+      '.phases[] | select(.name == $name) | .evidence_sha256' "$manifest")" ||
+      return $?
+    [[ "$phase_sha256" == "$expected_phase_sha256" ]] || return 1
+  done
+  load_started_sha256="$(jq -er \
+    '.phases[] | select(.name == "load_started") | .evidence_sha256' \
+    "$manifest")" || return $?
+  ready_sha256="$(jq -er \
+    '.ready.sha256' "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[barrier]}")" ||
+    return $?
+  release_published_sha256="$(jq -er \
+    '.phases[] | select(.name == "release_published") | .evidence_sha256' \
+    "$manifest")" || return $?
+  release_sha256="$(jq -er \
+    '.release.sha256' "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[barrier]}")" ||
+    return $?
+  [[ "$load_started_sha256" == "$ready_sha256" &&
+    "$release_published_sha256" == "$release_sha256" ]] || return 1
+  for pinned_key in "${!BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[@]}"; do
+    pinned_path="${BENCHMARK_PRESSURE_PINNED_EVIDENCE_PATHS[$pinned_key]}"
+    original_pinned_path="${BENCHMARK_PRESSURE_ORIGINAL_EVIDENCE_PATHS[$pinned_key]}"
+    path="$manifest_dir/${BENCHMARK_PRESSURE_PINNED_EVIDENCE_NAMES[$pinned_key]}"
+    pinned_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+      "$original_pinned_path")" ||
+      return $?
+    pinned_sha256="$(sha256sum -- "$pinned_path")" || return $?
+    pinned_sha256="${pinned_sha256%% *}"
+    observed_sha256="$(sha256sum -- "$original_pinned_path")" || return $?
+    observed_sha256="${observed_sha256%% *}"
+    [[ "$pinned_identity" == \
+        "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_IDENTITIES[$pinned_key]}" &&
+      "$pinned_sha256" == \
+        "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_SHA256S[$pinned_key]}" &&
+      "$observed_sha256" == \
+        "${BENCHMARK_PRESSURE_PINNED_EVIDENCE_SHA256S[$pinned_key]}" &&
+      -f "$path" && ! -L "$path" &&
+      "$path" -ef "$original_pinned_path" ]] || return 1
+  done
+  rm -- "$roster" || return $?
+  roster=""
+  observed_private_root_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "$private_root")" || return $?
+  observed_manifest_dir_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "$manifest_dir")" || return $?
+  lexical_private_root_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "$private_root_lexical")" || return $?
+  lexical_manifest_dir_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "$manifest_dir_lexical")" || return $?
+  observed_manifest_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "$manifest_original")" || return $?
+  observed_manifest_sha256="$(sha256sum -- "$manifest_original")" || return $?
+  observed_manifest_sha256="${observed_manifest_sha256%% *}"
+  lexical_manifest_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "$manifest_path")" || return $?
+  [[ "$observed_private_root_identity" == "$private_root_identity" &&
+    "$observed_manifest_dir_identity" == "$manifest_dir_identity" &&
+    "$lexical_private_root_identity" == "$private_root_identity" &&
+    "$lexical_manifest_dir_identity" == "$manifest_dir_identity" &&
+    "$observed_manifest_identity" == "$manifest_identity" &&
+    "$observed_manifest_sha256" == "$manifest_sha256" &&
+    "$lexical_manifest_identity" == "$manifest_identity" &&
+    "$private_root_lexical" -ef "$private_root" &&
+    "$manifest_dir_lexical" -ef "$manifest_dir" &&
+    "$manifest_path" -ef "$manifest_original" ]] || return 1
+  benchmark_pressure_cycle_directory_roster_matches \
+    "$manifest" "$expected_rows" "$manifest_dir" "$manifest_leaf"
+)
+
+write_benchmark_pressure_private_manifest() {
+  local -r cycle="$1"
+  local -r cycle_dir="$2"
+  local -r phases_json="$3"
+  local -r idle_elapsed_centiseconds="$4"
+  local -r recovery_one_tick="${5:-}"
+  local -r recovery_two_tick="${6:-}"
+  local target="$cycle_dir/private-manifest.json"
+  local candidate=""
+  local files='[]'
+  local recovery='{"captured_monotonic_centiseconds":[],"consecutive":false,"map_entries":[],"required_samples":0,"sample_sha256s":[]}'
+  local role=""
+  local name=""
+  local path=""
+  local sha256=""
+  local size=""
+  local entry=""
+  local stack_sha256=""
+  local content_sha256=""
+  local successful_requests=""
+  local failed_requests=""
+  local requested_duration_nanos=""
+  local traffic_elapsed_nanos=""
+  local recovery_one_sha256=""
+  local recovery_two_sha256=""
+  local admission_sha256=""
+  local marker_prefix=""
+  local marker_encoding=""
+  local admitted_requests=""
+  local first_request_ordinal=""
+  local last_request_ordinal=""
+  local attribution=""
+  local phase_candidate=""
+  local load_elapsed_centiseconds=""
+  local committed_result=""
+  local committed_stderr=""
+  local committed_receipt=""
+  local -a roles=(admission barrier benchmark benchmark_stderr
+    benchmark_client_commit bridge_reconciliation prepare fill verify cleanup \
+    cleanup_recovery idle_before
+    idle_after java_after java_after_stderr java_before java_before_stderr
+    java_delta metrics_after metrics_before metrics_delta resources_baseline
+    resources_postload resources_postidle stack_identity map_baseline
+    phase_boundaries trace_projection trace_reset trace_snapshot)
+  local -a names=(admission-receipt.json barrier-receipt.json benchmark-result.json
+    benchmark.stderr.log benchmark-client-commit.json \
+    bridge-reconciliation.json map-prepare.json map-fill.json
+    map-verify.json map-cleanup.json map-recovered.prom idle-before.prom
+    idle-after.prom java-diagnostics-after.txt java-diagnostics-after.stderr
+    java-diagnostics-before.txt java-diagnostics-before.stderr
+    java-diagnostics.delta obi-metrics-after.prom obi-metrics-before.prom
+    obi-metrics.delta resources-baseline.json resources-postload.json
+    resources-postidle.json stack-identity.json map-baseline.prom
+    phase-boundaries.json trace-projection.json trace-reset.json
+    trace-snapshot.json)
+  local index=0
+
+  [[ "$cycle" =~ ^([1-9]|10)$ && "$idle_elapsed_centiseconds" =~ ^[0-9]+$ &&
+    "$idle_elapsed_centiseconds" -ge "$((BENCHMARK_PRESSURE_IDLE_SECONDS * 100))" &&
+    "$idle_elapsed_centiseconds" -lt "$(((BENCHMARK_PRESSURE_IDLE_SECONDS + 1) * 100))" &&
+    ! -e "$target" && ! -L "$target" ]] || return 1
+  benchmark_pressure_client_bundle_images_for_consumer \
+    "$cycle_dir/benchmark-result.json" "$cycle" committed_result \
+    committed_stderr committed_receipt || return $?
+  load_elapsed_centiseconds="$(jq -er '
+    ([.[] | select(.name == "load_started") |
+      .monotonic_centiseconds] | if length == 1 then .[0] else error("load start") end) as $start |
+    ([.[] | select(.name == "load_finished") |
+      .monotonic_centiseconds] | if length == 1 then .[0] else error("load finish") end) as $finish |
+    select($finish >= $start) | $finish - $start
+  ' <<<"$phases_json")" || return $?
+  [[ "$load_elapsed_centiseconds" =~ ^[0-9]+$ &&
+    "$load_elapsed_centiseconds" -ge \
+      "$((BENCHMARK_PRESSURE_LOAD_SECONDS * 100))" &&
+    "$load_elapsed_centiseconds" -lt \
+      "$(((BENCHMARK_PRESSURE_LOAD_SECONDS + 1) * 100))" ]] || return 1
+  phase_candidate="$(mktemp "$cycle_dir/.phase-boundaries.XXXXXX")" || return $?
+  jq -cS -n --argjson cycle "$cycle" \
+    --argjson load_requested_seconds "$BENCHMARK_PRESSURE_LOAD_SECONDS" \
+    --argjson load_elapsed_centiseconds "$load_elapsed_centiseconds" \
+    --argjson idle_requested_seconds "$BENCHMARK_PRESSURE_IDLE_SECONDS" \
+    --argjson idle_elapsed_centiseconds "$idle_elapsed_centiseconds" \
+    --argjson phases "$phases_json" '
+      {schema:"obi-benchmark-pressure-phase-boundaries-v1",cycle:$cycle,
+       load_requested_seconds:$load_requested_seconds,
+       load_elapsed_centiseconds:$load_elapsed_centiseconds,
+       idle_requested_seconds:$idle_requested_seconds,
+       idle_elapsed_centiseconds:$idle_elapsed_centiseconds,phases:$phases}
+  ' >"$phase_candidate" || return $?
+  chmod 0600 -- "$phase_candidate" || return $?
+  benchmark_pressure_publish_validated_file \
+    "$phase_candidate" "$cycle_dir/phase-boundaries.json" 600 \
+    validate_benchmark_pressure_phase_boundaries "$cycle" \
+    "$cycle_dir/benchmark-result.json" || return $?
+  if ((cycle == BENCHMARK_PRESSURE_CYCLE_COUNT)); then
+    [[ "$recovery_one_tick" =~ ^[0-9]+$ &&
+      "$recovery_two_tick" =~ ^[0-9]+$ &&
+      "$recovery_one_tick" -le "$recovery_two_tick" ]] || return 1
+    roles+=(recovery_1 recovery_2)
+    names+=(recovery-01.prom recovery-02.prom)
+  fi
+  for ((index = 0; index < ${#roles[@]}; index++)); do
+    role="${roles[$index]}"
+    name="${names[$index]}"
+    case "$role" in
+      benchmark) path="$committed_result" ;;
+      benchmark_stderr) path="$committed_stderr" ;;
+      benchmark_client_commit) path="$committed_receipt" ;;
+      *) path="$cycle_dir/$name" ;;
+    esac
+    benchmark_pressure_trusted_regular_path "$path" || return $?
+    if [[ "$path" =~ ^/proc/self/fd/[1-9][0-9]*$ ]]; then
+      [[ "$(stat -Lc '%u:%a:%h' -- "$path")" == "$EUID:600:0" ]] || return 1
+    else
+      [[ "$(stat -Lc '%u:%a:%h' -- "$path")" == "$EUID:600:1" ]] || return 1
+    fi
+    sha256="$(sha256sum -- "$path")" || return $?
+    sha256="${sha256%% *}"
+    size="$(stat -Lc '%s' -- "$path")" || return $?
+    entry="$(jq -cS -n --arg role "$role" --arg name "$name" \
+      --arg sha256 "$sha256" --argjson size_bytes "$size" \
+      '{role:$role,name:$name,sha256:$sha256,size_bytes:$size_bytes}')" || return $?
+    files="$(jq -cS --argjson entry "$entry" '. + [$entry]' <<<"$files")" || return $?
+  done
+  stack_sha256="$(sha256sum -- "$cycle_dir/stack-identity.json")" || return $?
+  stack_sha256="${stack_sha256%% *}"
+  content_sha256="$(jq -er '.map.content_sha256' "$cycle_dir/barrier-receipt.json")" ||
+    return $?
+  successful_requests="$(jq -er '.successful_requests' \
+    "$committed_result")" || return $?
+  failed_requests="$(jq -er '.failed_requests' \
+    "$committed_result")" || return $?
+  requested_duration_nanos="$(jq -er '.requested_duration_nanos' \
+    "$committed_result")" || return $?
+  traffic_elapsed_nanos="$(jq -er '.traffic_elapsed_nanos' \
+    "$committed_result")" || return $?
+  marker_prefix="$(jq -er '.marker_prefix' \
+    "$committed_result")" || return $?
+  marker_encoding="$(jq -er '.marker_encoding' \
+    "$committed_result")" || return $?
+  admitted_requests="$(jq -er '.admitted_requests' \
+    "$committed_result")" || return $?
+  first_request_ordinal="$(jq -er '.first_request_ordinal' \
+    "$committed_result")" || return $?
+  last_request_ordinal="$(jq -er '.last_request_ordinal' \
+    "$committed_result")" || return $?
+  admission_sha256="$(sha256sum -- "$cycle_dir/admission-receipt.json")" ||
+    return $?
+  admission_sha256="${admission_sha256%% *}"
+  attribution="$(jq -cS --arg admission_sha256 "$admission_sha256" '
+    {admission_receipt_sha256:$admission_sha256,
+     overload:.admission.overload,ambiguous:.admission.ambiguous,
+     unexpected_evictions:.admission.unexpected_evictions,
+     received_batches:.trace.received_batches,
+     received_spans:.trace.received_spans,
+     retained_bytes:.trace.retained_bytes,
+     retained_span_count:.trace.retained_span_count,
+     exact_hit_count:.trace.exact_hit_count,
+     explicit_root_count:.trace.explicit_root_count}
+  ' "$cycle_dir/admission-receipt.json")" || return $?
+  if ((cycle == BENCHMARK_PRESSURE_CYCLE_COUNT)); then
+    recovery_one_sha256="$(sha256sum -- "$cycle_dir/recovery-01.prom")" || return $?
+    recovery_one_sha256="${recovery_one_sha256%% *}"
+    recovery_two_sha256="$(sha256sum -- "$cycle_dir/recovery-02.prom")" || return $?
+    recovery_two_sha256="${recovery_two_sha256%% *}"
+    recovery="$(jq -cS -n --arg first "$recovery_one_sha256" \
+      --arg second "$recovery_two_sha256" \
+      --argjson first_tick "$recovery_one_tick" \
+      --argjson second_tick "$recovery_two_tick" '
+        {captured_monotonic_centiseconds:[$first_tick,$second_tick],
+         consecutive:true,map_entries:[0,0],required_samples:2,
+         sample_sha256s:[$first,$second]}
+      ')" || return $?
+  else
+    [[ -z "$recovery_one_tick" && -z "$recovery_two_tick" ]] || return 1
+  fi
+  candidate="$(mktemp "$cycle_dir/.private-manifest.XXXXXX")" || return $?
+  jq -cS -n \
+    --argjson cycle "$cycle" \
+    --argjson cycle_count "$BENCHMARK_PRESSURE_CYCLE_COUNT" \
+    --argjson load_seconds "$BENCHMARK_PRESSURE_LOAD_SECONDS" \
+    --argjson idle_seconds "$BENCHMARK_PRESSURE_IDLE_SECONDS" \
+    --arg stack_sha256 "$stack_sha256" \
+    --arg process_map_id "$PRESSURE_PROCESS_MAP_ID" \
+    --arg process_pid "$PRESSURE_PROCESS_PID" \
+    --arg process_namespace "$PRESSURE_PROCESS_NAMESPACE" \
+    --argjson successful_requests "$successful_requests" \
+    --argjson failed_requests "$failed_requests" \
+    --argjson requested_duration_nanos "$requested_duration_nanos" \
+    --argjson traffic_elapsed_nanos "$traffic_elapsed_nanos" \
+    --argjson load_elapsed_centiseconds "$load_elapsed_centiseconds" \
+    --arg histogram_encoding "$BENCHMARK_PRESSURE_HISTOGRAM_ENCODING" \
+    --arg marker_prefix "$marker_prefix" \
+    --arg marker_encoding "$marker_encoding" \
+    --argjson admitted_requests "$admitted_requests" \
+    --argjson first_request_ordinal "$first_request_ordinal" \
+    --argjson last_request_ordinal "$last_request_ordinal" \
+    --argjson attribution "$attribution" \
+    --arg map_id "$PRESSURE_MAP_ID" \
+    --argjson capacity "$PRESSURE_MAP_MAX_ENTRIES" \
+    --arg content_sha256 "$content_sha256" \
+    --argjson idle_elapsed_centiseconds "$idle_elapsed_centiseconds" \
+    --argjson phases "$phases_json" \
+    --argjson files "$files" \
+    --argjson recovery "$recovery" '
+      {schema:"obi-benchmark-pressure-private-manifest-v2",status:"passed",
+       acceptance_eligible:false,cycle:$cycle,
+       requested:{cycle_count:$cycle_count,load_seconds:$load_seconds,
+         idle_seconds:$idle_seconds},
+       timing:{load_elapsed_centiseconds:$load_elapsed_centiseconds,
+         idle_elapsed_centiseconds:$idle_elapsed_centiseconds},
+       identity:{stack_identity_sha256:$stack_sha256,
+         process_map_id:$process_map_id,process_pid:$process_pid,
+         process_namespace:$process_namespace},
+       load:{requested_duration_nanos:$requested_duration_nanos,
+         traffic_elapsed_nanos:$traffic_elapsed_nanos,
+         successful_requests:$successful_requests,failed_requests:$failed_requests,
+         histogram_encoding:$histogram_encoding},
+       marker:{prefix:$marker_prefix,encoding:$marker_encoding,
+         admitted_requests:$admitted_requests,
+         first_request_ordinal:$first_request_ordinal,
+         last_request_ordinal:$last_request_ordinal},
+       attribution:$attribution,
+       map:{map_id:$map_id,baseline_entries:0,max_entries:$capacity,
+         filled_entries:$capacity,capacity_rejected_entries:1,
+         content_sha256:$content_sha256,postload_content_sha256:$content_sha256,
+         cleanup_entries:0},phases:$phases,files:$files,recovery:$recovery}
+    ' >"$candidate" || return $?
+  chmod 0600 -- "$candidate" || return $?
+  benchmark_pressure_publish_validated_file \
+    "$candidate" "$target" 600 \
+    validate_benchmark_pressure_private_manifest "$cycle" "${cycle_dir%/*}"
+}
+
+validate_benchmark_pressure_aggregate() (
+  local -r aggregate_input="$1"
+  local -r private_root_lexical="${2:-}"
+  local aggregate=""
+  local aggregate_original=""
+  local aggregate_fd=""
+  local aggregate_snapshot_fd=""
+  local aggregate_source_identity=""
+  local aggregate_snapshot_sha256=""
+  local aggregate_snapshot_size=""
+  local aggregate_identity=""
+  local aggregate_sha256=""
+  local lexical_aggregate_identity=""
+  local observed_aggregate_identity=""
+  local observed_aggregate_sha256=""
+  local aggregate_snapshot_terminal_sha256=""
+  local aggregate_parent=""
+  local aggregate_leaf=""
+  local aggregate_parent_fd=""
+  local aggregate_parent_identity=""
+  local aggregate_parent_lexical_identity=""
+  local aggregate_is_exact_descriptor=false
+  local private_root=""
+  local private_root_fd=""
+  local private_root_identity=""
+  local lexical_private_root_identity=""
+  local observed_private_root_identity=""
+  local cycle_dir=""
+  local cycle_dir_fd=""
+  local cycle_dir_identity=""
+  local observed_cycle_dir_identity=""
+  local cycle_manifest_fd=""
+  local cycle_manifest_snapshot_fd=""
+  local cycle_manifest_path=""
+  local lexical_cycle_manifest_path=""
+  local cycle_manifest_original=""
+  local cycle_manifest_identity=""
+  local cycle_manifest_source_identity=""
+  local cycle_manifest_snapshot_sha256=""
+  local cycle_manifest_snapshot_size=""
+  local observed_cycle_manifest_identity=""
+  local cycle=""
+  local tag=""
+  local manifest=""
+  local expected_sha256=""
+  local expected_size=""
+  local expected_count=""
+  local observed_sha256=""
+  local observed_snapshot_sha256=""
+  local observed_size=""
+  local observed_count=""
+  local expected_barrier_sha256=""
+  local expected_admission_sha256=""
+  local expected_result_sha256=""
+  local baseline_private_identity=""
+  local observed_private_identity=""
+  local baseline_map_id=""
+  local observed_map_id=""
+  local marker_prefix=""
+  local marker_prefixes=$'\n'
+  local receiver_instance_id=""
+  local baseline_receiver_instance_id=""
+  local reset_generation=""
+  local previous_reset_generation=""
+  local final_recovery=""
+  local private_entries=""
+  local observed_private_entries=""
+  local expected_private_entries=""
+  local roster_text=""
+  local role=""
+  local name=""
+  local extra=""
+  local limits=""
+  local maximum_bytes=""
+  local maximum_lines=""
+  local leaf_fd=""
+  local leaf_snapshot_fd=""
+  local leaf_path=""
+  local lexical_leaf_path=""
+  local leaf_original_path=""
+  local leaf_identity=""
+  local leaf_source_identity=""
+  local leaf_snapshot_sha256=""
+  local leaf_snapshot_size=""
+  local leaf_sha256=""
+  local leaf_key=""
+  local expected_leaf_sha256=""
+  local expected_leaf_size=""
+  local leaf_rows=0
+  local coherent_specification=$'V\t1\n'
+  local -a aggregate_snapshot_fds=()
+  local -A aggregate_cycle_dirs=()
+  local -A aggregate_cycle_dir_fds=()
+  local -A aggregate_cycle_dir_identities=()
+  local -A BENCHMARK_PRESSURE_CAMPAIGN_MANIFEST_PATHS=()
+  local -A BENCHMARK_PRESSURE_CAMPAIGN_MANIFEST_ORIGINAL_PATHS=()
+  local -A BENCHMARK_PRESSURE_CAMPAIGN_MANIFEST_ORIGINAL_FDS=()
+  local -A BENCHMARK_PRESSURE_CAMPAIGN_MANIFEST_IDENTITIES=()
+  local -A BENCHMARK_PRESSURE_CAMPAIGN_MANIFEST_SHA256S=()
+  local -A aggregate_manifest_identities=()
+  local -A aggregate_manifest_sha256s=()
+  local -A BENCHMARK_PRESSURE_CAMPAIGN_LEAF_PATHS=()
+  local -A BENCHMARK_PRESSURE_CAMPAIGN_LEAF_ORIGINAL_PATHS=()
+  local -A BENCHMARK_PRESSURE_CAMPAIGN_LEAF_ORIGINAL_FDS=()
+  local -A BENCHMARK_PRESSURE_CAMPAIGN_LEAF_NAMES=()
+  local -A BENCHMARK_PRESSURE_CAMPAIGN_LEAF_IDENTITIES=()
+  local -A BENCHMARK_PRESSURE_CAMPAIGN_LEAF_SHA256S=()
+
+  if [[ "$aggregate_input" =~ ^/proc/self/fd/[1-9][0-9]*$ ]]; then
+    aggregate_is_exact_descriptor=true
+  elif [[ -n "$private_root_lexical" ]]; then
+    [[ "$aggregate_input" == /* && "${aggregate_input##*/}" =~ \
+      ^[A-Za-z0-9._-]+$ ]] || return 1
+    aggregate_parent="${aggregate_input%/*}"
+    [[ -n "$aggregate_parent" ]] || aggregate_parent=/
+    aggregate_leaf="${aggregate_input##*/}"
+    [[ -d "$aggregate_parent" && ! -L "$aggregate_parent" ]] || return 1
+    exec {aggregate_parent_fd}<"$aggregate_parent" || return $?
+    aggregate_parent_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+      "/proc/self/fd/$aggregate_parent_fd")" || return $?
+    aggregate_parent_lexical_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+      "$aggregate_parent")" || return $?
+    [[ "$aggregate_parent_identity" == "$aggregate_parent_lexical_identity" &&
+      "$aggregate_parent_identity" =~ \
+        ^[0-9]+:[1-9][0-9]*:$EUID:[0-7]{3,4}$ &&
+      "$aggregate_parent" -ef "/proc/self/fd/$aggregate_parent_fd" ]] || return 1
+  fi
+  benchmark_pressure_trusted_regular_path "$aggregate_input" || return $?
+  bounded_evidence_file "$aggregate_input" \
+    "$BENCHMARK_PRESSURE_AGGREGATE_MAX_BYTES" 1 || return $?
+  benchmark_pressure_trusted_regular_path "$aggregate_input" || return $?
+  exec {aggregate_fd}<"$aggregate_input" || return $?
+  aggregate_original="/proc/self/fd/$aggregate_fd"
+  aggregate_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "$aggregate_original")" ||
+    return $?
+  lexical_aggregate_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "$aggregate_input")" || return $?
+  benchmark_pressure_trusted_regular_path "$aggregate_input" || return $?
+  [[ "$aggregate_identity" =~ \
+      ^[0-9]+:[1-9][0-9]*:$EUID:(600|644):(0|1)$ &&
+    "$lexical_aggregate_identity" == "$aggregate_identity" &&
+    "$aggregate_input" -ef "$aggregate_original" ]] || return 1
+  benchmark_pressure_hold_file_snapshot \
+    "$aggregate_original" "$BENCHMARK_PRESSURE_AGGREGATE_MAX_BYTES" \
+    aggregate_snapshot_fd aggregate_source_identity aggregate_snapshot_sha256 \
+    aggregate_snapshot_size || return $?
+  aggregate="/proc/self/fd/$aggregate_snapshot_fd"
+  aggregate_sha256="$(sha256sum -- "$aggregate_original")" || return $?
+  aggregate_sha256="${aggregate_sha256%% *}"
+  benchmark_pressure_trusted_regular_path "$aggregate_input" || return $?
+  [[ "${aggregate_source_identity%:*}" == "$aggregate_identity" &&
+    "$aggregate_snapshot_sha256" == "$aggregate_sha256" &&
+    "$aggregate_snapshot_size" == "$(stat -Lc '%s' -- "$aggregate_original")" &&
+    "$aggregate_input" -ef "$aggregate_original" ]] ||
+    return 1
+  benchmark_pressure_json_has_unique_object_keys \
+    "$aggregate" "$BENCHMARK_PRESSURE_AGGREGATE_MAX_BYTES" || return $?
+  jq -e \
+    --argjson cycle_count "$BENCHMARK_PRESSURE_CYCLE_COUNT" \
+    --argjson load_seconds "$BENCHMARK_PRESSURE_LOAD_SECONDS" \
+    --argjson idle_seconds "$BENCHMARK_PRESSURE_IDLE_SECONDS" \
+    --argjson recovery_samples "$BENCHMARK_PRESSURE_RECOVERY_SAMPLES" \
+    --argjson maximum_successful_requests "$BENCHMARK_PRESSURE_MAX_SUCCESSFUL_REQUESTS" \
+    --arg histogram_encoding "$BENCHMARK_PRESSURE_HISTOGRAM_ENCODING" '
+      def integer: type == "number" and floor == .;
+      def digest: type == "string" and test("^[0-9a-f]{64}$");
+      . as $aggregate |
+      keys == ["acceptance_eligible","cycle_count","cycles","evidence_class",
+        "histograms","idle_seconds_per_cycle","load_seconds_per_cycle",
+        "recovery","schema","status"] and
+      .schema == "obi-benchmark-pressure-cycles-v2" and
+      .status == "non_acceptance" and .acceptance_eligible == false and
+      .evidence_class == "targeted_pressure_cycle_campaign" and
+      .cycle_count == $cycle_count and
+      .load_seconds_per_cycle == $load_seconds and
+      .idle_seconds_per_cycle == $idle_seconds and
+      .histograms == "linked_not_pooled" and
+      (.cycles | type == "array" and length == $cycle_count) and
+      all(range(0;$cycle_count);
+        $aggregate.cycles[.].cycle == (. + 1)) and
+      all(.cycles[];
+        keys == ["admission_receipt_sha256","barrier_receipt_sha256","cycle",
+          "histogram_encoding",
+          "idle_elapsed_centiseconds","idle_requested_seconds",
+          "load_elapsed_nanos","load_requested_seconds",
+          "private_file_count","private_manifest_bytes",
+          "private_manifest_sha256","rle_result_sha256",
+          "stack_identity_sha256","status","successful_requests",
+          "unexpected_evictions"] and
+        .status == "passed" and
+        .histogram_encoding == $histogram_encoding and
+        .load_requested_seconds == $load_seconds and
+        .idle_requested_seconds == $idle_seconds and
+        (.idle_elapsed_centiseconds | integer and
+          . >= ($idle_seconds * 100) and
+          . < (($idle_seconds + 1) * 100)) and
+        (.load_elapsed_nanos | integer and . >= ($load_seconds * 1000000000) and
+          . < (($load_seconds + 1) * 1000000000)) and
+        (.successful_requests | integer and . > 0 and
+          . <= $maximum_successful_requests) and
+        (.private_file_count | integer) and
+        .private_file_count ==
+          (if .cycle == $cycle_count then 32 else 30 end) and
+        (.private_manifest_bytes | integer and . > 0 and . <= 1048576) and
+        (.private_manifest_sha256 | digest) and
+        (.admission_receipt_sha256 | digest) and
+        (.barrier_receipt_sha256 | digest) and
+        (.rle_result_sha256 | digest) and
+        (.stack_identity_sha256 | digest) and .unexpected_evictions == 0) and
+      ([.cycles[].stack_identity_sha256] | unique | length) == 1 and
+      (.recovery | keys) == ["captured_monotonic_centiseconds","consecutive",
+        "map_entries","required_samples","sample_sha256s"] and
+      .recovery.required_samples == $recovery_samples and
+      .recovery.consecutive == true and .recovery.map_entries == [0,0] and
+      (.recovery.sample_sha256s | length == $recovery_samples and
+        all(.[]; digest)) and
+      (.recovery.captured_monotonic_centiseconds |
+        length == $recovery_samples and all(.[]; integer and . >= 0)) and
+      .recovery.captured_monotonic_centiseconds[0] <=
+        .recovery.captured_monotonic_centiseconds[1] and
+      ([paths(objects) as $path | getpath($path) | keys[]] |
+        any(. == "histogram" or . == "pooled_histogram")) == false and
+      ([.. | strings] | any(test("benchmark-pressure-cycles-raw|barrier-receipt\\.json|benchmark-result\\.json|pressure-control|/"))) == false
+  ' "$aggregate" >/dev/null || return $?
+  if [[ -z "$private_root_lexical" ]]; then
+    benchmark_pressure_trusted_regular_path "$aggregate_input" || return $?
+    observed_aggregate_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+      "$aggregate_original")" || return $?
+    observed_aggregate_sha256="$(sha256sum -- "$aggregate_original")" || return $?
+    observed_aggregate_sha256="${observed_aggregate_sha256%% *}"
+    lexical_aggregate_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+      "$aggregate_input")" || return $?
+    benchmark_pressure_trusted_regular_path "$aggregate_input" || return $?
+    [[ "$observed_aggregate_identity" == "$aggregate_identity" &&
+      "$observed_aggregate_sha256" == "$aggregate_sha256" &&
+      "$lexical_aggregate_identity" == "$aggregate_identity" &&
+      "$aggregate_input" -ef "$aggregate_original" ]]
+    return
+  fi
+  [[ -d "$private_root_lexical" && ! -L "$private_root_lexical" ]] || return 1
+  exec {private_root_fd}<"$private_root_lexical" || return $?
+  private_root="/proc/self/fd/$private_root_fd/."
+  private_root_identity="$(stat -Lc '%d:%i:%u:%a' -- "$private_root")" ||
+    return $?
+  lexical_private_root_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "$private_root_lexical")" || return $?
+  [[ "$private_root_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:700$ &&
+    "$lexical_private_root_identity" == "$private_root_identity" &&
+    "$private_root_lexical" -ef "$private_root" ]] || return 1
+  benchmark_pressure_bounded_directory_roster \
+    "$private_root" private_entries || return $?
+  ((${#private_entries} <= 256)) || return 1
+  for ((cycle = 1; cycle <= BENCHMARK_PRESSURE_CYCLE_COUNT; cycle++)); do
+    printf -v tag '%02d' "$cycle"
+    expected_private_entries+="cycle-$tag:d"$'\n'
+  done
+  expected_private_entries="${expected_private_entries%$'\n'}"
+  [[ "$private_entries" == "$expected_private_entries" ]] || return 1
+
+  # Establish one campaign-wide snapshot before validating any cycle.  Every
+  # cycle directory, manifest, and manifest-listed leaf remains open until the
+  # aggregate's terminal identity/digest/roster seal below.
+  for ((cycle = 1; cycle <= BENCHMARK_PRESSURE_CYCLE_COUNT; cycle++)); do
+    printf -v tag '%02d' "$cycle"
+    [[ -d "$private_root/cycle-$tag" &&
+      ! -L "$private_root/cycle-$tag" ]] || return 1
+    unset cycle_dir_fd
+    exec {cycle_dir_fd}<"$private_root/cycle-$tag" || return $?
+    aggregate_snapshot_fds+=("$cycle_dir_fd")
+    cycle_dir="/proc/self/fd/$cycle_dir_fd/."
+    cycle_dir_identity="$(stat -Lc '%d:%i:%u:%a' -- "$cycle_dir")" ||
+      return $?
+    [[ "$cycle_dir_identity" =~ ^[0-9]+:[1-9][0-9]*:$EUID:700$ &&
+      "$private_root/cycle-$tag" -ef "$cycle_dir" ]] || return 1
+    aggregate_cycle_dirs["$cycle"]="$cycle_dir"
+    aggregate_cycle_dir_fds["$cycle"]="$cycle_dir_fd"
+    aggregate_cycle_dir_identities["$cycle"]="$cycle_dir_identity"
+
+    cycle_manifest_path="$cycle_dir/private-manifest.json"
+    lexical_cycle_manifest_path="$private_root_lexical/cycle-$tag/private-manifest.json"
+    [[ ! -L "$cycle_manifest_path" && -f "$cycle_manifest_path" &&
+      ! -L "$lexical_cycle_manifest_path" &&
+      -f "$lexical_cycle_manifest_path" ]] || return 1
+    unset cycle_manifest_fd
+    exec {cycle_manifest_fd}<"$cycle_manifest_path" || return $?
+    aggregate_snapshot_fds+=("$cycle_manifest_fd")
+    cycle_manifest_original="/proc/self/fd/$cycle_manifest_fd"
+    cycle_manifest_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+      "$cycle_manifest_original")" || return $?
+    [[ ! -L "$cycle_manifest_path" && -f "$cycle_manifest_path" &&
+      ! -L "$lexical_cycle_manifest_path" &&
+      -f "$lexical_cycle_manifest_path" &&
+      "$cycle_manifest_identity" =~ \
+      ^[0-9]+:[1-9][0-9]*:$EUID:600:1:[1-9][0-9]*$ &&
+      "$cycle_manifest_path" -ef "$cycle_manifest_original" &&
+      "$lexical_cycle_manifest_path" -ef "$cycle_manifest_original" ]] || return 1
+    unset cycle_manifest_snapshot_fd
+    benchmark_pressure_hold_file_snapshot \
+      "$cycle_manifest_original" "$BENCHMARK_PRESSURE_MANIFEST_MAX_BYTES" \
+      cycle_manifest_snapshot_fd cycle_manifest_source_identity \
+      cycle_manifest_snapshot_sha256 cycle_manifest_snapshot_size || return $?
+    aggregate_snapshot_fds+=("$cycle_manifest_snapshot_fd")
+    manifest="/proc/self/fd/$cycle_manifest_snapshot_fd"
+    [[ "$cycle_manifest_source_identity" == "$cycle_manifest_identity" &&
+      "$cycle_manifest_snapshot_size" == "${cycle_manifest_identity##*:}" ]] ||
+      return 1
+    bounded_evidence_file "$manifest" \
+      "$BENCHMARK_PRESSURE_MANIFEST_MAX_BYTES" 1 || return $?
+    benchmark_pressure_json_has_unique_object_keys \
+      "$manifest" "$BENCHMARK_PRESSURE_MANIFEST_MAX_BYTES" || return $?
+    observed_sha256="$(sha256sum -- "$cycle_manifest_original")" || return $?
+    observed_sha256="${observed_sha256%% *}"
+    [[ ! -L "$cycle_manifest_path" && -f "$cycle_manifest_path" &&
+      ! -L "$lexical_cycle_manifest_path" &&
+      -f "$lexical_cycle_manifest_path" &&
+      "$observed_sha256" == "$cycle_manifest_snapshot_sha256" &&
+      "$cycle_manifest_path" -ef "$cycle_manifest_original" &&
+      "$lexical_cycle_manifest_path" -ef "$cycle_manifest_original" ]] ||
+      return 1
+    BENCHMARK_PRESSURE_CAMPAIGN_MANIFEST_PATHS["$cycle"]="$manifest"
+    BENCHMARK_PRESSURE_CAMPAIGN_MANIFEST_ORIGINAL_PATHS["$cycle"]="$cycle_manifest_original"
+    BENCHMARK_PRESSURE_CAMPAIGN_MANIFEST_ORIGINAL_FDS["$cycle"]="$cycle_manifest_fd"
+    BENCHMARK_PRESSURE_CAMPAIGN_MANIFEST_IDENTITIES["$cycle"]="$cycle_manifest_identity"
+    BENCHMARK_PRESSURE_CAMPAIGN_MANIFEST_SHA256S["$cycle"]="$observed_sha256"
+    aggregate_manifest_identities["$cycle"]="$cycle_manifest_identity"
+    aggregate_manifest_sha256s["$cycle"]="$observed_sha256"
+
+    expected_count="$(jq -er '.files | length' "$manifest")" || return $?
+    [[ "$expected_count" == \
+      "$((cycle == BENCHMARK_PRESSURE_CYCLE_COUNT ? 32 : 30))" ]] || return 1
+    benchmark_pressure_cycle_directory_roster_matches \
+      "$manifest" "$expected_count" "$cycle_dir" private-manifest.json || return $?
+    roster_text="$(jq -er \
+      '.files[] | [.role,.name,.sha256,.size_bytes] | @tsv' \
+      "$manifest")" || return $?
+    ((${#roster_text} <= 65536)) || return 1
+    leaf_rows=0
+    while IFS=$'\t' read -r role name expected_leaf_sha256 \
+      expected_leaf_size extra; do
+      ((leaf_rows += 1))
+      [[ -z "$extra" && "$role" =~ ^[a-z0-9_]+$ &&
+        "$name" =~ ^[a-z0-9][a-z0-9.-]*$ &&
+        "$expected_leaf_sha256" =~ ^[0-9a-f]{64}$ &&
+        "$expected_leaf_size" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+      leaf_key="$cycle:$role"
+      [[ -z "${BENCHMARK_PRESSURE_CAMPAIGN_LEAF_PATHS[$leaf_key]+present}" ]] ||
+        return 1
+      leaf_path="$cycle_dir/$name"
+      lexical_leaf_path="$private_root_lexical/cycle-$tag/$name"
+      [[ ! -L "$leaf_path" && -f "$leaf_path" &&
+        ! -L "$lexical_leaf_path" && -f "$lexical_leaf_path" ]] || return 1
+      unset leaf_fd
+      exec {leaf_fd}<"$leaf_path" || return $?
+      aggregate_snapshot_fds+=("$leaf_fd")
+      leaf_original_path="/proc/self/fd/$leaf_fd"
+      leaf_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+        "$leaf_original_path")" ||
+        return $?
+      [[ ! -L "$leaf_path" && -f "$leaf_path" &&
+        ! -L "$lexical_leaf_path" && -f "$lexical_leaf_path" &&
+        "$leaf_identity" =~ \
+          ^[0-9]+:[1-9][0-9]*:$EUID:600:1:$expected_leaf_size$ &&
+        "$leaf_path" -ef "$leaf_original_path" &&
+        "$lexical_leaf_path" -ef "$leaf_original_path" ]] || return 1
+      limits="$(benchmark_pressure_role_limits "$role")" || return $?
+      IFS=' ' read -r maximum_bytes maximum_lines extra <<<"$limits" || return $?
+      [[ -z "$extra" ]] || return 1
+      unset leaf_snapshot_fd
+      benchmark_pressure_hold_file_snapshot \
+        "$leaf_original_path" "$maximum_bytes" leaf_snapshot_fd \
+        leaf_source_identity leaf_snapshot_sha256 leaf_snapshot_size || return $?
+      aggregate_snapshot_fds+=("$leaf_snapshot_fd")
+      leaf_path="/proc/self/fd/$leaf_snapshot_fd"
+      [[ "$leaf_source_identity" == "$leaf_identity" &&
+        "$leaf_snapshot_size" == "$expected_leaf_size" ]] || return 1
+      bounded_evidence_file "$leaf_path" "$maximum_bytes" "$maximum_lines" ||
+        return $?
+      leaf_sha256="$(sha256sum -- "$leaf_original_path")" || return $?
+      leaf_sha256="${leaf_sha256%% *}"
+      [[ ! -L "$cycle_dir/$name" && -f "$cycle_dir/$name" &&
+        ! -L "$lexical_leaf_path" && -f "$lexical_leaf_path" &&
+        "$leaf_sha256" == "$expected_leaf_sha256" &&
+        "$leaf_snapshot_sha256" == "$expected_leaf_sha256" &&
+        "$cycle_dir/$name" -ef "$leaf_original_path" &&
+        "$lexical_leaf_path" -ef "$leaf_original_path" ]] || return 1
+      BENCHMARK_PRESSURE_CAMPAIGN_LEAF_PATHS["$leaf_key"]="$leaf_path"
+      BENCHMARK_PRESSURE_CAMPAIGN_LEAF_ORIGINAL_PATHS["$leaf_key"]="$leaf_original_path"
+      BENCHMARK_PRESSURE_CAMPAIGN_LEAF_ORIGINAL_FDS["$leaf_key"]="$leaf_fd"
+      BENCHMARK_PRESSURE_CAMPAIGN_LEAF_NAMES["$leaf_key"]="$name"
+      BENCHMARK_PRESSURE_CAMPAIGN_LEAF_IDENTITIES["$leaf_key"]="$leaf_identity"
+      BENCHMARK_PRESSURE_CAMPAIGN_LEAF_SHA256S["$leaf_key"]="$leaf_sha256"
+    done <<<"$roster_text"
+    ((leaf_rows == expected_count)) || return 1
+  done
+
+  for ((cycle = 1; cycle <= BENCHMARK_PRESSURE_CYCLE_COUNT; cycle++)); do
+    printf -v tag '%02d' "$cycle"
+    cycle_dir="${aggregate_cycle_dirs[$cycle]}"
+    cycle_dir_identity="${aggregate_cycle_dir_identities[$cycle]}"
+    cycle_manifest_path="$cycle_dir/private-manifest.json"
+    lexical_cycle_manifest_path="$private_root_lexical/cycle-$tag/private-manifest.json"
+    manifest="${BENCHMARK_PRESSURE_CAMPAIGN_MANIFEST_PATHS[$cycle]}"
+    cycle_manifest_identity="${aggregate_manifest_identities[$cycle]}"
+    [[ ! -L "$cycle_manifest_path" && -f "$cycle_manifest_path" &&
+      ! -L "$lexical_cycle_manifest_path" &&
+      -f "$lexical_cycle_manifest_path" ]] || return 1
+    validate_benchmark_pressure_private_manifest \
+      "$manifest" "$cycle" "$private_root" "$cycle_dir" || return $?
+    expected_sha256="$(jq -er --argjson cycle "$cycle" \
+      '.cycles[] | select(.cycle == $cycle) | .private_manifest_sha256' \
+      "$aggregate")" || return $?
+    expected_size="$(jq -er --argjson cycle "$cycle" \
+      '.cycles[] | select(.cycle == $cycle) | .private_manifest_bytes' \
+      "$aggregate")" || return $?
+    expected_count="$(jq -er --argjson cycle "$cycle" \
+      '.cycles[] | select(.cycle == $cycle) | .private_file_count' \
+      "$aggregate")" || return $?
+    observed_sha256="$(sha256sum -- "$manifest")" || return $?
+    observed_sha256="${observed_sha256%% *}"
+    observed_size="$(stat -Lc '%s' -- "$manifest")" || return $?
+    observed_count="$(jq -er '.files | length' "$manifest")" || return $?
+    [[ "$observed_sha256" == "$expected_sha256" &&
+      "$observed_size" == "$expected_size" &&
+      "$observed_count" == "$expected_count" ]] || return 1
+    expected_barrier_sha256="$(jq -er '.files[] | select(.role == "barrier") | .sha256' \
+      "$manifest")" || return $?
+    expected_admission_sha256="$(jq -er \
+      '.files[] | select(.role == "admission") | .sha256' \
+      "$manifest")" || return $?
+    expected_result_sha256="$(jq -er '.files[] | select(.role == "benchmark") | .sha256' \
+      "$manifest")" || return $?
+    jq -e --argjson cycle "$cycle" \
+      --arg barrier "$expected_barrier_sha256" \
+      --arg admission "$expected_admission_sha256" \
+      --arg result "$expected_result_sha256" \
+      --slurpfile manifest "$manifest" '
+        .cycles[] | select(.cycle == $cycle) |
+        ($manifest | length) == 1 and
+        .status == $manifest[0].status and
+        .load_requested_seconds == $manifest[0].requested.load_seconds and
+        .idle_requested_seconds == $manifest[0].requested.idle_seconds and
+        .load_elapsed_nanos == $manifest[0].load.traffic_elapsed_nanos and
+        .idle_elapsed_centiseconds ==
+          $manifest[0].timing.idle_elapsed_centiseconds and
+        .successful_requests == $manifest[0].load.successful_requests and
+        .histogram_encoding == $manifest[0].load.histogram_encoding and
+        .stack_identity_sha256 ==
+          $manifest[0].identity.stack_identity_sha256 and
+        .admission_receipt_sha256 == $admission and
+        .unexpected_evictions == 0 and
+        .barrier_receipt_sha256 == $barrier and .rle_result_sha256 == $result
+      ' "$aggregate" >/dev/null || return $?
+    marker_prefix="$(jq -er '.marker.prefix' "$manifest")" || return $?
+    [[ "$marker_prefix" =~ ^pressure-[0-9a-f]{32}-cycle-$tag$ &&
+      "$marker_prefixes" != *$'\n'"$marker_prefix"$'\n'* ]] || return 1
+    marker_prefixes+="$marker_prefix"$'\n'
+    receiver_instance_id="$(jq -er \
+      '.trace.receiver_instance_id' \
+      "${BENCHMARK_PRESSURE_CAMPAIGN_LEAF_PATHS["$cycle:admission"]}")" ||
+      return $?
+    reset_generation="$(jq -er \
+      '.trace.reset_generation' \
+      "${BENCHMARK_PRESSURE_CAMPAIGN_LEAF_PATHS["$cycle:admission"]}")" ||
+      return $?
+    if [[ -z "$baseline_receiver_instance_id" ]]; then
+      baseline_receiver_instance_id="$receiver_instance_id"
+    else
+      [[ "$receiver_instance_id" == "$baseline_receiver_instance_id" &&
+        "$reset_generation" == "$((previous_reset_generation + 1))" ]] || return 1
+    fi
+    previous_reset_generation="$reset_generation"
+    observed_private_identity="$(jq -cS '.identity' "$manifest")" || return $?
+    observed_map_id="$(jq -er '.map.map_id' "$manifest")" || return $?
+    if [[ -z "$baseline_private_identity" ]]; then
+      baseline_private_identity="$observed_private_identity"
+      baseline_map_id="$observed_map_id"
+    else
+      [[ "$observed_private_identity" == "$baseline_private_identity" &&
+        "$observed_map_id" == "$baseline_map_id" ]] || return 1
+    fi
+    if ((cycle == BENCHMARK_PRESSURE_CYCLE_COUNT)); then
+      final_recovery="$(jq -cS '.recovery' "$manifest")" || return $?
+    fi
+    observed_cycle_dir_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+      "$cycle_dir")" || return $?
+    cycle_manifest_original="${BENCHMARK_PRESSURE_CAMPAIGN_MANIFEST_ORIGINAL_PATHS[$cycle]}"
+    observed_cycle_manifest_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+      "$cycle_manifest_original")" || return $?
+    observed_sha256="$(sha256sum -- "$cycle_manifest_original")" || return $?
+    observed_sha256="${observed_sha256%% *}"
+    observed_snapshot_sha256="$(sha256sum -- "$manifest")" || return $?
+    observed_snapshot_sha256="${observed_snapshot_sha256%% *}"
+    [[ ! -L "$cycle_manifest_path" && -f "$cycle_manifest_path" &&
+      ! -L "$lexical_cycle_manifest_path" &&
+      -f "$lexical_cycle_manifest_path" &&
+      "$observed_cycle_dir_identity" == "$cycle_dir_identity" &&
+      "$private_root/cycle-$tag" -ef "$cycle_dir" &&
+      "$observed_cycle_manifest_identity" == "$cycle_manifest_identity" &&
+      "$observed_sha256" == "${aggregate_manifest_sha256s[$cycle]}" &&
+      "$observed_snapshot_sha256" == \
+        "${aggregate_manifest_sha256s[$cycle]}" &&
+      "$cycle_manifest_path" -ef "$cycle_manifest_original" &&
+      "$lexical_cycle_manifest_path" -ef "$cycle_manifest_original" ]] ||
+      return 1
+  done
+  [[ -n "$final_recovery" ]] || return 1
+  jq -e --argjson recovery "$final_recovery" \
+    '.recovery == $recovery' "$aggregate" >/dev/null || return $?
+  for ((cycle = 1; cycle <= BENCHMARK_PRESSURE_CYCLE_COUNT; cycle++)); do
+    printf -v tag '%02d' "$cycle"
+    cycle_dir="${aggregate_cycle_dirs[$cycle]}"
+    manifest="${BENCHMARK_PRESSURE_CAMPAIGN_MANIFEST_PATHS[$cycle]}"
+    cycle_manifest_original="${BENCHMARK_PRESSURE_CAMPAIGN_MANIFEST_ORIGINAL_PATHS[$cycle]}"
+    cycle_manifest_path="$cycle_dir/private-manifest.json"
+    lexical_cycle_manifest_path="$private_root_lexical/cycle-$tag/private-manifest.json"
+    [[ ! -L "$cycle_manifest_path" && -f "$cycle_manifest_path" &&
+      ! -L "$lexical_cycle_manifest_path" &&
+      -f "$lexical_cycle_manifest_path" ]] || return 1
+    observed_cycle_dir_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+      "$cycle_dir")" || return $?
+    observed_cycle_manifest_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+      "$cycle_manifest_original")" || return $?
+    observed_sha256="$(sha256sum -- "$cycle_manifest_original")" || return $?
+    observed_sha256="${observed_sha256%% *}"
+    observed_snapshot_sha256="$(sha256sum -- "$manifest")" || return $?
+    observed_snapshot_sha256="${observed_snapshot_sha256%% *}"
+    [[ ! -L "$cycle_manifest_path" && -f "$cycle_manifest_path" &&
+      ! -L "$lexical_cycle_manifest_path" &&
+      -f "$lexical_cycle_manifest_path" &&
+      "$observed_cycle_dir_identity" == \
+        "${aggregate_cycle_dir_identities[$cycle]}" &&
+      "$private_root/cycle-$tag" -ef "$cycle_dir" &&
+      "$observed_cycle_manifest_identity" == \
+        "${aggregate_manifest_identities[$cycle]}" &&
+      "$observed_sha256" == "${aggregate_manifest_sha256s[$cycle]}" &&
+      "$observed_snapshot_sha256" == \
+        "${aggregate_manifest_sha256s[$cycle]}" &&
+      "$cycle_manifest_path" -ef "$cycle_manifest_original" &&
+      "$lexical_cycle_manifest_path" -ef "$cycle_manifest_original" ]] ||
+      return 1
+    expected_count="$(jq -er '.files | length' "$manifest")" || return $?
+    benchmark_pressure_cycle_directory_roster_matches \
+      "$manifest" "$expected_count" "$cycle_dir" private-manifest.json || return $?
+    observed_cycle_manifest_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+      "$cycle_manifest_original")" || return $?
+    observed_sha256="$(sha256sum -- "$cycle_manifest_original")" || return $?
+    observed_sha256="${observed_sha256%% *}"
+    [[ ! -L "$cycle_manifest_path" && -f "$cycle_manifest_path" &&
+      ! -L "$lexical_cycle_manifest_path" &&
+      -f "$lexical_cycle_manifest_path" &&
+      "$observed_cycle_manifest_identity" == \
+        "${aggregate_manifest_identities[$cycle]}" &&
+      "$observed_sha256" == "${aggregate_manifest_sha256s[$cycle]}" &&
+      "$cycle_manifest_path" -ef "$cycle_manifest_original" &&
+      "$lexical_cycle_manifest_path" -ef "$cycle_manifest_original" ]] ||
+      return 1
+  done
+  for leaf_key in "${!BENCHMARK_PRESSURE_CAMPAIGN_LEAF_PATHS[@]}"; do
+    cycle="${leaf_key%%:*}"
+    printf -v tag '%02d' "$cycle"
+    leaf_path="${BENCHMARK_PRESSURE_CAMPAIGN_LEAF_PATHS[$leaf_key]}"
+    leaf_original_path="${BENCHMARK_PRESSURE_CAMPAIGN_LEAF_ORIGINAL_PATHS[$leaf_key]}"
+    cycle_dir="${aggregate_cycle_dirs[$cycle]}"
+    name="${BENCHMARK_PRESSURE_CAMPAIGN_LEAF_NAMES[$leaf_key]}"
+    lexical_leaf_path="$private_root_lexical/cycle-$tag/$name"
+    [[ ! -L "$cycle_dir/$name" && -f "$cycle_dir/$name" &&
+      ! -L "$lexical_leaf_path" && -f "$lexical_leaf_path" ]] || return 1
+    leaf_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+      "$leaf_original_path")" ||
+      return $?
+    leaf_sha256="$(sha256sum -- "$leaf_original_path")" || return $?
+    leaf_sha256="${leaf_sha256%% *}"
+    observed_snapshot_sha256="$(sha256sum -- "$leaf_path")" || return $?
+    observed_snapshot_sha256="${observed_snapshot_sha256%% *}"
+    [[ ! -L "$cycle_dir/$name" && -f "$cycle_dir/$name" &&
+      ! -L "$lexical_leaf_path" && -f "$lexical_leaf_path" &&
+      "$leaf_identity" == \
+        "${BENCHMARK_PRESSURE_CAMPAIGN_LEAF_IDENTITIES[$leaf_key]}" &&
+      "$leaf_sha256" == \
+        "${BENCHMARK_PRESSURE_CAMPAIGN_LEAF_SHA256S[$leaf_key]}" &&
+      "$observed_snapshot_sha256" == \
+        "${BENCHMARK_PRESSURE_CAMPAIGN_LEAF_SHA256S[$leaf_key]}" &&
+      "$cycle_dir/$name" -ef "$leaf_original_path" &&
+      "$lexical_leaf_path" -ef "$leaf_original_path" ]] || return 1
+  done
+  benchmark_pressure_bounded_directory_roster \
+    "$private_root" observed_private_entries || return $?
+  observed_private_root_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "$private_root")" || return $?
+  lexical_private_root_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "$private_root_lexical")" || return $?
+  observed_aggregate_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "$aggregate_original")" || return $?
+  observed_aggregate_sha256="$(sha256sum -- "$aggregate_original")" || return $?
+  observed_aggregate_sha256="${observed_aggregate_sha256%% *}"
+  aggregate_snapshot_terminal_sha256="$(sha256sum -- "$aggregate")" || return $?
+  aggregate_snapshot_terminal_sha256="${aggregate_snapshot_terminal_sha256%% *}"
+  lexical_aggregate_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- \
+    "$aggregate_input")" || return $?
+  benchmark_pressure_trusted_regular_path "$aggregate_input" || return $?
+  [[ "$observed_private_entries" == "$expected_private_entries" &&
+    "$observed_private_root_identity" == "$private_root_identity" &&
+    "$lexical_private_root_identity" == "$private_root_identity" &&
+    "$private_root_lexical" -ef "$private_root" &&
+    "$observed_aggregate_identity" == "$aggregate_identity" &&
+    "$observed_aggregate_sha256" == "$aggregate_sha256" &&
+    "$aggregate_snapshot_terminal_sha256" == "$aggregate_sha256" &&
+    "$lexical_aggregate_identity" == "$aggregate_identity" &&
+    "$aggregate_input" -ef "$aggregate_original" ]] || return 1
+
+  # One broker pass is the campaign-wide linearization point.  The root and
+  # every cycle roster are exact; every public leaf is opened relative to its
+  # retained directory with O_NOFOLLOW and bound to the original held inode.
+  # A descriptor-only aggregate is admitted only as the exact retained regular
+  # image supplied by the publication validator.
+  printf -v coherent_specification '%sP\t0\t%s\t%s\t%s\texact\n' \
+    "$coherent_specification" "$private_root_fd" "$private_root_lexical" \
+    "$private_root_identity"
+  for ((cycle = 1; cycle <= BENCHMARK_PRESSURE_CYCLE_COUNT; cycle++)); do
+    printf -v tag '%02d' "$cycle"
+    printf -v coherent_specification '%sD\t0\tcycle-%s\t%s\t%s\n' \
+      "$coherent_specification" "$tag" \
+      "${aggregate_cycle_dir_fds[$cycle]}" \
+      "${aggregate_cycle_dir_identities[$cycle]}"
+    printf -v coherent_specification '%sP\t%s\t%s\t%s\t%s\texact\n' \
+      "$coherent_specification" "$cycle" \
+      "${aggregate_cycle_dir_fds[$cycle]}" \
+      "$private_root_lexical/cycle-$tag" \
+      "${aggregate_cycle_dir_identities[$cycle]}"
+    printf -v coherent_specification '%sF\t%s\t%s\t%s\t%s\t%s\n' \
+      "$coherent_specification" "$cycle" private-manifest.json \
+      "${BENCHMARK_PRESSURE_CAMPAIGN_MANIFEST_ORIGINAL_FDS[$cycle]}" \
+      "${BENCHMARK_PRESSURE_CAMPAIGN_MANIFEST_IDENTITIES[$cycle]}" \
+      "${BENCHMARK_PRESSURE_CAMPAIGN_MANIFEST_SHA256S[$cycle]}"
+  done
+  for leaf_key in "${!BENCHMARK_PRESSURE_CAMPAIGN_LEAF_PATHS[@]}"; do
+    cycle="${leaf_key%%:*}"
+    printf -v coherent_specification '%sF\t%s\t%s\t%s\t%s\t%s\n' \
+      "$coherent_specification" "$cycle" \
+      "${BENCHMARK_PRESSURE_CAMPAIGN_LEAF_NAMES[$leaf_key]}" \
+      "${BENCHMARK_PRESSURE_CAMPAIGN_LEAF_ORIGINAL_FDS[$leaf_key]}" \
+      "${BENCHMARK_PRESSURE_CAMPAIGN_LEAF_IDENTITIES[$leaf_key]}" \
+      "${BENCHMARK_PRESSURE_CAMPAIGN_LEAF_SHA256S[$leaf_key]}"
+  done
+  if [[ "$aggregate_is_exact_descriptor" == true ]]; then
+    printf -v coherent_specification '%sX\t%s\t%s\t%s\n' \
+      "$coherent_specification" "$aggregate_fd" "$aggregate_source_identity" \
+      "$aggregate_sha256"
+  else
+    printf -v coherent_specification '%sP\t11\t%s\t%s\t%s\trelevant\n' \
+      "$coherent_specification" "$aggregate_parent_fd" "$aggregate_parent" \
+      "$aggregate_parent_identity"
+    printf -v coherent_specification '%sF\t11\t%s\t%s\t%s\t%s\n' \
+      "$coherent_specification" "$aggregate_leaf" "$aggregate_fd" \
+      "$aggregate_source_identity" "$aggregate_sha256"
+  fi
+  benchmark_pressure_coherent_file_set verify "$coherent_specification"
+)
+
+publish_benchmark_pressure_aggregate() {
+  local -r cycles_json="$1"
+  local -r recovery_json="$2"
+  local -r private_root="$3"
+  local target="$RESULT_DIR/benchmark-pressure-cycles.json"
+  local candidate=""
+
+  [[ ! -e "$target" && ! -L "$target" ]] || return 1
+  candidate="$(mktemp "$RESULT_DIR/.benchmark-pressure-cycles.XXXXXX")" || return $?
+  jq -cS -n \
+    --argjson cycle_count "$BENCHMARK_PRESSURE_CYCLE_COUNT" \
+    --argjson load_seconds "$BENCHMARK_PRESSURE_LOAD_SECONDS" \
+    --argjson idle_seconds "$BENCHMARK_PRESSURE_IDLE_SECONDS" \
+    --argjson cycles "$cycles_json" \
+    --argjson recovery "$recovery_json" '
+      {schema:"obi-benchmark-pressure-cycles-v2",status:"non_acceptance",
+       acceptance_eligible:false,evidence_class:"targeted_pressure_cycle_campaign",
+       cycle_count:$cycle_count,load_seconds_per_cycle:$load_seconds,
+       idle_seconds_per_cycle:$idle_seconds,histograms:"linked_not_pooled",
+       cycles:$cycles,recovery:$recovery}
+    ' >"$candidate" || return $?
+  chmod 0644 -- "$candidate" || return $?
+  benchmark_pressure_publish_validated_file \
+    "$candidate" "$target" 644 \
+    validate_benchmark_pressure_aggregate "$private_root"
+}
+
+run_benchmark_pressure_cycles() {
+  local private_root="$RESULT_DIR/benchmark-pressure-cycles-raw"
+  local aggregate_cycles='[]'
+  local aggregate_recovery='null'
+  local baseline_stack=""
+  local current_stack=""
+  local cycle_dir=""
+  local label=""
+  local tag=""
+  local candidate=""
+  local cycle_deadline=0
+  local cleanup_deadline=0
+  local cycle=0
+  local prepare_tick=""
+  local capacity_tick=""
+  local load_start_tick=""
+  local load_finish_tick=""
+  local release_tick=""
+  local verify_tick=""
+  local cleanup_tick=""
+  local idle_start_tick=""
+  local idle_finish_tick=""
+  local baseline_resource_tick=""
+  local postload_resource_tick=""
+  local attribution_tick=""
+  local postidle_resource_tick=""
+  local idle_elapsed_centiseconds=""
+  local phases='[]'
+  local phase=""
+  local phase_name=""
+  local phase_tick=""
+  local digest=""
+  local fill_digest=""
+  local benchmark_digest=""
+  local verify_digest=""
+  local cleanup_digest=""
+  local idle_before_digest=""
+  local idle_after_digest=""
+  local baseline_resource_digest=""
+  local postload_resource_digest=""
+  local admission_digest=""
+  local postidle_resource_digest=""
+  local stack_digest=""
+  local ready_digest=""
+  local release_digest=""
+  local committed_result=""
+  local committed_stderr=""
+  local committed_receipt=""
+  local manifest_digest=""
+  local manifest_size=""
+  local manifest_count=""
+  local barrier_digest=""
+  local result_digest=""
+  local successful_requests=""
+  local traffic_elapsed_nanos=""
+  local recovery_one_digest=""
+  local recovery_two_digest=""
+  local recovery_one_tick=""
+  local recovery_two_tick=""
+  local public_cycle=""
+  local observed_cycle_count=""
+  local source=""
+  local target=""
+  local -a copy_sources=()
+  local -a copy_targets=()
+  local copy_index=0
+
+  [[ "$SCENARIO" == benchmark-pressure-cycles && "$TRANSPORT" == getsockopt &&
+    "$SELECTED_TRANSPORT" == getsockopt && "$OBI_RUNNING" == true &&
+    "$BRIDGE_RUNNING" == true && "$BENCHMARK_PRESSURE_CYCLE_COUNT" == 10 &&
+    "$BENCHMARK_PRESSURE_LOAD_SECONDS" == 60 &&
+    "$BENCHMARK_PRESSURE_IDLE_SECONDS" == 30 &&
+    "$BENCHMARK_PRESSURE_RECOVERY_SAMPLES" == 2 &&
+    ! -e "$private_root" && ! -L "$private_root" ]] || return 1
+  if ! benchmark_pressure_broker_executables_are_authenticated \
+    >/dev/null; then
+    log_error "benchmark pressure evidence brokers require authenticated system executables"
+    return 1
+  fi
+  (umask 077; mkdir -m 0700 -- "$private_root") || return $?
+  [[ "$(stat -Lc '%u:%a' -- "$private_root")" == "$EUID:700" ]] ||
+    return 1
+  baseline_stack="$(benchmark_pressure_stack_identity_json)" || return $?
+
+  for ((cycle = 1; cycle <= BENCHMARK_PRESSURE_CYCLE_COUNT; cycle++)); do
+    printf -v tag '%02d' "$cycle"
+    label="pressure-run-$tag"
+    cycle_dir="$private_root/cycle-$tag"
+    [[ ! -e "$cycle_dir" && ! -L "$cycle_dir" ]] || return 1
+    (umask 077; mkdir -m 0700 -- "$cycle_dir") || return $?
+    [[ "$(stat -Lc '%u:%a' -- "$cycle_dir")" == "$EUID:700" ]] ||
+      return 1
+    RUN_STAGE="benchmark-pressure-cycle-$tag-identity"
+    current_stack="$(benchmark_pressure_stack_identity_json)" || return $?
+    [[ "$current_stack" == "$baseline_stack" ]] || {
+      log_error "benchmark pressure stack identity drifted before cycle $tag"
+      return 1
+    }
+    candidate="$(mktemp "$cycle_dir/.stack-identity.XXXXXX")" || return $?
+    printf '%s\n' "$current_stack" >"$candidate" || return $?
+    chmod 0600 -- "$candidate" || return $?
+    benchmark_pressure_publish_validated_file \
+      "$candidate" "$cycle_dir/stack-identity.json" 600 \
+      validate_benchmark_pressure_stack_identity_file || return $?
+    stack_digest="$(sha256sum -- "$cycle_dir/stack-identity.json")" || return $?
+    stack_digest="${stack_digest%% *}"
+
+    RUN_STAGE="benchmark-pressure-cycle-$tag-baseline"
+    fetch_obi_metrics "$cycle_dir/map-baseline.prom" 5 || return $?
+    chmod 0600 -- "$cycle_dir/map-baseline.prom" || return $?
+    capture_benchmark_pressure_resources \
+      "$cycle_dir/stack-identity.json" \
+      "$cycle_dir/resources-baseline.json" || return $?
+    baseline_resource_tick="$(jq -er \
+      '.captured_monotonic_centiseconds' \
+      "$cycle_dir/resources-baseline.json")" || return $?
+    [[ "$baseline_resource_tick" =~ ^[0-9]+$ ]] || return 1
+    prepare_tick="$(benchmark_pressure_monotonic_centiseconds)" || return $?
+    cycle_deadline="$((SECONDS + BENCHMARK_PRESSURE_CONTROL_DEADLINE_SECONDS))"
+    prepare_pressure_control_runtime \
+      "$cycle_deadline" "$((SECONDS + PRESSURE_CONTROL_READY_TIMEOUT_SECONDS))" ||
+      return $?
+    start_map_pressure "$label" "$cycle_dir/map-baseline.prom" || return $?
+    publish_benchmark_pressure_control_file \
+      "$PRESSURE_CONTROL_READY_FILE" \
+      "$RESULT_DIR/map-pressure-$label-fill.json" || return $?
+    capacity_tick="$(benchmark_pressure_monotonic_centiseconds)" || return $?
+    ready_digest="$(sha256_file \
+      "$PRESSURE_CONTROL_LIVE_DIR/$PRESSURE_CONTROL_READY_FILE" \
+      "$PRESSURE_CONTROL_DEADLINE")" || return $?
+    prepare_benchmark_pressure_attribution "$cycle" "$cycle_dir" || return $?
+
+    RUN_STAGE="benchmark-pressure-cycle-$tag-load"
+    load_start_tick="$(benchmark_pressure_monotonic_centiseconds)" || return $?
+    run_benchmark_pressure_client "$cycle" "$cycle_dir" || return $?
+    load_finish_tick="$(benchmark_pressure_monotonic_centiseconds)" || return $?
+    publish_benchmark_pressure_control_file \
+      "$PRESSURE_CONTROL_RELEASE_FILE" "$cycle_dir/benchmark-result.json" \
+      "$cycle" ||
+      return $?
+    release_tick="$(benchmark_pressure_monotonic_centiseconds)" || return $?
+    release_digest="$(sha256_file \
+      "$PRESSURE_CONTROL_LIVE_DIR/$PRESSURE_CONTROL_RELEASE_FILE" \
+      "$PRESSURE_CONTROL_DEADLINE")" || return $?
+    verify_map_pressure_after_traffic "$label" || return $?
+    verify_tick="$(benchmark_pressure_monotonic_centiseconds)" || return $?
+    copy_sources=(
+      "$RESULT_DIR/map-pressure-$label-prepare.json"
+      "$RESULT_DIR/map-pressure-$label-fill.json"
+      "$RESULT_DIR/map-pressure-$label-verify.json"
+    )
+    copy_targets=(
+      "$cycle_dir/map-prepare.json"
+      "$cycle_dir/map-fill.json"
+      "$cycle_dir/map-verify.json"
+    )
+    for ((copy_index = 0; copy_index < ${#copy_sources[@]}; copy_index++)); do
+      benchmark_pressure_copy_private_evidence \
+        "${copy_sources[$copy_index]}" "${copy_targets[$copy_index]}" || return $?
+    done
+    write_benchmark_pressure_barrier_receipt "$cycle" "$cycle_dir" || return $?
+    current_stack="$(benchmark_pressure_stack_identity_json)" || return $?
+    [[ "$current_stack" == "$baseline_stack" ]] || {
+      log_error "benchmark pressure stack identity drifted after load $tag"
+      return 1
+    }
+    capture_benchmark_pressure_resources \
+      "$cycle_dir/stack-identity.json" \
+      "$cycle_dir/resources-postload.json" || return $?
+    postload_resource_tick="$(jq -er \
+      '.captured_monotonic_centiseconds' \
+      "$cycle_dir/resources-postload.json")" || return $?
+    [[ "$postload_resource_tick" =~ ^[0-9]+$ ]] || return 1
+    finish_benchmark_pressure_attribution "$cycle" "$cycle_dir" "$label" ||
+      return $?
+    attribution_tick="$(benchmark_pressure_monotonic_centiseconds)" || return $?
+    admission_digest="$(sha256sum -- "$cycle_dir/admission-receipt.json")" ||
+      return $?
+    admission_digest="${admission_digest%% *}"
+
+    RUN_STAGE="benchmark-pressure-cycle-$tag-cleanup"
+    cleanup_deadline="$((SECONDS + PRESSURE_RUNTIME_CLEANUP_DEADLINE_SECONDS))"
+    cleanup_pressure_scenario_runtime_with_retries "$cleanup_deadline" || return $?
+    [[ "$PRESSURE_BARRIER_RUNTIME_STATUS" == failed &&
+      "$PRESSURE_ACTIVE" == true && -z "$PRESSURE_CONTROL_LIVE_DIR" ]] ||
+      return 1
+    cleanup_map_pressure_with_retries || return $?
+    [[ "$PRESSURE_ACTIVE" == false &&
+      "$PRESSURE_BARRIER_RUNTIME_STATUS" == not-run ]] || return 1
+    cleanup_tick="$(benchmark_pressure_monotonic_centiseconds)" || return $?
+
+    copy_sources=(
+      "$RESULT_DIR/map-pressure-$label-cleanup.json"
+      "$RESULT_DIR/map-pressure-$label-recovered.prom"
+    )
+    copy_targets=(
+      "$cycle_dir/map-cleanup.json"
+      "$cycle_dir/map-recovered.prom"
+    )
+    for ((copy_index = 0; copy_index < ${#copy_sources[@]}; copy_index++)); do
+      benchmark_pressure_copy_private_evidence \
+        "${copy_sources[$copy_index]}" "${copy_targets[$copy_index]}" || return $?
+    done
+
+    RUN_STAGE="benchmark-pressure-cycle-$tag-idle"
+    fetch_obi_metrics "$cycle_dir/idle-before.prom" 5 || return $?
+    chmod 0600 -- "$cycle_dir/idle-before.prom" || return $?
+    pressure_map_state_snapshot_matches recovered \
+      "$cycle_dir/idle-before.prom" "$((SECONDS + 10))" || return $?
+    idle_start_tick="$(benchmark_pressure_monotonic_centiseconds)" || return $?
+    sleep "$BENCHMARK_PRESSURE_IDLE_SECONDS" || return $?
+    idle_finish_tick="$(benchmark_pressure_monotonic_centiseconds)" || return $?
+    idle_elapsed_centiseconds="$((idle_finish_tick - idle_start_tick))"
+    ((idle_elapsed_centiseconds >= BENCHMARK_PRESSURE_IDLE_SECONDS * 100 &&
+      idle_elapsed_centiseconds < (BENCHMARK_PRESSURE_IDLE_SECONDS + 1) * 100)) ||
+      return 1
+    fetch_obi_metrics "$cycle_dir/idle-after.prom" 5 || return $?
+    chmod 0600 -- "$cycle_dir/idle-after.prom" || return $?
+    pressure_map_state_snapshot_matches recovered \
+      "$cycle_dir/idle-after.prom" "$((SECONDS + 10))" || return $?
+    if ((cycle == BENCHMARK_PRESSURE_CYCLE_COUNT)); then
+      # No application traffic or resource probe may occur between these two
+      # final post-idle samples; each independently resolves the same map ID.
+      fetch_obi_metrics "$cycle_dir/recovery-01.prom" 5 || return $?
+      chmod 0600 -- "$cycle_dir/recovery-01.prom" || return $?
+      pressure_map_state_snapshot_matches recovered \
+        "$cycle_dir/recovery-01.prom" "$((SECONDS + 10))" || return $?
+      recovery_one_tick="$(benchmark_pressure_monotonic_centiseconds)" || return $?
+      fetch_obi_metrics "$cycle_dir/recovery-02.prom" 5 || return $?
+      chmod 0600 -- "$cycle_dir/recovery-02.prom" || return $?
+      pressure_map_state_snapshot_matches recovered \
+        "$cycle_dir/recovery-02.prom" "$((SECONDS + 10))" || return $?
+      recovery_two_tick="$(benchmark_pressure_monotonic_centiseconds)" || return $?
+      [[ "$recovery_one_tick" =~ ^[0-9]+$ &&
+        "$recovery_two_tick" =~ ^[0-9]+$ &&
+        "$recovery_one_tick" -le "$recovery_two_tick" ]] || return 1
+    fi
+
+    RUN_STAGE="benchmark-pressure-cycle-$tag-capture"
+    current_stack="$(benchmark_pressure_stack_identity_json)" || return $?
+    [[ "$current_stack" == "$baseline_stack" ]] || {
+      log_error "benchmark pressure stack identity drifted during cycle $tag"
+      return 1
+    }
+    capture_benchmark_pressure_resources \
+      "$cycle_dir/stack-identity.json" \
+      "$cycle_dir/resources-postidle.json" || return $?
+    postidle_resource_tick="$(jq -er \
+      '.captured_monotonic_centiseconds' \
+      "$cycle_dir/resources-postidle.json")" || return $?
+    [[ "$postidle_resource_tick" =~ ^[0-9]+$ ]] || return 1
+
+    fill_digest="$(sha256sum -- "$cycle_dir/map-fill.json")" || return $?
+    fill_digest="${fill_digest%% *}"
+    benchmark_pressure_client_bundle_images_for_consumer \
+      "$cycle_dir/benchmark-result.json" "$cycle" committed_result \
+      committed_stderr committed_receipt || return $?
+    benchmark_digest="$(sha256sum -- "$committed_result")" || return $?
+    benchmark_digest="${benchmark_digest%% *}"
+    verify_digest="$(sha256sum -- "$cycle_dir/map-verify.json")" || return $?
+    verify_digest="${verify_digest%% *}"
+    cleanup_digest="$(sha256sum -- "$cycle_dir/map-cleanup.json")" || return $?
+    cleanup_digest="${cleanup_digest%% *}"
+    idle_before_digest="$(sha256sum -- "$cycle_dir/idle-before.prom")" || return $?
+    idle_before_digest="${idle_before_digest%% *}"
+    idle_after_digest="$(sha256sum -- "$cycle_dir/idle-after.prom")" || return $?
+    idle_after_digest="${idle_after_digest%% *}"
+    baseline_resource_digest="$(sha256sum -- \
+      "$cycle_dir/resources-baseline.json")" || return $?
+    baseline_resource_digest="${baseline_resource_digest%% *}"
+    postload_resource_digest="$(sha256sum -- \
+      "$cycle_dir/resources-postload.json")" || return $?
+    postload_resource_digest="${postload_resource_digest%% *}"
+    postidle_resource_digest="$(sha256sum -- \
+      "$cycle_dir/resources-postidle.json")" || return $?
+    postidle_resource_digest="${postidle_resource_digest%% *}"
+
+    phases='[]'
+    for source in \
+      "baseline_resources_captured|$baseline_resource_tick|$baseline_resource_digest" \
+      "prepare_started|$prepare_tick|$stack_digest" \
+      "capacity_ready|$capacity_tick|$fill_digest" \
+      "load_started|$load_start_tick|$ready_digest" \
+      "load_finished|$load_finish_tick|$benchmark_digest" \
+      "release_published|$release_tick|$release_digest" \
+      "content_verified|$verify_tick|$verify_digest" \
+      "postload_resources_captured|$postload_resource_tick|$postload_resource_digest" \
+      "attribution_reconciled|$attribution_tick|$admission_digest" \
+      "cleanup_absent|$cleanup_tick|$cleanup_digest" \
+      "idle_started|$idle_start_tick|$idle_before_digest" \
+      "idle_finished|$idle_finish_tick|$idle_after_digest" \
+      "postidle_resources_captured|$postidle_resource_tick|$postidle_resource_digest"; do
+      IFS='|' read -r phase_name phase_tick digest <<<"$source"
+      [[ "$phase_name" =~ ^[a-z_]+$ && "$phase_tick" =~ ^[0-9]+$ &&
+        "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+      phase="$(jq -cS -n --arg name "$phase_name" \
+        --argjson monotonic_centiseconds "$phase_tick" \
+        --arg evidence_sha256 "$digest" \
+        '{name:$name,monotonic_centiseconds:$monotonic_centiseconds,
+          evidence_sha256:$evidence_sha256}')" || return $?
+      phases="$(jq -cS --argjson phase "$phase" '. + [$phase]' <<<"$phases")" ||
+        return $?
+    done
+    write_benchmark_pressure_private_manifest \
+      "$cycle" "$cycle_dir" "$phases" "$idle_elapsed_centiseconds" \
+      "$recovery_one_tick" "$recovery_two_tick" || return $?
+
+    manifest_digest="$(sha256sum -- "$cycle_dir/private-manifest.json")" || return $?
+    manifest_digest="${manifest_digest%% *}"
+    manifest_size="$(stat -Lc '%s' -- "$cycle_dir/private-manifest.json")" || return $?
+    manifest_count="$(jq -er '.files | length' \
+      "$cycle_dir/private-manifest.json")" || return $?
+    barrier_digest="$(jq -er '.files[] | select(.role == "barrier") | .sha256' \
+      "$cycle_dir/private-manifest.json")" || return $?
+    result_digest="$(jq -er '.files[] | select(.role == "benchmark") | .sha256' \
+      "$cycle_dir/private-manifest.json")" || return $?
+    successful_requests="$(jq -er '.load.successful_requests' \
+      "$cycle_dir/private-manifest.json")" || return $?
+    traffic_elapsed_nanos="$(jq -er '.load.traffic_elapsed_nanos' \
+      "$cycle_dir/private-manifest.json")" || return $?
+    public_cycle="$(jq -cS -n \
+      --argjson cycle "$cycle" \
+      --argjson load_requested_seconds "$BENCHMARK_PRESSURE_LOAD_SECONDS" \
+      --argjson load_elapsed_nanos "$traffic_elapsed_nanos" \
+      --argjson idle_requested_seconds "$BENCHMARK_PRESSURE_IDLE_SECONDS" \
+      --argjson idle_elapsed_centiseconds "$idle_elapsed_centiseconds" \
+      --argjson successful_requests "$successful_requests" \
+      --arg histogram_encoding "$BENCHMARK_PRESSURE_HISTOGRAM_ENCODING" \
+      --arg private_manifest_sha256 "$manifest_digest" \
+      --argjson private_manifest_bytes "$manifest_size" \
+      --argjson private_file_count "$manifest_count" \
+      --arg barrier_receipt_sha256 "$barrier_digest" \
+      --arg admission_receipt_sha256 "$admission_digest" \
+      --arg rle_result_sha256 "$result_digest" \
+      --arg stack_identity_sha256 "$stack_digest" '
+        {cycle:$cycle,status:"passed",
+         load_requested_seconds:$load_requested_seconds,
+         load_elapsed_nanos:$load_elapsed_nanos,
+         idle_requested_seconds:$idle_requested_seconds,
+         idle_elapsed_centiseconds:$idle_elapsed_centiseconds,
+         successful_requests:$successful_requests,
+         histogram_encoding:$histogram_encoding,
+         private_manifest_sha256:$private_manifest_sha256,
+         private_manifest_bytes:$private_manifest_bytes,
+         private_file_count:$private_file_count,
+         admission_receipt_sha256:$admission_receipt_sha256,
+         unexpected_evictions:0,
+         barrier_receipt_sha256:$barrier_receipt_sha256,
+         rle_result_sha256:$rle_result_sha256,
+         stack_identity_sha256:$stack_identity_sha256}
+      ')" || return $?
+    aggregate_cycles="$(jq -cS --argjson cycle "$public_cycle" \
+      '. + [$cycle]' <<<"$aggregate_cycles")" || return $?
+    if ((cycle == BENCHMARK_PRESSURE_CYCLE_COUNT)); then
+      recovery_one_digest="$(sha256sum -- "$cycle_dir/recovery-01.prom")" || return $?
+      recovery_one_digest="${recovery_one_digest%% *}"
+      recovery_two_digest="$(sha256sum -- "$cycle_dir/recovery-02.prom")" || return $?
+      recovery_two_digest="${recovery_two_digest%% *}"
+      aggregate_recovery="$(jq -cS -n \
+        --arg first "$recovery_one_digest" --arg second "$recovery_two_digest" \
+        --argjson first_tick "$recovery_one_tick" \
+        --argjson second_tick "$recovery_two_tick" \
+        --argjson required_samples "$BENCHMARK_PRESSURE_RECOVERY_SAMPLES" '
+          {required_samples:$required_samples,consecutive:true,map_entries:[0,0],
+           captured_monotonic_centiseconds:[$first_tick,$second_tick],
+           sample_sha256s:[$first,$second]}
+        ')" || return $?
+    fi
+  done
+  observed_cycle_count="$(jq -er 'length' <<<"$aggregate_cycles")" || return $?
+  [[ "$observed_cycle_count" == "$BENCHMARK_PRESSURE_CYCLE_COUNT" &&
+    "$aggregate_recovery" != null ]] ||
+    return 1
+  RUN_STAGE="benchmark-pressure-cycles-aggregate"
+  publish_benchmark_pressure_aggregate \
+    "$aggregate_cycles" "$aggregate_recovery" "$private_root"
 }
 
 run_scenario() {
@@ -23004,17 +31365,23 @@ read_bounded_single_line_regular_file() {
   local size=""
   local digest=""
   local reconstructed_digest=""
+  local input_is_held_descriptor=false
   local -a lines=()
   local LC_ALL=C
 
-  [[ "$maximum_bytes" =~ ^[1-9][0-9]*$ &&
-    -f "$input" && ! -L "$input" ]] || return 1
+  [[ "$maximum_bytes" =~ ^[1-9][0-9]*$ ]] || return 1
+  if [[ "$input" =~ ^/proc/self/fd/[1-9][0-9]*$ ]]; then
+    [[ -f "$input" ]] || return 1
+    input_is_held_descriptor=true
+  else
+    [[ -f "$input" && ! -L "$input" ]] || return 1
+  fi
   path_identity="$(stat -Lc '%d:%i' -- "$input")" || return 1
   exec {descriptor}<"$input" || return $?
   descriptor_path="/proc/self/fd/$descriptor"
   if [[ ! -f "$descriptor_path" ]] ||
     ! descriptor_identity="$(stat -Lc '%d:%i' -- "$descriptor_path")" ||
-    [[ -L "$input" ]] ||
+    [[ "$input_is_held_descriptor" == false && -L "$input" ]] ||
     [[ "$(stat -Lc '%d:%i' -- "$input")" != "$path_identity" ]] ||
     [[ "$descriptor_identity" != "$path_identity" ]]; then
     exec {descriptor}<&-
@@ -23028,7 +31395,9 @@ read_bounded_single_line_regular_file() {
     exec {descriptor}<&-
     return 1
   }
-  if [[ "$links" != 1 ]] || ((size == 0 || size > maximum_bytes)); then
+  if [[ ( "$input_is_held_descriptor" == false && "$links" != 1 ) ||
+    ( "$input_is_held_descriptor" == true && ! "$links" =~ ^[01]$ ) ]] ||
+    ((size == 0 || size > maximum_bytes)); then
     exec {descriptor}<&-
     return 1
   fi
@@ -23051,7 +31420,9 @@ read_bounded_single_line_regular_file() {
     return 1
   fi
   reconstructed_digest="${reconstructed_digest%% *}"
-  [[ "$reconstructed_digest" == "$digest" ]] || return 1
+  [[ "$reconstructed_digest" == "$digest" &&
+    ( "$input_is_held_descriptor" == true || ! -L "$input" ) ]] || return 1
+  [[ "$(stat -Lc '%d:%i' -- "$input")" == "$path_identity" ]] || return 1
   printf '%s\n' "${lines[0]}"
 }
 
@@ -32779,6 +41150,9 @@ execute_requested_scenarios() {
       run_scenario concurrency true full none normal uninstrumented
       complete_obi_metric_boundary benchmark-uninstrumented
       ;;
+    benchmark-pressure-cycles)
+      run_benchmark_pressure_cycles
+      ;;
     uninstrumented)
       run_scenario uninstrumented
       ;;
@@ -33223,7 +41597,7 @@ write_metrics_delta() {
   local -r output="$3"
   local unsorted=""
 
-  unsorted="$(mktemp "$RESULT_DIR/.metrics-delta.XXXXXX")" || return $?
+  unsorted="$(mktemp "${output%/*}/.metrics-delta.XXXXXX")" || return $?
   awk '
     function wanted(metric) {
       return metric ~ /^obi_java_remote_parent_operations_total/ ||
@@ -33276,16 +41650,23 @@ pressure_bridge_reconciliation() {
   local -r expected_valid="$3"
   local -r expected_roots="$4"
   local -r expected_requests="$5"
+  local -r supplied_maximum_admission="${6:-}"
   local maximum_admission=""
 
-  [[ -f "$input" && ! -L "$input" &&
-    ( "$transport" == "getsockopt" || "$transport" == "unix" ) &&
+  [[ ( "$transport" == "getsockopt" || "$transport" == "unix" ) &&
     "$expected_valid" =~ ^(0|[1-9][0-9]*)$ &&
     "$expected_roots" =~ ^[1-9][0-9]*$ &&
     "$expected_requests" =~ ^[1-9][0-9]*$ ]] || return 1
-  maximum_admission="$(
-    pressure_admission_max_events "$expected_requests"
-  )" || return 1
+  benchmark_pressure_trusted_regular_path "$input" || return $?
+  if [[ -n "$supplied_maximum_admission" ]]; then
+    bounded_decimal "$supplied_maximum_admission" "$MAX_SHELL_INTEGER" false \
+      >/dev/null || return 1
+    maximum_admission="$supplied_maximum_admission"
+  else
+    maximum_admission="$(
+      pressure_admission_max_events "$expected_requests"
+    )" || return 1
+  fi
 
   awk \
     -v selected="$transport" \

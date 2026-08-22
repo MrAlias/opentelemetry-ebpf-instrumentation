@@ -5,7 +5,7 @@
 # This harness intentionally overrides sourced run.sh globals and functions in
 # isolated subshells. ShellCheck merges the sourced runner's array types with
 # same-named scalar test locals even though those seams execute in isolation.
-# shellcheck disable=SC2016,SC2030,SC2031,SC2034,SC2100,SC2128,SC2178,SC2317,SC2329
+# shellcheck disable=SC2016,SC2030,SC2031,SC2034,SC2100,SC2128,SC2154,SC2178,SC2317,SC2329
 
 set -Eeuo pipefail
 
@@ -42192,6 +42192,5354 @@ test_obi_metric_boundary_journal_freeze_intent_orders_writers() {
   )
 }
 
+benchmark_pressure_test_write_result() {
+  local -r output="$1"
+  local -r requested_nanos="${2:-60000000000}"
+  local -r elapsed_nanos="${3:-60000000000}"
+  local -r cycle="${4:-1}"
+  local -r session="${5:-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}"
+  local tag=""
+  local marker_prefix=""
+
+  printf -v tag '%02d' "$cycle"
+  [[ "$session" =~ ^[0-9a-f]{32}$ ]] || return 1
+  marker_prefix="pressure-$session-cycle-$tag"
+
+  jq -cS -n \
+    --argjson requested_nanos "$requested_nanos" \
+    --argjson elapsed_nanos "$elapsed_nanos" \
+    --arg marker_prefix "$marker_prefix" \
+    --arg marker_encoding "$BENCHMARK_PRESSURE_MARKER_ENCODING" '
+      {admitted_requests:1,base_url:"http://127.0.0.1:18080",canceled:false,
+       concurrency:16,
+       connection_mode:"close",failed_requests:0,
+       finished_at:"2026-01-01T00:01:00Z",
+       first_request_ordinal:1,last_request_ordinal:1,
+       latency:{histogram:[{count:1,nanos:100}],
+         histogram_encoding:"sorted_rle_nanos_v1",p50_nanos:100,
+         p95_nanos:100,p99_nanos:100},marker_encoding:$marker_encoding,
+       marker_prefix:$marker_prefix,path:"/api/echo?delay_ms=500",
+       request_limit:4096,request_limit_reached:false,
+       request_timeout_nanos:10000000000,
+       requested_duration_nanos:$requested_nanos,seed:0,
+       started_at:"2026-01-01T00:00:00Z",status:"passed",
+       successful_requests:1,
+       throughput_per_second:(1000000000 / $elapsed_nanos),
+       tls_verification:"not_applicable",traffic_elapsed_nanos:$elapsed_nanos,
+       w3c:false}
+    ' >"$output" || return $?
+  chmod 0600 -- "$output"
+}
+
+benchmark_pressure_test_write_client_commit() {
+  local -r directory="$1"
+  local -r cycle="$2"
+  local parent_identity=""
+  local result_identity=""
+  local result_sha256=""
+  local result_size=""
+  local stderr_identity=""
+  local stderr_sha256=""
+  local stderr_size=""
+
+  parent_identity="$(stat -Lc '%d:%i:%u:%a' -- "$directory")" || return $?
+  result_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "$directory/benchmark-result.json")" || return $?
+  result_sha256="$(benchmark_pressure_test_sha256 \
+    "$directory/benchmark-result.json")" || return $?
+  result_size="$(stat -Lc '%s' -- "$directory/benchmark-result.json")" || return $?
+  stderr_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "$directory/benchmark.stderr.log")" || return $?
+  stderr_sha256="$(benchmark_pressure_test_sha256 \
+    "$directory/benchmark.stderr.log")" || return $?
+  stderr_size="$(stat -Lc '%s' -- "$directory/benchmark.stderr.log")" || return $?
+  jq -cS -n --argjson cycle "$cycle" \
+    --arg parent_identity "$parent_identity" \
+    --arg result_identity "$result_identity" \
+    --arg result_sha256 "$result_sha256" --argjson result_size "$result_size" \
+    --arg stderr_identity "$stderr_identity" \
+    --arg stderr_sha256 "$stderr_sha256" --argjson stderr_size "$stderr_size" '
+      {schema:"obi-benchmark-pressure-client-commit-v1",status:"committed",
+       kind:"success_pair",cycle:$cycle,parent_identity:$parent_identity,
+       member_count:2,
+       members:[
+         {role:"benchmark_result",name:"benchmark-result.json",
+          identity:$result_identity,sha256:$result_sha256,size_bytes:$result_size},
+         {role:"benchmark_stderr",name:"benchmark.stderr.log",
+          identity:$stderr_identity,sha256:$stderr_sha256,size_bytes:$stderr_size}
+       ]}
+    ' >"$directory/benchmark-client-commit.json" || return $?
+  chmod 0600 -- "$directory/benchmark-client-commit.json"
+}
+
+benchmark_pressure_test_write_map_receipts() {
+  local -r directory="$1"
+  local -r content_sha256="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+  printf '%s\n' \
+    '{"status":"passed","mode":"prepare","map_id":123,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":10000,"process_map_id":456,"process_pid":789,"process_namespace":4026533000,"token_base":1000,"synthetic_pid":0,"synthetic_namespace":0,"touched":0}' \
+    >"$directory/map-prepare.json" || return $?
+  printf '%s\n' \
+    "{\"status\":\"passed\",\"mode\":\"fill\",\"map_id\":123,\"map_name\":\"java_remote_parent_handoff_claims\",\"kernel_name\":\"java_remote_par\",\"map_type\":\"Hash\",\"max_entries\":10000,\"process_map_id\":456,\"process_pid\":789,\"process_namespace\":4026533000,\"token_base\":1000,\"synthetic_pid\":0,\"synthetic_namespace\":0,\"touched\":10000,\"capacity_rejected_entries\":1,\"verified_present_entries\":10000,\"content_sha256\":\"$content_sha256\",\"verified_absent_entries\":1}" \
+    >"$directory/map-fill.json" || return $?
+  printf '%s\n' \
+    "{\"status\":\"passed\",\"mode\":\"verify\",\"map_id\":123,\"map_name\":\"java_remote_parent_handoff_claims\",\"kernel_name\":\"java_remote_par\",\"map_type\":\"Hash\",\"max_entries\":10000,\"process_map_id\":456,\"process_pid\":789,\"process_namespace\":4026533000,\"token_base\":1000,\"synthetic_pid\":0,\"synthetic_namespace\":0,\"touched\":0,\"verified_present_entries\":10000,\"content_sha256\":\"$content_sha256\",\"verified_absent_entries\":1}" \
+    >"$directory/map-verify.json" || return $?
+  printf '%s\n' \
+    '{"status":"passed","mode":"cleanup","map_id":123,"map_name":"java_remote_parent_handoff_claims","kernel_name":"java_remote_par","map_type":"Hash","max_entries":10000,"process_map_id":0,"process_pid":789,"process_namespace":4026533000,"token_base":1000,"synthetic_pid":0,"synthetic_namespace":0,"touched":10000,"cleanup_verified":true,"verified_absent_entries":10001}' \
+    >"$directory/map-cleanup.json" || return $?
+  chmod 0600 -- "$directory"/map-{prepare,fill,verify,cleanup}.json
+}
+
+benchmark_pressure_test_write_stack() {
+  local -r output="$1"
+  local obi_id=""
+  local java_id=""
+  local apache_id=""
+
+  printf -v obi_id '%064x' 1
+  printf -v java_id '%064x' 2
+  printf -v apache_id '%064x' 3
+  jq -cS -n \
+    --arg obi_id "$obi_id" --arg java_id "$java_id" \
+    --arg apache_id "$apache_id" '
+      [{service:"obi",container_id:$obi_id,container_name:"pressure-obi",
+        host_pid:101,started_at:"2026-01-01T00:00:00Z"},
+       {service:"java-backend",container_id:$java_id,
+        container_name:"pressure-java",host_pid:202,
+        started_at:"2026-01-01T00:00:00Z"},
+       {service:"apache-proxy",container_id:$apache_id,
+        container_name:"pressure-apache",host_pid:303,
+        started_at:"2026-01-01T00:00:00Z"}]
+    ' >"$output" || return $?
+  chmod 0600 -- "$output"
+}
+
+benchmark_pressure_test_write_resource() {
+  local -r output="$1"
+  local -r stack="$2"
+  local -r tick="$3"
+
+  jq -cS -n --argjson tick "$tick" --slurpfile stack "$stack" '
+    {schema:"obi-benchmark-pressure-resources-v1",
+     captured_monotonic_centiseconds:$tick,stack:$stack[0],
+     stats:($stack[0] | map({ID:.container_id,Name:.container_name,
+       Container:.container_name,CPUPerc:"0.00%",MemPerc:"0.10%",
+       MemUsage:"1MiB / 1GiB",NetIO:"0B / 0B",BlockIO:"0B / 0B",
+       PIDs:"1"}))}
+  ' >"$output" || return $?
+  chmod 0600 -- "$output"
+}
+
+benchmark_pressure_test_sha256() {
+  local digest=""
+
+  digest="$(sha256sum -- "$1")" || return $?
+  printf '%s\n' "${digest%% *}"
+}
+
+benchmark_pressure_test_write_barrier() {
+  local -r directory="$1"
+  local -r cycle="$2"
+  local -r session=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  local -r content_sha256="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  local ready_payload="pressure-ready-v1:$session"
+  local release_payload="pressure-release-v1:$session"
+  local ready_sha256=""
+  local release_sha256=""
+  local fill_sha256=""
+  local verify_sha256=""
+  local result_sha256=""
+
+  ready_sha256="$(printf '%s\n' "$ready_payload" | sha256sum)" || return $?
+  ready_sha256="${ready_sha256%% *}"
+  release_sha256="$(printf '%s\n' "$release_payload" | sha256sum)" || return $?
+  release_sha256="${release_sha256%% *}"
+  fill_sha256="$(benchmark_pressure_test_sha256 \
+    "$directory/map-fill.json")" || return $?
+  verify_sha256="$(benchmark_pressure_test_sha256 \
+    "$directory/map-verify.json")" || return $?
+  result_sha256="$(benchmark_pressure_test_sha256 \
+    "$directory/benchmark-result.json")" || return $?
+  jq -cS -n --argjson cycle "$cycle" --arg session "$session" \
+    --arg owner "$EUID" --arg ready_payload "$ready_payload" \
+    --arg release_payload "$release_payload" \
+    --arg ready_sha256 "$ready_sha256" --arg release_sha256 "$release_sha256" \
+    --arg fill_sha256 "$fill_sha256" --arg verify_sha256 "$verify_sha256" \
+    --arg result_sha256 "$result_sha256" --arg content "$content_sha256" '
+      {schema:"obi-benchmark-pressure-host-barrier-v1",status:"passed",
+       cycle:$cycle,session:$session,
+       sequence:["host_ready_after_capacity_proof","benchmark_completed",
+         "host_release_published","postload_content_verified"],
+       ready:{identity:("1:2:"+$owner+":600:1:51"),payload:$ready_payload,
+         sha256:$ready_sha256},
+       release:{identity:("1:3:"+$owner+":600:1:53"),payload:$release_payload,
+         sha256:$release_sha256},
+       map:{map_id:"123",max_entries:"10000",token_base:"1000",
+         content_sha256:$content,fill_sha256:$fill_sha256,
+         verify_sha256:$verify_sha256},benchmark_result_sha256:$result_sha256}
+    ' >"$directory/barrier-receipt.json" || return $?
+  chmod 0600 -- "$directory/barrier-receipt.json"
+}
+
+benchmark_pressure_test_write_java_snapshot() {
+  local -r output="$1"
+  local -r missing="${2:-0}"
+  local name=""
+  local value=""
+  local record=""
+  local -a names=(
+    cfg_on cfg_off provider_ok provider_reject provider_ver extension_reg
+    lookup_ready lookup_missing lookup_version lookup_error record_version
+    invoke_error discard_standard extract_fields extract_invalid extract_error
+    registration_ok registration_fail take_sampled take_unsampled tls_reads tls_bytes
+    framework_depth framework_cycle framework_late transport_missing
+    t_unknown d_unknown t_valid d_valid t_missing d_missing t_stale d_stale
+    t_unsupported d_unsupported t_malformed d_malformed
+    t_version_mismatch d_version_mismatch t_ambiguous d_ambiguous
+    t_unauthorized d_unauthorized t_already_consumed d_already_consumed
+    t_timeout d_timeout t_overload d_overload
+    t_transport_error d_transport_error t_disabled d_disabled
+  )
+
+  [[ "$missing" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+  for name in "${names[@]}"; do
+    value=0
+    [[ "$name" != t_missing ]] || value="$missing"
+    if [[ -n "$record" ]]; then
+      record+=,
+    fi
+    record+="$name=$value"
+  done
+  printf '%s\n' "$record" >"$output" || return $?
+  chmod 0600 -- "$output"
+}
+
+benchmark_pressure_test_write_attribution() {
+  local -r directory="$1"
+  local -r cycle="$2"
+  local tag=""
+  local marker_prefix=""
+  local projection=""
+  local bridge=""
+
+  printf -v tag '%02d' "$cycle"
+  marker_prefix="pressure-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-cycle-$tag"
+  jq -cS -n --arg receiver receiver-instance-fixed-0001 \
+    --argjson generation "$cycle" \
+    '{status:"reset",receiver_instance_id:$receiver,
+      reset_generation:$generation}' >"$directory/trace-reset.json" || return $?
+  jq -cS -n \
+    --arg receiver receiver-instance-fixed-0001 \
+    --argjson generation "$cycle" --arg marker "$marker_prefix-0000001" \
+    --argjson max_retained "$BENCHMARK_PRESSURE_TRACE_MAX_RETAINED_BYTES" \
+    --argjson max_value "$BENCHMARK_PRESSURE_TRACE_MAX_VALUE_BYTES" '
+      def span($trace;$span;$parent;$service;$kind;$marker;$start;$end):
+        {trace_id:$trace,span_id:$span,parent_span_id:$parent,
+         service_name:$service,kind:$kind,name:"GET /api/echo",flags:0,
+         start_unix_nano:$start,end_unix_nano:$end,
+         received_unix_milli:1767225600000,scope_name:"fixture",
+         attributes:{"http.request.header.x-obi-demo-id":$marker,
+           "http.route":"/api/echo","http.request.method":"GET",
+           "http.response.status_code":"200"}};
+      {receiver_instance_id:$receiver,reset_generation:$generation,marker:"",
+       received_batches:1,received_spans:3,dropped_spans:0,
+       dropped_count_spans:0,dropped_value_limit_spans:0,
+       dropped_retained_limit_spans:0,retained_bytes:0,
+       max_retained_bytes:$max_retained,max_value_bytes:$max_value,
+       omitted_related_spans:0,ambiguous_related_spans:0,related_spans:[],
+       spans:[
+         span("11111111111111111111111111111111";"1111111111111111";"";
+           "apache-proxy";"SERVER";$marker;1;4),
+         span("11111111111111111111111111111111";"2222222222222222";
+           "1111111111111111";"apache-proxy";"CLIENT";$marker;2;3),
+         span("33333333333333333333333333333333";"3333333333333333";"";
+           "java-backend";"SERVER";$marker;2;3)]} |
+      .retained_bytes = ([.spans[] |
+        ([.trace_id,.span_id,(.parent_span_id // ""),.service_name,
+          (.scope_name // ""),.name,.kind] +
+          [(.attributes // {}) | to_entries[] | .key,.value]) |
+        map(utf8bytelength) | add] | add)
+    ' >"$directory/trace-snapshot.json" || return $?
+  chmod 0600 -- "$directory/trace-reset.json" "$directory/trace-snapshot.json"
+  projection="$(benchmark_pressure_trace_projection \
+    "$directory/trace-snapshot.json" "$directory/benchmark-result.json" \
+    "$directory/trace-reset.json" "$cycle")" || return $?
+  printf '%s\n' "$projection" >"$directory/trace-projection.json" || return $?
+
+  printf '%s\n' \
+    'obi_java_remote_parent_operations_total{operation="handoff_admission",status="overload",transport="tcp"} 0' \
+    'obi_java_remote_parent_operations_total{operation="inject",status="missing",transport="tcp"} 0' \
+    >"$directory/obi-metrics-before.prom" || return $?
+  printf '%s\n' \
+    'obi_java_remote_parent_operations_total{operation="handoff_admission",status="overload",transport="tcp"} 1' \
+    'obi_java_remote_parent_operations_total{operation="inject",status="missing",transport="tcp"} 1' \
+    >"$directory/obi-metrics-after.prom" || return $?
+  write_metrics_delta "$directory/obi-metrics-before.prom" \
+    "$directory/obi-metrics-after.prom" "$directory/obi-metrics.delta" || return $?
+  bridge="$(pressure_bridge_reconciliation "$directory/obi-metrics.delta" \
+    getsockopt 0 1 1 "$(benchmark_pressure_admission_max_events 1)")" || return $?
+  printf '%s\n' "$bridge" | jq -cS . \
+    >"$directory/bridge-reconciliation.json" || return $?
+
+  benchmark_pressure_test_write_java_snapshot \
+    "$directory/java-diagnostics-before.txt" 0 || return $?
+  benchmark_pressure_test_write_java_snapshot \
+    "$directory/java-diagnostics-after.txt" 2 || return $?
+  : >"$directory/java-diagnostics-before.stderr" || return $?
+  : >"$directory/java-diagnostics-after.stderr" || return $?
+  write_java_diagnostics_delta "$directory/java-diagnostics-before.txt" \
+    "$directory/java-diagnostics-after.txt" \
+    "$directory/java-diagnostics.delta" || return $?
+  chmod 0600 -- "$directory"/trace-projection.json \
+    "$directory"/obi-metrics-{before,after}.prom \
+    "$directory"/obi-metrics.delta "$directory/bridge-reconciliation.json" \
+    "$directory"/java-diagnostics-{before,after}.stderr \
+    "$directory/java-diagnostics.delta"
+  write_benchmark_pressure_admission_receipt "$cycle" "$directory"
+}
+
+benchmark_pressure_test_phases() {
+  local -r directory="$1"
+  local stack_sha256=""
+  local fill_sha256=""
+  local result_sha256=""
+  local verify_sha256=""
+  local cleanup_sha256=""
+  local idle_before_sha256=""
+  local idle_after_sha256=""
+  local baseline_resource_sha256=""
+  local postload_resource_sha256=""
+  local postidle_resource_sha256=""
+  local admission_sha256=""
+  local ready_sha256=""
+  local release_sha256=""
+
+  stack_sha256="$(benchmark_pressure_test_sha256 \
+    "$directory/stack-identity.json")" || return $?
+  fill_sha256="$(benchmark_pressure_test_sha256 \
+    "$directory/map-fill.json")" || return $?
+  result_sha256="$(benchmark_pressure_test_sha256 \
+    "$directory/benchmark-result.json")" || return $?
+  verify_sha256="$(benchmark_pressure_test_sha256 \
+    "$directory/map-verify.json")" || return $?
+  cleanup_sha256="$(benchmark_pressure_test_sha256 \
+    "$directory/map-cleanup.json")" || return $?
+  idle_before_sha256="$(benchmark_pressure_test_sha256 \
+    "$directory/idle-before.prom")" || return $?
+  idle_after_sha256="$(benchmark_pressure_test_sha256 \
+    "$directory/idle-after.prom")" || return $?
+  baseline_resource_sha256="$(benchmark_pressure_test_sha256 \
+    "$directory/resources-baseline.json")" || return $?
+  postload_resource_sha256="$(benchmark_pressure_test_sha256 \
+    "$directory/resources-postload.json")" || return $?
+  postidle_resource_sha256="$(benchmark_pressure_test_sha256 \
+    "$directory/resources-postidle.json")" || return $?
+  admission_sha256="$(benchmark_pressure_test_sha256 \
+    "$directory/admission-receipt.json")" || return $?
+  ready_sha256="$(jq -er '.ready.sha256' \
+    "$directory/barrier-receipt.json")" || return $?
+  release_sha256="$(jq -er '.release.sha256' \
+    "$directory/barrier-receipt.json")" || return $?
+  jq -cS -n \
+    --arg stack "$stack_sha256" --arg fill "$fill_sha256" \
+    --arg result "$result_sha256" --arg verify "$verify_sha256" \
+    --arg cleanup "$cleanup_sha256" --arg idle_before "$idle_before_sha256" \
+    --arg idle_after "$idle_after_sha256" \
+    --arg baseline_resource "$baseline_resource_sha256" \
+    --arg postload_resource "$postload_resource_sha256" \
+    --arg postidle_resource "$postidle_resource_sha256" \
+    --arg admission "$admission_sha256" \
+    --arg ready "$ready_sha256" --arg release "$release_sha256" '
+      [{name:"baseline_resources_captured",monotonic_centiseconds:100,
+        evidence_sha256:$baseline_resource},
+       {name:"prepare_started",monotonic_centiseconds:101,evidence_sha256:$stack},
+       {name:"capacity_ready",monotonic_centiseconds:102,evidence_sha256:$fill},
+       {name:"load_started",monotonic_centiseconds:103,evidence_sha256:$ready},
+       {name:"load_finished",monotonic_centiseconds:6103,evidence_sha256:$result},
+       {name:"release_published",monotonic_centiseconds:6104,
+        evidence_sha256:$release},
+       {name:"content_verified",monotonic_centiseconds:6105,
+        evidence_sha256:$verify},
+       {name:"postload_resources_captured",monotonic_centiseconds:6106,
+         evidence_sha256:$postload_resource},
+       {name:"attribution_reconciled",monotonic_centiseconds:6107,
+         evidence_sha256:$admission},
+       {name:"cleanup_absent",monotonic_centiseconds:6108,
+         evidence_sha256:$cleanup},
+       {name:"idle_started",monotonic_centiseconds:6200,
+        evidence_sha256:$idle_before},
+       {name:"idle_finished",monotonic_centiseconds:9200,
+        evidence_sha256:$idle_after},
+       {name:"postidle_resources_captured",monotonic_centiseconds:9203,
+        evidence_sha256:$postidle_resource}]
+    '
+}
+
+benchmark_pressure_test_prepare_cycle_fixture() {
+  local -r private_root="$1"
+  local -r cycle="$2"
+  local tag=""
+  local directory=""
+  local phases=""
+  local metrics='obi_bpf_map_entries_total{map_id="123",map_name="java_remote_par",map_type="hash"} 0'
+  local RESULT_DIR=""
+
+  printf -v tag '%02d' "$cycle"
+  directory="$private_root/cycle-$tag"
+  RESULT_DIR="$directory"
+  mkdir -m 0700 -- "$private_root" 2>/dev/null || [[ -d "$private_root" ]] || return 1
+  chmod 0700 -- "$private_root" || return $?
+  mkdir -m 0700 -- "$directory" || return $?
+  benchmark_pressure_test_write_result \
+    "$directory/benchmark-result.json" 60000000000 60000000000 "$cycle" || return $?
+  : >"$directory/benchmark.stderr.log" || return $?
+  chmod 0600 -- "$directory/benchmark.stderr.log" || return $?
+  PRESSURE_CONTROL_SESSION=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  benchmark_pressure_test_write_client_commit "$directory" "$cycle" || return $?
+  benchmark_pressure_test_write_map_receipts "$directory" || return $?
+  benchmark_pressure_test_write_stack "$directory/stack-identity.json" || return $?
+  printf '%s\n' "$metrics" >"$directory/map-baseline.prom" || return $?
+  printf '%s\n' "$metrics" >"$directory/map-recovered.prom" || return $?
+  printf '%s\n' "$metrics" >"$directory/idle-before.prom" || return $?
+  printf '%s\n' "$metrics" >"$directory/idle-after.prom" || return $?
+  if ((cycle == BENCHMARK_PRESSURE_CYCLE_COUNT)); then
+    printf '%s\n' "$metrics" >"$directory/recovery-01.prom" || return $?
+    printf '# recovery sample 2\n%s\n' "$metrics" \
+      >"$directory/recovery-02.prom" || return $?
+  fi
+  chmod 0600 -- "$directory"/*.prom "$directory/benchmark.stderr.log" || return $?
+  benchmark_pressure_test_write_resource \
+    "$directory/resources-baseline.json" "$directory/stack-identity.json" 100 ||
+    return $?
+  benchmark_pressure_test_write_resource \
+    "$directory/resources-postload.json" "$directory/stack-identity.json" 6106 ||
+    return $?
+  benchmark_pressure_test_write_resource \
+    "$directory/resources-postidle.json" "$directory/stack-identity.json" 9203 ||
+    return $?
+  benchmark_pressure_test_write_barrier "$directory" "$cycle" || return $?
+  benchmark_pressure_test_write_attribution "$directory" "$cycle" || return $?
+  phases="$(benchmark_pressure_test_phases "$directory")" || return $?
+  PRESSURE_MAP_ID=123
+  PRESSURE_MAP_MAX_ENTRIES=10000
+  PRESSURE_PROCESS_MAP_ID=456
+  PRESSURE_PROCESS_PID=789
+  PRESSURE_PROCESS_NAMESPACE=4026533000
+  PRESSURE_TOKEN_BASE=1000
+  if ((cycle == BENCHMARK_PRESSURE_CYCLE_COUNT)); then
+    write_benchmark_pressure_private_manifest \
+      "$cycle" "$directory" "$phases" 3000 9201 9202
+  else
+    write_benchmark_pressure_private_manifest "$cycle" "$directory" "$phases" 3000
+  fi
+}
+
+benchmark_pressure_test_rehash_manifest_role() {
+  local -r manifest="$1"
+  local -r role="$2"
+  local name=""
+  local path=""
+  local digest=""
+  local size=""
+  local candidate="${manifest}.updated"
+
+  name="$(jq -er --arg role "$role" \
+    '.files[] | select(.role == $role) | .name' "$manifest")" || return $?
+  path="${manifest%/*}/$name"
+  digest="$(benchmark_pressure_test_sha256 "$path")" || return $?
+  size="$(stat -Lc '%s' -- "$path")" || return $?
+  jq -cS --arg role "$role" --arg digest "$digest" --argjson size "$size" '
+    .files |= map(if .role == $role then
+      .sha256=$digest | .size_bytes=$size else . end)
+  ' "$manifest" >"$candidate" || return $?
+  chmod 0600 -- "$candidate" || return $?
+  mv -T -- "$candidate" "$manifest"
+}
+
+benchmark_pressure_test_write_aggregate() {
+  local -r output="$1"
+  local cycles='[]'
+  local cycle=""
+  local count=""
+  local row=""
+  local digest="cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+
+  for ((cycle = 1; cycle <= BENCHMARK_PRESSURE_CYCLE_COUNT; cycle++)); do
+    count=30
+    ((cycle == BENCHMARK_PRESSURE_CYCLE_COUNT)) && count=32
+    row="$(jq -cS -n --argjson cycle "$cycle" --argjson count "$count" \
+      --arg digest "$digest" '
+        {cycle:$cycle,status:"passed",load_requested_seconds:60,
+         load_elapsed_nanos:60000000000,idle_requested_seconds:30,
+         idle_elapsed_centiseconds:3000,successful_requests:1,
+         histogram_encoding:"sorted_rle_nanos_v1",
+         private_manifest_sha256:$digest,private_manifest_bytes:1000,
+         private_file_count:$count,admission_receipt_sha256:$digest,
+         barrier_receipt_sha256:$digest,rle_result_sha256:$digest,
+         stack_identity_sha256:$digest,unexpected_evictions:0}
+      ')" || return $?
+    cycles="$(jq -cS --argjson row "$row" '. + [$row]' <<<"$cycles")" ||
+      return $?
+  done
+  jq -cS -n --argjson cycles "$cycles" --arg digest "$digest" '
+    {schema:"obi-benchmark-pressure-cycles-v2",status:"non_acceptance",
+     acceptance_eligible:false,evidence_class:"targeted_pressure_cycle_campaign",
+     cycle_count:10,load_seconds_per_cycle:60,idle_seconds_per_cycle:30,
+     histograms:"linked_not_pooled",cycles:$cycles,
+     recovery:{required_samples:2,consecutive:true,map_entries:[0,0],
+       captured_monotonic_centiseconds:[9201,9202],
+       sample_sha256s:[$digest,$digest]}}
+  ' >"$output" || return $?
+  chmod 0644 -- "$output"
+}
+
+test_benchmark_pressure_result_and_window_contracts_are_strict() {
+  local -r valid="$TEST_TMP_DIR/pressure-benchmark-valid.json"
+  local -r marker_prefix=pressure-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-cycle-01
+  local mutated=""
+
+  benchmark_pressure_test_write_result "$valid"
+  validate_benchmark_pressure_result "$valid" "$marker_prefix"
+  for requested in 59000000000 61000000000; do
+    mutated="$TEST_TMP_DIR/pressure-benchmark-requested-$requested.json"
+    benchmark_pressure_test_write_result "$mutated" "$requested" 60000000000
+    if validate_benchmark_pressure_result "$mutated" "$marker_prefix"; then
+      printf 'pressure benchmark accepted requested duration %s\n' "$requested" >&2
+      return 1
+    fi
+  done
+  for elapsed in 59000000000 61000000000; do
+    mutated="$TEST_TMP_DIR/pressure-benchmark-elapsed-$elapsed.json"
+    benchmark_pressure_test_write_result "$mutated" 60000000000 "$elapsed"
+    if validate_benchmark_pressure_result "$mutated" "$marker_prefix"; then
+      printf 'pressure benchmark accepted traffic elapsed %s\n' "$elapsed" >&2
+      return 1
+    fi
+  done
+  mutated="$TEST_TMP_DIR/pressure-benchmark-duplicate.json"
+  sed 's/"latency":{/"latency":{"p99_nanos":100,/' "$valid" >"$mutated"
+  chmod 0600 -- "$mutated"
+  if validate_benchmark_pressure_result "$mutated" "$marker_prefix"; then
+    printf 'pressure benchmark accepted a nested duplicate key\n' >&2
+    return 1
+  fi
+  mutated="$TEST_TMP_DIR/pressure-benchmark-admission.json"
+  jq -cS '.failed_requests=1' "$valid" >"$mutated"
+  chmod 0600 -- "$mutated"
+  if validate_benchmark_pressure_result "$mutated" "$marker_prefix"; then
+    printf 'pressure benchmark accepted a failed request\n' >&2
+    return 1
+  fi
+  mutated="$TEST_TMP_DIR/pressure-benchmark-pooled.json"
+  jq -cS '.latency.histogram_encoding="pooled"' "$valid" >"$mutated"
+  chmod 0600 -- "$mutated"
+  if validate_benchmark_pressure_result "$mutated" "$marker_prefix"; then
+    printf 'pressure benchmark accepted a pooled histogram\n' >&2
+    return 1
+  fi
+}
+
+test_benchmark_pressure_private_manifest_recomputes_raw_evidence() {
+  local -r private_root="$TEST_TMP_DIR/pressure-private"
+  local -r directory="$private_root/cycle-01"
+  local -r manifest="$directory/private-manifest.json"
+  local candidate=""
+  local result_digest=""
+  local barrier_digest=""
+  local admission_digest=""
+  local phases=""
+
+  benchmark_pressure_test_prepare_cycle_fixture "$private_root" 1
+  validate_benchmark_pressure_private_manifest "$manifest" 1
+
+  # Coordinate all manifest-level hashes after forging the raw requested
+  # duration. The independent result validator must still reject the set.
+  candidate="$directory/.result-forgery"
+  jq -cS '.requested_duration_nanos=61000000000' \
+    "$directory/benchmark-result.json" >"$candidate"
+  chmod 0600 -- "$candidate"
+  mv -T -- "$candidate" "$directory/benchmark-result.json"
+  result_digest="$(benchmark_pressure_test_sha256 \
+    "$directory/benchmark-result.json")" || return $?
+  candidate="$directory/.barrier-forgery"
+  jq -cS --arg digest "$result_digest" \
+    '.benchmark_result_sha256=$digest' "$directory/barrier-receipt.json" \
+    >"$candidate"
+  chmod 0600 -- "$candidate"
+  mv -T -- "$candidate" "$directory/barrier-receipt.json"
+  barrier_digest="$(benchmark_pressure_test_sha256 \
+    "$directory/barrier-receipt.json")" || return $?
+  candidate="$directory/.phase-forgery"
+  jq -cS --arg digest "$result_digest" '
+    .phases |= map(if .name == "load_finished" then
+      .evidence_sha256=$digest else . end)
+  ' "$directory/phase-boundaries.json" >"$candidate"
+  chmod 0600 -- "$candidate"
+  mv -T -- "$candidate" "$directory/phase-boundaries.json"
+  phases="$(jq -c '.phases' "$directory/phase-boundaries.json")" || return $?
+  candidate="$directory/.manifest-forgery"
+  jq -cS --argjson phases "$phases" --arg result "$result_digest" \
+    --arg barrier "$barrier_digest" '
+      .load.requested_duration_nanos=61000000000 | .phases=$phases |
+      .files |= map(
+        if .role == "benchmark" then .sha256=$result
+        elif .role == "barrier" then .sha256=$barrier else . end)
+    ' "$manifest" >"$candidate"
+  chmod 0600 -- "$candidate"
+  mv -T -- "$candidate" "$manifest"
+  benchmark_pressure_test_rehash_manifest_role "$manifest" phase_boundaries
+  if validate_benchmark_pressure_private_manifest "$manifest" 1; then
+    printf 'pressure manifest accepted a coordinated 61-second raw forgery\n' >&2
+    return 1
+  fi
+}
+
+test_benchmark_pressure_resource_and_phase_rosters_are_exact() {
+  local private_root="$TEST_TMP_DIR/pressure-resource"
+  local directory="$private_root/cycle-01"
+  local manifest="$directory/private-manifest.json"
+  local candidate=""
+  local phases=""
+
+  benchmark_pressure_test_prepare_cycle_fixture "$private_root" 1
+  candidate="$directory/.resource-reordered"
+  jq -cS '.stats |= reverse' "$directory/resources-postload.json" >"$candidate"
+  chmod 0600 -- "$candidate"
+  mv -T -- "$candidate" "$directory/resources-postload.json"
+  benchmark_pressure_test_rehash_manifest_role "$manifest" resources_postload
+  if validate_benchmark_pressure_private_manifest "$manifest" 1; then
+    printf 'pressure manifest accepted reordered resource identities\n' >&2
+    return 1
+  fi
+
+  private_root="$TEST_TMP_DIR/pressure-phase"
+  directory="$private_root/cycle-01"
+  manifest="$directory/private-manifest.json"
+  benchmark_pressure_test_prepare_cycle_fixture "$private_root" 1
+  candidate="$directory/.phase-reordered"
+  jq -cS '.phases[6:8] |= reverse' "$directory/phase-boundaries.json" >"$candidate"
+  chmod 0600 -- "$candidate"
+  mv -T -- "$candidate" "$directory/phase-boundaries.json"
+  phases="$(jq -c '.phases' "$directory/phase-boundaries.json")" || return $?
+  candidate="$directory/.manifest-phase-reordered"
+  jq -cS --argjson phases "$phases" '.phases=$phases' "$manifest" >"$candidate"
+  chmod 0600 -- "$candidate"
+  mv -T -- "$candidate" "$manifest"
+  benchmark_pressure_test_rehash_manifest_role "$manifest" phase_boundaries
+  if validate_benchmark_pressure_private_manifest "$manifest" 1; then
+    printf 'pressure manifest accepted reordered phase boundaries\n' >&2
+    return 1
+  fi
+
+  for idle_elapsed in 2900 3100; do
+    private_root="$TEST_TMP_DIR/pressure-phase-timing-$idle_elapsed"
+    directory="$private_root/cycle-01"
+    manifest="$directory/private-manifest.json"
+    benchmark_pressure_test_prepare_cycle_fixture "$private_root" 1
+    candidate="$directory/.phase-timing"
+    jq -cS --argjson elapsed "$idle_elapsed" '
+      .idle_elapsed_centiseconds=$elapsed |
+      (.phases[] | select(.name == "idle_finished") |
+        .monotonic_centiseconds)=(6200+$elapsed)
+    ' "$directory/phase-boundaries.json" >"$candidate"
+    chmod 0600 -- "$candidate"
+    mv -T -- "$candidate" "$directory/phase-boundaries.json"
+    phases="$(jq -c '.phases' "$directory/phase-boundaries.json")" || return $?
+    candidate="$directory/.manifest-phase-timing"
+    jq -cS --argjson phases "$phases" --argjson elapsed "$idle_elapsed" '
+      .phases=$phases | .timing.idle_elapsed_centiseconds=$elapsed
+    ' "$manifest" >"$candidate"
+    chmod 0600 -- "$candidate"
+    mv -T -- "$candidate" "$manifest"
+    benchmark_pressure_test_rehash_manifest_role "$manifest" phase_boundaries
+    if validate_benchmark_pressure_private_manifest "$manifest" 1; then
+      printf 'pressure manifest accepted idle phase duration %s\n' \
+        "$idle_elapsed" >&2
+      return 1
+    fi
+  done
+
+  private_root="$TEST_TMP_DIR/pressure-phase-digest"
+  directory="$private_root/cycle-01"
+  manifest="$directory/private-manifest.json"
+  benchmark_pressure_test_prepare_cycle_fixture "$private_root" 1
+  candidate="$directory/.phase-digest"
+  jq -cS '(.phases[] | select(.name == "content_verified") |
+    .evidence_sha256)=("d"*64)' "$directory/phase-boundaries.json" >"$candidate"
+  chmod 0600 -- "$candidate"
+  mv -T -- "$candidate" "$directory/phase-boundaries.json"
+  phases="$(jq -c '.phases' "$directory/phase-boundaries.json")" || return $?
+  candidate="$directory/.manifest-phase-digest"
+  jq -cS --argjson phases "$phases" '.phases=$phases' "$manifest" >"$candidate"
+  chmod 0600 -- "$candidate"
+  mv -T -- "$candidate" "$manifest"
+  benchmark_pressure_test_rehash_manifest_role "$manifest" phase_boundaries
+  if validate_benchmark_pressure_private_manifest "$manifest" 1; then
+    printf 'pressure manifest accepted a forged phase evidence digest\n' >&2
+    return 1
+  fi
+
+  private_root="$TEST_TMP_DIR/pressure-resource-missing"
+  directory="$private_root/cycle-01"
+  manifest="$directory/private-manifest.json"
+  benchmark_pressure_test_prepare_cycle_fixture "$private_root" 1
+  mv -T -- "$directory/resources-baseline.json" \
+    "$TEST_TMP_DIR/removed-resources-baseline.json"
+  if validate_benchmark_pressure_private_manifest "$manifest" 1; then
+    printf 'pressure manifest accepted a missing resource boundary\n' >&2
+    return 1
+  fi
+
+  private_root="$TEST_TMP_DIR/pressure-resource-duplicate"
+  directory="$private_root/cycle-01"
+  manifest="$directory/private-manifest.json"
+  benchmark_pressure_test_prepare_cycle_fixture "$private_root" 1
+  candidate="$directory/.resource-duplicate"
+  sed '0,/"ID":/s//"ID":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","ID":/' \
+    "$directory/resources-baseline.json" >"$candidate"
+  chmod 0600 -- "$candidate"
+  mv -T -- "$candidate" "$directory/resources-baseline.json"
+  benchmark_pressure_test_rehash_manifest_role "$manifest" resources_baseline
+  if validate_benchmark_pressure_private_manifest "$manifest" 1; then
+    printf 'pressure manifest accepted duplicate resource row identity\n' >&2
+    return 1
+  fi
+}
+
+test_benchmark_pressure_recovery_samples_are_consecutive_and_clean() {
+  local -r private_root="$TEST_TMP_DIR/pressure-recovery"
+  local -r directory="$private_root/cycle-10"
+  local -r manifest="$directory/private-manifest.json"
+  local candidate=""
+  local recovery_digest=""
+  local saved_manifest="$TEST_TMP_DIR/recovery-valid-manifest.json"
+
+  benchmark_pressure_test_prepare_cycle_fixture "$private_root" 10
+  validate_benchmark_pressure_private_manifest "$manifest" 10
+  cp -- "$manifest" "$saved_manifest"
+  for expression in \
+    '.recovery.sample_sha256s |= reverse' \
+    '.recovery.sample_sha256s |= .[0:1]' \
+    '.recovery.captured_monotonic_centiseconds |= reverse'; do
+    candidate="$directory/.recovery-metadata-forgery"
+    jq -cS "$expression" "$saved_manifest" >"$candidate"
+    chmod 0600 -- "$candidate"
+    mv -T -- "$candidate" "$manifest"
+    if validate_benchmark_pressure_private_manifest "$manifest" 10; then
+      printf 'pressure manifest accepted recovery mutation: %s\n' \
+        "$expression" >&2
+      return 1
+    fi
+  done
+  cp -- "$saved_manifest" "$manifest"
+  chmod 0600 -- "$manifest"
+  printf '%s\n' \
+    'obi_bpf_map_entries_total{map_id="123",map_name="java_remote_par",map_type="hash"} 1' \
+    >"$directory/recovery-02.prom"
+  chmod 0600 -- "$directory/recovery-02.prom"
+  recovery_digest="$(benchmark_pressure_test_sha256 \
+    "$directory/recovery-02.prom")" || return $?
+  candidate="$directory/.recovery-forgery"
+  jq -cS --arg digest "$recovery_digest" \
+    '.recovery.sample_sha256s[1]=$digest' "$manifest" >"$candidate"
+  chmod 0600 -- "$candidate"
+  mv -T -- "$candidate" "$manifest"
+  benchmark_pressure_test_rehash_manifest_role "$manifest" recovery_2
+  if validate_benchmark_pressure_private_manifest "$manifest" 10; then
+    printf 'pressure manifest accepted a non-clean second recovery sample\n' >&2
+    return 1
+  fi
+}
+
+test_benchmark_pressure_manifest_propagates_traversal_failure() {
+  local -r private_root="$TEST_TMP_DIR/pressure-jq-failure"
+  local -r manifest="$private_root/cycle-01/private-manifest.json"
+
+  benchmark_pressure_test_prepare_cycle_fixture "$private_root" 1
+  jq() {
+    if [[ "$*" == *'.files[] | [.role,.name,.sha256,.size_bytes] | @tsv'* ]]; then
+      return 79
+    fi
+    command jq "$@"
+  }
+  if validate_benchmark_pressure_private_manifest "$manifest" 1; then
+    printf 'pressure manifest swallowed its roster traversal failure\n' >&2
+    return 1
+  fi
+  [[ -z "$(find "$private_root/cycle-01" -maxdepth 1 \
+    -name '.manifest-roster.*' -print -quit)" ]]
+}
+
+test_benchmark_pressure_publication_rolls_back_exact_targets() {
+  local -r directory="$TEST_TMP_DIR/pressure-publication"
+  local source="$directory/source"
+  local target="$directory/target"
+  local marker="$directory/stat-failed"
+  local benign_json='{"kind":"safe","pad":"xx"}'
+  local duplicate_json='{"kind":"bad","kind":"safe"}'
+  local json_width=64
+  local source_parent_identity=""
+  local source_identity=""
+  local source_sha256=""
+
+  mkdir -m 0700 -- "$directory"
+  printf 'candidate\n' >"$source"
+  chmod 0600 -- "$source"
+  benchmark_pressure_capture_candidate_authority \
+    "$source" 600 source_parent_identity source_identity source_sha256
+  stat() {
+    local final_argument="${!#}"
+    if [[ "$final_argument" == /proc/self/fd/*/target && ! -e "$marker" ]]; then
+      : >"$marker"
+      return 78
+    fi
+    command stat "$@"
+  }
+  if benchmark_pressure_commit_file_no_clobber \
+    "$source" "$target" 600 "$source_parent_identity" \
+    "$source_parent_identity" "$source_identity" "$source_sha256"; then
+    printf 'pressure publication ignored a post-link identity failure\n' >&2
+    return 1
+  fi
+  unset -f stat
+  [[ ! -e "$source" && ! -L "$source" &&
+    ! -e "$target" && ! -L "$target" ]] || return 1
+
+  source="$directory/validated-source"
+  target="$directory/validated-target"
+  printf 'candidate\n' >"$source"
+  chmod 0600 -- "$source"
+  benchmark_pressure_test_path_validator() {
+    [[ "$1" == "$source" ]]
+  }
+  if benchmark_pressure_publish_validated_file "$source" "$target" 600 \
+    benchmark_pressure_test_path_validator; then
+    printf 'pressure publication ignored post-commit validation failure\n' >&2
+    return 1
+  fi
+  [[ ! -e "$source" && ! -L "$source" &&
+    ! -e "$target" && ! -L "$target" ]] || return 1
+
+  source="$directory/json-source"
+  target="$directory/json-target"
+  marker="$directory/json-aba-fired"
+  printf '%-*s\n' "$json_width" "$benign_json" >"$source"
+  chmod 0600 -- "$source"
+  benchmark_pressure_test_sealed_json_validator() {
+    [[ "$1" =~ ^/proc/self/fd/[1-9][0-9]*$ && ! "$1" -ef "$source" ]] ||
+      return 1
+    benchmark_pressure_json_has_unique_object_keys "$1" 4096 || return $?
+    jq -e '.kind == "safe"' "$1" >/dev/null
+  }
+  jq() {
+    local final_argument="${!#}"
+    local status=0
+
+    if [[ "$final_argument" =~ ^/proc/self/fd/[1-9][0-9]*$ &&
+      ! -e "$marker" ]]; then
+      : >"$marker"
+      printf '%-*s\n' "$json_width" "$duplicate_json" >"$source"
+      command jq "$@" || status=$?
+      printf '%-*s\n' "$json_width" "$benign_json" >"$source"
+      return "$status"
+    fi
+    command jq "$@"
+  }
+  benchmark_pressure_publish_validated_file "$source" "$target" 600 \
+    benchmark_pressure_test_sealed_json_validator
+  unset -f jq
+  [[ -f "$marker" && ! -e "$source" && ! -L "$source" &&
+    -f "$target" && "$(stat -Lc '%u:%a:%h:%s' -- "$target")" == \
+      "$EUID:600:1:$((json_width + 1))" &&
+    "$(jq -er '.kind' "$target")" == safe ]] || return 1
+  benchmark_pressure_json_has_unique_object_keys "$target" 4096
+}
+
+test_benchmark_pressure_last_check_and_parent_authority_are_bound() {
+  local private_root="$TEST_TMP_DIR/pressure-last-check"
+  local directory="$private_root/cycle-01"
+  local manifest="$directory/private-manifest.json"
+  local marker="$TEST_TMP_DIR/late-roster-mutation"
+  local source=""
+  local target=""
+  local original_parent=""
+  local saved_directory=""
+  local foreign_directory=""
+  local saved_manifest="$TEST_TMP_DIR/pressure-manifest-original"
+  local foreign_manifest="$TEST_TMP_DIR/pressure-manifest-foreign"
+  local manifest_aba_marker="$TEST_TMP_DIR/pressure-manifest-aba-fired"
+  local aba_manifest_path=""
+  local lasting_marker="$TEST_TMP_DIR/pressure-lasting-leaf-fired"
+  local lasting_saved="$TEST_TMP_DIR/pressure-lasting-map-fill-original"
+  local lasting_foreign="$TEST_TMP_DIR/pressure-lasting-map-fill-foreign"
+
+  benchmark_pressure_test_prepare_cycle_fixture "$private_root" 1
+  jq() {
+    if [[ "$*" == *'release_published'* && ! -e "$marker" ]]; then
+      : >"$marker"
+      : >"$directory/foreign-late-file"
+      chmod 0600 -- "$directory/foreign-late-file"
+    fi
+    command jq "$@"
+  }
+  if validate_benchmark_pressure_private_manifest "$manifest" 1; then
+    printf 'pressure manifest accepted a post-roster foreign file\n' >&2
+    return 1
+  fi
+  unset -f jq
+
+  private_root="$TEST_TMP_DIR/pressure-root-substitution"
+  directory="$private_root/cycle-01"
+  manifest="$directory/private-manifest.json"
+  marker="$TEST_TMP_DIR/root-substitution-fired"
+  saved_directory="$private_root/cycle-original"
+  foreign_directory="$TEST_TMP_DIR/pressure-foreign-served"
+  benchmark_pressure_test_prepare_cycle_fixture "$private_root" 1
+  sha256sum() {
+    local final_argument="${!#}"
+    local status=0
+
+    if [[ "$final_argument" =~ ^/proc/self/fd/[1-9][0-9]*$ &&
+      "$final_argument" -ef "$directory/map-fill.json" && ! -e "$marker" ]]; then
+      : >"$marker"
+      mv -T -- "$directory" "$saved_directory"
+      cp -a -- "$saved_directory" "$directory"
+      printf 'foreign map bytes\n' >"$directory/map-fill.json"
+      chmod 0600 -- "$directory/map-fill.json"
+      command sha256sum "$@" || status=$?
+      mv -T -- "$directory" "$foreign_directory"
+      mv -T -- "$saved_directory" "$directory"
+      return "$status"
+    fi
+    command sha256sum "$@"
+  }
+  if ! validate_benchmark_pressure_private_manifest "$manifest" 1; then
+    printf 'pressure manifest followed lexical bytes during an ABA swap\n' >&2
+    return 1
+  fi
+  unset -f sha256sum
+  [[ -f "$marker" && "$(<"$foreign_directory/map-fill.json")" == \
+    'foreign map bytes' ]] || return 1
+  aba_manifest_path="$manifest"
+  jq() {
+    local final_argument="${!#}"
+    local status=0
+
+    if [[ "$final_argument" =~ ^/proc/self/fd/[1-9][0-9]*$ &&
+      ! -e "$manifest_aba_marker" ]]; then
+      : >"$manifest_aba_marker"
+      mv -T -- "$aba_manifest_path" "$saved_manifest"
+      command jq -cS '.cycle=2' "$saved_manifest" >"$aba_manifest_path"
+      chmod 0600 -- "$aba_manifest_path"
+      command jq "$@" || status=$?
+      mv -T -- "$aba_manifest_path" "$foreign_manifest"
+      mv -T -- "$saved_manifest" "$aba_manifest_path"
+      return "$status"
+    fi
+    command jq "$@"
+  }
+  if ! validate_benchmark_pressure_private_manifest "$manifest" 1; then
+    printf 'pressure manifest followed a same-directory ABA replacement\n' >&2
+    return 1
+  fi
+  unset -f jq
+  [[ -f "$manifest_aba_marker" && -f "$manifest" &&
+    ! -e "$saved_manifest" && ! -L "$saved_manifest" &&
+    "$(command jq -er '.cycle' "$foreign_manifest")" == 2 ]] || return 1
+
+  sha256sum() {
+    local final_argument="${!#}"
+
+    if [[ "$final_argument" =~ ^/proc/self/fd/[1-9][0-9]*$ &&
+      "$final_argument" -ef "$directory/trace-snapshot.json" &&
+      ! -e "$lasting_marker" ]]; then
+      : >"$lasting_marker"
+      mv -T -- "$directory/map-fill.json" "$lasting_saved"
+      printf 'lasting foreign map bytes\n' >"$directory/map-fill.json"
+      chmod 0600 -- "$directory/map-fill.json"
+    fi
+    command sha256sum "$@"
+  }
+  if validate_benchmark_pressure_private_manifest "$manifest" 1; then
+    printf 'pressure manifest accepted a lasting pinned-leaf replacement\n' >&2
+    return 1
+  fi
+  unset -f sha256sum
+  [[ -f "$lasting_marker" && -f "$lasting_saved" &&
+    "$(<"$directory/map-fill.json")" == 'lasting foreign map bytes' ]] ||
+    return 1
+  mv -T -- "$directory/map-fill.json" "$lasting_foreign"
+  mv -T -- "$lasting_saved" "$directory/map-fill.json"
+
+  original_parent="$TEST_TMP_DIR/pressure-parent-original"
+  mkdir -m 0700 -- "$original_parent"
+  source="$original_parent/source"
+  target="$original_parent/target"
+  printf 'candidate\n' >"$source"
+  chmod 0600 -- "$source"
+  benchmark_pressure_test_parent_swap_validator() {
+    if [[ "$1" =~ ^/proc/self/fd/[1-9][0-9]*$ &&
+      ! "$1" -ef "$source" ]]; then
+      mv -T -- "$original_parent" "$original_parent-renamed"
+      mkdir -m 0700 -- "$original_parent"
+      printf 'foreign\n' >"$target"
+      chmod 0600 -- "$target"
+    fi
+    return 0
+  }
+  if benchmark_pressure_publish_validated_file "$source" "$target" 600 \
+    benchmark_pressure_test_parent_swap_validator; then
+    printf 'pressure publication accepted target-parent substitution\n' >&2
+    return 1
+  fi
+  [[ "$(<"$target")" == foreign &&
+    ! -e "$original_parent-renamed/target" &&
+    ! -L "$original_parent-renamed/target" ]]
+}
+
+test_benchmark_pressure_aggregate_is_exact_and_non_disclosing() {
+  local -r valid="$TEST_TMP_DIR/pressure-aggregate.json"
+  local mutated=""
+
+  benchmark_pressure_test_write_aggregate "$valid"
+  validate_benchmark_pressure_aggregate "$valid"
+  for expression in \
+    '.cycles |= .[0:9]' \
+    '.cycles += [.cycles[-1] | .cycle=11]' \
+    '.cycles[0].load_requested_seconds=59' \
+    '.cycles[0].load_requested_seconds=61' \
+    '.cycles[0].load_elapsed_nanos=59000000000' \
+    '.cycles[0].load_elapsed_nanos=61000000000' \
+    '.cycles[0].idle_requested_seconds=29' \
+    '.cycles[0].idle_requested_seconds=31' \
+    '.cycles[0].idle_elapsed_centiseconds=2900' \
+    '.cycles[0].idle_elapsed_centiseconds=3100' \
+    '.cycles[0:2] |= reverse' \
+    '.cycles[1].stack_identity_sha256=("d"*64)' \
+    '.histograms="pooled"' \
+    '.recovery.map_entries=[0,1]' \
+    '.cycles[0].histogram=[]'; do
+    mutated="$TEST_TMP_DIR/pressure-aggregate-mutated-$(printf '%s' "$expression" | cksum | awk '{print $1}').json"
+    jq -cS "$expression" "$valid" >"$mutated"
+    if validate_benchmark_pressure_aggregate "$mutated"; then
+      printf 'pressure aggregate accepted hostile mutation: %s\n' "$expression" >&2
+      return 1
+    fi
+  done
+}
+
+test_benchmark_pressure_aggregate_recomputes_all_private_cycles() {
+  local -r result_dir="$TEST_TMP_DIR/pressure-bound-aggregate"
+  local -r private_root="$result_dir/benchmark-pressure-cycles-raw"
+  local cycles='[]'
+  local recovery=""
+  local cycle=""
+  local tag=""
+  local manifest=""
+  local manifest_digest=""
+  local manifest_size=""
+  local manifest_count=""
+  local barrier_digest=""
+  local result_digest=""
+  local stack_digest=""
+  local row=""
+  local mutated="$TEST_TMP_DIR/pressure-bound-aggregate-mutated.json"
+  local aba_private_root=""
+  local aba_saved_root="$TEST_TMP_DIR/pressure-aggregate-root-original"
+  local aba_foreign_root="$TEST_TMP_DIR/pressure-aggregate-root-foreign"
+  local aba_marker="$TEST_TMP_DIR/pressure-aggregate-root-aba-fired"
+  local aggregate_path=""
+  local aggregate_saved="$TEST_TMP_DIR/pressure-aggregate-file-original"
+  local aggregate_foreign="$TEST_TMP_DIR/pressure-aggregate-file-foreign"
+  local aggregate_aba_marker="$TEST_TMP_DIR/pressure-aggregate-file-aba-fired"
+  local earlier_cycle_marker="$TEST_TMP_DIR/pressure-earlier-cycle-fired"
+  local earlier_cycle_saved="$TEST_TMP_DIR/pressure-cycle-01-map-fill-original"
+  local earlier_cycle_foreign="$TEST_TMP_DIR/pressure-cycle-01-map-fill-foreign"
+  local manifest_symlink_marker="$TEST_TMP_DIR/pressure-manifest-symlink-fired"
+  local manifest_symlink_saved="$TEST_TMP_DIR/pressure-manifest-symlink-owned"
+  local manifest_path=""
+  local first_leaf_marker="$TEST_TMP_DIR/pressure-first-leaf-symlink-fired"
+  local first_leaf_saved="$TEST_TMP_DIR/pressure-first-leaf-symlink-owned"
+  local first_leaf=""
+  local first_leaf_name=""
+  local aggregate_symlink_marker="$TEST_TMP_DIR/pressure-aggregate-symlink-fired"
+  local aggregate_symlink_saved="$result_dir/.aggregate-symlink-owned"
+  local aggregate_digest=""
+  local aggregate_hash_count=0
+  local aggregate_hash_counter="$TEST_TMP_DIR/pressure-aggregate-hash-count"
+  local aggregate_hash_counter_identity=""
+  local cross_leaf_marker="$TEST_TMP_DIR/pressure-cross-leaf-symlink-fired"
+  local cross_leaf_saved="$TEST_TMP_DIR/pressure-cross-leaf-symlink-owned"
+  local roster_mutation_marker="$TEST_TMP_DIR/pressure-cycle-roster-fired"
+  local roster_foreign="$private_root/cycle-01/unexpected-roster-leaf"
+
+  mkdir -m 0700 -- "$result_dir"
+  RESULT_DIR="$result_dir"
+  for ((cycle = 1; cycle <= 10; cycle++)); do
+    benchmark_pressure_test_prepare_cycle_fixture "$private_root" "$cycle"
+    printf -v tag '%02d' "$cycle"
+    manifest="$private_root/cycle-$tag/private-manifest.json"
+    manifest_digest="$(benchmark_pressure_test_sha256 "$manifest")" || return $?
+    manifest_size="$(stat -Lc '%s' -- "$manifest")" || return $?
+    manifest_count="$(jq -er '.files | length' "$manifest")" || return $?
+    barrier_digest="$(jq -er \
+      '.files[] | select(.role == "barrier") | .sha256' "$manifest")" ||
+      return $?
+    admission_digest="$(jq -er \
+      '.files[] | select(.role == "admission") | .sha256' "$manifest")" ||
+      return $?
+    result_digest="$(jq -er \
+      '.files[] | select(.role == "benchmark") | .sha256' "$manifest")" ||
+      return $?
+    stack_digest="$(jq -er '.identity.stack_identity_sha256' "$manifest")" ||
+      return $?
+    row="$(jq -cS -n --argjson cycle "$cycle" \
+      --arg manifest_digest "$manifest_digest" \
+      --argjson manifest_size "$manifest_size" \
+      --argjson manifest_count "$manifest_count" \
+      --arg admission "$admission_digest" --arg barrier "$barrier_digest" \
+      --arg result "$result_digest" \
+      --arg stack "$stack_digest" '
+        {cycle:$cycle,status:"passed",load_requested_seconds:60,
+         load_elapsed_nanos:60000000000,idle_requested_seconds:30,
+         idle_elapsed_centiseconds:3000,successful_requests:1,
+         histogram_encoding:"sorted_rle_nanos_v1",
+         private_manifest_sha256:$manifest_digest,
+         private_manifest_bytes:$manifest_size,private_file_count:$manifest_count,
+         admission_receipt_sha256:$admission,
+         barrier_receipt_sha256:$barrier,rle_result_sha256:$result,
+         stack_identity_sha256:$stack,unexpected_evictions:0}
+      ')" || return $?
+    cycles="$(jq -cS --argjson row "$row" '. + [$row]' <<<"$cycles")" ||
+      return $?
+  done
+  recovery="$(jq -cS '.recovery' \
+    "$private_root/cycle-10/private-manifest.json")" || return $?
+  publish_benchmark_pressure_aggregate "$cycles" "$recovery" "$private_root"
+  aggregate_path="$result_dir/benchmark-pressure-cycles.json"
+  aba_private_root="$private_root"
+  jq() {
+    local final_argument="${!#}"
+    local status=0
+
+    if [[ "$final_argument" =~ ^/proc/self/fd/[1-9][0-9]*$ &&
+      ! -e "$aggregate_aba_marker" ]]; then
+      : >"$aggregate_aba_marker"
+      mv -T -- "$aggregate_path" "$aggregate_saved"
+      command jq -cS '.cycle_count=9' "$aggregate_saved" >"$aggregate_path"
+      chmod 0644 -- "$aggregate_path"
+      command jq "$@" || status=$?
+      mv -T -- "$aggregate_path" "$aggregate_foreign"
+      mv -T -- "$aggregate_saved" "$aggregate_path"
+      return "$status"
+    fi
+    command jq "$@"
+  }
+  sha256sum() {
+    local final_argument="${!#}"
+    local status=0
+
+    if [[ "$final_argument" =~ ^/proc/self/fd/[1-9][0-9]*$ &&
+      "$final_argument" -ef "$aba_private_root/cycle-01/map-fill.json" &&
+      ! -e "$aba_marker" ]]; then
+      : >"$aba_marker"
+      mv -T -- "$aba_private_root" "$aba_saved_root"
+      cp -a -- "$aba_saved_root" "$aba_private_root"
+      printf 'foreign aggregate map bytes\n' \
+        >"$aba_private_root/cycle-01/map-fill.json"
+      chmod 0600 -- "$aba_private_root/cycle-01/map-fill.json"
+      command sha256sum "$@" || status=$?
+      mv -T -- "$aba_private_root" "$aba_foreign_root"
+      mv -T -- "$aba_saved_root" "$aba_private_root"
+      return "$status"
+    fi
+    command sha256sum "$@"
+  }
+  if ! validate_benchmark_pressure_aggregate \
+    "$aggregate_path" "$private_root"; then
+    printf 'pressure aggregate followed lexical bytes during an ABA swap\n' >&2
+    return 1
+  fi
+  unset -f jq
+  unset -f sha256sum
+  [[ -f "$aba_marker" && -d "$aba_private_root" &&
+    ! -e "$aba_saved_root" && ! -L "$aba_saved_root" &&
+    "$(<"$aba_foreign_root/cycle-01/map-fill.json")" == \
+      'foreign aggregate map bytes' &&
+    -f "$aggregate_aba_marker" && -f "$aggregate_path" &&
+    ! -e "$aggregate_saved" && ! -L "$aggregate_saved" &&
+    "$(command jq -er '.cycle_count' "$aggregate_foreign")" == 9 ]] || return 1
+
+  jq() {
+    local final_argument="${!#}"
+
+    if [[ "$final_argument" =~ ^/proc/self/fd/[1-9][0-9]*$ &&
+      ! -e "$earlier_cycle_marker" ]] &&
+      command jq -e \
+        '.schema == "obi-benchmark-pressure-admission-v1" and .cycle == 2' \
+        "$final_argument" >/dev/null 2>&1; then
+      : >"$earlier_cycle_marker"
+      mv -T -- "$private_root/cycle-01/map-fill.json" "$earlier_cycle_saved"
+      printf 'lasting earlier-cycle foreign bytes\n' \
+        >"$private_root/cycle-01/map-fill.json"
+      chmod 0600 -- "$private_root/cycle-01/map-fill.json"
+    fi
+    command jq "$@"
+  }
+  if validate_benchmark_pressure_aggregate "$aggregate_path" "$private_root"; then
+    printf 'pressure aggregate accepted an earlier-cycle leaf replacement\n' >&2
+    return 1
+  fi
+  unset -f jq
+  [[ -f "$earlier_cycle_marker" && -f "$earlier_cycle_saved" &&
+    "$(<"$private_root/cycle-01/map-fill.json")" == \
+      'lasting earlier-cycle foreign bytes' ]] || return 1
+  mv -T -- "$private_root/cycle-01/map-fill.json" "$earlier_cycle_foreign"
+  mv -T -- "$earlier_cycle_saved" "$private_root/cycle-01/map-fill.json"
+
+  # A private manifest must remain a regular lexical name even when a symlink
+  # would resolve to the exact retained inode.
+  manifest_path="$private_root/cycle-01/private-manifest.json"
+  sha256sum() {
+    local final_argument="${!#}"
+    local output=""
+    local status=0
+
+    output="$(command sha256sum "$@")" || status=$?
+    if ((status == 0)) &&
+      [[ "$final_argument" =~ ^/proc/self/fd/[1-9][0-9]*$ &&
+        "$final_argument" -ef "$manifest_path" &&
+        ! -e "$manifest_symlink_marker" ]]; then
+      : >"$manifest_symlink_marker"
+      command mv -T -- "$manifest_path" "$manifest_symlink_saved" || return $?
+      command ln -s -- "$manifest_symlink_saved" "$manifest_path" || return $?
+    fi
+    printf '%s\n' "$output"
+    return "$status"
+  }
+  if validate_benchmark_pressure_aggregate "$aggregate_path" "$private_root"; then
+    printf 'pressure aggregate accepted a symlinked exact private manifest\n' >&2
+    return 1
+  fi
+  unset -f sha256sum
+  [[ -f "$manifest_symlink_marker" && -L "$manifest_path" &&
+    -f "$manifest_symlink_saved" ]] || return 1
+  command rm -- "$manifest_path"
+  command mv -T -- "$manifest_symlink_saved" "$manifest_path"
+
+  # The first roster leaf stat is followed by another lexical type check; the
+  # retained descriptor cannot legitimize a symlink installed at that boundary.
+  first_leaf_name="$(jq -er '.files[0].name' "$manifest_path")" || return $?
+  first_leaf="$private_root/cycle-01/$first_leaf_name"
+  stat() {
+    local final_argument="${!#}"
+    local output=""
+    local status=0
+
+    output="$(command stat "$@")" || status=$?
+    if ((status == 0)) &&
+      [[ "$final_argument" =~ ^/proc/self/fd/[1-9][0-9]*$ &&
+        "$final_argument" -ef "$first_leaf" &&
+        ! -e "$first_leaf_marker" ]]; then
+      : >"$first_leaf_marker"
+      command mv -T -- "$first_leaf" "$first_leaf_saved" || return $?
+      command ln -s -- "$first_leaf_saved" "$first_leaf" || return $?
+    fi
+    printf '%s\n' "$output"
+    return "$status"
+  }
+  if validate_benchmark_pressure_aggregate "$aggregate_path" "$private_root"; then
+    printf 'pressure aggregate accepted a symlinked exact roster leaf\n' >&2
+    return 1
+  fi
+  unset -f stat
+  [[ -f "$first_leaf_marker" && -L "$first_leaf" &&
+    -f "$first_leaf_saved" ]] || return 1
+  command rm -- "$first_leaf"
+  command mv -T -- "$first_leaf_saved" "$first_leaf"
+
+  # The aggregate lexical name is retyped after the final sealed-image digest;
+  # a same-inode symlink installed by that digest boundary is rejected.
+  aggregate_digest="$(benchmark_pressure_test_sha256 "$aggregate_path")" || return $?
+  (umask 077; set -o noclobber; printf '0\n' >"$aggregate_hash_counter") ||
+    return $?
+  aggregate_hash_counter_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+    "$aggregate_hash_counter")" || return $?
+  [[ "$aggregate_hash_counter_identity" =~ \
+    ^[0-9]+:[1-9][0-9]*:$EUID:600:1:2$ ]] || return 1
+  sha256sum() {
+    local final_argument="${!#}"
+    local output=""
+    local status=0
+
+    output="$(command sha256sum "$@")" || status=$?
+    if ((status == 0)) &&
+      [[ "$final_argument" =~ ^/proc/self/fd/[1-9][0-9]*$ &&
+        ! "$final_argument" -ef "$aggregate_path" &&
+        "${output%% *}" == "$aggregate_digest" &&
+        "$(command stat -Lc '%h' -- "$final_argument")" == 0 ]]; then
+      aggregate_hash_count="$(<"$aggregate_hash_counter")" || return $?
+      [[ "$aggregate_hash_count" =~ ^[01]$ ]] || return 1
+      ((aggregate_hash_count += 1))
+      printf '%d\n' "$aggregate_hash_count" >"$aggregate_hash_counter" ||
+        return $?
+      if ((aggregate_hash_count == 2)) &&
+        [[ ! -e "$aggregate_symlink_marker" ]]; then
+        : >"$aggregate_symlink_marker"
+        command mv -T -- "$aggregate_path" "$aggregate_symlink_saved" ||
+          return $?
+        command ln -s -- "${aggregate_symlink_saved##*/}" "$aggregate_path" ||
+          return $?
+      fi
+    fi
+    printf '%s\n' "$output"
+    return "$status"
+  }
+  if validate_benchmark_pressure_aggregate "$aggregate_path" "$private_root"; then
+    printf 'pressure aggregate accepted a final same-inode symlink\n' >&2
+    return 1
+  fi
+  unset -f sha256sum
+  [[ -f "$aggregate_symlink_marker" && -L "$aggregate_path" &&
+    -f "$aggregate_symlink_saved" &&
+    "$(<"$aggregate_hash_counter")" == 2 ]] || return 1
+  command rm -- "$aggregate_path"
+  command mv -T -- "$aggregate_symlink_saved" "$aggregate_path"
+  [[ "$(stat -Lc '%d:%i:%u:%a:%h:%s' -- "$aggregate_hash_counter")" == \
+    "$aggregate_hash_counter_identity" ]] || return 1
+  command rm -- "$aggregate_hash_counter"
+
+  # The final aggregate-image hash is later than every cycle leaf hash.  A
+  # same-inode symlink installed for an already-checked cycle-01 member is
+  # rejected by the broker's one all-cycle O_NOFOLLOW roster acquisition.
+  (umask 077; set -o noclobber; printf '0\n' >"$aggregate_hash_counter") ||
+    return $?
+  aggregate_hash_counter_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+    "$aggregate_hash_counter")" || return $?
+  [[ "$aggregate_hash_counter_identity" =~ \
+    ^[0-9]+:[1-9][0-9]*:$EUID:600:1:2$ ]] || return 1
+  sha256sum() {
+    local final_argument="${!#}"
+    local output=""
+    local status=0
+
+    output="$(command sha256sum "$@")" || status=$?
+    if ((status == 0)) &&
+      [[ "$final_argument" =~ ^/proc/self/fd/[1-9][0-9]*$ &&
+        ! "$final_argument" -ef "$aggregate_path" &&
+        "${output%% *}" == "$aggregate_digest" &&
+        "$(command stat -Lc '%h' -- "$final_argument")" == 0 ]]; then
+      aggregate_hash_count="$(<"$aggregate_hash_counter")" || return $?
+      [[ "$aggregate_hash_count" =~ ^[01]$ ]] || return 1
+      ((aggregate_hash_count += 1))
+      printf '%d\n' "$aggregate_hash_count" >"$aggregate_hash_counter" ||
+        return $?
+      if ((aggregate_hash_count == 2)) && [[ ! -e "$cross_leaf_marker" ]]; then
+        : >"$cross_leaf_marker"
+        command mv -T -- "$first_leaf" "$cross_leaf_saved" || return $?
+        command ln -s -- "$cross_leaf_saved" "$first_leaf" || return $?
+      fi
+    fi
+    printf '%s\n' "$output"
+    return "$status"
+  }
+  if validate_benchmark_pressure_aggregate "$aggregate_path" "$private_root"; then
+    printf 'pressure aggregate accepted a later-cycle cross-leaf symlink\n' >&2
+    return 1
+  fi
+  unset -f sha256sum
+  [[ -f "$cross_leaf_marker" && -L "$first_leaf" &&
+    "$(readlink -- "$first_leaf")" == "$cross_leaf_saved" &&
+    -f "$cross_leaf_saved" &&
+    "$(<"$aggregate_hash_counter")" == 2 ]] || return 1
+  command rm -- "$first_leaf"
+  command mv -T -- "$cross_leaf_saved" "$first_leaf"
+  [[ "$(stat -Lc '%d:%i:%u:%a:%h:%s' -- "$aggregate_hash_counter")" == \
+    "$aggregate_hash_counter_identity" ]] || return 1
+  command rm -- "$aggregate_hash_counter"
+
+  # The same late boundary cannot add an unmanifested name to an earlier cycle;
+  # exact cycle rosters are checked together inside the terminal broker pass.
+  (umask 077; set -o noclobber; printf '0\n' >"$aggregate_hash_counter") ||
+    return $?
+  aggregate_hash_counter_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+    "$aggregate_hash_counter")" || return $?
+  [[ "$aggregate_hash_counter_identity" =~ \
+    ^[0-9]+:[1-9][0-9]*:$EUID:600:1:2$ ]] || return 1
+  sha256sum() {
+    local final_argument="${!#}"
+    local output=""
+    local status=0
+
+    output="$(command sha256sum "$@")" || status=$?
+    if ((status == 0)) &&
+      [[ "$final_argument" =~ ^/proc/self/fd/[1-9][0-9]*$ &&
+        ! "$final_argument" -ef "$aggregate_path" &&
+        "${output%% *}" == "$aggregate_digest" &&
+        "$(command stat -Lc '%h' -- "$final_argument")" == 0 ]]; then
+      aggregate_hash_count="$(<"$aggregate_hash_counter")" || return $?
+      [[ "$aggregate_hash_count" =~ ^[01]$ ]] || return 1
+      ((aggregate_hash_count += 1))
+      printf '%d\n' "$aggregate_hash_count" >"$aggregate_hash_counter" ||
+        return $?
+      if ((aggregate_hash_count == 2)) &&
+        [[ ! -e "$roster_mutation_marker" ]]; then
+        : >"$roster_mutation_marker"
+        printf 'foreign roster member\n' >"$roster_foreign" || return $?
+        chmod 0600 -- "$roster_foreign"
+      fi
+    fi
+    printf '%s\n' "$output"
+    return "$status"
+  }
+  if validate_benchmark_pressure_aggregate "$aggregate_path" "$private_root"; then
+    printf 'pressure aggregate accepted a late earlier-cycle roster mutation\n' >&2
+    return 1
+  fi
+  unset -f sha256sum
+  [[ -f "$roster_mutation_marker" &&
+    "$(<"$roster_foreign")" == 'foreign roster member' &&
+    "$(<"$aggregate_hash_counter")" == 2 ]] || return 1
+  command rm -- "$roster_foreign"
+  [[ "$(stat -Lc '%d:%i:%u:%a:%h:%s' -- "$aggregate_hash_counter")" == \
+    "$aggregate_hash_counter_identity" ]] || return 1
+  command rm -- "$aggregate_hash_counter"
+
+  jq -cS '.cycles[0].successful_requests=2' \
+    "$aggregate_path" >"$mutated"
+  chmod 0644 -- "$mutated"
+  if validate_benchmark_pressure_aggregate "$mutated" "$private_root"; then
+    printf 'pressure aggregate accepted a public/private counter mismatch\n' >&2
+    return 1
+  fi
+  mkdir -m 0700 -- "$private_root/cycle-11"
+  if validate_benchmark_pressure_aggregate \
+    "$aggregate_path" "$private_root"; then
+    printf 'pressure aggregate accepted an eleventh private cycle\n' >&2
+    return 1
+  fi
+}
+
+test_benchmark_pressure_client_failures_are_cleanup_owned() {
+  local -r failure_dir="$TEST_TMP_DIR/pressure-client-failure"
+  local -r admission_dir="$TEST_TMP_DIR/pressure-client-admission"
+  local -r valid_result="$TEST_TMP_DIR/pressure-client-valid.json"
+  local calls="$TEST_TMP_DIR/pressure-client-calls"
+  local client_mode=nonzero
+
+  mkdir -m 0700 -- "$failure_dir" "$admission_dir"
+  benchmark_pressure_test_write_result "$valid_result"
+  PRESSURE_CONTROL_SESSION=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  COMPOSE=(docker compose --project-name pressure-test)
+  benchmark_pressure_client_absent() {
+    printf '%s\n' "$2" >>"$calls"
+    return 0
+  }
+  run_bounded_foreground_group() {
+    if [[ "$client_mode" == nonzero ]]; then
+      printf '{}\n'
+      return 47
+    fi
+    command jq -cS '.request_limit_reached=true' "$valid_result"
+  }
+
+  if run_benchmark_pressure_client 1 "$failure_dir"; then
+    printf 'pressure client accepted a nonzero benchmark exit\n' >&2
+    return 1
+  fi
+  [[ "$(sed -n '1p' "$calls")" == false &&
+    "$(sed -n '2p' "$calls")" == true &&
+    ! -e "$failure_dir/benchmark-result.json" &&
+    -f "$failure_dir/benchmark-client-failure.json" &&
+    "$(jq -er '.command_status' \
+      "$failure_dir/benchmark-client-failure.json")" == 47 &&
+    -z "$(find "$failure_dir" -maxdepth 1 -name '.*' -print -quit)" ]] || return 1
+
+  : >"$calls"
+  client_mode=admission
+  if run_benchmark_pressure_client 2 "$admission_dir"; then
+    printf 'pressure client accepted request-limit exhaustion\n' >&2
+    return 1
+  fi
+  [[ "$(sed -n '1p' "$calls")" == false &&
+    "$(sed -n '2p' "$calls")" == true &&
+    ! -e "$admission_dir/benchmark-result.json" &&
+    -f "$admission_dir/benchmark-client-failure.json" &&
+    "$(jq -er '.command_status' \
+      "$admission_dir/benchmark-client-failure.json")" == 65 &&
+    -z "$(find "$admission_dir" -maxdepth 1 -name '.*' -print -quit)" ]]
+}
+
+test_benchmark_pressure_controller_runs_exact_ordered_cycles() {
+  local -r result_dir="$TEST_TMP_DIR/pressure-controller-results"
+  local -r stack_fixture="$TEST_TMP_DIR/pressure-controller-stack.json"
+  local -r clock_file="$TEST_TMP_DIR/pressure-controller-clock"
+  local -r calls="$TEST_TMP_DIR/pressure-controller-calls"
+  local current_cycle=""
+  local tag=""
+  local actual=""
+  local expected=""
+
+  mkdir -m 0700 -- "$result_dir"
+  benchmark_pressure_test_write_stack "$stack_fixture"
+  printf '0\n' >"$clock_file"
+  : >"$calls"
+  RESULT_DIR="$result_dir"
+  SCENARIO=benchmark-pressure-cycles
+  TRANSPORT=getsockopt
+  SELECTED_TRANSPORT=getsockopt
+  OBI_RUNNING=true
+  BRIDGE_RUNNING=true
+
+  benchmark_pressure_stack_identity_json() {
+    command cat -- "$stack_fixture"
+  }
+  benchmark_pressure_monotonic_centiseconds() {
+    local tick=""
+    tick="$(<"$clock_file")"
+    tick="$((tick + 1))"
+    printf '%s\n' "$tick" >"$clock_file"
+    printf '%s\n' "$tick"
+  }
+  sleep() {
+    local tick=""
+    [[ "$1" == 30 ]]
+    tick="$(<"$clock_file")"
+    printf '%s\n' "$((tick + 3000))" >"$clock_file"
+    printf '%s:idle\n' "$current_cycle" >>"$calls"
+  }
+  fetch_obi_metrics() {
+    printf '%s\n' \
+      'obi_bpf_map_entries_total{map_id="123",map_name="java_remote_par",map_type="hash"} 0' \
+      >"$1"
+    case "${1##*/}" in
+      recovery-01.prom) printf '%s:recovery-1\n' "$current_cycle" >>"$calls" ;;
+      recovery-02.prom) printf '%s:recovery-2\n' "$current_cycle" >>"$calls" ;;
+    esac
+  }
+  prepare_pressure_control_runtime() {
+    printf -v current_cycle '%02d' "$cycle"
+    PRESSURE_CONTROL_LIVE_DIR="$TEST_TMP_DIR/control-$current_cycle"
+    mkdir -m 0700 -- "$PRESSURE_CONTROL_LIVE_DIR"
+    printf -v PRESSURE_CONTROL_SESSION '%032d' "$cycle"
+    PRESSURE_CONTROL_DEADLINE="$((SECONDS + 600))"
+    PRESSURE_BARRIER_RUNTIME_STATUS=prepared
+  }
+  start_map_pressure() {
+    local -r label="$1"
+    PRESSURE_MAP_ID=123
+    PRESSURE_MAP_MAX_ENTRIES=10000
+    PRESSURE_PROCESS_MAP_ID=456
+    PRESSURE_PROCESS_PID=789
+    PRESSURE_PROCESS_NAMESPACE=4026533000
+    PRESSURE_TOKEN_BASE=1000
+    PRESSURE_ACTIVE=true
+    printf '{"mode":"prepare"}\n' \
+      >"$RESULT_DIR/map-pressure-$label-prepare.json"
+    printf '{"mode":"fill"}\n' \
+      >"$RESULT_DIR/map-pressure-$label-fill.json"
+    chmod 0600 -- "$RESULT_DIR/map-pressure-$label-"{prepare,fill}.json
+    printf '%s:prepare\n' "$current_cycle" >>"$calls"
+  }
+  publish_benchmark_pressure_control_file() {
+    local -r name="$1"
+    local payload=""
+    payload="pressure-$name-v1:$PRESSURE_CONTROL_SESSION"
+    printf '%s\n' "$payload" >"$PRESSURE_CONTROL_LIVE_DIR/$name"
+    chmod 0600 -- "$PRESSURE_CONTROL_LIVE_DIR/$name"
+    if [[ "$name" == "$PRESSURE_CONTROL_READY_FILE" ]]; then
+      PRESSURE_BARRIER_RUNTIME_STATUS=ready
+      printf '%s:ready\n' "$current_cycle" >>"$calls"
+    else
+      PRESSURE_BARRIER_RUNTIME_STATUS=released
+      printf '%s:release\n' "$current_cycle" >>"$calls"
+    fi
+  }
+  sha256_file() {
+    benchmark_pressure_test_sha256 "$1"
+  }
+  run_benchmark_pressure_client() {
+    benchmark_pressure_test_write_result \
+      "$2/benchmark-result.json" 60000000000 60000000000 "$1" \
+      "$PRESSURE_CONTROL_SESSION"
+    : >"$2/benchmark.stderr.log"
+    chmod 0600 -- "$2/benchmark.stderr.log"
+    benchmark_pressure_test_write_client_commit "$2" "$1"
+    printf '%s:client\n' "$current_cycle" >>"$calls"
+  }
+  prepare_benchmark_pressure_attribution() {
+    printf '%s:attribution-prepare\n' "$current_cycle" >>"$calls"
+  }
+  finish_benchmark_pressure_attribution() {
+    printf '{"cycle":%s}\n' "$1" >"$2/admission-receipt.json"
+    chmod 0600 -- "$2/admission-receipt.json"
+    printf '%s:attribution-finish\n' "$current_cycle" >>"$calls"
+  }
+  verify_map_pressure_after_traffic() {
+    printf '{"mode":"verify"}\n' \
+      >"$RESULT_DIR/map-pressure-$1-verify.json"
+    chmod 0600 -- "$RESULT_DIR/map-pressure-$1-verify.json"
+    PRESSURE_VERIFY_STATUS=passed
+    printf '%s:verify\n' "$current_cycle" >>"$calls"
+  }
+  write_benchmark_pressure_barrier_receipt() {
+    printf '{"cycle":%s}\n' "$1" >"$2/barrier-receipt.json"
+    chmod 0600 -- "$2/barrier-receipt.json"
+  }
+  cleanup_pressure_scenario_runtime_with_retries() {
+    PRESSURE_BARRIER_RUNTIME_STATUS=failed
+    PRESSURE_CONTROL_LIVE_DIR=""
+    printf '%s:cleanup-control\n' "$current_cycle" >>"$calls"
+  }
+  cleanup_map_pressure_with_retries() {
+    local label="pressure-run-$current_cycle"
+    printf '{"mode":"cleanup"}\n' \
+      >"$RESULT_DIR/map-pressure-$label-cleanup.json"
+    printf '%s\n' \
+      'obi_bpf_map_entries_total{map_id="123",map_name="java_remote_par",map_type="hash"} 0' \
+      >"$RESULT_DIR/map-pressure-$label-recovered.prom"
+    chmod 0600 -- "$RESULT_DIR/map-pressure-$label-cleanup.json" \
+      "$RESULT_DIR/map-pressure-$label-recovered.prom"
+    PRESSURE_ACTIVE=false
+    PRESSURE_BARRIER_RUNTIME_STATUS=not-run
+    printf '%s:cleanup-map\n' "$current_cycle" >>"$calls"
+  }
+  pressure_map_state_snapshot_matches() {
+    return 0
+  }
+  capture_benchmark_pressure_resources() {
+    local tick=""
+    local boundary="${2##*/}"
+    local resource_cycle="${2%/*}"
+    resource_cycle="${resource_cycle##*/cycle-}"
+    boundary="${boundary#resources-}"
+    boundary="${boundary%.json}"
+    tick="$(benchmark_pressure_monotonic_centiseconds)" || return $?
+    jq -cS -n --argjson tick "$tick" \
+      '{captured_monotonic_centiseconds:$tick}' >"$2"
+    chmod 0600 -- "$2"
+    printf '%s:%s\n' "$resource_cycle" "$boundary" >>"$calls"
+  }
+  write_benchmark_pressure_private_manifest() {
+    local -r fixture_cycle="$1"
+    local -r directory="$2"
+    local -r phases="$3"
+    local -r idle_elapsed="$4"
+    local count=30
+    local barrier_sha=""
+    local result_sha=""
+    ((fixture_cycle == 10)) && count=32
+    jq -e --argjson idle "$idle_elapsed" '
+      (map(.name) == ["baseline_resources_captured","prepare_started",
+        "capacity_ready","load_started","load_finished","release_published",
+        "content_verified","postload_resources_captured",
+        "attribution_reconciled","cleanup_absent",
+        "idle_started","idle_finished","postidle_resources_captured"]) and
+      (.[11].monotonic_centiseconds - .[10].monotonic_centiseconds) == $idle
+    ' <<<"$phases" >/dev/null || return $?
+    if ((fixture_cycle == 10)); then
+      [[ "$5" =~ ^[0-9]+$ && "$6" =~ ^[0-9]+$ && "$5" -le "$6" ]] ||
+        return 1
+    else
+      [[ -z "${5:-}" && -z "${6:-}" ]] || return 1
+    fi
+    barrier_sha="$(benchmark_pressure_test_sha256 \
+      "$directory/barrier-receipt.json")" || return $?
+    result_sha="$(benchmark_pressure_test_sha256 \
+      "$directory/benchmark-result.json")" || return $?
+    jq -cS -n --argjson count "$count" --arg barrier "$barrier_sha" \
+      --arg result "$result_sha" '
+        {files:([{role:"barrier",sha256:$barrier},
+          {role:"benchmark",sha256:$result}] +
+          [range(2;$count) | {role:("dummy"+tostring),sha256:$result}]),
+         load:{successful_requests:1,traffic_elapsed_nanos:60000000000}}
+      ' >"$directory/private-manifest.json" || return $?
+    chmod 0600 -- "$directory/private-manifest.json"
+    printf '%s:manifest\n' "$current_cycle" >>"$calls"
+  }
+  publish_benchmark_pressure_aggregate() {
+    jq -e '. as $cycles | length == 10 and
+      all(range(0;10); $cycles[.].cycle == (. + 1))' \
+      <<<"$1" >/dev/null || return $?
+    jq -e '
+      .required_samples == 2 and .consecutive == true and
+      (.sample_sha256s | length) == 2 and
+      (.captured_monotonic_centiseconds | length) == 2 and
+      .captured_monotonic_centiseconds[0] <=
+        .captured_monotonic_centiseconds[1]
+    ' <<<"$2" >/dev/null || return $?
+    printf 'aggregate\n' >>"$calls"
+  }
+
+  run_benchmark_pressure_cycles
+  for ((cycle = 1; cycle <= 10; cycle++)); do
+    printf -v tag '%02d' "$cycle"
+    actual="$(awk -F: -v tag="$tag" '$1 == tag {print $2}' "$calls" |
+      paste -sd, -)" || return $?
+    expected='baseline,prepare,ready,attribution-prepare,client,release,verify,postload,attribution-finish,cleanup-control,cleanup-map,idle'
+    if ((cycle == 10)); then
+      expected+=',recovery-1,recovery-2'
+    fi
+    expected+=',postidle,manifest'
+    [[ "$actual" == "$expected" ]] || {
+      printf 'pressure controller order mismatch for %s: %s\n' "$tag" "$actual" >&2
+      return 1
+    }
+  done
+  [[ "$(tail -n 1 "$calls")" == aggregate &&
+    "$(grep -c ':client$' "$calls")" == 10 &&
+    "$(grep -c ':idle$' "$calls")" == 10 &&
+    "$(grep -c ':recovery-' "$calls")" == 2 ]]
+}
+
+test_benchmark_pressure_source_contract_is_fixed_and_host_side() {
+  local client_source=""
+  local campaign_source=""
+  local attribution_source=""
+  local projection_source=""
+  local phase_source=""
+  local resource_source=""
+  local java_source=""
+  local java_pair_source=""
+  local json_parser_source=""
+  local clean_exec_source=""
+  local broker_source=""
+  local coherent_source=""
+  local client_set_source=""
+  local go_source="$TEST_SCRIPT_DIR/../tracecheck/cmd/benchmark/main.go"
+
+  [[ "$BENCHMARK_PRESSURE_CYCLE_COUNT" == 10 &&
+    "$BENCHMARK_PRESSURE_LOAD_SECONDS" == 60 &&
+    "$BENCHMARK_PRESSURE_IDLE_SECONDS" == 30 &&
+    "$BENCHMARK_PRESSURE_RECOVERY_SAMPLES" == 2 &&
+    "$BENCHMARK_PRESSURE_CONCURRENCY" == 16 &&
+    "$BENCHMARK_PRESSURE_REQUEST_TIMEOUT_SECONDS" == 10 &&
+    "$BENCHMARK_PRESSURE_REQUEST_LIMIT" == 4096 &&
+    "$BENCHMARK_PRESSURE_MAX_SUCCESSFUL_REQUESTS" == 2000 &&
+    "$BENCHMARK_PRESSURE_STATS_MAX_BYTES" == 65536 &&
+    "$BENCHMARK_PRESSURE_STATS_MAX_LINES" == 3 &&
+    "$BENCHMARK_PRESSURE_STDERR_MAX_BYTES" == 65536 &&
+    "$BENCHMARK_PRESSURE_STDERR_MAX_LINES" == 512 &&
+    "$BENCHMARK_PRESSURE_TRACE_MAX_SPANS" == 10000 &&
+    "$BENCHMARK_PRESSURE_TRACE_MAX_RETAINED_BYTES" == 67108864 &&
+    "$BENCHMARK_PRESSURE_TRACE_SPANS_PER_REQUEST" == 3 &&
+    "$BENCHMARK_PRESSURE_JSON_MAX_DEPTH" == 64 &&
+    "$BENCHMARK_PRESSURE_PYTHON_EXECUTABLE" == /usr/bin/python3 &&
+    "$BENCHMARK_PRESSURE_ENV_EXECUTABLE" == /usr/bin/env &&
+    "$BENCHMARK_PRESSURE_TIMEOUT_EXECUTABLE" == /usr/bin/timeout &&
+    "$BENCHMARK_PRESSURE_BROKER_TIMEOUT_SECONDS" == 10 &&
+    "$BENCHMARK_PRESSURE_BROKER_KILL_GRACE_SECONDS" == 1 &&
+    "$BENCHMARK_PRESSURE_COHERENT_MAX_DIRECTORY_ENTRIES" == 2048 &&
+    "$BENCHMARK_PRESSURE_COHERENT_MAX_DIRECTORY_NAME_BYTES" == 131072 &&
+    "$BENCHMARK_PRESSURE_PATH" == '/api/echo?delay_ms=500' &&
+    "$BENCHMARK_PRESSURE_HISTOGRAM_ENCODING" == sorted_rle_nanos_v1 &&
+    "$BENCHMARK_PRESSURE_MARKER_ENCODING" == \
+      prefix-dash-zero-padded-ordinal-v1 &&
+    "$BENCHMARK_PRESSURE_REQUEST_LIMIT" -gt \
+      "$BENCHMARK_PRESSURE_MAX_SUCCESSFUL_REQUESTS" &&
+    "$((BENCHMARK_PRESSURE_MAX_SUCCESSFUL_REQUESTS *
+      BENCHMARK_PRESSURE_TRACE_SPANS_PER_REQUEST))" -le \
+      "$BENCHMARK_PRESSURE_TRACE_MAX_SPANS" ]]
+  client_source="$(declare -f run_benchmark_pressure_client)" || return $?
+  [[ "$client_source" == *'--duration "${BENCHMARK_PRESSURE_LOAD_SECONDS}s"'* &&
+    "$client_source" == *'--request-timeout "${BENCHMARK_PRESSURE_REQUEST_TIMEOUT_SECONDS}s"'* &&
+    "$client_source" == *'--request-limit "$BENCHMARK_PRESSURE_REQUEST_LIMIT"'* &&
+    "$client_source" == *'--marker-prefix "$marker_prefix"'* &&
+    "$client_source" == *'benchmark_pressure_run_client_captured'* &&
+    "$client_source" != *'--pressure-control-dir'* &&
+    "$client_source" != *'--pressure-control-session'* ]]
+  campaign_source="$(declare -f run_benchmark_pressure_cycles)" || return $?
+  [[ "$campaign_source" == *'resources-baseline.json'* &&
+    "$campaign_source" == *'resources-postload.json'* &&
+    "$campaign_source" == *'resources-postidle.json'* &&
+    "$campaign_source" == *'recovery-01.prom'* &&
+    "$campaign_source" == *'recovery-02.prom'* &&
+    "$campaign_source" == \
+      *'benchmark_pressure_broker_executables_are_authenticated'* &&
+    "$campaign_source" == *'prepare_benchmark_pressure_attribution'* &&
+    "$campaign_source" == *'finish_benchmark_pressure_attribution'* ]]
+  attribution_source="$(declare -f finish_benchmark_pressure_attribution)" ||
+    return $?
+  [[ "$attribution_source" == *'wait_for_benchmark_pressure_trace_snapshot'* &&
+    "$attribution_source" == *'write_metrics_delta'* &&
+    "$attribution_source" == *'pressure_bridge_reconciliation'* &&
+    "$attribution_source" == *'write_java_diagnostics_delta'* &&
+    "$attribution_source" == *'write_benchmark_pressure_admission_receipt'* ]]
+  projection_source="$(declare -f benchmark_pressure_trace_projection)" ||
+    return $?
+  [[ "$projection_source" == *'.received_spans == (.spans | length)'* &&
+    "$projection_source" == *'.received_batches <= .received_spans'* &&
+    "$projection_source" == *'retained_span_bytes'* &&
+    "$projection_source" == *'length == (unique | length)'* ]]
+  phase_source="$(declare -f validate_benchmark_pressure_phase_boundaries)" ||
+    return $?
+  [[ "$phase_source" == *'load_elapsed_centiseconds'* &&
+    "$phase_source" == *'traffic_elapsed_nanos'* ]]
+  resource_source="$(declare -f capture_benchmark_pressure_resources)" ||
+    return $?
+  java_source="$(declare -f capture_benchmark_pressure_java_diagnostics)" ||
+    return $?
+  java_pair_source="$(declare -f \
+    benchmark_pressure_publish_java_diagnostics_pair)" || return $?
+  json_parser_source="$(declare -f \
+    benchmark_pressure_json_has_unique_object_keys)" || return $?
+  clean_exec_source="$(declare -f \
+    benchmark_pressure_clean_broker_exec)" || return $?
+  broker_source="$(declare -f \
+    benchmark_pressure_broker_executables_are_authenticated)" || return $?
+  coherent_source="$(declare -f \
+    benchmark_pressure_coherent_file_set)" || return $?
+  client_set_source="$(declare -f \
+    benchmark_pressure_publish_owned_file_set)" || return $?
+  [[ "$resource_source" == *'benchmark_pressure_run_role_captured'* &&
+    "$resource_source" == *'BENCHMARK_PRESSURE_STATS_MAX_BYTES'* &&
+    "$java_source" == *'benchmark_pressure_run_role_captured'* &&
+    "$java_source" == *'BENCHMARK_PRESSURE_STDERR_MAX_BYTES'* &&
+    "$java_source" == *'benchmark_pressure_publish_java_diagnostics_pair'* &&
+    "$java_pair_source" == *'pinned_stdout_target'* &&
+    "$java_pair_source" == *'pinned_stderr_target'* &&
+    "$java_pair_source" == *'lexical_parent_identity'* &&
+    "$json_parser_source" == \
+      *'"$BENCHMARK_PRESSURE_PYTHON_EXECUTABLE" -I /dev/fd/3'* &&
+    "$json_parser_source" == *'maximum_depth'* &&
+    "$json_parser_source" == *'key in keys'* &&
+    "$json_parser_source" != *'jq --stream'* ]]
+  [[ "$clean_exec_source" == *'POSIXLY_CORRECT=1'* &&
+    "$clean_exec_source" == *'exec -c "$bootstrap_path"'* &&
+    "$clean_exec_source" == *'--noprofile --norc --posix'* &&
+    "$clean_exec_source" == *'exec -c "$@"'* &&
+    "$clean_exec_source" == *'"/proc/$bootstrap_pid/exe"'* &&
+    "$broker_source" == *'benchmark_pressure_clean_broker_exec'* &&
+    "$broker_source" != *'unset -f -- exec'* &&
+    "$broker_source" == *'os.path.realpath("/proc/self/exe")'* &&
+    "$broker_source" == *'open("/proc/self/maps"'* &&
+    "$coherent_source" == *'coherent_sweep()'* &&
+    "$coherent_source" == *'TEST_POST_COMMIT_DELAY_SECONDS'* &&
+    "$coherent_source" == *'scan_directory(directory, lexical_fd)'* &&
+    "$coherent_source" == *'capture_signal_status'* &&
+    "$coherent_source" == *'lease_surrendered=true'* &&
+    "$coherent_source" == *'signal.pidfd_send_signal'* &&
+    "$coherent_source" == *'watchdog_cancel_read'* &&
+    "$coherent_source" == *'os.closerange'* &&
+    "$coherent_source" == *'MAX_DIRECTORY_ENTRIES'* &&
+    "$coherent_source" == *'MAX_DIRECTORY_NAME_BYTES'* &&
+    "$coherent_source" == *'LIBC.linkat'* &&
+    "$coherent_source" == *'os._exit'* &&
+    "$coherent_source" != *'"$BENCHMARK_PRESSURE_TIMEOUT_EXECUTABLE"'* &&
+    "$client_set_source" == *'publish_marker'* &&
+    "$client_set_source" == *'publication_sealed'* &&
+    "$client_set_source" != *'precommit\t%s'* ]]
+  [[ -f "$go_source" && ! -L "$go_source" ]] || return 1
+  grep -Eq 'maxReceiverMarkerBytes[[:space:]]*=[[:space:]]*128' \
+    "$go_source" || return 1
+  grep -Eq 'requestMarkerWidth[[:space:]]*=[[:space:]]*7' \
+    "$go_source" || return 1
+  grep -Fq 'requestMarkerEncoding        = "prefix-dash-zero-padded-ordinal-v1"' \
+    "$go_source" || return 1
+  grep -Fq 'defaultRequestMarker         = "benchmark-load"' \
+    "$go_source" || return 1
+  grep -Fq 'flags.StringVar(&cfg.markerPrefix, "marker-prefix"' \
+    "$go_source" || return 1
+  grep -Fq 'marker, err = requestMarker(cfg.markerPrefix, requestNumber)' \
+    "$go_source"
+}
+
+test_benchmark_pressure_admission_and_java_conservation_are_independent() {
+  local private_root="$TEST_TMP_DIR/pressure-admission-forgery"
+  local directory="$private_root/cycle-01"
+  local manifest="$directory/private-manifest.json"
+  local receipt="$directory/admission-receipt.json"
+  local candidate=""
+  local digest=""
+  local maximum=""
+
+  benchmark_pressure_test_prepare_cycle_fixture "$private_root" 1
+  validate_benchmark_pressure_admission_receipt "$receipt" 1 "$directory"
+
+  candidate="$directory/.trace-ordinal-forgery"
+  jq -cS '
+    .spans[2].attributes["http.request.header.x-obi-demo-id"] |=
+      sub("0000001$";"0000002")
+  ' "$directory/trace-snapshot.json" >"$candidate" || return $?
+  chmod 0600 -- "$candidate"
+  mv -T -- "$candidate" "$directory/trace-snapshot.json"
+  if validate_benchmark_pressure_admission_receipt "$receipt" 1 "$directory"; then
+    printf 'pressure admission accepted a missing/foreign marker ordinal\n' >&2
+    return 1
+  fi
+
+  private_root="$TEST_TMP_DIR/pressure-admission-maximum"
+  directory="$private_root/cycle-01"
+  receipt="$directory/admission-receipt.json"
+  benchmark_pressure_test_prepare_cycle_fixture "$private_root" 1
+  maximum="$(benchmark_pressure_admission_max_events 1)" || return $?
+  candidate="$directory/.metrics-admission-maximum"
+  awk -v value="$((maximum + 1))" '
+    /operation="handoff_admission"/ {$NF=value}
+    {print}
+  ' "$directory/obi-metrics-after.prom" >"$candidate" || return $?
+  chmod 0600 -- "$candidate"
+  mv -T -- "$candidate" "$directory/obi-metrics-after.prom"
+  write_metrics_delta "$directory/obi-metrics-before.prom" \
+    "$directory/obi-metrics-after.prom" "$directory/obi-metrics.delta" || return $?
+  chmod 0600 -- "$directory/obi-metrics.delta"
+  if validate_benchmark_pressure_admission_receipt "$receipt" 1 "$directory"; then
+    printf 'pressure admission accepted max+1 overload evidence\n' >&2
+    return 1
+  fi
+
+  private_root="$TEST_TMP_DIR/pressure-java-coordinated-forgery"
+  directory="$private_root/cycle-01"
+  manifest="$directory/private-manifest.json"
+  receipt="$directory/admission-receipt.json"
+  benchmark_pressure_test_prepare_cycle_fixture "$private_root" 1
+  candidate="$directory/.java-after-forgery"
+  sed 's/t_missing=2/t_missing=3/' \
+    "$directory/java-diagnostics-after.txt" >"$candidate" || return $?
+  chmod 0600 -- "$candidate"
+  mv -T -- "$candidate" "$directory/java-diagnostics-after.txt"
+  write_java_diagnostics_delta "$directory/java-diagnostics-before.txt" \
+    "$directory/java-diagnostics-after.txt" \
+    "$directory/java-diagnostics.delta" || return $?
+  chmod 0600 -- "$directory/java-diagnostics.delta"
+  digest="$(benchmark_pressure_test_sha256 \
+    "$directory/java-diagnostics-after.txt")" || return $?
+  candidate="$directory/.admission-forgery"
+  jq -cS --arg after "$digest" \
+    --arg delta "$(benchmark_pressure_test_sha256 \
+      "$directory/java-diagnostics.delta")" '
+      .digests.java_after=$after | .digests.java_delta=$delta
+    ' "$receipt" >"$candidate" || return $?
+  chmod 0600 -- "$candidate"
+  mv -T -- "$candidate" "$receipt"
+  benchmark_pressure_test_rehash_manifest_role "$manifest" java_after
+  benchmark_pressure_test_rehash_manifest_role "$manifest" java_delta
+  benchmark_pressure_test_rehash_manifest_role "$manifest" admission
+  if validate_benchmark_pressure_private_manifest "$manifest" 1; then
+    printf 'pressure manifest accepted coordinated raw/receipt Java forgery\n' >&2
+    return 1
+  fi
+
+  candidate="$directory/.admission-duplicate"
+  sed 's/"admission":{/"admission":{"ambiguous":0,/' \
+    "$receipt" >"$candidate" || return $?
+  chmod 0600 -- "$candidate"
+  if validate_benchmark_pressure_admission_receipt "$candidate" 1 "$directory"; then
+    printf 'pressure admission accepted a nested duplicate key\n' >&2
+    return 1
+  fi
+}
+
+test_benchmark_pressure_json_keys_are_streamed_bounded_and_terminal() {
+  local directory="$TEST_TMP_DIR/pressure-json-keys"
+  local valid="$directory/valid.json"
+  local candidate=""
+  local size=""
+  local depth=0
+  local prefix=""
+  local suffix=""
+  local label=""
+  local payload=""
+  local private_root=""
+  local cycle_dir=""
+  local snapshot=""
+  local receipt=""
+  local manifest=""
+  local snapshot_digest=""
+  local admission_digest=""
+
+  mkdir -m 0700 -- "$directory"
+  printf '%s\n' \
+    '{"outer":{"array":[{"key":"value"}],"empty_array":[],"empty_object":{}}}' \
+    >"$valid" || return $?
+  chmod 0600 -- "$valid"
+  size="$(stat -Lc '%s' -- "$valid")" || return $?
+  benchmark_pressure_json_has_unique_object_keys "$valid" "$size"
+  if benchmark_pressure_json_has_unique_object_keys "$valid" "$((size - 1))";
+  then
+    printf 'pressure JSON parser accepted cap+1 raw bytes\n' >&2
+    return 1
+  fi
+
+  while IFS=$'\t' read -r label payload; do
+    candidate="$directory/$label.json"
+    printf '%s\n' "$payload" >"$candidate" || return $?
+    chmod 0600 -- "$candidate"
+    if benchmark_pressure_json_has_unique_object_keys "$candidate" 4096; then
+      printf 'pressure JSON parser accepted %s duplicate container key\n' \
+        "$label" >&2
+      return 1
+    fi
+  done <<'EOF'
+top-array	{"spans":[],"spans":[{"attributes":{}}]}
+nested-object	{"span":{"attributes":{},"attributes":{"http.route":"/api/echo"}}}
+empty-array	{"related_spans":[],"related_spans":[]}
+empty-object	{"attributes":{},"attributes":{}}
+escaped-equivalent	{"spans":[],"\u0073pans":[]}
+EOF
+
+  for ((depth = 0; depth < BENCHMARK_PRESSURE_JSON_MAX_DEPTH; depth++)); do
+    prefix+='['
+    suffix+=']'
+  done
+  candidate="$directory/depth-max.json"
+  printf '%s0%s\n' "$prefix" "$suffix" >"$candidate" || return $?
+  chmod 0600 -- "$candidate"
+  benchmark_pressure_json_has_unique_object_keys "$candidate" 4096
+  candidate="$directory/depth-max-plus-one.json"
+  printf '[%s0%s]\n' "$prefix" "$suffix" >"$candidate" || return $?
+  chmod 0600 -- "$candidate"
+  if benchmark_pressure_json_has_unique_object_keys "$candidate" 4096; then
+    printf 'pressure JSON parser accepted max+1 nesting depth\n' >&2
+    return 1
+  fi
+
+  # Rehash both the raw snapshot and every receipt/manifest claim.  The
+  # terminal validator must still parse the original raw member stream before
+  # jq collapses the duplicate container-valued key.
+  for label in top-spans nested-attributes; do
+    private_root="$TEST_TMP_DIR/pressure-json-terminal-$label"
+    cycle_dir="$private_root/cycle-01"
+    snapshot="$cycle_dir/trace-snapshot.json"
+    receipt="$cycle_dir/admission-receipt.json"
+    manifest="$cycle_dir/private-manifest.json"
+    benchmark_pressure_test_prepare_cycle_fixture "$private_root" 1
+    candidate="$cycle_dir/.trace-duplicate-container"
+    if [[ "$label" == top-spans ]]; then
+      sed 's/"spans":\[/"spans":[],"spans":[/' \
+        "$snapshot" >"$candidate" || return $?
+    else
+      sed '0,/"attributes":{/s//"attributes":{},"attributes":{/' \
+        "$snapshot" >"$candidate" || return $?
+    fi
+    chmod 0600 -- "$candidate"
+    mv -T -- "$candidate" "$snapshot"
+    snapshot_digest="$(benchmark_pressure_test_sha256 "$snapshot")" ||
+      return $?
+    candidate="$cycle_dir/.admission-duplicate-container"
+    jq -cS --arg digest "$snapshot_digest" \
+      '.digests.trace_snapshot=$digest' "$receipt" >"$candidate" || return $?
+    chmod 0600 -- "$candidate"
+    mv -T -- "$candidate" "$receipt"
+    admission_digest="$(benchmark_pressure_test_sha256 "$receipt")" ||
+      return $?
+    benchmark_pressure_test_rehash_manifest_role "$manifest" trace_snapshot
+    benchmark_pressure_test_rehash_manifest_role "$manifest" admission
+    candidate="$cycle_dir/.manifest-duplicate-container"
+    jq -cS --arg digest "$admission_digest" \
+      '.attribution.admission_receipt_sha256=$digest' \
+      "$manifest" >"$candidate" || return $?
+    chmod 0600 -- "$candidate"
+    mv -T -- "$candidate" "$manifest"
+    if validate_benchmark_pressure_private_manifest "$manifest" 1; then
+      printf 'pressure terminal manifest accepted coordinated %s duplicate\n' \
+        "$label" >&2
+      return 1
+    fi
+  done
+}
+
+test_benchmark_pressure_python_brokers_are_isolated() {
+  local directory="$TEST_TMP_DIR/pressure-python-broker-isolation"
+  local valid="$directory/valid.json"
+  local duplicate="$directory/duplicate.json"
+  local poison_dir="$directory/poison"
+  local shadow_marker="$directory/function-shadow-fired"
+  local snapshot_poison_marker="$directory/snapshot-poison-fired"
+  local json_poison_marker="$directory/json-poison-fired"
+  local loader_poison_marker="$directory/loader-poison-fired"
+  local loader_poison_source="$poison_dir/loader-poison.c"
+  local snapshot_fd=""
+  local held_source_identity=""
+  local held_source_sha256=""
+  local held_source_size=""
+  local expected_identity=""
+  local expected_sha256=""
+  local expected_size=""
+  local coherent_parent_fd=""
+  local coherent_member_fd=""
+  local coherent_parent_identity=""
+  local coherent_specification=$'V\t1\n'
+
+  mkdir -m 0700 -- "$directory" "$poison_dir"
+  printf '%s\n' '{"outer":{"value":1}}' >"$valid"
+  printf '%s\n' '{"outer":{"value":1},"outer":{"value":2}}' >"$duplicate"
+  chmod 0600 -- "$valid" "$duplicate"
+  expected_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- "$valid")" ||
+    return $?
+  expected_sha256="$(benchmark_pressure_test_sha256 "$valid")" || return $?
+  expected_size="$(stat -Lc '%s' -- "$valid")" || return $?
+
+  exec {coherent_parent_fd}<"$directory" || return $?
+  exec {coherent_member_fd}<"$valid" || return $?
+  coherent_parent_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "/proc/self/fd/$coherent_parent_fd")" || return $?
+  printf -v coherent_specification '%sP\t0\t%s\t%s\t%s\trelevant\n' \
+    "$coherent_specification" "$coherent_parent_fd" "$directory" \
+    "$coherent_parent_identity"
+  printf -v coherent_specification '%sF\t0\t%s\t%s\t%s\t%s\n' \
+    "$coherent_specification" "${valid##*/}" "$coherent_member_fd" \
+    "$expected_identity" "$expected_sha256"
+
+  # No sourced or exported command-name function, including hostile unset and
+  # exec functions and Bash's unusual slash-bearing names, may impersonate a
+  # framed broker or the duplicate-key parser.  The zero-argument branches let
+  # existing descriptor redirections complete; any old `unset -f` or `exec -c`
+  # launch immediately records the attack.  A subshell owns these deliberately
+  # unremovable shadows.
+  (
+    command() {
+      printf 'command shadow invoked\n' >"$shadow_marker"
+      return 97
+    }
+    builtin() {
+      printf 'builtin shadow invoked\n' >"$shadow_marker"
+      return 97
+    }
+    type() {
+      printf 'type shadow invoked\n' >"$shadow_marker"
+      return 97
+    }
+    python3() {
+      printf 'python3 shadow invoked\n' >"$shadow_marker"
+      return 97
+    }
+    # Deliberately uncalled: a trustworthy bootstrap must bypass this shadow.
+    # shellcheck disable=SC2120
+    exec() {
+      (($# == 0)) && return 0
+      printf 'exec shadow invoked\n' >"$shadow_marker"
+      return 97
+    }
+    unset() {
+      [[ "${1:-}" != -f ]] && return 0
+      printf 'unset shadow invoked\n' >"$shadow_marker"
+      return 97
+    }
+    function /usr/bin/env() {
+      printf 'absolute env shadow invoked\n' >"$shadow_marker"
+      return 97
+    }
+    function /usr/bin/python3() {
+      printf 'absolute python shadow invoked\n' >"$shadow_marker"
+      return 97
+    }
+    function /usr/bin/timeout() {
+      printf 'absolute timeout shadow invoked\n' >"$shadow_marker"
+      return 97
+    }
+    function /usr/bin/stat() {
+      printf 'absolute stat shadow invoked\n' >"$shadow_marker"
+      return 97
+    }
+    function /usr/bin/readlink() {
+      printf 'absolute readlink shadow invoked\n' >"$shadow_marker"
+      return 97
+    }
+    export -f command builtin type python3 exec unset
+    benchmark_pressure_broker_executables_are_authenticated || return $?
+    benchmark_pressure_hold_file_snapshot \
+      "$valid" 4096 snapshot_fd held_source_identity held_source_sha256 \
+        held_source_size || return $?
+    benchmark_pressure_coherent_file_set verify "$coherent_specification" ||
+      return $?
+    benchmark_pressure_json_has_unique_object_keys "$valid" 4096 || return $?
+    if benchmark_pressure_json_has_unique_object_keys "$duplicate" 4096; then
+      printf 'pressure duplicate parser accepted bytes via function shadow\n' >&2
+      return 1
+    fi
+    [[ ! -e "$shadow_marker" && ! -L "$shadow_marker" &&
+      "$held_source_identity" == "$expected_identity" &&
+      "$held_source_sha256" == "$expected_sha256" &&
+      "$held_source_size" == "$expected_size" &&
+      "$(stat -Lc '%u:%a:%h:%s' -- "/proc/self/fd/$snapshot_fd")" == \
+        "$EUID:600:0:$expected_size" ]] || return 1
+    cmp -s -- "$valid" "/proc/self/fd/$snapshot_fd" || return $?
+  ) || return 1
+  snapshot_fd=""
+
+  # Isolated mode must ignore a caller-provided module search path.  Without
+  # -I this hashlib module records execution before aborting the broker.
+  cat >"$poison_dir/hashlib.py" <<'PY'
+import os
+with open(os.environ["OBI_PRESSURE_PYTHON_POISON_MARKER"], "w",
+          encoding="utf-8") as marker:
+    marker.write("poisoned\n")
+raise RuntimeError("untrusted hashlib module loaded")
+PY
+  chmod 0600 -- "$poison_dir/hashlib.py"
+  OBI_PRESSURE_PYTHON_POISON_MARKER="$snapshot_poison_marker" \
+    PYTHONPATH="$poison_dir" benchmark_pressure_hold_file_snapshot \
+      "$valid" 4096 snapshot_fd held_source_identity held_source_sha256 \
+        held_source_size ||
+    return $?
+  [[ ! -e "$snapshot_poison_marker" && ! -L "$snapshot_poison_marker" &&
+    "$held_source_identity" == "$expected_identity" &&
+    "$held_source_sha256" == "$expected_sha256" &&
+    "$held_source_size" == "$expected_size" ]] || return 1
+  cmp -s -- "$valid" "/proc/self/fd/$snapshot_fd" || return $?
+  exec {snapshot_fd}<&-
+  snapshot_fd=""
+
+  # The parser's json import is likewise independent of PYTHONPATH on both its
+  # successful and rejecting paths.
+  cat >"$poison_dir/json.py" <<'PY'
+import os
+with open(os.environ["OBI_PRESSURE_PYTHON_POISON_MARKER"], "w",
+          encoding="utf-8") as marker:
+    marker.write("poisoned\n")
+raise RuntimeError("untrusted json module loaded")
+PY
+  chmod 0600 -- "$poison_dir/json.py"
+  OBI_PRESSURE_PYTHON_POISON_MARKER="$json_poison_marker" \
+    PYTHONPATH="$poison_dir" \
+    benchmark_pressure_json_has_unique_object_keys "$valid" 4096 || return $?
+  if OBI_PRESSURE_PYTHON_POISON_MARKER="$json_poison_marker" \
+    PYTHONPATH="$poison_dir" \
+    benchmark_pressure_json_has_unique_object_keys "$duplicate" 4096; then
+    printf 'pressure duplicate parser accepted bytes via PYTHONPATH poison\n' >&2
+    return 1
+  fi
+  [[ ! -e "$json_poison_marker" && ! -L "$json_poison_marker" ]] || return 1
+
+  # The coherent helper imports hashlib/stat/re in the same isolated runtime.
+  OBI_PRESSURE_PYTHON_POISON_MARKER="$snapshot_poison_marker" \
+    PYTHONPATH="$poison_dir" benchmark_pressure_coherent_file_set verify \
+      "$coherent_specification" || return $?
+  [[ ! -e "$snapshot_poison_marker" && ! -L "$snapshot_poison_marker" ]] ||
+    return 1
+
+  # A malicious library constructor must not run before the broker's env
+  # whitelist takes effect.  libz is a direct dependency of this Python binary,
+  # so an ordinary LD_LIBRARY_PATH launch would execute this constructor.
+  cat >"$loader_poison_source" <<'C'
+#include <fcntl.h>
+#include <stdlib.h>
+#include <unistd.h>
+__attribute__((constructor)) static void poison(void) {
+  const char *path = getenv("OBI_PRESSURE_LOADER_POISON_MARKER");
+  if (path != NULL) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd >= 0) {
+      (void)write(fd, "poisoned\n", 9);
+      (void)close(fd);
+    }
+  }
+}
+C
+  /usr/bin/cc -shared -fPIC -Wl,-soname,libz.so.1 \
+    -o "$poison_dir/libz.so.1" "$loader_poison_source" || return $?
+  chmod 0600 -- "$poison_dir/libz.so.1"
+  # Exercise loader poisoning and every command-name shadow simultaneously.
+  # A clean reexec must defeat both classes before its own dynamic loader runs.
+  (
+    command() {
+      printf 'command shadow invoked\n' >"$shadow_marker"
+      return 97
+    }
+    builtin() {
+      printf 'builtin shadow invoked\n' >"$shadow_marker"
+      return 97
+    }
+    type() {
+      printf 'type shadow invoked\n' >"$shadow_marker"
+      return 97
+    }
+    python3() {
+      printf 'python3 shadow invoked\n' >"$shadow_marker"
+      return 97
+    }
+    # Deliberately uncalled: a trustworthy bootstrap must bypass this shadow.
+    # shellcheck disable=SC2120
+    exec() {
+      (($# == 0)) && return 0
+      printf 'exec shadow invoked\n' >"$shadow_marker"
+      return 97
+    }
+    unset() {
+      [[ "${1:-}" != -f ]] && return 0
+      printf 'unset shadow invoked\n' >"$shadow_marker"
+      return 97
+    }
+    function /usr/bin/env() {
+      printf 'absolute env shadow invoked\n' >"$shadow_marker"
+      return 97
+    }
+    function /usr/bin/python3() {
+      printf 'absolute python shadow invoked\n' >"$shadow_marker"
+      return 97
+    }
+    function /usr/bin/timeout() {
+      printf 'absolute timeout shadow invoked\n' >"$shadow_marker"
+      return 97
+    }
+    function /usr/bin/stat() {
+      printf 'absolute stat shadow invoked\n' >"$shadow_marker"
+      return 97
+    }
+    function /usr/bin/readlink() {
+      printf 'absolute readlink shadow invoked\n' >"$shadow_marker"
+      return 97
+    }
+    export -f command builtin type python3 exec unset
+    OBI_PRESSURE_LOADER_POISON_MARKER="$loader_poison_marker" \
+      LD_LIBRARY_PATH="$poison_dir" \
+      benchmark_pressure_broker_executables_are_authenticated || return $?
+    OBI_PRESSURE_LOADER_POISON_MARKER="$loader_poison_marker" \
+      LD_LIBRARY_PATH="$poison_dir" benchmark_pressure_hold_file_snapshot \
+        "$valid" 4096 snapshot_fd held_source_identity held_source_sha256 \
+          held_source_size || return $?
+    [[ "$held_source_identity" == "$expected_identity" &&
+      "$held_source_sha256" == "$expected_sha256" &&
+      "$held_source_size" == "$expected_size" ]] || return 1
+    cmp -s -- "$valid" "/proc/self/fd/$snapshot_fd" || return $?
+    exec {snapshot_fd}<&-
+    snapshot_fd=""
+    OBI_PRESSURE_LOADER_POISON_MARKER="$loader_poison_marker" \
+      LD_LIBRARY_PATH="$poison_dir" \
+      benchmark_pressure_json_has_unique_object_keys "$valid" 4096 || return $?
+    if OBI_PRESSURE_LOADER_POISON_MARKER="$loader_poison_marker" \
+      LD_LIBRARY_PATH="$poison_dir" \
+      benchmark_pressure_json_has_unique_object_keys "$duplicate" 4096; then
+      printf 'pressure duplicate parser accepted bytes via loader poison\n' >&2
+      return 1
+    fi
+    OBI_PRESSURE_LOADER_POISON_MARKER="$loader_poison_marker" \
+      LD_LIBRARY_PATH="$poison_dir" \
+      benchmark_pressure_coherent_file_set verify \
+        "$coherent_specification" || return $?
+    [[ ! -e "$loader_poison_marker" && ! -L "$loader_poison_marker" &&
+      ! -e "$shadow_marker" && ! -L "$shadow_marker" ]]
+  ) || return 1
+  snapshot_fd=""
+}
+
+test_benchmark_pressure_coherent_broker_is_bounded_and_reaped() {
+  local root="$TEST_TMP_DIR/pressure-coherent-bounds"
+  local directory=""
+  local data=""
+  local data_two=""
+  local data_hidden=""
+  local marker_source=""
+  local marker_target=""
+  local parent_fd=""
+  local data_fd=""
+  local data_two_fd=""
+  local marker_fd=""
+  local parent_identity=""
+  local data_identity=""
+  local data_two_identity=""
+  local marker_identity=""
+  local data_sha256=""
+  local data_two_sha256=""
+  local marker_sha256=""
+  local specification=""
+  local leaf=""
+  local index=0
+  local started=0
+  local finished=0
+  local elapsed=0
+  local broker_status=0
+  local pid_file=""
+  local broker_pid=""
+  local watchdog_pid=""
+  local rollback_surrendered=false
+  local attempt=0
+  local termination=""
+  local attack=""
+  local fired=""
+  local supervisor_pid=""
+  local observer_pid=""
+  local observation=""
+  local children=""
+
+  mkdir -m 0700 -- "$root"
+
+  # Every scandir entry counts, including irrelevant names in a relevant-roster
+  # directory.  Cap+1 fails before the ten-second watchdog is involved.
+  directory="$root/entry-cap"
+  mkdir -m 0700 -- "$directory"
+  data="$directory/data"
+  printf 'data\n' >"$data"
+  chmod 0600 -- "$data"
+  for ((index = 0;
+    index < BENCHMARK_PRESSURE_COHERENT_MAX_DIRECTORY_ENTRIES;
+    index++)); do
+    printf -v leaf 'entry-%04d' "$index"
+    : >"$directory/$leaf"
+  done
+  exec {parent_fd}<"$directory"
+  exec {data_fd}<"$data"
+  parent_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "/proc/self/fd/$parent_fd")" || return $?
+  data_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+    "/proc/self/fd/$data_fd")" || return $?
+  data_sha256="$(benchmark_pressure_test_sha256 "/proc/self/fd/$data_fd")" ||
+    return $?
+  specification=$'V\t1\n'
+  printf -v specification '%sP\t0\t%s\t%s\t%s\trelevant\n' \
+    "$specification" "$parent_fd" "$directory" "$parent_identity"
+  printf -v specification '%sF\t0\tdata\t%s\t%s\t%s\n' \
+    "$specification" "$data_fd" "$data_identity" "$data_sha256"
+  started="$(benchmark_pressure_monotonic_centiseconds)" || return $?
+  if benchmark_pressure_coherent_file_set verify "$specification"; then
+    printf 'pressure coherent broker accepted directory entry cap+1\n' >&2
+    return 1
+  fi
+  finished="$(benchmark_pressure_monotonic_centiseconds)" || return $?
+  ((finished - started < BENCHMARK_PRESSURE_BROKER_TIMEOUT_SECONDS * 100)) ||
+    return 1
+  if benchmark_pressure_bounded_directory_roster "$directory" termination; then
+    printf 'pressure bounded roster accepted directory entry cap+1\n' >&2
+    return 1
+  fi
+  exec {data_fd}<&-
+  exec {parent_fd}<&-
+
+  # Independently exceed the encoded-name-byte cap while staying below the
+  # entry-count cap.
+  directory="$root/name-byte-cap"
+  mkdir -m 0700 -- "$directory"
+  data="$directory/data"
+  printf 'data\n' >"$data"
+  chmod 0600 -- "$data"
+  for ((index = 0; index < 1041; index++)); do
+    printf -v leaf 'n%04d-%0120d' "$index" 0
+    : >"$directory/$leaf"
+  done
+  exec {parent_fd}<"$directory"
+  exec {data_fd}<"$data"
+  parent_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "/proc/self/fd/$parent_fd")" || return $?
+  data_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+    "/proc/self/fd/$data_fd")" || return $?
+  data_sha256="$(benchmark_pressure_test_sha256 "/proc/self/fd/$data_fd")" ||
+    return $?
+  specification=$'V\t1\n'
+  printf -v specification '%sP\t0\t%s\t%s\t%s\trelevant\n' \
+    "$specification" "$parent_fd" "$directory" "$parent_identity"
+  printf -v specification '%sF\t0\tdata\t%s\t%s\t%s\n' \
+    "$specification" "$data_fd" "$data_identity" "$data_sha256"
+  started="$(benchmark_pressure_monotonic_centiseconds)" || return $?
+  if benchmark_pressure_coherent_file_set verify "$specification"; then
+    printf 'pressure coherent broker accepted encoded-name-byte cap+1\n' >&2
+    return 1
+  fi
+  finished="$(benchmark_pressure_monotonic_centiseconds)" || return $?
+  ((finished - started < BENCHMARK_PRESSURE_BROKER_TIMEOUT_SECONDS * 100)) ||
+    return 1
+  if benchmark_pressure_bounded_directory_roster "$directory" termination; then
+    printf 'pressure bounded roster accepted encoded-name-byte cap+1\n' >&2
+    return 1
+  fi
+  exec {data_fd}<&-
+  exec {parent_fd}<&-
+
+  # Both the ordinary TERM deadline and its retained-pidfd KILL escalation
+  # leave no broker/watchdog process and never expose the final marker.
+  for termination in term kill; do
+    rollback_surrendered=false
+    directory="$root/timeout-$termination"
+    pid_file="$root/timeout-$termination.pids"
+    mkdir -m 0700 -- "$directory"
+    data="$directory/data"
+    marker_source="$directory/marker.source"
+    marker_target="$directory/commit"
+    printf 'data\n' >"$data"
+    printf 'marker\n' >"$marker_source"
+    chmod 0600 -- "$data" "$marker_source"
+    exec {parent_fd}<"$directory"
+    exec {data_fd}<"$data"
+    exec {marker_fd}<"$marker_source"
+    parent_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+      "/proc/self/fd/$parent_fd")" || return $?
+    data_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+      "/proc/self/fd/$data_fd")" || return $?
+    marker_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+      "/proc/self/fd/$marker_fd")" || return $?
+    data_sha256="$(benchmark_pressure_test_sha256 \
+      "/proc/self/fd/$data_fd")" || return $?
+    marker_sha256="$(benchmark_pressure_test_sha256 \
+      "/proc/self/fd/$marker_fd")" || return $?
+    command rm -- "$marker_source"
+    marker_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+      "/proc/self/fd/$marker_fd")" || return $?
+    specification=$'V\t1\n'
+    printf -v specification '%sP\t0\t%s\t%s\t%s\trelevant\n' \
+      "$specification" "$parent_fd" "$directory" "$parent_identity"
+    printf -v specification '%sF\t0\tdata\t%s\t%s\t%s\n' \
+      "$specification" "$data_fd" "$data_identity" "$data_sha256"
+    printf -v specification '%sM\t0\tcommit\t%s\t%s\t%s\n' \
+      "$specification" "$marker_fd" "$marker_identity" "$marker_sha256"
+    read() {
+      local read_status=0
+
+      builtin read "$@" || read_status=$?
+      if ((read_status == 0)) && [[ "${ready:-}" == ready &&
+        "${capture_count:-}" == 0 && ! -e "$pid_file" ]]; then
+        printf '%s %s\n' "$holder_pid" "$watchdog_pid" >"$pid_file"
+        chmod 0600 -- "$pid_file"
+      fi
+      return "$read_status"
+    }
+    started="$(benchmark_pressure_monotonic_centiseconds)" || return $?
+    set +e
+    if [[ "$termination" == kill ]]; then
+      BENCHMARK_PRESSURE_TEST_COHERENT_IGNORE_TERM=true \
+      BENCHMARK_PRESSURE_TEST_COHERENT_DELAY_SECONDS=11 \
+        benchmark_pressure_coherent_file_set publish_marker \
+          "$specification" "" "" "" rollback_surrendered 2>/dev/null
+      broker_status=$?
+    else
+      BENCHMARK_PRESSURE_TEST_COHERENT_DELAY_SECONDS=11 \
+        benchmark_pressure_coherent_file_set publish_marker \
+          "$specification" "" "" "" rollback_surrendered 2>/dev/null
+      broker_status=$?
+    fi
+    set -e
+    unset -f read
+    finished="$(benchmark_pressure_monotonic_centiseconds)" || return $?
+    elapsed="$((finished - started))"
+    [[ "$broker_status" != 0 && "$rollback_surrendered" == false &&
+      -s "$pid_file" &&
+      ! -e "$marker_target" && ! -L "$marker_target" &&
+      "$elapsed" -ge \
+        "$((BENCHMARK_PRESSURE_BROKER_TIMEOUT_SECONDS * 100 - 100))" &&
+      "$elapsed" -le \
+        "$((BENCHMARK_PRESSURE_BROKER_TIMEOUT_SECONDS * 100 + 400))" ]] ||
+      return 1
+    read -r broker_pid watchdog_pid <"$pid_file" || return $?
+    [[ "$broker_pid" =~ ^[1-9][0-9]*$ &&
+      "$watchdog_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    for ((attempt = 0; attempt < 40; attempt++)); do
+      if ! kill -0 "$broker_pid" 2>/dev/null &&
+        ! kill -0 "$watchdog_pid" 2>/dev/null; then
+        break
+      fi
+      sleep 0.05
+    done
+    ! kill -0 "$broker_pid" 2>/dev/null || return 1
+    ! kill -0 "$watchdog_pid" 2>/dev/null || return 1
+    exec {marker_fd}<&-
+    exec {data_fd}<&-
+    exec {parent_fd}<&-
+  done
+
+  # Early watchdog/supervisor death, stopped watchdog/worker processes, and a
+  # deadline that expires after the shell lease are all bounded and exactly
+  # reaped.  Stopping the watchdog and delaying after precommit both surrender
+  # the lease, so they are ambiguous/preserved rather than rollback-safe.
+  for attack in watchdog-term supervisor-term watchdog-stop worker-stop \
+    deadline-after-lease; do
+    directory="$root/lifecycle-$attack"
+    pid_file="$root/lifecycle-$attack.pids"
+    marker_source="$directory/marker.source"
+    marker_target="$directory/commit"
+    data="$directory/data"
+    mkdir -m 0700 -- "$directory"
+    printf 'data\n' >"$data"
+    printf 'marker\n' >"$marker_source"
+    chmod 0600 -- "$data" "$marker_source"
+    exec {parent_fd}<"$directory"
+    exec {data_fd}<"$data"
+    exec {marker_fd}<"$marker_source"
+    parent_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+      "/proc/self/fd/$parent_fd")" || return $?
+    data_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+      "/proc/self/fd/$data_fd")" || return $?
+    marker_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+      "/proc/self/fd/$marker_fd")" || return $?
+    data_sha256="$(benchmark_pressure_test_sha256 \
+      "/proc/self/fd/$data_fd")" || return $?
+    marker_sha256="$(benchmark_pressure_test_sha256 \
+      "/proc/self/fd/$marker_fd")" || return $?
+    command rm -- "$marker_source"
+    marker_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+      "/proc/self/fd/$marker_fd")" || return $?
+    specification=$'V\t1\n'
+    printf -v specification '%sP\t0\t%s\t%s\t%s\trelevant\n' \
+      "$specification" "$parent_fd" "$directory" "$parent_identity"
+    printf -v specification '%sF\t0\tdata\t%s\t%s\t%s\n' \
+      "$specification" "$data_fd" "$data_identity" "$data_sha256"
+    printf -v specification '%sM\t0\tcommit\t%s\t%s\t%s\n' \
+      "$specification" "$marker_fd" "$marker_identity" "$marker_sha256"
+    read() {
+      local read_status=0
+
+      builtin read "$@" || read_status=$?
+      if ((read_status == 0)) && [[ "${ready:-}" == ready &&
+        "${capture_count:-}" == 0 && ! -e "$pid_file" ]]; then
+        printf '%s %s %s\n' "$broker_pid" "$holder_pid" "$watchdog_pid" \
+          >"$pid_file" || return $?
+        case "$attack" in
+          watchdog-term)
+            kill -TERM "$watchdog_pid" || return $?
+            for ((attempt = 0; attempt < 100; attempt++)); do
+              if [[ ! -r "/proc/$watchdog_pid/stat" ]]; then
+                break
+              fi
+              IFS=' ' builtin read -r _ _ termination _ \
+                <"/proc/$watchdog_pid/stat" || break
+              [[ "$termination" == Z ]] && break
+              sleep 0.01
+            done
+            [[ ! -r "/proc/$watchdog_pid/stat" || "$termination" == Z ]] ||
+              return 1
+            ;;
+          supervisor-term) kill -TERM "$broker_pid" ;;
+          watchdog-stop) kill -STOP "$watchdog_pid" ;;
+          worker-stop) kill -STOP "$holder_pid" ;;
+          deadline-after-lease) : ;;
+          *) return 1 ;;
+        esac
+      fi
+      return "$read_status"
+    }
+    rollback_surrendered=false
+    started="$(benchmark_pressure_monotonic_centiseconds)" || return $?
+    set +e
+    if [[ "$attack" == deadline-after-lease ]]; then
+      BENCHMARK_PRESSURE_TEST_COHERENT_PRECOMMIT_DELAY_SECONDS=11 \
+        benchmark_pressure_coherent_file_set publish_marker "$specification" \
+          "" "" "" rollback_surrendered 2>/dev/null
+    else
+      benchmark_pressure_coherent_file_set publish_marker "$specification" \
+        "" "" "" rollback_surrendered 2>/dev/null
+    fi
+    broker_status=$?
+    set -e
+    unset -f read
+    finished="$(benchmark_pressure_monotonic_centiseconds)" || return $?
+    [[ "$broker_status" != 0 && -s "$pid_file" &&
+      ! -e "$marker_target" && ! -L "$marker_target" &&
+      "$((finished - started))" -le \
+        "$((BENCHMARK_PRESSURE_BROKER_TIMEOUT_SECONDS * 100 + 400))" ]] ||
+      return 1
+    if [[ "$attack" =~ ^(watchdog-stop|deadline-after-lease)$ ]]; then
+      [[ "$broker_status" == "$BENCHMARK_PRESSURE_PUBLICATION_AMBIGUOUS_STATUS" &&
+        "$rollback_surrendered" == true ]] || return 1
+    else
+      [[ "$rollback_surrendered" == false ]] || return 1
+    fi
+    read -r supervisor_pid broker_pid watchdog_pid <"$pid_file" || return $?
+    for ((attempt = 0; attempt < 40; attempt++)); do
+      if ! kill -0 "$supervisor_pid" 2>/dev/null &&
+        ! kill -0 "$broker_pid" 2>/dev/null &&
+        ! kill -0 "$watchdog_pid" 2>/dev/null; then
+        break
+      fi
+      sleep 0.05
+    done
+    ! kill -0 "$supervisor_pid" 2>/dev/null || return 1
+    ! kill -0 "$broker_pid" 2>/dev/null || return 1
+    ! kill -0 "$watchdog_pid" 2>/dev/null || return 1
+    exec {marker_fd}<&-
+    exec {data_fd}<&-
+    exec {parent_fd}<&-
+  done
+
+  # PRECOMMIT is not a content linearization point.  After the shell has
+  # atomically surrendered rollback and sent ACK, substitute an earlier public
+  # member while a later member is still in the same transaction.  The shared
+  # post-ACK sweep must reject the symlink (even though it resolves to the exact
+  # owned inode), preserve both unknown names, and never link the marker.
+  directory="$root/post-ack-cross-member"
+  pid_file="$root/post-ack-cross-member.pids"
+  marker_source="$directory/marker.source"
+  marker_target="$directory/commit"
+  data="$directory/data-one"
+  data_two="$directory/data-two"
+  data_hidden="$directory/data-one.hidden"
+  fired="$root/post-ack-cross-member.fired"
+  mkdir -m 0700 -- "$directory"
+  printf 'first data\n' >"$data"
+  printf 'second data\n' >"$data_two"
+  printf 'marker\n' >"$marker_source"
+  chmod 0600 -- "$data" "$data_two" "$marker_source"
+  exec {parent_fd}<"$directory"
+  exec {data_fd}<"$data"
+  exec {data_two_fd}<"$data_two"
+  exec {marker_fd}<"$marker_source"
+  parent_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "/proc/self/fd/$parent_fd")" || return $?
+  data_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+    "/proc/self/fd/$data_fd")" || return $?
+  data_two_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+    "/proc/self/fd/$data_two_fd")" || return $?
+  marker_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+    "/proc/self/fd/$marker_fd")" || return $?
+  data_sha256="$(benchmark_pressure_test_sha256 \
+    "/proc/self/fd/$data_fd")" || return $?
+  data_two_sha256="$(benchmark_pressure_test_sha256 \
+    "/proc/self/fd/$data_two_fd")" || return $?
+  marker_sha256="$(benchmark_pressure_test_sha256 \
+    "/proc/self/fd/$marker_fd")" || return $?
+  command rm -- "$marker_source"
+  marker_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+    "/proc/self/fd/$marker_fd")" || return $?
+  specification=$'V\t1\n'
+  printf -v specification '%sP\t0\t%s\t%s\t%s\trelevant\n' \
+    "$specification" "$parent_fd" "$directory" "$parent_identity"
+  printf -v specification '%sF\t0\tdata-one\t%s\t%s\t%s\n' \
+    "$specification" "$data_fd" "$data_identity" "$data_sha256"
+  printf -v specification '%sF\t0\tdata-two\t%s\t%s\t%s\n' \
+    "$specification" "$data_two_fd" "$data_two_identity" \
+    "$data_two_sha256"
+  printf -v specification '%sM\t0\tcommit\t%s\t%s\t%s\n' \
+    "$specification" "$marker_fd" "$marker_identity" "$marker_sha256"
+  read() {
+    local read_status=0
+
+    builtin read "$@" || read_status=$?
+    if ((read_status == 0)) && [[ "${ready:-}" == ready &&
+      "${capture_count:-}" == 0 && ! -e "$pid_file" ]]; then
+      builtin printf '%s %s %s\n' \
+        "$broker_pid" "$holder_pid" "$watchdog_pid" >"$pid_file" ||
+        return $?
+    fi
+    return "$read_status"
+  }
+  printf() {
+    local printf_status=0
+
+    builtin printf "$@" || printf_status=$?
+    if ((printf_status == 0 && $# == 1)) && [[ "$1" == 'commit\n' &&
+      "${mode:-}" == publish_marker &&
+      "${lease_surrendered:-false}" == true && ! -e "$fired" ]]; then
+      command mv -T -- "$data" "$data_hidden" || return $?
+      command ln -s -- "${data_hidden##*/}" "$data" || return $?
+      : >"$fired"
+    fi
+    return "$printf_status"
+  }
+  rollback_surrendered=false
+  set +e
+  BENCHMARK_PRESSURE_TEST_COHERENT_POST_COMMIT_DELAY_SECONDS=1 \
+    benchmark_pressure_coherent_file_set publish_marker "$specification" \
+      "" "" "" rollback_surrendered
+  broker_status=$?
+  set -e
+  unset -f read printf
+  [[ "$broker_status" == "$BENCHMARK_PRESSURE_PUBLICATION_AMBIGUOUS_STATUS" &&
+    "$rollback_surrendered" == true && -s "$pid_file" && -f "$fired" &&
+    -L "$data" && "$(readlink -- "$data")" == "${data_hidden##*/}" &&
+    -f "$data_hidden" && ! -L "$data_hidden" &&
+    "$(<"$data_hidden")" == 'first data' &&
+    "$(<"$data_two")" == 'second data' &&
+    ! -e "$marker_target" && ! -L "$marker_target" ]] || return 1
+  read -r supervisor_pid broker_pid watchdog_pid <"$pid_file" || return $?
+  ! kill -0 "$supervisor_pid" 2>/dev/null || return 1
+  ! kill -0 "$broker_pid" 2>/dev/null || return 1
+  ! kill -0 "$watchdog_pid" 2>/dev/null || return 1
+  exec {marker_fd}<&-
+  exec {data_two_fd}<&-
+  exec {data_fd}<&-
+  exec {parent_fd}<&-
+
+  # A deterministic supervisor failure after marker link and exact child reap
+  # is post-lease ambiguity: the marker/data survive, and the held supervisor's
+  # child roster is observably empty before it returns failure.
+  directory="$root/post-reap-ambiguity"
+  pid_file="$root/post-reap-ambiguity.pids"
+  observation="$root/post-reap-ambiguity.observed"
+  marker_source="$directory/marker.source"
+  marker_target="$directory/commit"
+  data="$directory/data"
+  mkdir -m 0700 -- "$directory"
+  printf 'data\n' >"$data"
+  printf 'marker\n' >"$marker_source"
+  chmod 0600 -- "$data" "$marker_source"
+  exec {parent_fd}<"$directory"
+  exec {data_fd}<"$data"
+  exec {marker_fd}<"$marker_source"
+  parent_identity="$(stat -Lc '%d:%i:%u:%a' -- \
+    "/proc/self/fd/$parent_fd")" || return $?
+  data_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+    "/proc/self/fd/$data_fd")" || return $?
+  marker_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+    "/proc/self/fd/$marker_fd")" || return $?
+  data_sha256="$(benchmark_pressure_test_sha256 \
+    "/proc/self/fd/$data_fd")" || return $?
+  marker_sha256="$(benchmark_pressure_test_sha256 \
+    "/proc/self/fd/$marker_fd")" || return $?
+  command rm -- "$marker_source"
+  marker_identity="$(stat -Lc '%d:%i:%u:%a:%h:%s' -- \
+    "/proc/self/fd/$marker_fd")" || return $?
+  specification=$'V\t1\n'
+  printf -v specification '%sP\t0\t%s\t%s\t%s\trelevant\n' \
+    "$specification" "$parent_fd" "$directory" "$parent_identity"
+  printf -v specification '%sF\t0\tdata\t%s\t%s\t%s\n' \
+    "$specification" "$data_fd" "$data_identity" "$data_sha256"
+  printf -v specification '%sM\t0\tcommit\t%s\t%s\t%s\n' \
+    "$specification" "$marker_fd" "$marker_identity" "$marker_sha256"
+  observer_pid=""
+  read() {
+    local read_status=0
+
+    builtin read "$@" || read_status=$?
+    if ((read_status == 0)) && [[ "${ready:-}" == ready &&
+      "${capture_count:-}" == 0 && ! -e "$pid_file" ]]; then
+      printf '%s %s %s\n' "$broker_pid" "$holder_pid" "$watchdog_pid" \
+        >"$pid_file" || return $?
+      (
+        for ((attempt = 0; attempt < 300; attempt++)); do
+          if [[ -f "$marker_target" &&
+            -r "/proc/$broker_pid/task/$broker_pid/children" ]]; then
+            children="$(<"/proc/$broker_pid/task/$broker_pid/children")"
+            if [[ -z "$children" ]]; then
+              printf 'empty\n' >"$observation"
+              exit 0
+            fi
+          fi
+          sleep 0.01
+        done
+        exit 1
+      ) &
+      observer_pid=$!
+    fi
+    return "$read_status"
+  }
+  rollback_surrendered=false
+  set +e
+  BENCHMARK_PRESSURE_TEST_COHERENT_POST_REAP_DELAY_SECONDS=2 \
+  BENCHMARK_PRESSURE_TEST_COHERENT_FAIL_AFTER_WORKER_REAP=true \
+    benchmark_pressure_coherent_file_set publish_marker "$specification" \
+      "" "" "" rollback_surrendered
+  broker_status=$?
+  set -e
+  unset -f read
+  [[ "$observer_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  wait "$observer_pid" || return $?
+  [[ "$broker_status" == "$BENCHMARK_PRESSURE_PUBLICATION_AMBIGUOUS_STATUS" &&
+    "$rollback_surrendered" == true && -f "$marker_target" &&
+    ! -L "$marker_target" && -f "$observation" &&
+    "$(<"$observation")" == empty ]] || return 1
+  read -r supervisor_pid broker_pid watchdog_pid <"$pid_file" || return $?
+  ! kill -0 "$supervisor_pid" 2>/dev/null || return 1
+  ! kill -0 "$broker_pid" 2>/dev/null || return 1
+  ! kill -0 "$watchdog_pid" 2>/dev/null || return 1
+  exec {marker_fd}<&-
+  exec {data_fd}<&-
+  exec {parent_fd}<&-
+}
+
+test_benchmark_pressure_trace_receiver_counters_are_terminally_bound() {
+  local private_root="$TEST_TMP_DIR/pressure-trace-counters"
+  local directory="$private_root/cycle-01"
+  local manifest="$directory/private-manifest.json"
+  local snapshot="$directory/trace-snapshot.json"
+  local result="$directory/benchmark-result.json"
+  local reset="$directory/trace-reset.json"
+  local receipt="$directory/admission-receipt.json"
+  local candidate=""
+  local expression=""
+  local label=""
+  local snapshot_digest=""
+  local admission_digest=""
+
+  benchmark_pressure_test_prepare_cycle_fixture "$private_root" 1
+  benchmark_pressure_trace_projection "$snapshot" "$result" "$reset" 1 |
+    jq -e '
+      .received_batches == 1 and .received_spans == 3 and
+      .retained_span_count == 3 and .retained_bytes > 0
+    ' >/dev/null || return $?
+
+  while IFS=$'\t' read -r label expression; do
+    candidate="$directory/.trace-$label"
+    jq -cS "$expression" "$snapshot" >"$candidate" || return $?
+    chmod 0600 -- "$candidate"
+    if benchmark_pressure_trace_projection \
+      "$candidate" "$result" "$reset" 1 >/dev/null 2>&1; then
+      printf 'pressure trace accepted contradictory %s receiver evidence\n' \
+        "$label" >&2
+      return 1
+    fi
+  done <<EOF
+zero-batches	.received_batches=0
+too-many-batches	.received_batches=(.received_spans+1)
+over-cap	.received_spans=($BENCHMARK_PRESSURE_TRACE_MAX_SPANS+1)
+zero-retained-bytes	.retained_bytes=0
+span-count-drift	.received_spans=(.spans|length)+1
+duplicate-identity	.spans[2].trace_id=.spans[0].trace_id | .spans[2].span_id=.spans[0].span_id
+EOF
+
+  # Coordinate the raw digest, admission receipt, private file roster, and
+  # manifest summary after duplicating an identity.  Terminal validation must
+  # still recompute the snapshot rather than trusting those matching hashes.
+  candidate="$directory/.trace-duplicate-coordinated"
+  jq -cS '
+    .spans[2].trace_id=.spans[0].trace_id |
+    .spans[2].span_id=.spans[0].span_id
+  ' "$snapshot" >"$candidate" || return $?
+  chmod 0600 -- "$candidate"
+  mv -T -- "$candidate" "$snapshot"
+  snapshot_digest="$(benchmark_pressure_test_sha256 "$snapshot")" || return $?
+  candidate="$directory/.admission-duplicate-coordinated"
+  jq -cS --arg digest "$snapshot_digest" \
+    '.digests.trace_snapshot=$digest' "$receipt" >"$candidate" || return $?
+  chmod 0600 -- "$candidate"
+  mv -T -- "$candidate" "$receipt"
+  admission_digest="$(benchmark_pressure_test_sha256 "$receipt")" || return $?
+  benchmark_pressure_test_rehash_manifest_role "$manifest" trace_snapshot
+  benchmark_pressure_test_rehash_manifest_role "$manifest" admission
+  candidate="$directory/.manifest-duplicate-coordinated"
+  jq -cS --arg digest "$admission_digest" \
+    '.attribution.admission_receipt_sha256=$digest' \
+    "$manifest" >"$candidate" || return $?
+  chmod 0600 -- "$candidate"
+  mv -T -- "$candidate" "$manifest"
+  if validate_benchmark_pressure_private_manifest "$manifest" 1; then
+    printf 'pressure manifest accepted coordinated duplicate trace identity\n' >&2
+    return 1
+  fi
+}
+
+test_benchmark_pressure_host_load_window_is_sealed() {
+  local private_root="$TEST_TMP_DIR/pressure-host-load-window"
+  local directory="$private_root/cycle-01"
+  local boundaries="$directory/phase-boundaries.json"
+  local result="$directory/benchmark-result.json"
+  local manifest="$directory/private-manifest.json"
+  local candidate=""
+  local elapsed=""
+  local phases=""
+  local drift_result="$directory/benchmark-result-drift.json"
+
+  benchmark_pressure_test_prepare_cycle_fixture "$private_root" 1
+  validate_benchmark_pressure_phase_boundaries "$boundaries" 1 "$result"
+  for elapsed in 0 5900 6100; do
+    candidate="$directory/.phase-load-$elapsed"
+    jq -cS --argjson elapsed "$elapsed" '
+      .load_elapsed_centiseconds=$elapsed |
+      .phases[4].monotonic_centiseconds=
+        (.phases[3].monotonic_centiseconds+$elapsed)
+    ' "$boundaries" >"$candidate" || return $?
+    chmod 0600 -- "$candidate"
+    if validate_benchmark_pressure_phase_boundaries \
+      "$candidate" 1 "$result"; then
+      printf 'pressure phases accepted host load duration %s centiseconds\n' \
+        "$elapsed" >&2
+      return 1
+    fi
+  done
+
+  benchmark_pressure_test_write_result \
+    "$drift_result" 60000000000 60500000000 1 || return $?
+  if validate_benchmark_pressure_phase_boundaries \
+    "$boundaries" 1 "$drift_result"; then
+    printf 'pressure phases accepted traffic outside the sealed host window\n' >&2
+    return 1
+  fi
+
+  candidate="$directory/.phase-load-terminal"
+  jq -cS '
+    .load_elapsed_centiseconds=5900 |
+    .phases[4].monotonic_centiseconds=
+      (.phases[3].monotonic_centiseconds+5900)
+  ' "$boundaries" >"$candidate" || return $?
+  chmod 0600 -- "$candidate"
+  mv -T -- "$candidate" "$boundaries"
+  phases="$(jq -c '.phases' "$boundaries")" || return $?
+  candidate="$directory/.manifest-load-terminal"
+  jq -cS --argjson phases "$phases" '
+    .phases=$phases | .timing.load_elapsed_centiseconds=5900
+  ' "$manifest" >"$candidate" || return $?
+  chmod 0600 -- "$candidate"
+  mv -T -- "$candidate" "$manifest"
+  benchmark_pressure_test_rehash_manifest_role "$manifest" phase_boundaries
+  if validate_benchmark_pressure_private_manifest "$manifest" 1; then
+    printf 'pressure manifest accepted coordinated short host load evidence\n' >&2
+    return 1
+  fi
+}
+
+test_benchmark_pressure_resource_schemas_and_role_caps_are_exact() {
+  local directory="$TEST_TMP_DIR/pressure-resource-schema"
+  local stack="$directory/stack.json"
+  local resource="$directory/resource.json"
+  local candidate=""
+  local stats="$directory/stats.jsonl"
+  local private_root=""
+  local manifest=""
+
+  mkdir -m 0700 -- "$directory"
+  benchmark_pressure_test_write_stack "$stack"
+  benchmark_pressure_test_write_resource "$resource" "$stack" 1
+  validate_benchmark_pressure_resources "$resource" "$stack"
+  jq -cS 'del(.stats[0].PIDs)' "$resource" >"$directory/missing.json"
+  chmod 0600 -- "$directory/missing.json"
+  if validate_benchmark_pressure_resources "$directory/missing.json" "$stack"; then
+    printf 'pressure resources accepted a missing Docker stats field\n' >&2
+    return 1
+  fi
+  jq -cS '.stats[1].ID=.stats[0].ID' "$resource" >"$directory/foreign.json"
+  chmod 0600 -- "$directory/foreign.json"
+  if validate_benchmark_pressure_resources "$directory/foreign.json" "$stack"; then
+    printf 'pressure resources accepted a duplicate/foreign Docker row\n' >&2
+    return 1
+  fi
+  jq -c '.stats[]' "$resource" >"$stats"
+  chmod 0600 -- "$stats"
+  validate_benchmark_pressure_stats_rows "$stats"
+  candidate="$directory/resource-max-plus-one.json"
+  LC_ALL=C head -c "$((BENCHMARK_PRESSURE_RESOURCE_MAX_BYTES + 1))" \
+    /dev/zero | tr '\0' x >"$candidate" || return $?
+  chmod 0600 -- "$candidate"
+  if validate_benchmark_pressure_resources "$candidate" "$stack"; then
+    printf 'pressure resources accepted max+1 bytes\n' >&2
+    return 1
+  fi
+
+  private_root="$TEST_TMP_DIR/pressure-role-cap"
+  benchmark_pressure_test_prepare_cycle_fixture "$private_root" 1
+  manifest="$private_root/cycle-01/private-manifest.json"
+  candidate="$private_root/cycle-01/.stderr-max-plus-one"
+  LC_ALL=C head -c "$((BENCHMARK_PRESSURE_STDERR_MAX_BYTES + 1))" \
+    /dev/zero | tr '\0' x >"$candidate" || return $?
+  chmod 0600 -- "$candidate"
+  mv -T -- "$candidate" "$private_root/cycle-01/benchmark.stderr.log"
+  benchmark_pressure_test_rehash_manifest_role "$manifest" benchmark_stderr
+  if validate_benchmark_pressure_private_manifest "$manifest" 1; then
+    printf 'pressure manifest accepted a role-specific max+1 leaf\n' >&2
+    return 1
+  fi
+}
+
+test_benchmark_pressure_role_capture_is_bounded_reaped_and_foreign_safe() {
+  local directory="$TEST_TMP_DIR/pressure-role-capture"
+  local stdout="$directory/stdout"
+  local stderr="$directory/stderr"
+  local child_pid_file="$directory/child.pid"
+  local child_pid=""
+  local helper_pid=""
+  local capture_pid=""
+  local capture_status=0
+  local index=0
+  local foreign_marker="$directory/foreign-fired"
+
+  mkdir -m 0700 -- "$directory"
+  : >"$stdout"
+  : >"$stderr"
+  chmod 0600 -- "$stdout" "$stderr"
+  benchmark_pressure_run_role_captured \
+    "$stdout" 4 1 "$stderr" 4 1 5 \
+    bash -c 'printf 1234; printf ab >&2'
+  [[ "$(<"$stdout")" == 1234 && "$(<"$stderr")" == ab ]]
+
+  : >"$stdout"
+  : >"$stderr"
+  if benchmark_pressure_run_role_captured \
+    "$stdout" 4 1 "$stderr" 4 1 5 \
+    bash -c 'printf 12345'; then
+    printf 'role capture accepted cap+1 stdout bytes\n' >&2
+    return 1
+  else
+    capture_status=$?
+  fi
+  [[ "$capture_status" == 125 && "$(stat -Lc '%s' -- "$stdout")" == 5 ]]
+
+  : >"$stdout"
+  : >"$stderr"
+  if benchmark_pressure_run_role_captured \
+    "$stdout" 16 1 "$stderr" 16 1 5 \
+    bash -c 'printf partial; exit 7'; then
+    printf 'role capture hid a partial producer failure\n' >&2
+    return 1
+  else
+    capture_status=$?
+  fi
+  [[ "$capture_status" == 7 && "$(<"$stdout")" == partial ]]
+
+  : >"$stdout"
+  : >"$stderr"
+  if benchmark_pressure_run_role_captured \
+    "$stdout" 16 1 "$stderr" 16 1 1 \
+    bash -c '
+      printf "%s\n" "$$" >"$1"
+      while :; do sleep 1; done
+    ' role-timeout "$child_pid_file"; then
+    printf 'role capture accepted an infinite producer\n' >&2
+    return 1
+  else
+    capture_status=$?
+  fi
+  [[ "$capture_status" == 124 && -s "$child_pid_file" ]]
+  child_pid="$(<"$child_pid_file")"
+  for ((index = 0; index < 20; index++)); do
+    kill -0 "$child_pid" 2>/dev/null || break
+    sleep 0.05
+  done
+  if kill -0 "$child_pid" 2>/dev/null; then
+    printf 'role capture left a timed-out producer alive\n' >&2
+    return 1
+  fi
+
+  rm -- "$child_pid_file"
+  : >"$stdout"
+  : >"$stderr"
+  benchmark_pressure_run_role_captured \
+    "$stdout" 16 1 "$stderr" 16 1 30 \
+    bash -c '
+      printf "%s\n" "$$" >"$1"
+      while :; do sleep 1; done
+    ' role-signal "$child_pid_file" &
+  helper_pid=$!
+  for ((index = 0; index < 40; index++)); do
+    [[ -s "$child_pid_file" ]] && break
+    sleep 0.05
+  done
+  [[ -s "$child_pid_file" ]] || return 1
+  child_pid="$(<"$child_pid_file")"
+  capture_pid="$(<"/proc/$helper_pid/task/$helper_pid/children")" || return $?
+  capture_pid="${capture_pid% }"
+  [[ "$capture_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  kill -TERM "$capture_pid"
+  if wait "$helper_pid"; then
+    printf 'role capture ignored TERM\n' >&2
+    return 1
+  else
+    capture_status=$?
+  fi
+  [[ "$capture_status" == 143 ]]
+  for ((index = 0; index < 20; index++)); do
+    kill -0 "$child_pid" 2>/dev/null || break
+    sleep 0.05
+  done
+  if kill -0 "$child_pid" 2>/dev/null; then
+    printf 'role capture left a signaled producer alive\n' >&2
+    return 1
+  fi
+  [[ -z "$(find "$directory" -maxdepth 1 \
+    -name '.role-capture.*' -print -quit)" ]]
+
+  (
+    local foreign_stdout="$directory/foreign-stdout"
+    local foreign_stderr="$directory/foreign-stderr"
+
+    : >"$foreign_stdout"
+    : >"$foreign_stderr"
+    chmod 0600 -- "$foreign_stdout" "$foreign_stderr"
+    head() {
+      local source="${*: -1}"
+      if [[ "$source" == */stdout && ! -e "$foreign_marker" ]]; then
+        : >"$foreign_marker"
+        command rm -- "$foreign_stdout" || return $?
+        printf 'foreign\n' >"$foreign_stdout" || return $?
+        chmod 0600 -- "$foreign_stdout" || return $?
+      fi
+      command head "$@"
+    }
+    if benchmark_pressure_run_role_captured \
+      "$foreign_stdout" 16 1 "$foreign_stderr" 16 1 5 \
+      bash -c 'printf owned'; then
+      printf 'role capture authenticated a foreign pathname replacement\n' >&2
+      return 1
+    fi
+    [[ "$(<"$foreign_stdout")" == foreign &&
+      -z "$(find "$directory" -maxdepth 1 \
+        -name '.role-capture.*' -print -quit)" ]]
+  )
+}
+
+test_benchmark_pressure_resource_and_java_producers_use_role_capture() {
+  local directory="$TEST_TMP_DIR/pressure-production-capture"
+  local shim_dir="$directory/shims"
+  local stack="$directory/stack.json"
+  local stats="$directory/stats.jsonl"
+  local resources="$directory/resources.json"
+  local resource_overflow="$directory/resources-overflow.json"
+  local java_fixture="$directory/java.txt"
+  local java_output="$directory/java-output.txt"
+  local java_stderr="$directory/java-output.stderr"
+  local overflow_output="$directory/java-overflow.txt"
+  local overflow_stderr="$directory/java-overflow.stderr"
+  local old_path="$PATH"
+
+  mkdir -m 0700 -- "$directory" "$shim_dir" "$directory/certs"
+  benchmark_pressure_test_write_stack "$stack"
+  jq -c '.[] | {ID:.container_id,Name:.container_name,
+    Container:.container_name,CPUPerc:"0.00%",MemPerc:"0.10%",
+    MemUsage:"1MiB / 1GiB",NetIO:"0B / 0B",BlockIO:"0B / 0B",PIDs:"1"}' \
+    "$stack" >"$stats" || return $?
+  chmod 0600 -- "$stats"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -eu' \
+    '[[ "$1" == stats ]] || exit 91' \
+    'bytes="${BENCHMARK_PRESSURE_TEST_STATS_BYTES:-0}"' \
+    'if ((bytes > 0)); then' \
+    '  dd if=/dev/zero bs=1 count="$bytes" 2>/dev/null | tr "\\000" x' \
+    'else' \
+    '  command cat -- "$BENCHMARK_PRESSURE_TEST_STATS"' \
+    'fi' \
+    >"$shim_dir/docker" || return $?
+  chmod 0700 -- "$shim_dir/docker"
+  BENCHMARK_PRESSURE_TEST_STATS="$stats"
+  BENCHMARK_PRESSURE_TEST_STATS_BYTES=0
+  export BENCHMARK_PRESSURE_TEST_STATS BENCHMARK_PRESSURE_TEST_STATS_BYTES
+  PATH="$shim_dir:$old_path"
+  export PATH
+  capture_benchmark_pressure_resources "$stack" "$resources"
+  validate_benchmark_pressure_resources "$resources" "$stack"
+  BENCHMARK_PRESSURE_TEST_STATS_BYTES="$((BENCHMARK_PRESSURE_STATS_MAX_BYTES + 1))"
+  export BENCHMARK_PRESSURE_TEST_STATS_BYTES
+  if capture_benchmark_pressure_resources "$stack" "$resource_overflow"; then
+    printf 'Docker stats accepted cap+1 streamed stdout\n' >&2
+    return 1
+  fi
+  [[ ! -e "$resource_overflow" && ! -L "$resource_overflow" ]]
+
+  benchmark_pressure_test_write_java_snapshot "$java_fixture" 0
+  printf 'fixture\n' >"$directory/certs/ca.crt"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -eu' \
+    'bytes="${BENCHMARK_PRESSURE_TEST_STDERR_BYTES:-0}"' \
+    'if ((bytes > 0)); then' \
+    '  dd if=/dev/zero bs=1 count="$bytes" 2>/dev/null | tr "\\000" x >&2' \
+    'fi' \
+    'command cat -- "$BENCHMARK_PRESSURE_TEST_JAVA"' \
+    >"$shim_dir/curl" || return $?
+  chmod 0700 -- "$shim_dir/curl"
+  BENCHMARK_PRESSURE_TEST_JAVA="$java_fixture"
+  BENCHMARK_PRESSURE_TEST_STDERR_BYTES="$BENCHMARK_PRESSURE_STDERR_MAX_BYTES"
+  CERT_DIR="$directory/certs"
+  export BENCHMARK_PRESSURE_TEST_JAVA BENCHMARK_PRESSURE_TEST_STDERR_BYTES
+  capture_benchmark_pressure_java_diagnostics "$java_output" "$java_stderr"
+  validate_benchmark_pressure_java_snapshot "$java_output"
+  [[ "$(stat -Lc '%s' -- "$java_stderr")" == "$BENCHMARK_PRESSURE_STDERR_MAX_BYTES" ]]
+
+  BENCHMARK_PRESSURE_TEST_STDERR_BYTES="$((BENCHMARK_PRESSURE_STDERR_MAX_BYTES + 1))"
+  export BENCHMARK_PRESSURE_TEST_STDERR_BYTES
+  if capture_benchmark_pressure_java_diagnostics \
+    "$overflow_output" "$overflow_stderr"; then
+    printf 'Java diagnostics accepted cap+1 streamed stderr\n' >&2
+    return 1
+  fi
+  [[ ! -e "$overflow_output" && ! -L "$overflow_output" &&
+    ! -e "$overflow_stderr" && ! -L "$overflow_stderr" &&
+    -z "$(find "$directory" -maxdepth 1 \
+      \( -name '.java-diagnostics.*' -o \
+         -name '.java-diagnostics-stderr.*' -o \
+         -name '.resource.*' -o -name '.resource-stats.*' -o \
+         -name '.resource-stats-stderr.*' -o -name '.role-capture.*' \) \
+      -print -quit)" ]]
+}
+
+benchmark_pressure_test_prepare_java_pair() {
+  local -r directory="$1"
+
+  mkdir -m 0700 -- "$directory" || return $?
+  benchmark_pressure_test_write_java_snapshot \
+    "$directory/.java-stdout-source" 0 || return $?
+  printf 'bounded diagnostic warning\n' >"$directory/.java-stderr-source" ||
+    return $?
+  chmod 0600 -- "$directory/.java-stderr-source"
+}
+
+test_benchmark_pressure_java_pair_is_sealed_and_foreign_safe() {
+  local root="$TEST_TMP_DIR/pressure-java-pair"
+  local directory=""
+  local marker=""
+  local saved_parent=""
+  local helper_pid=""
+  local pair_pid=""
+  local pair_status=0
+  local attempt=0
+
+  mkdir -m 0700 -- "$root"
+  directory="$root/success"
+  benchmark_pressure_test_prepare_java_pair "$directory"
+  benchmark_pressure_publish_java_diagnostics_pair \
+    "$directory/.java-stdout-source" "$directory/.java-stderr-source" \
+    "$directory/java.stdout" "$directory/java.stderr"
+  validate_benchmark_pressure_java_snapshot "$directory/java.stdout"
+  [[ "$(<"$directory/java.stderr")" == 'bounded diagnostic warning' &&
+    "$(stat -Lc '%u:%a:%h' -- "$directory/java.stdout")" == "$EUID:600:1" &&
+    "$(stat -Lc '%u:%a:%h' -- "$directory/java.stderr")" == "$EUID:600:1" &&
+    ! -e "$directory/.java-stdout-source" &&
+    ! -e "$directory/.java-stderr-source" ]]
+
+  (
+    local directory="$root/stdout-swap"
+    local marker="$root/stdout-swap-fired"
+    local target=""
+
+    benchmark_pressure_test_prepare_java_pair "$directory"
+    ln() {
+      target="${*: -1}"
+      command ln "$@" || return $?
+      if [[ "$target" == /proc/self/fd/*/java.stderr && ! -e "$marker" ]]; then
+        : >"$marker"
+        command rm -- "$directory/java.stdout" || return $?
+        printf 'foreign stdout\n' >"$directory/java.stdout" || return $?
+        chmod 0600 -- "$directory/java.stdout"
+      fi
+    }
+    if benchmark_pressure_publish_java_diagnostics_pair \
+      "$directory/.java-stdout-source" "$directory/.java-stderr-source" \
+      "$directory/java.stdout" "$directory/java.stderr"; then
+      printf 'Java pair accepted stdout replacement during stderr commit\n' >&2
+      return 1
+    fi
+    [[ -f "$marker" && "$(<"$directory/java.stdout")" == 'foreign stdout' &&
+      ! -e "$directory/java.stderr" &&
+      ! -e "$directory/.java-stdout-source" &&
+      ! -e "$directory/.java-stderr-source" &&
+      -z "$(find "$directory" -maxdepth 1 \
+        -name '.benchmark-pressure-quarantine.*' -print -quit)" ]]
+  ) || return 1
+
+  (
+    local directory="$root/stderr-swap"
+    local marker="$root/stderr-swap-fired"
+    local target=""
+
+    benchmark_pressure_test_prepare_java_pair "$directory"
+    ln() {
+      target="${*: -1}"
+      command ln "$@" || return $?
+      if [[ "$target" == /proc/self/fd/*/java.stderr && ! -e "$marker" ]]; then
+        : >"$marker"
+        command rm -- "$directory/java.stderr" || return $?
+        printf 'foreign stderr\n' >"$directory/java.stderr" || return $?
+        chmod 0600 -- "$directory/java.stderr"
+      fi
+    }
+    if benchmark_pressure_publish_java_diagnostics_pair \
+      "$directory/.java-stdout-source" "$directory/.java-stderr-source" \
+      "$directory/java.stdout" "$directory/java.stderr"; then
+      printf 'Java pair accepted stderr replacement during its commit\n' >&2
+      return 1
+    fi
+    [[ -f "$marker" && "$(<"$directory/java.stderr")" == 'foreign stderr' &&
+      ! -e "$directory/java.stdout" &&
+      ! -e "$directory/.java-stdout-source" &&
+      ! -e "$directory/.java-stderr-source" &&
+      -z "$(find "$directory" -maxdepth 1 \
+        -name '.benchmark-pressure-quarantine.*' -print -quit)" ]]
+  ) || return 1
+
+  (
+    local directory="$root/cross-role-swap"
+    local marker="$root/cross-role-swap-fired"
+    local target=""
+    local temporary="$directory/.cross-role-swap"
+
+    benchmark_pressure_test_prepare_java_pair "$directory"
+    ln() {
+      target="${*: -1}"
+      command ln "$@" || return $?
+      if [[ "$target" == /proc/self/fd/*/java.stderr && ! -e "$marker" ]]; then
+        : >"$marker"
+        command mv -T -- "$directory/java.stdout" "$temporary" || return $?
+        command mv -T -- "$directory/java.stderr" \
+          "$directory/java.stdout" || return $?
+        command mv -T -- "$temporary" "$directory/java.stderr" || return $?
+      fi
+    }
+    if benchmark_pressure_publish_java_diagnostics_pair \
+      "$directory/.java-stdout-source" "$directory/.java-stderr-source" \
+      "$directory/java.stdout" "$directory/java.stderr"; then
+      printf 'Java pair accepted a cross-role target permutation\n' >&2
+      return 1
+    fi
+    [[ -f "$marker" && ! -e "$temporary" && ! -L "$temporary" &&
+      ! -e "$directory/java.stdout" && ! -L "$directory/java.stdout" &&
+      ! -e "$directory/java.stderr" && ! -L "$directory/java.stderr" &&
+      ! -e "$directory/.java-stdout-source" &&
+      ! -e "$directory/.java-stderr-source" &&
+      -z "$(find "$directory" -maxdepth 1 \
+        -name '.benchmark-pressure-quarantine.*' -print -quit)" ]]
+  ) || return 1
+
+  (
+    local case_root="$root/parent-swap"
+    local directory="$case_root/current"
+    local saved_parent="$case_root/original"
+    local marker="$root/parent-swap-fired"
+    local target=""
+
+    mkdir -m 0700 -- "$case_root"
+    benchmark_pressure_test_prepare_java_pair "$directory"
+    ln() {
+      target="${*: -1}"
+      command ln "$@" || return $?
+      if [[ "$target" == /proc/self/fd/*/java.stderr && ! -e "$marker" ]]; then
+        : >"$marker"
+        command mv -T -- "$directory" "$saved_parent" || return $?
+        command mkdir -m 0700 -- "$directory" || return $?
+        printf 'foreign parent stdout\n' >"$directory/java.stdout" || return $?
+        printf 'foreign parent stderr\n' >"$directory/java.stderr" || return $?
+        chmod 0600 -- "$directory/java.stdout" "$directory/java.stderr"
+      fi
+    }
+    if benchmark_pressure_publish_java_diagnostics_pair \
+      "$directory/.java-stdout-source" "$directory/.java-stderr-source" \
+      "$directory/java.stdout" "$directory/java.stderr"; then
+      printf 'Java pair accepted target-parent substitution\n' >&2
+      return 1
+    fi
+    [[ -f "$marker" &&
+      "$(<"$directory/java.stdout")" == 'foreign parent stdout' &&
+      "$(<"$directory/java.stderr")" == 'foreign parent stderr' &&
+      ! -e "$saved_parent/java.stdout" && ! -e "$saved_parent/java.stderr" &&
+      ! -e "$saved_parent/.java-stdout-source" &&
+      ! -e "$saved_parent/.java-stderr-source" &&
+      -z "$(find "$saved_parent" -maxdepth 1 \
+        -name '.benchmark-pressure-quarantine.*' -print -quit)" ]]
+  ) || return 1
+
+  (
+    local directory="$root/symlink-back"
+    local marker="$root/symlink-back-fired"
+    local final_argument=""
+    local output=""
+    local status=0
+
+    benchmark_pressure_test_prepare_java_pair "$directory"
+    sha256sum() {
+      final_argument="${!#}"
+      status=0
+      output="$(command sha256sum "$@")" || status=$?
+      if ((status == 0)) &&
+        [[ "$final_argument" =~ ^/proc/self/fd/[1-9][0-9]*$ &&
+          -e "$directory/java.stdout" && -e "$directory/java.stderr" &&
+          ! -e "$directory/.java-stdout-source" &&
+          ! -e "$directory/.java-stderr-source" && ! -e "$marker" ]]; then
+        : >"$marker"
+        command mv -T -- "$directory/java.stdout" \
+          "$directory/.java-stdout-source" || return $?
+        command ln -s -- .java-stdout-source "$directory/java.stdout" ||
+          return $?
+      fi
+      printf '%s\n' "$output"
+      return "$status"
+    }
+    if benchmark_pressure_publish_java_diagnostics_pair \
+      "$directory/.java-stdout-source" "$directory/.java-stderr-source" \
+      "$directory/java.stdout" "$directory/java.stderr"; then
+      printf 'Java pair accepted a public symlink to its owned inode\n' >&2
+      return 1
+    fi
+    unset -f sha256sum
+    [[ -f "$marker" && -L "$directory/java.stdout" &&
+      "$(readlink -- "$directory/java.stdout")" == .java-stdout-source &&
+      ! -e "$directory/.java-stdout-source" &&
+      ! -e "$directory/java.stderr" &&
+      ! -e "$directory/.java-stderr-source" &&
+      -z "$(find "$directory" -maxdepth 1 \
+        -name '.benchmark-pressure-quarantine.*' -print -quit)" ]]
+  ) || return 1
+
+  # Mutating stdout while the later stderr member is framed, after the legacy
+  # shell pair seal, must still be rejected by the one terminal broker pass.
+  (
+    local directory="$root/pre-broker-cross-member"
+    local marker="$root/pre-broker-cross-member-fired"
+
+    benchmark_pressure_test_prepare_java_pair "$directory"
+    printf() {
+      if [[ "$1" == -v && "$2" == coherent_specification &&
+        "${5:-}" == java.stderr && -e "$directory/java.stdout" &&
+        -e "$directory/java.stderr" &&
+        ! -e "$directory/.java-stdout-source" &&
+        ! -e "$directory/.java-stderr-source" && ! -e "$marker" ]]; then
+        : >"$marker"
+        command mv -T -- "$directory/java.stdout" \
+          "$directory/.java-stdout-source" || return $?
+        command ln -s -- .java-stdout-source "$directory/java.stdout" ||
+          return $?
+      fi
+      builtin printf "$@"
+    }
+    if benchmark_pressure_publish_java_diagnostics_pair \
+      "$directory/.java-stdout-source" "$directory/.java-stderr-source" \
+      "$directory/java.stdout" "$directory/java.stderr"; then
+      printf 'Java pair accepted a pre-broker cross-member symlink\n' >&2
+      return 1
+    fi
+    unset -f printf
+    [[ -f "$marker" && -L "$directory/java.stdout" &&
+      "$(readlink -- "$directory/java.stdout")" == .java-stdout-source &&
+      ! -e "$directory/.java-stdout-source" &&
+      ! -e "$directory/java.stderr" &&
+      ! -e "$directory/.java-stderr-source" &&
+      -z "$(find "$directory" -maxdepth 1 \
+        -name '.benchmark-pressure-quarantine.*' -print -quit)" ]]
+  ) || return 1
+
+  directory="$root/signal"
+  marker="$root/signal-pair-pid"
+  benchmark_pressure_test_prepare_java_pair "$directory"
+  (
+    local target=""
+
+    ln() {
+      target="${*: -1}"
+      if [[ "$target" == /proc/self/fd/*/java.stderr ]]; then
+        printf '%s\n' "$BASHPID" >"$marker" || return $?
+        while :; do :; done
+      fi
+      command ln "$@"
+    }
+    benchmark_pressure_publish_java_diagnostics_pair \
+      "$directory/.java-stdout-source" "$directory/.java-stderr-source" \
+      "$directory/java.stdout" "$directory/java.stderr"
+  ) &
+  helper_pid=$!
+  for ((attempt = 0; attempt < 100; attempt++)); do
+    [[ -s "$marker" ]] && break
+    sleep 0.02
+  done
+  [[ -s "$marker" ]] || return 1
+  pair_pid="$(<"$marker")"
+  [[ "$pair_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  kill -TERM "$pair_pid"
+  if wait "$helper_pid"; then
+    printf 'Java pair ignored TERM during second-leaf publication\n' >&2
+    return 1
+  else
+    pair_status=$?
+  fi
+  [[ "$pair_status" == 143 &&
+    ! -e "$directory/java.stdout" && ! -e "$directory/java.stderr" &&
+    ! -e "$directory/.java-stdout-source" &&
+    ! -e "$directory/.java-stderr-source" &&
+    -z "$(find "$directory" -maxdepth 1 \
+      -name '.benchmark-pressure-quarantine.*' -print -quit)" ]]
+}
+
+test_benchmark_pressure_client_capture_is_bounded_reaped_and_publishable() {
+  local directory="$TEST_TMP_DIR/pressure-client-capture"
+  local stdout="$directory/stdout"
+  local stderr="$directory/stderr"
+  local status_file="$directory/status"
+  local status_observed="$directory/status.observed"
+  local child_pid_file="$directory/child.pid"
+  local child_pid=""
+  local helper_pid=""
+  local capture_pid=""
+  local helper_status=0
+  local index=0
+  local success_dir="$TEST_TMP_DIR/pressure-client-success"
+  local overflow_dir="$TEST_TMP_DIR/pressure-client-overflow"
+  local swap_dir="$TEST_TMP_DIR/pressure-client-path-swap"
+  local valid_result="$directory/valid.json"
+  local foreign_result="$directory/foreign.json"
+  local swap_candidate=""
+  local swap_marker="$directory/client-path-swap-fired"
+  local calls="$directory/calls"
+  local client_mode=success
+  local BENCHMARK_PRESSURE_CLIENT_CAPTURE_CALLBACK=\
+benchmark_pressure_test_observe_client_capture
+
+  benchmark_pressure_test_observe_client_capture() {
+    command cp -- "$3" "$status_observed" || return $?
+    if ((10#${10} != 0)); then
+      return "${10}"
+    fi
+    return "$9"
+  }
+
+  mkdir -m 0700 -- "$directory" "$success_dir" "$overflow_dir" "$swap_dir"
+  if benchmark_pressure_run_client_captured \
+    "$stdout" "$stderr" "$status_file" 1 \
+    bash -c '
+      printf "%s\n" "$$" >"$1"
+      trap "exit 0" TERM
+      while :; do sleep 1; done
+    ' benchmark-timeout "$child_pid_file"; then
+    printf 'pressure capture accepted a timed-out command\n' >&2
+    return 1
+  fi
+  [[ "$(awk -F= '$1 == "command_status" {print $2}' \
+      "$status_observed")" == 124 &&
+    ! -e "$stdout" && ! -L "$stdout" &&
+    ! -e "$stderr" && ! -L "$stderr" &&
+    ! -e "$status_file" && ! -L "$status_file" ]]
+  child_pid="$(<"$child_pid_file")"
+  for ((index = 0; index < 20 && index >= 0; index++)); do
+    kill -0 "$child_pid" 2>/dev/null || break
+    sleep 0.05
+  done
+  if kill -0 "$child_pid" 2>/dev/null; then
+    printf 'pressure capture left a timed-out child alive\n' >&2
+    return 1
+  fi
+  [[ -z "$(find "$directory" -maxdepth 1 \
+    -name '.benchmark-capture.*' -print -quit)" ]] || return 1
+
+  rm -- "$status_observed" "$child_pid_file"
+  benchmark_pressure_run_client_captured \
+    "$stdout" "$stderr" "$status_file" 30 \
+    bash -c '
+      printf "%s\n" "$$" >"$1"
+      trap "exit 0" TERM
+      while :; do sleep 1; done
+    ' benchmark-signal "$child_pid_file" &
+  helper_pid=$!
+  for ((index = 0; index < 40; index++)); do
+    [[ -s "$child_pid_file" ]] && break
+    sleep 0.05
+  done
+  [[ -s "$child_pid_file" ]] || return 1
+  child_pid="$(<"$child_pid_file")"
+  capture_pid="$(<"/proc/$helper_pid/task/$helper_pid/children")" || return $?
+  capture_pid="${capture_pid% }"
+  [[ "$capture_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  kill -TERM "$capture_pid"
+  if wait "$helper_pid"; then
+    printf 'pressure capture ignored TERM\n' >&2
+    return 1
+  else
+    helper_status=$?
+  fi
+  [[ "$helper_status" == 143 ]] || return 1
+  for ((index = 0; index < 20 && index >= 0; index++)); do
+    kill -0 "$child_pid" 2>/dev/null || break
+    sleep 0.05
+  done
+  if kill -0 "$child_pid" 2>/dev/null; then
+    printf 'pressure capture left a signaled child alive\n' >&2
+    return 1
+  fi
+  [[ -z "$(find "$directory" -maxdepth 1 \
+    -name '.benchmark-capture.*' -print -quit)" &&
+    ! -e "$stdout" && ! -L "$stdout" &&
+    ! -e "$stderr" && ! -L "$stderr" &&
+    ! -e "$status_file" && ! -L "$status_file" ]] || return 1
+
+  benchmark_pressure_test_write_result "$valid_result"
+  PRESSURE_CONTROL_SESSION=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  COMPOSE=(docker compose --project-name pressure-test)
+  benchmark_pressure_client_absent() {
+    printf '%s\n' "$2" >>"$calls"
+  }
+  run_bounded_foreground_group() {
+    if [[ "$client_mode" == success ]]; then
+      command cat -- "$valid_result"
+      return 0
+    fi
+    LC_ALL=C head -c "$((BENCHMARK_PRESSURE_RESULT_MAX_BYTES + 2))" \
+      /dev/zero | tr '\0' x
+  }
+  run_benchmark_pressure_client 1 "$success_dir"
+  [[ -f "$success_dir/benchmark-result.json" &&
+    -f "$success_dir/benchmark.stderr.log" &&
+    ! -e "$success_dir/benchmark-client-failure.json" &&
+    "$(sed -n '1p' "$calls")" == false &&
+    "$(sed -n '2p' "$calls")" == true ]] || return 1
+  validate_benchmark_pressure_result "$success_dir/benchmark-result.json" \
+    pressure-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-cycle-01
+
+  cp -- "$valid_result" "$foreign_result"
+  chmod 0600 -- "$foreign_result"
+  swap_candidate="$swap_dir/.benchmark-result.capture"
+  head() {
+    local final_argument="${!#}"
+    local status=0
+
+    if [[ "$final_argument" == *'/.benchmark-capture.'*'/stdout' &&
+      ! -e "$swap_marker" ]]; then
+      command head "$@" || status=$?
+      : >"$swap_marker"
+      command rm -- "$swap_candidate" || return $?
+      command cp -- "$foreign_result" "$swap_candidate" || return $?
+      command chmod 0600 -- "$swap_candidate" || return $?
+      return "$status"
+    fi
+    command head "$@"
+  }
+  if run_benchmark_pressure_client 1 "$swap_dir"; then
+    printf 'pressure client accepted a stdout pathname replacement\n' >&2
+    return 1
+  fi
+  unset -f head
+  [[ -f "$swap_marker" && -f "$swap_candidate" &&
+    "$(benchmark_pressure_test_sha256 "$swap_candidate")" == \
+      "$(benchmark_pressure_test_sha256 "$foreign_result")" &&
+    ! -e "$swap_dir/.benchmark-stderr.capture" &&
+    ! -e "$swap_dir/.benchmark-status.capture" &&
+    ! -e "$swap_dir/benchmark-result.json" &&
+    ! -e "$swap_dir/benchmark.stderr.log" &&
+    ! -e "$swap_dir/benchmark-client-failure.json" ]] || return 1
+
+  : >"$calls"
+  client_mode=overflow
+  if run_benchmark_pressure_client 1 "$overflow_dir"; then
+    printf 'pressure client accepted max+1 streamed output\n' >&2
+    return 1
+  fi
+  [[ ! -e "$overflow_dir/benchmark-result.json" &&
+    -f "$overflow_dir/benchmark-client-failure.json" &&
+    "$(jq -er '.capture_status' \
+      "$overflow_dir/benchmark-client-failure.json")" == 125 &&
+    "$(stat -Lc '%s' -- "$overflow_dir/benchmark.failure.stdout.log")" -le \
+      "$BENCHMARK_PRESSURE_RESULT_MAX_BYTES" &&
+    -z "$(find "$overflow_dir" -maxdepth 1 \
+      -name '.benchmark-capture.*' -print -quit)" ]]
+}
+
+test_benchmark_pressure_client_capture_registration_and_permutations() {
+  local root="$TEST_TMP_DIR/pressure-client-registration"
+  local directory=""
+  local stdout=""
+  local stderr=""
+  local status_file=""
+  local marker=""
+  local final_argument=""
+  local output=""
+  local command_status=0
+  local permutation=""
+  local first=0
+  local second=0
+  local third=0
+  local index=0
+  local -a temporary=()
+  local -a permutations=(
+    '0 1 2'
+    '0 2 1'
+    '1 0 2'
+    '1 2 0'
+    '2 0 1'
+    '2 1 0'
+  )
+
+  mkdir -m 0700 -- "$root"
+
+  # A collision introduced after leaf one must preserve the foreign leaf and
+  # retire the immediately registered stdout inode.
+  directory="$root/partial-one"
+  mkdir -m 0700 -- "$directory"
+  stdout="$directory/stdout"
+  stderr="$directory/stderr"
+  status_file="$directory/status"
+  marker="$directory/fired"
+  stat() {
+    final_argument="${!#}"
+    if [[ "$final_argument" =~ ^/proc/self/fd/[1-9][0-9]*$ &&
+      -e "$stdout" && ! -e "$stderr" && ! -e "$marker" ]]; then
+      output="$(command stat "$@")" || command_status=$?
+      printf '%s\n' "$output"
+      : >"$marker"
+      printf 'foreign stderr\n' >"$stderr"
+      chmod 0600 -- "$stderr"
+      return "$command_status"
+    fi
+    command stat "$@"
+  }
+  if benchmark_pressure_run_client_captured \
+    "$stdout" "$stderr" "$status_file" 5 bash -c 'printf "unused\n"'; then
+    printf 'pressure client accepted a leaf-two creation collision\n' >&2
+    return 1
+  fi
+  unset -f stat
+  [[ -f "$marker" && ! -e "$stdout" && ! -L "$stdout" &&
+    "$(<"$stderr")" == 'foreign stderr' &&
+    ! -e "$status_file" && ! -L "$status_file" ]] || return 1
+
+  # The same invariant holds after two successful O_EXCL registrations.
+  directory="$root/partial-two"
+  mkdir -m 0700 -- "$directory"
+  stdout="$directory/stdout"
+  stderr="$directory/stderr"
+  status_file="$directory/status"
+  marker="$directory/fired"
+  command_status=0
+  stat() {
+    final_argument="${!#}"
+    if [[ "$final_argument" =~ ^/proc/self/fd/[1-9][0-9]*$ &&
+      -e "$stdout" && -e "$stderr" && ! -e "$status_file" &&
+      ! -e "$marker" ]]; then
+      output="$(command stat "$@")" || command_status=$?
+      printf '%s\n' "$output"
+      : >"$marker"
+      printf 'foreign status\n' >"$status_file"
+      chmod 0600 -- "$status_file"
+      return "$command_status"
+    fi
+    command stat "$@"
+  }
+  if benchmark_pressure_run_client_captured \
+    "$stdout" "$stderr" "$status_file" 5 bash -c 'printf "unused\n"'; then
+    printf 'pressure client accepted a leaf-three creation collision\n' >&2
+    return 1
+  fi
+  unset -f stat
+  [[ -f "$marker" && ! -e "$stdout" && ! -L "$stdout" &&
+    ! -e "$stderr" && ! -L "$stderr" &&
+    "$(<"$status_file")" == 'foreign status' ]] || return 1
+
+  # A post-registration setup failure retires all three owned inodes.
+  directory="$root/partial-three"
+  mkdir -m 0700 -- "$directory"
+  stdout="$directory/stdout"
+  stderr="$directory/stderr"
+  status_file="$directory/status"
+  mkfifo() { return 79; }
+  if benchmark_pressure_run_client_captured \
+    "$stdout" "$stderr" "$status_file" 5 bash -c 'printf "unused\n"'; then
+    printf 'pressure client accepted a post-triplet setup failure\n' >&2
+    return 1
+  fi
+  unset -f mkfifo
+  [[ ! -e "$stdout" && ! -L "$stdout" &&
+    ! -e "$stderr" && ! -L "$stderr" &&
+    ! -e "$status_file" && ! -L "$status_file" ]] || return 1
+
+  # TERM arriving during the O_EXCL-to-identity critical section is deferred
+  # only until the just-created descriptor is registered, then rolls it back.
+  directory="$root/signal-registration"
+  mkdir -m 0700 -- "$directory"
+  stdout="$directory/stdout"
+  stderr="$directory/stderr"
+  status_file="$directory/status"
+  marker="$directory/fired"
+  command_status=0
+  stat() {
+    final_argument="${!#}"
+    if [[ "$final_argument" =~ ^/proc/self/fd/[1-9][0-9]*$ &&
+      -e "$stdout" && ! -e "$stderr" && ! -e "$marker" ]]; then
+      output="$(command stat "$@")" || command_status=$?
+      printf '%s\n' "$output"
+      : >"$marker"
+      kill -TERM "$capture_owner_bashpid"
+      return "$command_status"
+    fi
+    command stat "$@"
+  }
+  set +e
+  benchmark_pressure_run_client_captured \
+    "$stdout" "$stderr" "$status_file" 5 bash -c 'printf "unused\n"'
+  command_status=$?
+  set -e
+  unset -f stat
+  [[ "$command_status" == 143 && -f "$marker" &&
+    ! -e "$stdout" && ! -L "$stdout" &&
+    ! -e "$stderr" && ! -L "$stderr" &&
+    ! -e "$status_file" && ! -L "$status_file" ]] || return 1
+
+  # Every permutation of the three owned role names is classified by set
+  # membership during cleanup; no role-specific owned residue can escape.
+  for ((index = 0; index < ${#permutations[@]}; index++)); do
+    permutation="${permutations[index]}"
+    directory="$root/permutation-$index"
+    mkdir -m 0700 -- "$directory"
+    stdout="$directory/stdout"
+    stderr="$directory/stderr"
+    status_file="$directory/status"
+    marker="$directory/fired"
+    temporary=("$directory/tmp-0" "$directory/tmp-1" "$directory/tmp-2")
+    head() {
+      final_argument="${!#}"
+      command_status=0
+      command head "$@" || command_status=$?
+      if [[ "$final_argument" == *'/.benchmark-capture.'*'/stdout' &&
+        ! -e "$marker" ]]; then
+        : >"$marker"
+        read -r first second third <<<"$permutation"
+        command mv -T -- "$stdout" "${temporary[0]}" || return $?
+        command mv -T -- "$stderr" "${temporary[1]}" || return $?
+        command mv -T -- "$status_file" "${temporary[2]}" || return $?
+        command mv -T -- "${temporary[first]}" "$stdout" || return $?
+        command mv -T -- "${temporary[second]}" "$stderr" || return $?
+        command mv -T -- "${temporary[third]}" "$status_file" || return $?
+      fi
+      return "$command_status"
+    }
+    set +e
+    benchmark_pressure_run_client_captured \
+      "$stdout" "$stderr" "$status_file" 5 \
+      bash -c 'printf "{\"ok\":true}\n"; printf "warning\n" >&2'
+    command_status=$?
+    set -e
+    unset -f head
+    if ((index == 0)); then
+      [[ "$command_status" == 0 ]] || return 1
+    else
+      [[ "$command_status" != 0 ]] || return 1
+    fi
+    [[ -f "$marker" && ! -e "$stdout" && ! -L "$stdout" &&
+      ! -e "$stderr" && ! -L "$stderr" &&
+      ! -e "$status_file" && ! -L "$status_file" &&
+      ! -e "${temporary[0]}" && ! -e "${temporary[1]}" &&
+      ! -e "${temporary[2]}" ]] || return 1
+  done
+}
+
+benchmark_pressure_test_client_transaction_owned_leaves_absent() {
+  local -r directory="$1"
+  local leaf=""
+
+  for leaf in \
+    .benchmark-result.capture \
+    .benchmark-stderr.capture \
+    .benchmark-status.capture \
+    .benchmark-client-commit.capture \
+    .benchmark-client-failure.capture \
+    benchmark-result.json \
+    benchmark.stderr.log \
+    benchmark-client-commit.json \
+    benchmark.failure.stdout.log \
+    benchmark.failure.stderr.log \
+    benchmark-client-failure.json; do
+    [[ ! -e "$directory/$leaf" && ! -L "$directory/$leaf" ]] || return 1
+  done
+  [[ -z "$(find "$directory" -mindepth 1 -maxdepth 1 \
+    -type d \( -name '.benchmark-capture.*' -o \
+      -name '.benchmark-pressure-quarantine.*' \) -print -quit)" ]]
+}
+
+benchmark_pressure_test_write_foreign_client_transaction_leaves() {
+  local -r directory="$1"
+  local leaf=""
+
+  for leaf in \
+    .benchmark-result.capture \
+    .benchmark-stderr.capture \
+    .benchmark-status.capture \
+    .benchmark-client-commit.capture \
+    .benchmark-client-failure.capture \
+    benchmark-result.json \
+    benchmark.stderr.log \
+    benchmark-client-commit.json \
+    benchmark.failure.stdout.log \
+    benchmark.failure.stderr.log \
+    benchmark-client-failure.json; do
+    printf 'foreign:%s\n' "$leaf" >"$directory/$leaf" || return $?
+    chmod 0600 -- "$directory/$leaf" || return $?
+  done
+}
+
+benchmark_pressure_test_client_transaction_foreign_leaves_preserved() {
+  local -r directory="$1"
+  local leaf=""
+
+  for leaf in \
+    .benchmark-result.capture \
+    .benchmark-stderr.capture \
+    .benchmark-status.capture \
+    .benchmark-client-commit.capture \
+    .benchmark-client-failure.capture \
+    benchmark-result.json \
+    benchmark.stderr.log \
+    benchmark-client-commit.json \
+    benchmark.failure.stdout.log \
+    benchmark.failure.stderr.log \
+    benchmark-client-failure.json; do
+    [[ -f "$directory/$leaf" && ! -L "$directory/$leaf" &&
+      "$(<"$directory/$leaf")" == "foreign:$leaf" ]] || return 1
+  done
+  [[ -z "$(find "$directory" -mindepth 1 -maxdepth 1 \
+    -type d -name '.benchmark-pressure-quarantine.*' -print -quit)" ]]
+}
+
+test_benchmark_pressure_client_publication_transactions_are_atomic() {
+  local root="$TEST_TMP_DIR/pressure-client-publication-transaction"
+  local valid_result="$root/valid.json"
+  local case_root=""
+  local directory=""
+  local marker=""
+  local saved_parent=""
+  local source_leaf=""
+  local target_path=""
+  local target_leaf=""
+  local source_path=""
+  local helper_pid=""
+  local transaction_pid=""
+  local helper_status=0
+  local transaction_status=0
+  local attempt=0
+  local client_mode=success
+  local held_stdout_fd=""
+  local held_stderr_fd=""
+  local held_receipt_fd=""
+  local final_argument=""
+  local hash_output=""
+  local hash_status=0
+  local reversed_receipt=""
+
+  mkdir -m 0700 -- "$root"
+  benchmark_pressure_test_write_result "$valid_result"
+  PRESSURE_CONTROL_SESSION=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  COMPOSE=(docker compose --project-name pressure-transaction-test)
+  benchmark_pressure_client_absent() { return 0; }
+  run_bounded_foreground_group() {
+    if [[ "$client_mode" == success ]]; then
+      command cat -- "$valid_result"
+      return 0
+    fi
+    LC_ALL=C head -c "$((BENCHMARK_PRESSURE_RESULT_MAX_BYTES + 2))" \
+      /dev/zero | tr '\0' x
+  }
+
+  # A failure reported after the second success link rolls back both public
+  # leaves and all three registered raw candidates.
+  directory="$root/success-second-link"
+  marker="$directory/fired"
+  mkdir -m 0700 -- "$directory"
+  ln() {
+    target_path="${*: -1}"
+    command ln "$@" || return $?
+    if [[ "$target_path" == /proc/self/fd/*/benchmark.stderr.log &&
+      ! -e "$marker" ]]; then
+      : >"$marker"
+      return 79
+    fi
+  }
+  if run_benchmark_pressure_client 1 "$directory"; then
+    printf 'pressure client accepted a success-pair mid-commit failure\n' >&2
+    return 1
+  fi
+  unset -f ln
+  [[ -f "$marker" ]] || return 1
+  benchmark_pressure_test_client_transaction_owned_leaves_absent "$directory"
+
+  # The same rollback contract covers the failure receipt triplet.
+  directory="$root/failure-second-link"
+  marker="$directory/fired"
+  mkdir -m 0700 -- "$directory"
+  client_mode=overflow
+  ln() {
+    target_path="${*: -1}"
+    command ln "$@" || return $?
+    if [[ "$target_path" == /proc/self/fd/*/benchmark.failure.stderr.log &&
+      ! -e "$marker" ]]; then
+      : >"$marker"
+      return 79
+    fi
+  }
+  if run_benchmark_pressure_client 1 "$directory"; then
+    printf 'pressure client accepted an overflowing failure transaction\n' >&2
+    return 1
+  fi
+  unset -f ln
+  [[ -f "$marker" ]] || return 1
+  benchmark_pressure_test_client_transaction_owned_leaves_absent "$directory"
+  client_mode=success
+
+  # A syntactically valid result for a different pressure session enters the
+  # failure path and publishes one coherent, authenticated evidence triplet.
+  directory="$root/mismatched-session"
+  mkdir -m 0700 -- "$directory"
+  PRESSURE_CONTROL_SESSION=cccccccccccccccccccccccccccccccc
+  set +e
+  run_benchmark_pressure_client 1 "$directory"
+  transaction_status=$?
+  set -e
+  PRESSURE_CONTROL_SESSION=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  [[ "$transaction_status" == 65 &&
+    -f "$directory/benchmark.failure.stdout.log" &&
+    -f "$directory/benchmark.failure.stderr.log" &&
+    -f "$directory/benchmark-client-failure.json" &&
+    ! -e "$directory/benchmark-result.json" &&
+    ! -e "$directory/benchmark.stderr.log" &&
+    ! -e "$directory/.benchmark-result.capture" &&
+    ! -e "$directory/.benchmark-stderr.capture" &&
+    ! -e "$directory/.benchmark-status.capture" &&
+    ! -e "$directory/.benchmark-client-failure.capture" ]] || return 1
+  jq -e '
+    .schema == "obi-benchmark-pressure-client-failure-v2" and
+    .status == "failed" and .kind == "failure_triplet" and
+    .cycle == 1 and .member_count == 2 and .command_status == 65 and
+    .capture_status == 0 and .cleanup_status == 0 and
+    (.members | map(.role)) ==
+      ["benchmark_failure_stderr","benchmark_failure_stdout"]
+  ' "$directory/benchmark-client-failure.json" >/dev/null || return $?
+  jq -e '
+    .marker_prefix == "pressure-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-cycle-01"
+  ' "$directory/benchmark.failure.stdout.log" >/dev/null || return $?
+  benchmark_pressure_hold_client_commit_bundle \
+    "$directory" 1 failure_triplet \
+    held_stdout_fd held_stderr_fd held_receipt_fd || return $?
+  exec {held_stdout_fd}<&-
+  exec {held_stderr_fd}<&-
+  exec {held_receipt_fd}<&-
+  reversed_receipt="$directory/.reversed-failure-receipt"
+  jq -cS '.members |= reverse' \
+    "$directory/benchmark-client-failure.json" >"$reversed_receipt" || return $?
+  chmod 0600 -- "$reversed_receipt"
+  mv -T -- "$reversed_receipt" "$directory/benchmark-client-failure.json"
+  if benchmark_pressure_hold_client_commit_bundle \
+    "$directory" 1 failure_triplet \
+    held_stdout_fd held_stderr_fd held_receipt_fd; then
+    printf 'pressure bundle accepted reversed failure receipt member order\n' >&2
+    return 1
+  fi
+
+  # A foreign first target introduced after its link is preserved, while
+  # every other authenticated source/target member is rolled back.
+  directory="$root/foreign-target"
+  marker="$directory/fired"
+  mkdir -m 0700 -- "$directory"
+  ln() {
+    target_path="${*: -1}"
+    command ln "$@" || return $?
+    if [[ "$target_path" == /proc/self/fd/*/benchmark-result.json &&
+      ! -e "$marker" ]]; then
+      : >"$marker"
+      command rm -- "$target_path" || return $?
+      printf 'foreign result\n' >"$target_path" || return $?
+      chmod 0600 -- "$target_path"
+    fi
+  }
+  if run_benchmark_pressure_client 1 "$directory"; then
+    printf 'pressure client accepted a foreign success target\n' >&2
+    return 1
+  fi
+  unset -f ln
+  [[ -f "$marker" && "$(<"$directory/benchmark-result.json")" == \
+      'foreign result' &&
+    ! -e "$directory/benchmark.stderr.log" &&
+    ! -e "$directory/.benchmark-result.capture" &&
+    ! -e "$directory/.benchmark-stderr.capture" &&
+    ! -e "$directory/.benchmark-status.capture" ]] || return 1
+
+  # A foreign source-name replacement is likewise preserved without leaking
+  # any other member of the owned transaction.
+  directory="$root/foreign-source"
+  marker="$directory/fired"
+  mkdir -m 0700 -- "$directory"
+  ln() {
+    source_path="${*: -2:1}"
+    target_path="${*: -1}"
+    command ln "$@" || return $?
+    if [[ "$source_path" =~ ^/proc/self/fd/[1-9][0-9]*/\.benchmark-result\.capture$ &&
+      "$target_path" == /proc/self/fd/*/benchmark-result.json &&
+      ! -e "$marker" ]]; then
+      : >"$marker"
+      command rm -- "$source_path" || return $?
+      printf 'foreign source\n' >"$source_path" || return $?
+      chmod 0600 -- "$source_path"
+    fi
+  }
+  if run_benchmark_pressure_client 1 "$directory"; then
+    printf 'pressure client accepted a foreign success source\n' >&2
+    return 1
+  fi
+  unset -f ln
+  [[ -f "$marker" &&
+    "$(<"$directory/.benchmark-result.capture")" == 'foreign source' &&
+    ! -e "$directory/benchmark-result.json" &&
+    ! -e "$directory/benchmark.stderr.log" &&
+    ! -e "$directory/.benchmark-stderr.capture" &&
+    ! -e "$directory/.benchmark-status.capture" ]] || return 1
+
+  # The directory sync is the last fallible operation before the completed
+  # sentinel.  Its failure must still roll back the now source-less pair.
+  directory="$root/pre-sentinel"
+  marker="$directory/fired"
+  mkdir -m 0700 -- "$directory"
+  sync() {
+    if [[ "$1" == -f && "$2" =~ ^/proc/self/fd/[1-9][0-9]*$ &&
+      ! -e "$marker" ]]; then
+      : >"$marker"
+      return 79
+    fi
+    command sync "$@"
+  }
+  if run_benchmark_pressure_client 1 "$directory"; then
+    printf 'pressure client crossed a failed publication sentinel\n' >&2
+    return 1
+  fi
+  unset -f sync
+  [[ -f "$marker" ]] || return 1
+  benchmark_pressure_test_client_transaction_owned_leaves_absent "$directory"
+
+  # TERM while the second target is pending is owned by the group trap and
+  # then by the outer capture trap; neither layer may leave a partial set.
+  directory="$root/signal-second-link"
+  marker="$directory/transaction-pid"
+  mkdir -m 0700 -- "$directory"
+  (
+    ln() {
+      target_path="${*: -1}"
+      if [[ "$target_path" == /proc/self/fd/*/benchmark.stderr.log ]]; then
+        printf '%s\n' "$BASHPID" >"$marker" || return $?
+        while :; do :; done
+      fi
+      command ln "$@"
+    }
+    run_benchmark_pressure_client 1 "$directory"
+  ) &
+  helper_pid=$!
+  for ((attempt = 0; attempt < 100; attempt++)); do
+    [[ -s "$marker" ]] && break
+    sleep 0.02
+  done
+  [[ -s "$marker" ]] || return 1
+  transaction_pid="$(<"$marker")"
+  [[ "$transaction_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  kill -TERM "$transaction_pid"
+  if wait "$helper_pid"; then
+    printf 'pressure client ignored TERM during pair publication\n' >&2
+    return 1
+  else
+    helper_status=$?
+  fi
+  [[ "$helper_status" == 143 ]] || return 1
+  benchmark_pressure_test_client_transaction_owned_leaves_absent "$directory"
+
+  # Substituting the lexical parent after either success-pair link must fail
+  # the final name/parent seal.  Cleanup remains confined to the pinned old
+  # parent, and every unknown leaf in the replacement parent survives.
+  client_mode=success
+  for target_leaf in benchmark-result.json benchmark.stderr.log; do
+    case "$target_leaf" in
+      benchmark-result.json) source_leaf=.benchmark-result.capture ;;
+      benchmark.stderr.log) source_leaf=.benchmark-stderr.capture ;;
+      *) return 1 ;;
+    esac
+    case_root="$root/parent-swap-success-${target_leaf//./-}"
+    directory="$case_root/current"
+    saved_parent="$case_root/original"
+    marker="$case_root/fired"
+    mkdir -m 0700 -- "$case_root" "$directory"
+    ln() {
+      source_path="${*: -2:1}"
+      target_path="${*: -1}"
+      command ln "$@" || return $?
+      if [[ "$source_path" =~ ^/proc/self/fd/[1-9][0-9]*/[A-Za-z0-9._-]+$ &&
+        "${source_path##*/}" == "$source_leaf" &&
+        "$target_path" =~ ^/proc/self/fd/[1-9][0-9]*/[A-Za-z0-9._-]+$ &&
+        "${target_path##*/}" == "$target_leaf" && ! -e "$marker" ]]; then
+        : >"$marker" || return $?
+        command mv -T -- "$directory" "$saved_parent" || return $?
+        command mkdir -m 0700 -- "$directory" || return $?
+        benchmark_pressure_test_write_foreign_client_transaction_leaves \
+          "$directory"
+      fi
+    }
+    set +e
+    run_benchmark_pressure_client 1 "$directory"
+    transaction_status=$?
+    set -e
+    unset -f ln
+    [[ "$transaction_status" != 0 && -f "$marker" ]] || return 1
+    benchmark_pressure_test_client_transaction_owned_leaves_absent \
+      "$saved_parent" || return $?
+    benchmark_pressure_test_client_transaction_foreign_leaves_preserved \
+      "$directory" || return $?
+  done
+
+  # The same retained-parent guarantee covers every link boundary in the
+  # failure-evidence data pair.  Its marker boundary is exercised separately
+  # at the isolated broker-ready gate below.
+  client_mode=overflow
+  for target_leaf in benchmark.failure.stdout.log \
+    benchmark.failure.stderr.log; do
+    case "$target_leaf" in
+      benchmark.failure.stdout.log) source_leaf=.benchmark-result.capture ;;
+      benchmark.failure.stderr.log) source_leaf=.benchmark-stderr.capture ;;
+      *) return 1 ;;
+    esac
+    case_root="$root/parent-swap-failure-${target_leaf//./-}"
+    directory="$case_root/current"
+    saved_parent="$case_root/original"
+    marker="$case_root/fired"
+    mkdir -m 0700 -- "$case_root" "$directory"
+    ln() {
+      source_path="${*: -2:1}"
+      target_path="${*: -1}"
+      command ln "$@" || return $?
+      if [[ "$source_path" =~ ^/proc/self/fd/[1-9][0-9]*/[A-Za-z0-9._-]+$ &&
+        "${source_path##*/}" == "$source_leaf" &&
+        "$target_path" =~ ^/proc/self/fd/[1-9][0-9]*/[A-Za-z0-9._-]+$ &&
+        "${target_path##*/}" == "$target_leaf" && ! -e "$marker" ]]; then
+        : >"$marker" || return $?
+        command mv -T -- "$directory" "$saved_parent" || return $?
+        command mkdir -m 0700 -- "$directory" || return $?
+        benchmark_pressure_test_write_foreign_client_transaction_leaves \
+          "$directory"
+      fi
+    }
+    set +e
+    run_benchmark_pressure_client 1 "$directory"
+    transaction_status=$?
+    set -e
+    unset -f ln
+    [[ "$transaction_status" != 0 && -f "$marker" ]] || return 1
+    benchmark_pressure_test_client_transaction_owned_leaves_absent \
+      "$saved_parent" || return $?
+    benchmark_pressure_test_client_transaction_foreign_leaves_preserved \
+      "$directory" || return $?
+  done
+  client_mode=success
+
+  # Parent substitution after the broker has sealed the data set but before
+  # its final marker link fails closed for both transaction kinds.  Rollback is
+  # confined to the pinned original directory; every foreign replacement leaf
+  # survives.
+  for client_mode in success overflow; do
+    case_root="$root/parent-swap-marker-$client_mode"
+    directory="$case_root/current"
+    saved_parent="$case_root/original"
+    marker="$case_root/fired"
+    mkdir -m 0700 -- "$case_root" "$directory"
+    read() {
+      local read_status=0
+
+      builtin read "$@" || read_status=$?
+      if ((read_status == 0)) && [[ "${ready:-}" == ready &&
+        "${capture_count:-}" == 0 && ! -e "$marker" ]]; then
+        : >"$marker" || return $?
+        command mv -T -- "$directory" "$saved_parent" || return $?
+        command mkdir -m 0700 -- "$directory" || return $?
+        benchmark_pressure_test_write_foreign_client_transaction_leaves \
+          "$directory" || return $?
+      fi
+      return "$read_status"
+    }
+    set +e
+    run_benchmark_pressure_client 1 "$directory"
+    transaction_status=$?
+    set -e
+    unset -f read
+    [[ "$transaction_status" != 0 && -f "$marker" ]] || return 1
+    benchmark_pressure_test_client_transaction_owned_leaves_absent \
+      "$saved_parent" || return $?
+    benchmark_pressure_test_client_transaction_foreign_leaves_preserved \
+      "$directory" || return $?
+  done
+  client_mode=success
+}
+
+test_benchmark_pressure_external_marker_is_final_and_signal_latched() {
+  local root="$TEST_TMP_DIR/pressure-marker-linearization"
+  local valid_result="$root/valid.json"
+  local directory=""
+  local observation=""
+  local fired=""
+  local target_marker=""
+  local transaction_status=0
+  local wait_status=0
+  local marker_fd_path=""
+  local marker_fd_link=""
+  local marker_fd_identity=""
+  local marker_fd_sha256=""
+  local marker_match_count=0
+  local signal_target=""
+  local observer_pid_file=""
+  local observer_pid=""
+  local observed_supervisor_pid=""
+  local observed_worker_pid=""
+  local observed_watchdog_pid=""
+  local attempt=0
+  local held_stdout_fd=""
+  local held_stderr_fd=""
+  local held_receipt_fd=""
+
+  mkdir -m 0700 -- "$root"
+  benchmark_pressure_test_write_result "$valid_result"
+  PRESSURE_CONTROL_SESSION=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  COMPOSE=(docker compose --project-name pressure-marker-linearization-test)
+  benchmark_pressure_client_absent() { return 0; }
+  run_bounded_foreground_group() {
+    command cat -- "$valid_result"
+  }
+
+  # The ready/ACK boundary is pre-commit: both data leaves are present, every
+  # private source is retired, and the external marker is absent.  Capture the
+  # broker's exact anonymous marker inode and prove the final name is that inode.
+  directory="$root/prepared"
+  observation="$root/prepared.observed"
+  target_marker="$directory/benchmark-client-commit.json"
+  mkdir -m 0700 -- "$directory"
+  read() {
+    local read_status=0
+
+    builtin read "$@" || read_status=$?
+    if ((read_status == 0)) && [[ "${ready:-}" == ready &&
+      "${capture_count:-}" == 0 && ! -e "$observation" ]]; then
+      [[ -f "$directory/benchmark-result.json" &&
+        -f "$directory/benchmark.stderr.log" &&
+        ! -e "$target_marker" && ! -L "$target_marker" &&
+        ! -e "$directory/.benchmark-result.capture" &&
+        ! -e "$directory/.benchmark-stderr.capture" &&
+        ! -e "$directory/.benchmark-client-commit.capture" ]] || return 91
+      marker_match_count=0
+      marker_fd_identity=""
+      for marker_fd_path in /proc/"$holder_pid"/fd/[0-9]*; do
+        [[ -e "$marker_fd_path" ]] || continue
+        marker_fd_link="$(command readlink -- "$marker_fd_path")" || continue
+        [[ "$marker_fd_link" == "$directory"/'#'*' (deleted)' ]] || continue
+        marker_fd_sha256="$(benchmark_pressure_test_sha256 \
+          "$marker_fd_path")" || continue
+        [[ "$marker_fd_sha256" == "${required_sha256s[2]}" ]] || continue
+        marker_fd_identity="$(stat -Lc '%d:%i:%u:%a:%s' -- \
+          "$marker_fd_path")" || return $?
+        [[ "$marker_fd_identity" =~ \
+          ^[0-9]+:[1-9][0-9]*:$EUID:600:[1-9][0-9]*$ ]] || return 91
+        ((marker_match_count += 1))
+      done
+      ((marker_match_count == 1)) || return 91
+      printf '%s\n' "$marker_fd_identity" >"$observation" || return $?
+      chmod 0600 -- "$observation"
+    fi
+    return "$read_status"
+  }
+  run_benchmark_pressure_client 1 "$directory" || return $?
+  unset -f read
+  [[ -s "$observation" && -f "$target_marker" &&
+    "$(stat -Lc '%d:%i:%u:%a:%s' -- "$target_marker")" == \
+      "$(<"$observation")" ]] || return 1
+
+  # A foreign marker installed before ACK wins no-clobber.  It is preserved,
+  # the broker reports failure, and all authenticated data/source members roll
+  # back without a visible partial transaction.
+  directory="$root/foreign-marker"
+  fired="$root/foreign-marker.fired"
+  target_marker="$directory/benchmark-client-commit.json"
+  mkdir -m 0700 -- "$directory"
+  read() {
+    local read_status=0
+
+    builtin read "$@" || read_status=$?
+    if ((read_status == 0)) && [[ "${ready:-}" == ready &&
+      "${capture_count:-}" == 0 && ! -e "$fired" ]]; then
+      [[ ! -e "$target_marker" && ! -L "$target_marker" ]] || return 91
+      printf 'foreign marker\n' >"$target_marker" || return $?
+      chmod 0600 -- "$target_marker"
+      : >"$fired"
+    fi
+    return "$read_status"
+  }
+  set +e
+  run_benchmark_pressure_client 1 "$directory"
+  transaction_status=$?
+  set -e
+  unset -f read
+  [[ "$transaction_status" != 0 && -f "$fired" &&
+    "$(<"$target_marker")" == 'foreign marker' &&
+    ! -e "$directory/benchmark-result.json" &&
+    ! -e "$directory/benchmark.stderr.log" &&
+    ! -e "$directory/.benchmark-result.capture" &&
+    ! -e "$directory/.benchmark-stderr.capture" &&
+    ! -e "$directory/.benchmark-status.capture" &&
+    ! -e "$directory/.benchmark-client-commit.capture" ]] || return 1
+
+  # Even a symlink to the broker's exact held anonymous marker inode is an
+  # unknown public name, not a successful no-clobber commit.  The terminal
+  # sweep rejects it, preserves the symlink, and rolls back the owned data set.
+  directory="$root/held-marker-symlink"
+  fired="$root/held-marker-symlink.fired"
+  observation="$root/held-marker-symlink.observed"
+  target_marker="$directory/benchmark-client-commit.json"
+  mkdir -m 0700 -- "$directory"
+  read() {
+    local read_status=0
+
+    builtin read "$@" || read_status=$?
+    if ((read_status == 0)) && [[ "${ready:-}" == ready &&
+      "${capture_count:-}" == 0 && ! -e "$fired" ]]; then
+      marker_match_count=0
+      marker_fd_path=""
+      for marker_fd_path in /proc/"$holder_pid"/fd/[0-9]*; do
+        [[ -e "$marker_fd_path" ]] || continue
+        marker_fd_link="$(command readlink -- "$marker_fd_path")" || continue
+        [[ "$marker_fd_link" == "$directory"/'#'*' (deleted)' ]] || continue
+        marker_fd_sha256="$(benchmark_pressure_test_sha256 \
+          "$marker_fd_path")" || continue
+        [[ "$marker_fd_sha256" == "${required_sha256s[2]}" ]] || continue
+        ((marker_match_count += 1))
+        ((marker_match_count == 1)) || return 91
+      done
+      ((marker_match_count == 1)) || return 91
+      command ln -s -- "$marker_fd_path" "$target_marker" || return $?
+      (umask 077; set -o noclobber; printf '%s\n' "$marker_fd_path" \
+        >"$observation") || return $?
+      : >"$fired"
+    fi
+    return "$read_status"
+  }
+  set +e
+  run_benchmark_pressure_client 1 "$directory"
+  transaction_status=$?
+  set -e
+  unset -f read
+  [[ "$transaction_status" != 0 && -f "$fired" &&
+    -L "$target_marker" &&
+    "$(readlink -- "$target_marker")" == "$(<"$observation")" &&
+    ! -e "$directory/benchmark-result.json" &&
+    ! -e "$directory/benchmark.stderr.log" &&
+    ! -e "$directory/.benchmark-result.capture" &&
+    ! -e "$directory/.benchmark-stderr.capture" &&
+    ! -e "$directory/.benchmark-status.capture" &&
+    ! -e "$directory/.benchmark-client-commit.capture" ]] || return 1
+
+  # Once the outer capture owner has surrendered rollback authority, a broker
+  # fault after the marker worker linked and was exactly reaped is ambiguous:
+  # the complete public bundle remains consumable and no raw candidate leaks.
+  directory="$root/post-reap-ambiguity"
+  mkdir -m 0700 -- "$directory"
+  set +e
+  BENCHMARK_PRESSURE_TEST_COHERENT_FAIL_AFTER_WORKER_REAP=true \
+    run_benchmark_pressure_client 1 "$directory"
+  transaction_status=$?
+  set -e
+  [[ "$transaction_status" == \
+      "$BENCHMARK_PRESSURE_PUBLICATION_AMBIGUOUS_STATUS" &&
+    -f "$directory/benchmark-result.json" &&
+    -f "$directory/benchmark.stderr.log" &&
+    -f "$directory/benchmark-client-commit.json" &&
+    ! -e "$directory/.benchmark-result.capture" &&
+    ! -e "$directory/.benchmark-stderr.capture" &&
+    ! -e "$directory/.benchmark-status.capture" &&
+    ! -e "$directory/.benchmark-client-commit.capture" ]] || return 1
+  benchmark_pressure_hold_client_commit_bundle \
+    "$directory" 1 success_pair held_stdout_fd held_stderr_fd \
+    held_receipt_fd || return $?
+  exec {held_stdout_fd}<&-
+  exec {held_stderr_fd}<&-
+  exec {held_receipt_fd}<&-
+
+  # Interrupt the outer capture owner while Bash is waiting for the coherent
+  # supervisor in its deliberate post-worker-reap delay.  The dynamic outer
+  # capture signal status—not merely the inner publication status—must make the
+  # wait retry until the exact supervisor reap.  Since the lease is already
+  # held and the marker is visible, TERM cannot override committed success.
+  directory="$root/outer-signal-delayed-reap"
+  fired="$root/outer-signal-delayed-reap.fired"
+  observer_pid_file="$root/outer-signal-delayed-reap.pid"
+  target_marker="$directory/benchmark-client-commit.json"
+  mkdir -m 0700 -- "$directory"
+  read() {
+    local read_status=0
+
+    builtin read "$@" || read_status=$?
+    if ((read_status == 0)) && [[ "${ready:-}" == ready &&
+      "${capture_count:-}" == 0 && ! -e "$observer_pid_file" ]]; then
+      (
+        for ((attempt = 0; attempt < 300; attempt++)); do
+          if [[ -f "$target_marker" &&
+            -r "/proc/$broker_pid/task/$broker_pid/children" &&
+            -z "$(<"/proc/$broker_pid/task/$broker_pid/children")" ]]; then
+            : >"$fired"
+            kill -TERM "$capture_owner_bashpid"
+            exit 0
+          fi
+          sleep 0.01
+        done
+        exit 1
+      ) &
+      builtin printf '%s %s %s %s\n' \
+        "$!" "$broker_pid" "$holder_pid" "$watchdog_pid" \
+        >"$observer_pid_file" || return $?
+    fi
+    return "$read_status"
+  }
+  set +e
+  BENCHMARK_PRESSURE_TEST_COHERENT_POST_REAP_DELAY_SECONDS=2 \
+    run_benchmark_pressure_client 1 "$directory"
+  transaction_status=$?
+  set -e
+  unset -f read
+  [[ "$transaction_status" == 0 && -f "$fired" &&
+    -s "$observer_pid_file" && -f "$directory/benchmark-result.json" &&
+    -f "$directory/benchmark.stderr.log" &&
+    -f "$directory/benchmark-client-commit.json" &&
+    ! -e "$directory/.benchmark-result.capture" &&
+    ! -e "$directory/.benchmark-stderr.capture" &&
+    ! -e "$directory/.benchmark-status.capture" &&
+    ! -e "$directory/.benchmark-client-commit.capture" ]] || return 1
+  read -r observer_pid observed_supervisor_pid observed_worker_pid \
+    observed_watchdog_pid <"$observer_pid_file" || return $?
+  [[ "$observer_pid" =~ ^[1-9][0-9]*$ &&
+    "$observed_supervisor_pid" =~ ^[1-9][0-9]*$ &&
+    "$observed_worker_pid" =~ ^[1-9][0-9]*$ &&
+    "$observed_watchdog_pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  for ((attempt = 0; attempt < 100; attempt++)); do
+    ! kill -0 "$observer_pid" 2>/dev/null && break
+    sleep 0.01
+  done
+  ! kill -0 "$observer_pid" 2>/dev/null || return 1
+  ! kill -0 "$observed_supervisor_pid" 2>/dev/null || return 1
+  ! kill -0 "$observed_worker_pid" 2>/dev/null || return 1
+  ! kill -0 "$observed_watchdog_pid" 2>/dev/null || return 1
+  benchmark_pressure_hold_client_commit_bundle \
+    "$directory" 1 success_pair held_stdout_fd held_stderr_fd \
+    held_receipt_fd || return $?
+  exec {held_stdout_fd}<&-
+  exec {held_stderr_fd}<&-
+  exec {held_receipt_fd}<&-
+
+  # A TERM delivered after the broker has linked the marker cannot authorize
+  # cleanup or override the committed semantic result.  The group is a brace
+  # function beneath the single outer capture cleanup owner, so both hook names
+  # target that same deferred-signal boundary.
+  for signal_target in group outer; do
+    directory="$root/signal-$signal_target"
+    fired="$root/signal-$signal_target.fired"
+    mkdir -m 0700 -- "$directory"
+    wait() {
+      wait_status=0
+      builtin wait "$@" 2>/dev/null || wait_status=$?
+      if ((wait_status == 0)) && [[ "${mode:-}" == publish_marker &&
+        "${publication_linearization_in_progress:-}" == true &&
+        ! -e "$fired" ]]; then
+        : >"$fired"
+        if [[ "$signal_target" == group ]]; then
+          kill -TERM "$publication_owner_bashpid"
+        else
+          kill -TERM "$capture_owner_bashpid"
+        fi
+      fi
+      return "$wait_status"
+    }
+    set +e
+    run_benchmark_pressure_client 1 "$directory"
+    transaction_status=$?
+    set -e
+    unset -f wait
+    [[ "$transaction_status" == 0 ]] || return 1
+    [[ -f "$fired" && -f "$directory/benchmark-result.json" &&
+      -f "$directory/benchmark.stderr.log" &&
+      -f "$directory/benchmark-client-commit.json" &&
+      ! -e "$directory/.benchmark-result.capture" &&
+      ! -e "$directory/.benchmark-stderr.capture" &&
+      ! -e "$directory/.benchmark-status.capture" &&
+      ! -e "$directory/.benchmark-client-commit.capture" ]] || return 1
+    benchmark_pressure_hold_client_commit_bundle \
+      "$directory" 1 success_pair held_stdout_fd held_stderr_fd \
+      held_receipt_fd || return $?
+    exec {held_stdout_fd}<&-
+    exec {held_stderr_fd}<&-
+    exec {held_receipt_fd}<&-
+  done
+}
+
+test_benchmark_pressure_terminal_broker_latches_defer_signals() {
+  local root="$TEST_TMP_DIR/pressure-terminal-broker-latches"
+  local directory=""
+  local source=""
+  local target=""
+  local fired=""
+  local parent_identity=""
+  local source_identity=""
+  local source_sha256=""
+  local transaction_status=0
+  local wait_status=0
+
+  mkdir -m 0700 -- "$root"
+
+  # The single-file broker's successful return is its linearization point.
+  # TERM in the return-to-latch gap cannot override the already linearized
+  # committed semantic result or make the target cleanup-eligible.
+  directory="$root/single"
+  source="$directory/source"
+  target="$directory/target"
+  fired="$root/single.fired"
+  mkdir -m 0700 -- "$directory"
+  printf 'owned single source\n' >"$source"
+  chmod 0600 -- "$source"
+  benchmark_pressure_capture_candidate_authority \
+    "$source" 600 parent_identity source_identity source_sha256 || return $?
+  wait() {
+    wait_status=0
+    builtin wait "$@" 2>/dev/null || wait_status=$?
+    if ((wait_status == 0)) && [[ "${mode:-}" == verify &&
+      "${linearization_in_progress:-}" == true && ! -e "$fired" ]]; then
+      : >"$fired"
+      kill -TERM "$publication_owner_bashpid"
+    fi
+    return "$wait_status"
+  }
+  set +e
+  benchmark_pressure_commit_file_no_clobber \
+    "$source" "$target" 600 "$parent_identity" "$parent_identity" \
+    "$source_identity" "$source_sha256"
+  transaction_status=$?
+  set -e
+  unset -f wait
+  [[ "$transaction_status" == 0 && -f "$fired" &&
+    ! -e "$source" && ! -L "$source" &&
+    -f "$target" && ! -L "$target" &&
+    "$(<"$target")" == 'owned single source' ]] || return 1
+
+  # Java has the same broker-terminal contract for its two fixed leaves.
+  # Neither committed leaf is removed when TERM lands before the caller latch.
+  directory="$root/java"
+  fired="$root/java.fired"
+  benchmark_pressure_test_prepare_java_pair "$directory"
+  wait() {
+    wait_status=0
+    builtin wait "$@" 2>/dev/null || wait_status=$?
+    if ((wait_status == 0)) && [[ "${mode:-}" == verify &&
+      "${linearization_in_progress:-}" == true && ! -e "$fired" ]]; then
+      : >"$fired"
+      kill -TERM "$publication_owner_bashpid"
+    fi
+    return "$wait_status"
+  }
+  set +e
+  benchmark_pressure_publish_java_diagnostics_pair \
+    "$directory/.java-stdout-source" "$directory/.java-stderr-source" \
+    "$directory/java.stdout" "$directory/java.stderr"
+  transaction_status=$?
+  set -e
+  unset -f wait
+  [[ "$transaction_status" == 0 && -f "$fired" &&
+    ! -e "$directory/.java-stdout-source" &&
+    ! -e "$directory/.java-stderr-source" &&
+    -f "$directory/java.stdout" && ! -L "$directory/java.stdout" &&
+    -f "$directory/java.stderr" && ! -L "$directory/java.stderr" &&
+    "$(<"$directory/java.stderr")" == 'bounded diagnostic warning' ]] ||
+    return 1
+  validate_benchmark_pressure_java_snapshot "$directory/java.stdout"
+}
+
+test_benchmark_pressure_post_sync_seals_and_commit_marker_are_authoritative() {
+  local root="$TEST_TMP_DIR/pressure-post-sync-seal"
+  local valid_result="$root/valid.json"
+  local directory=""
+  local source=""
+  local target=""
+  local marker=""
+  local receipt=""
+  local candidate=""
+  local expression=""
+  local mutation=""
+  local parent_identity=""
+  local source_identity=""
+  local source_sha256=""
+  local transaction_status=0
+  local sync_count=0
+  local client_mode=success
+  local held_stdout_fd=""
+  local held_stderr_fd=""
+  local held_receipt_fd=""
+
+  mkdir -m 0700 -- "$root"
+  benchmark_pressure_test_write_result "$valid_result"
+  PRESSURE_CONTROL_SESSION=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  COMPOSE=(docker compose --project-name pressure-post-sync-test)
+  benchmark_pressure_client_absent() { return 0; }
+  run_bounded_foreground_group() {
+    if [[ "$client_mode" == success ]]; then
+      command cat -- "$valid_result"
+      return 0
+    fi
+    LC_ALL=C head -c "$((BENCHMARK_PRESSURE_RESULT_MAX_BYTES + 2))" \
+      /dev/zero | tr '\0' x
+  }
+
+  # Public data names without the last-linked receipt are uncommitted.  The
+  # held-bundle validator and a semantic consumer both reject them without
+  # deleting evidence for which they have no transaction authority.
+  directory="$root/missing-marker"
+  mkdir -m 0700 -- "$directory"
+  command cp -- "$valid_result" "$directory/benchmark-result.json"
+  : >"$directory/benchmark.stderr.log"
+  printf '{}\n' >"$directory/trace-snapshot.json"
+  printf '{}\n' >"$directory/trace-reset.json"
+  chmod 0600 -- "$directory"/*
+  if benchmark_pressure_hold_client_commit_bundle \
+    "$directory" 1 success_pair held_stdout_fd held_stderr_fd held_receipt_fd \
+      2>/dev/null; then
+    printf 'pressure bundle accepted public members without its commit marker\n' >&2
+    return 1
+  fi
+  if benchmark_pressure_trace_projection \
+    "$directory/trace-snapshot.json" "$directory/benchmark-result.json" \
+    "$directory/trace-reset.json" 1 >/dev/null 2>&1; then
+    printf 'pressure consumer inferred commitment from partial member names\n' >&2
+    return 1
+  fi
+  [[ -f "$directory/benchmark-result.json" &&
+    -f "$directory/benchmark.stderr.log" &&
+    ! -e "$directory/benchmark-client-commit.json" ]] || return 1
+
+  # Missing, duplicate, and extra receipt members are all rejected even when
+  # the public data byte images themselves are valid.
+  while IFS=$'\t' read -r mutation expression; do
+    directory="$root/receipt-roster-$mutation"
+    mkdir -m 0700 -- "$directory"
+    command cp -- "$valid_result" "$directory/benchmark-result.json"
+    : >"$directory/benchmark.stderr.log"
+    chmod 0600 -- "$directory/benchmark-result.json" \
+      "$directory/benchmark.stderr.log"
+    benchmark_pressure_test_write_client_commit "$directory" 1 || return $?
+    receipt="$directory/benchmark-client-commit.json"
+    candidate="$directory/.receipt-mutated"
+    jq -cS "$expression" "$receipt" >"$candidate" || return $?
+    chmod 0600 -- "$candidate"
+    mv -T -- "$candidate" "$receipt"
+    if benchmark_pressure_hold_client_commit_bundle \
+      "$directory" 1 success_pair held_stdout_fd held_stderr_fd held_receipt_fd; then
+      printf 'pressure bundle accepted %s receipt roster\n' "$mutation" >&2
+      return 1
+    fi
+  done <<'EOF'
+missing	.member_count=1 | .members |= .[0:1]
+duplicate	.members[1]=.members[0]
+extra	.member_count=3 | .members += [.members[0] | .role="extra"]
+EOF
+
+  # The data-only sync is not the completion boundary if a data inode changes
+  # in place before the isolated marker broker's full coherent seal.
+  directory="$root/group-in-place"
+  marker="$directory/fired"
+  mkdir -m 0700 -- "$directory"
+  sync_count=0
+  sync() {
+    command sync "$@" || return $?
+    ((sync_count += 1))
+    if ((sync_count == 1)) && [[ ! -e "$marker" ]]; then
+      : >"$marker"
+      printf 'foreign post-sync result\n' >"$directory/benchmark-result.json"
+      chmod 0600 -- "$directory/benchmark-result.json"
+    fi
+  }
+  set +e
+  run_benchmark_pressure_client 1 "$directory"
+  transaction_status=$?
+  set -e
+  unset -f sync
+  [[ "$transaction_status" != 0 && -f "$marker" &&
+    "$(<"$directory/benchmark-result.json")" == 'foreign post-sync result' &&
+    ! -e "$directory/benchmark.stderr.log" &&
+    ! -e "$directory/benchmark-client-commit.json" &&
+    ! -e "$directory/.benchmark-result.capture" &&
+    ! -e "$directory/.benchmark-stderr.capture" &&
+    ! -e "$directory/.benchmark-client-commit.capture" ]] || return 1
+
+  # A foreign failure marker introduced after the data-only sync remains
+  # unknown and prevents the final no-clobber marker link; authenticated data
+  # members are rolled back.
+  directory="$root/group-path-swap"
+  marker="$directory/fired"
+  mkdir -m 0700 -- "$directory"
+  client_mode=overflow
+  sync_count=0
+  sync() {
+    command sync "$@" || return $?
+    ((sync_count += 1))
+    if ((sync_count == 1)) && [[ ! -e "$marker" ]]; then
+      : >"$marker"
+      printf 'foreign post-sync receipt\n' \
+        >"$directory/benchmark-client-failure.json" || return $?
+      chmod 0600 -- "$directory/benchmark-client-failure.json"
+    fi
+  }
+  set +e
+  run_benchmark_pressure_client 1 "$directory"
+  transaction_status=$?
+  set -e
+  unset -f sync
+  client_mode=success
+  [[ "$transaction_status" != 0 && -f "$marker" &&
+    "$(<"$directory/benchmark-client-failure.json")" == \
+      'foreign post-sync receipt' &&
+    ! -e "$directory/benchmark.failure.stdout.log" &&
+    ! -e "$directory/benchmark.failure.stderr.log" &&
+    ! -e "$directory/.benchmark-result.capture" &&
+    ! -e "$directory/.benchmark-stderr.capture" &&
+    ! -e "$directory/.benchmark-client-failure.capture" ]] || return 1
+
+  # Moving an owned data inode back under its registered source name and
+  # installing a public symlink to it is not an exact-name commit.  Rollback
+  # consumes the owned inode while preserving the now-unknown symlink.
+  directory="$root/group-data-symlink"
+  marker="$directory/fired"
+  mkdir -m 0700 -- "$directory"
+  sync_count=0
+  sync() {
+    command sync "$@" || return $?
+    ((sync_count += 1))
+    if ((sync_count == 1)) && [[ ! -e "$marker" ]]; then
+      : >"$marker"
+      command mv -T -- "$directory/benchmark-result.json" \
+        "$directory/.benchmark-result.capture" || return $?
+      command ln -s -- .benchmark-result.capture \
+        "$directory/benchmark-result.json" || return $?
+    fi
+  }
+  set +e
+  run_benchmark_pressure_client 1 "$directory"
+  transaction_status=$?
+  set -e
+  unset -f sync
+  [[ "$transaction_status" != 0 && -f "$marker" &&
+    -L "$directory/benchmark-result.json" &&
+    "$(readlink -- "$directory/benchmark-result.json")" == \
+      .benchmark-result.capture &&
+    ! -e "$directory/.benchmark-result.capture" &&
+    ! -e "$directory/benchmark.stderr.log" &&
+    ! -e "$directory/benchmark-client-commit.json" ]] || return 1
+
+  # The failure transaction rejects the same exact-inode symlink substitution.
+  directory="$root/failure-data-symlink"
+  marker="$directory/fired"
+  mkdir -m 0700 -- "$directory"
+  client_mode=overflow
+  sync_count=0
+  sync() {
+    command sync "$@" || return $?
+    ((sync_count += 1))
+    if ((sync_count == 1)) && [[ ! -e "$marker" ]]; then
+      : >"$marker"
+      command mv -T -- "$directory/benchmark.failure.stdout.log" \
+        "$directory/.benchmark-result.capture" || return $?
+      command ln -s -- .benchmark-result.capture \
+        "$directory/benchmark.failure.stdout.log" || return $?
+    fi
+  }
+  set +e
+  run_benchmark_pressure_client 1 "$directory"
+  transaction_status=$?
+  set -e
+  unset -f sync
+  client_mode=success
+  [[ "$transaction_status" != 0 && -f "$marker" &&
+    -L "$directory/benchmark.failure.stdout.log" &&
+    "$(readlink -- "$directory/benchmark.failure.stdout.log")" == \
+      .benchmark-result.capture &&
+    ! -e "$directory/.benchmark-result.capture" &&
+    ! -e "$directory/benchmark.failure.stderr.log" &&
+    ! -e "$directory/benchmark-client-failure.json" ]] || return 1
+
+  # The final receipt name is subject to the same rule; a symlink cannot act
+  # as the external commit sentinel even when it resolves to the owned inode.
+  directory="$root/group-marker-symlink"
+  marker="$directory/fired"
+  mkdir -m 0700 -- "$directory"
+  sync_count=0
+  sync() {
+    command sync "$@" || return $?
+    ((sync_count += 1))
+    if ((sync_count == 1)) && [[ ! -e "$marker" ]]; then
+      : >"$marker"
+      printf 'unknown marker referent\n' \
+        >"$directory/.unknown-marker-referent" || return $?
+      chmod 0600 -- "$directory/.unknown-marker-referent" || return $?
+      command ln -s -- .unknown-marker-referent \
+        "$directory/benchmark-client-commit.json" || return $?
+    fi
+  }
+  set +e
+  run_benchmark_pressure_client 1 "$directory"
+  transaction_status=$?
+  set -e
+  unset -f sync
+  [[ "$transaction_status" != 0 && -f "$marker" &&
+    -L "$directory/benchmark-client-commit.json" &&
+    "$(readlink -- "$directory/benchmark-client-commit.json")" == \
+      .unknown-marker-referent &&
+    ! -e "$directory/.benchmark-client-commit.capture" &&
+    -f "$directory/.unknown-marker-referent" &&
+    ! -e "$directory/benchmark-result.json" &&
+    ! -e "$directory/benchmark.stderr.log" ]] || return 1
+
+  # After the broker has opened every member but before its terminal sweep, a
+  # later protocol boundary cannot move an earlier exact inode aside and make
+  # its public leaf a symlink.  Rollback consumes the owned hidden inode and
+  # preserves the unknown symlink.
+  directory="$root/group-cross-member-symlink"
+  marker="$directory/fired"
+  mkdir -m 0700 -- "$directory"
+  read() {
+    local read_status=0
+
+    builtin read "$@" || read_status=$?
+    if ((read_status == 0)) && [[ "${ready:-}" == ready &&
+        "${capture_count:-}" == 0 &&
+        -e "$directory/benchmark-result.json" &&
+        -e "$directory/benchmark.stderr.log" &&
+        ! -e "$directory/benchmark-client-commit.json" &&
+        ! -e "$directory/.benchmark-client-commit.capture" &&
+        ! -e "$marker" ]]; then
+      : >"$marker"
+      command mv -T -- "$directory/benchmark-result.json" \
+        "$directory/.benchmark-result.capture" || return $?
+      command ln -s -- .benchmark-result.capture \
+        "$directory/benchmark-result.json" || return $?
+    fi
+    return "$read_status"
+  }
+  set +e
+  run_benchmark_pressure_client 1 "$directory"
+  transaction_status=$?
+  set -e
+  unset -f read
+  [[ "$transaction_status" != 0 && -f "$marker" &&
+    -L "$directory/benchmark-result.json" &&
+    "$(readlink -- "$directory/benchmark-result.json")" == \
+      .benchmark-result.capture &&
+    ! -e "$directory/.benchmark-result.capture" &&
+    ! -e "$directory/benchmark.stderr.log" &&
+    ! -e "$directory/benchmark-client-commit.json" ]] || return 1
+
+  # The failure transaction has the same cross-member terminal authority.
+  directory="$root/failure-cross-member-symlink"
+  marker="$directory/fired"
+  mkdir -m 0700 -- "$directory"
+  client_mode=overflow
+  read() {
+    local read_status=0
+
+    builtin read "$@" || read_status=$?
+    if ((read_status == 0)) && [[ "${ready:-}" == ready &&
+        "${capture_count:-}" == 0 &&
+        -e "$directory/benchmark.failure.stdout.log" &&
+        -e "$directory/benchmark.failure.stderr.log" &&
+        ! -e "$directory/benchmark-client-failure.json" &&
+        ! -e "$directory/.benchmark-client-failure.capture" &&
+        ! -e "$marker" ]]; then
+      : >"$marker"
+      command mv -T -- "$directory/benchmark.failure.stdout.log" \
+        "$directory/.benchmark-result.capture" || return $?
+      command ln -s -- .benchmark-result.capture \
+        "$directory/benchmark.failure.stdout.log" || return $?
+    fi
+    return "$read_status"
+  }
+  set +e
+  run_benchmark_pressure_client 1 "$directory"
+  transaction_status=$?
+  set -e
+  unset -f read
+  client_mode=success
+  [[ "$transaction_status" != 0 && -f "$marker" &&
+    -L "$directory/benchmark.failure.stdout.log" &&
+    "$(readlink -- "$directory/benchmark.failure.stdout.log")" == \
+      .benchmark-result.capture &&
+    ! -e "$directory/.benchmark-result.capture" &&
+    ! -e "$directory/benchmark.failure.stderr.log" &&
+    ! -e "$directory/benchmark-client-failure.json" ]] || return 1
+
+  # A read-only held-bundle consumer neither follows nor removes an exact-inode
+  # symlink substitution; it preserves both names for owner-side reconciliation.
+  directory="$root/held-consumer-symlink"
+  mkdir -m 0700 -- "$directory"
+  command cp -- "$valid_result" "$directory/benchmark-result.json"
+  : >"$directory/benchmark.stderr.log"
+  chmod 0600 -- "$directory/benchmark-result.json" \
+    "$directory/benchmark.stderr.log"
+  benchmark_pressure_test_write_client_commit "$directory" 1 || return $?
+  command mv -T -- "$directory/benchmark-result.json" \
+    "$directory/.held-owned-result"
+  command ln -s -- .held-owned-result "$directory/benchmark-result.json"
+  if benchmark_pressure_hold_client_commit_bundle \
+    "$directory" 1 success_pair held_stdout_fd held_stderr_fd held_receipt_fd; then
+    printf 'pressure bundle followed a public symlink to its exact inode\n' >&2
+    return 1
+  fi
+  [[ -L "$directory/benchmark-result.json" &&
+    "$(readlink -- "$directory/benchmark-result.json")" == \
+      .held-owned-result && -f "$directory/.held-owned-result" &&
+    -f "$directory/benchmark.stderr.log" &&
+    -f "$directory/benchmark-client-commit.json" ]] || return 1
+
+  # A mutation after semantic receipt validation but before the broker starts
+  # cannot redirect the coherent images returned to a consumer.  This test hook
+  # fires while framing the later receipt member, after all earlier shell seals.
+  (
+    local directory="$root/held-consumer-pre-broker-symlink"
+    local marker="$directory/fired"
+
+    mkdir -m 0700 -- "$directory"
+    command cp -- "$valid_result" "$directory/benchmark-result.json"
+    : >"$directory/benchmark.stderr.log"
+    chmod 0600 -- "$directory/benchmark-result.json" \
+      "$directory/benchmark.stderr.log"
+    benchmark_pressure_test_write_client_commit "$directory" 1 || return $?
+    printf() {
+      if [[ "$1" == -v && "$2" == capture_specification &&
+        "${5:-}" == benchmark-client-commit.json && ! -e "$marker" ]]; then
+        : >"$marker"
+        command mv -T -- "$directory/benchmark-result.json" \
+          "$directory/.held-owned-result" || return $?
+        command ln -s -- .held-owned-result \
+          "$directory/benchmark-result.json" || return $?
+      fi
+      builtin printf "$@"
+    }
+    if benchmark_pressure_hold_client_commit_bundle \
+      "$directory" 1 success_pair held_stdout_fd held_stderr_fd \
+      held_receipt_fd; then
+      printf 'pressure bundle accepted a pre-broker cross-member symlink\n' >&2
+      return 1
+    fi
+    unset -f printf
+    [[ -f "$marker" && -L "$directory/benchmark-result.json" &&
+      "$(readlink -- "$directory/benchmark-result.json")" == \
+        .held-owned-result && -f "$directory/.held-owned-result" &&
+      -f "$directory/benchmark.stderr.log" &&
+      -f "$directory/benchmark-client-commit.json" ]]
+  ) || return 1
+
+  # The generic single-file publisher repeats the same complete seal after a
+  # successful sync for in-place drift, a pathname replacement, and a symlink
+  # back to the exact owned inode.
+  for mutation in in-place path-swap symlink-back; do
+    directory="$root/single-$mutation"
+    source="$directory/source"
+    target="$directory/target"
+    marker="$directory/fired"
+    mkdir -m 0700 -- "$directory"
+    printf 'owned source\n' >"$source"
+    chmod 0600 -- "$source"
+    benchmark_pressure_capture_candidate_authority \
+      "$source" 600 parent_identity source_identity source_sha256 || return $?
+    sync() {
+      command sync "$@" || return $?
+      if [[ ! -e "$marker" ]]; then
+        : >"$marker"
+        if [[ "$mutation" == path-swap ]]; then
+          command rm -- "$target" || return $?
+        elif [[ "$mutation" == symlink-back ]]; then
+          command mv -T -- "$target" "$source" || return $?
+          command ln -s -- "${source##*/}" "$target" || return $?
+          return 0
+        fi
+        printf 'foreign single target\n' >"$target" || return $?
+        chmod 0600 -- "$target"
+      fi
+    }
+    if benchmark_pressure_commit_file_no_clobber \
+      "$source" "$target" 600 "$parent_identity" "$parent_identity" \
+      "$source_identity" "$source_sha256"; then
+      printf 'single commit accepted %s post-sync target mutation\n' \
+        "$mutation" >&2
+      return 1
+    fi
+    unset -f sync
+    if [[ "$mutation" == symlink-back ]]; then
+      [[ -f "$marker" && -L "$target" &&
+        "$(readlink -- "$target")" == "${source##*/}" &&
+        ! -e "$source" ]] || return 1
+    else
+      [[ -f "$marker" && ! -e "$source" &&
+        "$(<"$target")" == 'foreign single target' ]] || return 1
+    fi
+  done
+}
+
+test_benchmark_pressure_failure_receipt_registration_is_signal_safe() {
+  local root="$TEST_TMP_DIR/pressure-failure-receipt-registration"
+  local valid_result="$root/valid.json"
+  local directory=""
+  local receipt_candidate=""
+  local marker=""
+  local final_argument=""
+  local receipt_stat_output=""
+  local receipt_stat_status=0
+  local transaction_status=0
+
+  mkdir -m 0700 -- "$root"
+  benchmark_pressure_test_write_result "$valid_result"
+  PRESSURE_CONTROL_SESSION=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  COMPOSE=(docker compose --project-name pressure-receipt-registration-test)
+  benchmark_pressure_client_absent() { return 0; }
+  run_bounded_foreground_group() {
+    LC_ALL=C head -c "$((BENCHMARK_PRESSURE_RESULT_MAX_BYTES + 2))" \
+      /dev/zero | tr '\0' x
+  }
+
+  # A forced identity-read failure immediately after the O_EXCL open still has
+  # a live registered descriptor for authenticated cleanup.
+  directory="$root/forced-failure"
+  receipt_candidate="$directory/.benchmark-client-failure.capture"
+  marker="$directory/fired"
+  mkdir -m 0700 -- "$directory"
+  stat() {
+    final_argument="${!#}"
+    if [[ "$final_argument" =~ ^/proc/self/fd/[1-9][0-9]*$ &&
+      -e "$receipt_candidate" && "$receipt_candidate" -ef "$final_argument" &&
+      ! -e "$marker" ]]; then
+      : >"$marker"
+      return 79
+    fi
+    command stat "$@"
+  }
+  set +e
+  run_benchmark_pressure_client 1 "$directory"
+  transaction_status=$?
+  set -e
+  unset -f stat
+  [[ "$transaction_status" != 0 && -f "$marker" ]] || return 1
+  benchmark_pressure_test_client_transaction_owned_leaves_absent "$directory"
+
+  # TERM at the same boundary is deferred only until descriptor identity is
+  # recorded, then returned as 143 through the registered rollback path.
+  directory="$root/term"
+  receipt_candidate="$directory/.benchmark-client-failure.capture"
+  marker="$directory/fired"
+  mkdir -m 0700 -- "$directory"
+  stat() {
+    final_argument="${!#}"
+    if [[ "$final_argument" =~ ^/proc/self/fd/[1-9][0-9]*$ &&
+      -e "$receipt_candidate" && "$receipt_candidate" -ef "$final_argument" &&
+      ! -e "$marker" ]]; then
+      receipt_stat_status=0
+      receipt_stat_output="$(command stat "$@")" || receipt_stat_status=$?
+      : >"$marker"
+      kill -TERM "$capture_owner_bashpid"
+      printf '%s\n' "$receipt_stat_output"
+      return "$receipt_stat_status"
+    fi
+    command stat "$@"
+  }
+  set +e
+  run_benchmark_pressure_client 1 "$directory"
+  transaction_status=$?
+  set -e
+  unset -f stat
+  [[ "$transaction_status" == 143 && -f "$marker" ]] || return 1
+  benchmark_pressure_test_client_transaction_owned_leaves_absent "$directory"
+}
+
+test_benchmark_pressure_quarantine_and_parent_policies_are_foreign_safe() {
+  local directory="$TEST_TMP_DIR/pressure-quarantine"
+  local source=""
+  local target=""
+  local saved="$directory/saved-known"
+  local quarantine=""
+  local identity=""
+  local digest=""
+  local publication_parent_identity=""
+  local publication_source_identity=""
+  local publication_source_sha256=""
+  local foreign_target_marker="$TEST_TMP_DIR/pressure-foreign-target-fired"
+
+  mkdir -m 0700 -- "$directory"
+  source="$directory/source"
+  printf 'known\n' >"$source"
+  chmod 0600 -- "$source"
+  identity="$(stat -Lc '%d:%i:%u:%a' -- "$source")" || return $?
+  digest="$(benchmark_pressure_test_sha256 "$source")" || return $?
+  mv -T -- "$source" "$saved"
+  printf 'foreign\n' >"$source"
+  chmod 0600 -- "$source"
+  if benchmark_pressure_quarantine_exact_file "$source" "$identity" 1 "$digest"; then
+    printf 'pressure quarantine authenticated foreign replacement bytes\n' >&2
+    return 1
+  fi
+  quarantine="$(find "$directory" -mindepth 1 -maxdepth 1 \
+    -type d -name '.benchmark-pressure-quarantine.*' -print -quit)"
+  [[ -n "$quarantine" && ! -e "$source" &&
+    "$(<"$saved")" == known && "$(<"$quarantine/quarantined")" == foreign ]] ||
+    return 1
+
+  directory="$TEST_TMP_DIR/pressure-publish-unknown"
+  mkdir -m 0700 -- "$directory"
+  source="$directory/source"
+  target="$directory/target"
+  saved="$directory/saved-known"
+  printf 'known\n' >"$source"
+  chmod 0600 -- "$source"
+  command cp -- "$source" "$saved"
+  chmod 0600 -- "$saved"
+  benchmark_pressure_test_foreign_target_validator() {
+    return 0
+  }
+  ln() {
+    local target_path="${*: -1}"
+
+    command ln "$@" || return $?
+    if [[ "$target_path" == /proc/self/fd/*/target &&
+      ! -e "$foreign_target_marker" ]]; then
+      : >"$foreign_target_marker"
+      command rm -- "$target_path" || return $?
+      printf 'foreign\n' >"$target_path" || return $?
+      chmod 0600 -- "$target_path"
+    fi
+  }
+  if benchmark_pressure_publish_validated_file "$source" "$target" 600 \
+    benchmark_pressure_test_foreign_target_validator; then
+    printf 'pressure publication accepted foreign post-link bytes\n' >&2
+    return 1
+  fi
+  unset -f ln
+  [[ -f "$foreign_target_marker" && ! -e "$source" && ! -L "$source" &&
+    "$(<"$saved")" == known && "$(<"$target")" == foreign &&
+    -z "$(find "$directory" -mindepth 1 -maxdepth 1 \
+      -type d -name '.benchmark-pressure-quarantine.*' -print -quit)" ]] ||
+    return 1
+
+  (
+    local case_root="$TEST_TMP_DIR/pressure-commit-parent-swap"
+    local directory="$case_root/current"
+    local saved_parent="$case_root/original"
+    local source="$directory/source"
+    local target="$directory/target"
+    local marker="$case_root/swap-fired"
+    local parent_identity=""
+    local source_identity=""
+    local source_sha256=""
+    local link_target=""
+
+    mkdir -m 0700 -- "$case_root" "$directory"
+    printf 'owned source\n' >"$source"
+    chmod 0600 -- "$source"
+    benchmark_pressure_capture_candidate_authority \
+      "$source" 600 parent_identity source_identity source_sha256
+    ln() {
+      link_target="${*: -1}"
+      command ln "$@" || return $?
+      if [[ "$link_target" == /proc/self/fd/*/target && ! -e "$marker" ]]; then
+        : >"$marker"
+        command mv -T -- "$directory" "$saved_parent" || return $?
+        command mkdir -m 0700 -- "$directory" || return $?
+        printf 'foreign source\n' >"$source" || return $?
+        printf 'foreign target\n' >"$target" || return $?
+        chmod 0600 -- "$source" "$target"
+      fi
+    }
+    if benchmark_pressure_commit_file_no_clobber \
+      "$source" "$target" 600 "$parent_identity" "$parent_identity" \
+      "$source_identity" "$source_sha256"; then
+      printf 'pressure commit accepted a source-parent substitution\n' >&2
+      return 1
+    fi
+    unset -f ln
+    [[ -f "$marker" && "$(<"$source")" == 'foreign source' &&
+      "$(<"$target")" == 'foreign target' &&
+      ! -e "$saved_parent/source" && ! -L "$saved_parent/source" &&
+      ! -e "$saved_parent/target" && ! -L "$saved_parent/target" &&
+      -z "$(find "$saved_parent" -mindepth 1 -maxdepth 1 \
+        -type d -name '.benchmark-pressure-quarantine.*' -print -quit)" ]]
+  ) || return 1
+
+  directory="$TEST_TMP_DIR/pressure-private-parent-mode"
+  mkdir -m 0755 -- "$directory"
+  source="$directory/source"
+  target="$directory/target"
+  printf 'candidate\n' >"$source"
+  chmod 0600 -- "$source"
+  benchmark_pressure_capture_candidate_authority \
+    "$source" 600 publication_parent_identity publication_source_identity \
+    publication_source_sha256 || return $?
+  if benchmark_pressure_commit_file_no_clobber \
+    "$source" "$target" 600 "$publication_parent_identity" \
+    "$publication_parent_identity" "$publication_source_identity" \
+    "$publication_source_sha256"; then
+    printf 'pressure private publication accepted a non-0700 parent\n' >&2
+    return 1
+  fi
+  [[ -f "$source" && ! -e "$target" ]] || return 1
+
+  directory="$TEST_TMP_DIR/pressure-public-parent-mode"
+  mkdir -m 0770 -- "$directory"
+  source="$directory/source"
+  target="$directory/target"
+  printf 'candidate\n' >"$source"
+  chmod 0644 -- "$source"
+  benchmark_pressure_capture_candidate_authority \
+    "$source" 644 publication_parent_identity publication_source_identity \
+    publication_source_sha256 || return $?
+  if benchmark_pressure_commit_file_no_clobber \
+    "$source" "$target" 644 "$publication_parent_identity" \
+    "$publication_parent_identity" "$publication_source_identity" \
+    "$publication_source_sha256"; then
+    printf 'pressure public publication accepted a group-writable parent\n' >&2
+    return 1
+  fi
+  [[ -f "$source" && ! -e "$target" ]]
+}
+
 pressure_test_run_fresh_sourced_group() {
   local -r group_name="$1"
   local test_name=""
@@ -42288,6 +47636,40 @@ test_pressure_map_one_shot_fresh_sourced_group() {
     test_map_pressure_cleanup_only_transition_ordering_is_restartable \
     test_pressure_publication_is_no_clobber_and_cleans_temporaries \
     test_map_pressure_result_contract_is_single_record_and_exact
+}
+
+test_benchmark_pressure_cycles_fresh_sourced_group() {
+  pressure_test_run_fresh_sourced_group benchmark-pressure-cycles \
+    test_benchmark_pressure_result_and_window_contracts_are_strict \
+    test_benchmark_pressure_private_manifest_recomputes_raw_evidence \
+    test_benchmark_pressure_resource_and_phase_rosters_are_exact \
+    test_benchmark_pressure_recovery_samples_are_consecutive_and_clean \
+    test_benchmark_pressure_manifest_propagates_traversal_failure \
+    test_benchmark_pressure_publication_rolls_back_exact_targets \
+    test_benchmark_pressure_last_check_and_parent_authority_are_bound \
+    test_benchmark_pressure_aggregate_is_exact_and_non_disclosing \
+    test_benchmark_pressure_aggregate_recomputes_all_private_cycles \
+    test_benchmark_pressure_client_failures_are_cleanup_owned \
+    test_benchmark_pressure_controller_runs_exact_ordered_cycles \
+    test_benchmark_pressure_admission_and_java_conservation_are_independent \
+    test_benchmark_pressure_json_keys_are_streamed_bounded_and_terminal \
+    test_benchmark_pressure_python_brokers_are_isolated \
+    test_benchmark_pressure_coherent_broker_is_bounded_and_reaped \
+    test_benchmark_pressure_trace_receiver_counters_are_terminally_bound \
+    test_benchmark_pressure_host_load_window_is_sealed \
+    test_benchmark_pressure_resource_schemas_and_role_caps_are_exact \
+    test_benchmark_pressure_role_capture_is_bounded_reaped_and_foreign_safe \
+    test_benchmark_pressure_resource_and_java_producers_use_role_capture \
+    test_benchmark_pressure_java_pair_is_sealed_and_foreign_safe \
+    test_benchmark_pressure_client_capture_is_bounded_reaped_and_publishable \
+    test_benchmark_pressure_client_capture_registration_and_permutations \
+    test_benchmark_pressure_client_publication_transactions_are_atomic \
+    test_benchmark_pressure_external_marker_is_final_and_signal_latched \
+    test_benchmark_pressure_terminal_broker_latches_defer_signals \
+    test_benchmark_pressure_post_sync_seals_and_commit_marker_are_authoritative \
+    test_benchmark_pressure_failure_receipt_registration_is_signal_safe \
+    test_benchmark_pressure_quarantine_and_parent_policies_are_foreign_safe \
+    test_benchmark_pressure_source_contract_is_fixed_and_host_side
 }
 
 main() {
@@ -42433,6 +47815,7 @@ main() {
   test_pressure_transaction_authority_fresh_sourced_group
   test_pressure_runtime_lifecycle_fresh_sourced_group
   test_pressure_map_one_shot_fresh_sourced_group
+  test_benchmark_pressure_cycles_fresh_sourced_group
   test_bridge_take_count_includes_cancelled_request
   test_concurrency_overlap_reconciliation_is_exact
   test_tls_boundary_reconciliation_binds_exact_parents_to_record_evidence

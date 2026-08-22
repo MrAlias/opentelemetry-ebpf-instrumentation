@@ -11,6 +11,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"math/big"
 	"net"
@@ -221,6 +222,148 @@ func TestRunSendsW3CHeaders(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("server did not receive a request")
+	}
+}
+
+func TestRunEmitsCanonicalUniqueRequestMarkersAndOrdinalReceipt(t *testing.T) {
+	var mutex sync.Mutex
+	markers := make([]string, 0, 8)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		mutex.Lock()
+		markers = append(markers, request.Header.Get("X-OBI-Demo-ID"))
+		mutex.Unlock()
+		time.Sleep(5 * time.Millisecond)
+		writer.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	const prefix = "pressure-0123456789abcdef-cycle-01"
+	result, err := run(context.Background(), config{
+		baseURL:        server.URL,
+		path:           "/api/echo",
+		connectionMode: "close",
+		duration:       25 * time.Millisecond,
+		requestTimeout: time.Second,
+		concurrency:    1,
+		requestLimit:   maxRequestLimit,
+		markerPrefix:   prefix,
+	})
+	if err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+	mutex.Lock()
+	defer mutex.Unlock()
+	if len(markers) == 0 || uint64(len(markers)) != result.SuccessfulRequests {
+		t.Fatalf("markers=%d successful_requests=%d", len(markers), result.SuccessfulRequests)
+	}
+	for index, marker := range markers {
+		want, markerErr := requestMarker(prefix, uint64(index+1))
+		if markerErr != nil {
+			t.Fatal(markerErr)
+		}
+		if marker != want {
+			t.Fatalf("marker[%d] = %q, want %q", index, marker, want)
+		}
+	}
+	if result.MarkerPrefix != prefix || result.MarkerEncoding != requestMarkerEncoding ||
+		result.AdmittedRequests != result.SuccessfulRequests ||
+		result.FirstRequestOrdinal != 1 ||
+		result.LastRequestOrdinal != result.AdmittedRequests {
+		t.Fatalf("invalid marker receipt: %+v", result)
+	}
+}
+
+func TestMarkerPrefixValidationAndOrdinalBounds(t *testing.T) {
+	base := config{
+		baseURL:        "http://127.0.0.1:18080",
+		path:           "/api/echo",
+		connectionMode: "close",
+		duration:       time.Second,
+		requestTimeout: time.Second,
+		concurrency:    1,
+		requestLimit:   1,
+	}
+	validMaximum := "a" + strings.Repeat("0", maxMarkerPrefixBytes-1)
+	for _, prefix := range []string{"pressure-cycle-01", validMaximum} {
+		cfg := base
+		cfg.markerPrefix = prefix
+		if err := validateConfig(cfg); err != nil {
+			t.Fatalf("validateConfig(%q) error = %v", prefix, err)
+		}
+	}
+	for _, prefix := range []string{
+		"benchmark-load",
+		"Pressure-cycle-01",
+		"pressure--cycle",
+		"pressure-cycle-",
+		"-pressure-cycle",
+		"pressure_cycle",
+		"a" + strings.Repeat("0", maxMarkerPrefixBytes),
+	} {
+		cfg := base
+		cfg.markerPrefix = prefix
+		if err := validateConfig(cfg); err == nil {
+			t.Fatalf("validateConfig(%q) error = nil", prefix)
+		}
+	}
+	first, err := requestMarker("pressure-cycle-01", 1)
+	if err != nil || first != "pressure-cycle-01-0000001" {
+		t.Fatalf("requestMarker(first) = %q, %v", first, err)
+	}
+	last, err := requestMarker(validMaximum, maxRequestLimit)
+	if err != nil || len(last) != maxReceiverMarkerBytes {
+		t.Fatalf("requestMarker(last) length=%d error=%v", len(last), err)
+	}
+	if first == last {
+		t.Fatal("distinct marker prefixes/ordinals collided")
+	}
+	for _, ordinal := range []uint64{0, maxRequestLimit + 1} {
+		if _, err := requestMarker("pressure-cycle-01", ordinal); err == nil {
+			t.Fatalf("requestMarker ordinal %d error = nil", ordinal)
+		}
+	}
+}
+
+func TestParseFlagsAcceptsExactPressureClientContract(t *testing.T) {
+	const prefix = "pressure-0123456789abcdef0123456789abcdef-cycle-10"
+	cfg, err := parseFlags([]string{
+		"--base-url", "http://127.0.0.1:18080",
+		"--path", "/api/echo?delay_ms=500",
+		"--connection-mode", "close",
+		"--duration", "60s",
+		"--request-timeout", "10s",
+		"--concurrency", "16",
+		"--request-limit", "4096",
+		"--marker-prefix", prefix,
+	})
+	if err != nil {
+		t.Fatalf("parseFlags(pressure contract) error = %v", err)
+	}
+	if cfg.baseURL != "http://127.0.0.1:18080" ||
+		cfg.path != "/api/echo?delay_ms=500" || cfg.connectionMode != "close" ||
+		cfg.duration != 60*time.Second || cfg.requestTimeout != 10*time.Second ||
+		cfg.concurrency != 16 || cfg.requestLimit != 4096 ||
+		cfg.markerPrefix != prefix {
+		t.Fatalf("parseFlags(pressure contract) = %+v", cfg)
+	}
+	if _, err := requestMarker(cfg.markerPrefix, cfg.requestLimit); err != nil {
+		t.Fatalf("requestMarker(last admitted ordinal) error = %v", err)
+	}
+}
+
+func TestDefaultResultJSONOmitsMarkerReceiptFields(t *testing.T) {
+	payload, err := json.Marshal(runResult{Status: "failed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded := string(payload)
+	for _, field := range []string{
+		"marker_prefix", "marker_encoding", "admitted_requests",
+		"first_request_ordinal", "last_request_ordinal",
+	} {
+		if strings.Contains(encoded, field) {
+			t.Fatalf("default result unexpectedly contains %q: %s", field, encoded)
+		}
 	}
 }
 

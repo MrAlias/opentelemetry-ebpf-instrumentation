@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OBI Dynamic Instrumentation</title>
+  <link rel="stylesheet" href="styles.css?v=15">
+</head>
+<body>
+  <header class="app-bar">
+    <a class="brand" href="/" aria-label="OBI dynamic instrumentation home"><strong>OBI</strong><span></span>Dynamic Instrumentation</a>
+    <div class="target-summary" id="target-summary"><strong>Discovering services…</strong></div>
+    <div class="header-actions">
+      <span class="connection" id="connection">Checking OBI API…</span>
+      <button class="secondary-button" id="open-settings" type="button">Settings</button>
+      <button class="secondary-button" id="refresh-all" type="button">Refresh</button>
+    </div>
+  </header>
+
+  <main>
+    <h1 class="sr-only">OBI dynamic instrumentation</h1>
+
+    <nav class="workspace-nav" role="tablist" aria-label="Instrumentation workspaces">
+      <button id="inventory-tab" type="button" role="tab" aria-selected="true" aria-controls="inventory-view">Service inventory</button>
+      <button id="rules-tab" type="button" role="tab" aria-selected="false" aria-controls="rules-view">Rules <span id="rules-tab-count">0</span></button>
+    </nav>
+
+    <div class="notice" id="notice" role="status" aria-live="polite"></div>
+
+    <section id="inventory-view" role="tabpanel" aria-labelledby="inventory-tab">
+      <div class="inventory-layout" id="inventory-layout">
+        <div class="inventory-content">
+          <section class="table-section services-section" aria-labelledby="services-title">
+            <div class="section-bar">
+              <div><h2 id="services-title">Services</h2><span id="service-count">0 services</span></div>
+              <label class="inline-search" for="service-search"><span class="sr-only">Search services</span><input id="service-search" type="search" placeholder="Search services by name or namespace" autocomplete="off"></label>
+            </div>
+            <div class="data-table service-table">
+              <div class="table-head"><span>Service</span><span>Namespace</span><span>Language</span><span>Processes</span><span>Available functions</span><span>Instrumented</span><span>Rules</span></div>
+              <div id="service-rows"><div class="empty-state">Discovering services from OBI…</div></div>
+            </div>
+          </section>
+
+          <section class="table-section function-section" id="function-section" aria-labelledby="service-title">
+            <div class="service-heading">
+              <div>
+                <div class="service-identity"><h2 id="service-title">Select a service</h2><span id="service-namespace"></span><span id="service-language"></span></div>
+                <p id="service-summary">Choose a service above to inspect its available functions.</p>
+              </div>
+              <div class="service-stats" id="service-stats"></div>
+            </div>
+
+            <div class="function-toolbar">
+              <div class="function-scopes" role="group" aria-label="Function scope">
+                <button type="button" data-function-scope="application" aria-pressed="true">Application <span>0</span></button>
+                <button type="button" data-function-scope="dependency" aria-pressed="false">Dependencies <span>0</span></button>
+                <button type="button" data-function-scope="runtime" aria-pressed="false">Runtime <span>0</span></button>
+                <button type="button" data-function-scope="all" aria-pressed="false">All <span>0</span></button>
+              </div>
+              <div class="function-tools">
+                <label class="status-filter" for="function-status"><span>Status</span><select id="function-status">
+                  <option value="all">Any status</option>
+                  <option value="instrumented">Instrumented</option>
+                  <option value="available">Available</option>
+                </select></label>
+                <label class="inline-search function-search" for="function-search"><span class="sr-only">Search functions</span><input id="function-search" type="search" placeholder="Search exact symbol, package, or name" autocomplete="off"></label>
+              </div>
+            </div>
+            <div class="scope-summary" id="scope-summary"></div>
+
+            <div class="data-table function-table">
+              <div class="table-head"><input id="select-visible-functions" type="checkbox" aria-label="Select all visible functions" title="Select all visible functions" disabled><span>Function</span><span>Status</span><span>Rule owner</span><span>Span name</span></div>
+              <div id="function-rows"><div class="empty-state">Select a service to see its functions.</div></div>
+              <button class="show-more" id="show-more-functions" type="button" hidden>Show more functions</button>
+            </div>
+          </section>
+        </div>
+
+        <aside class="rule-composer" id="rule-composer" aria-labelledby="composer-title" hidden>
+          <div class="composer-sticky">
+            <div class="composer-heading">
+              <div><h2 id="composer-title">Create instrumentation rule</h2><p>Collect selected functions into one reusable rule.</p></div>
+            </div>
+            <div class="composer-action-bar">
+              <div class="validation-message" id="composer-validation">Select at least one function.</div>
+              <div class="composer-actions"><button class="secondary-button" id="cancel-composer" type="button">Cancel</button><button class="primary-button" id="apply-rule" type="button" disabled>Create rule</button></div>
+            </div>
+          </div>
+          <div class="composer-body">
+            <label class="stacked-field" for="composer-destination"><span>Add to</span><select id="composer-destination"><option value="">New instrumentation rule</option></select></label>
+            <label class="stacked-field" id="rule-id-field" for="rule-id"><span>Rule name</span><input id="rule-id" type="text" maxlength="80" spellcheck="false"></label>
+            <div class="target-field"><span>Target service</span><strong id="composer-service">—</strong><small>Narrows the inventory selector to the selected service language.</small></div>
+            <div class="composer-list-heading"><div><strong>Selected functions</strong><span class="count-badge" id="selection-count">0</span></div><button class="text-button" id="clear-selection" type="button">Clear all</button></div>
+            <div class="composer-list" id="selection-list"></div>
+            <details class="advanced-settings"><summary>Advanced options</summary><label for="composer-selector"><span>Service selector</span><textarea id="composer-selector" rows="4" spellcheck="false"></textarea></label></details>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <section id="rules-view" role="tabpanel" aria-labelledby="rules-tab" hidden>
+      <div class="rules-layout">
+        <section class="rule-catalog" aria-labelledby="rules-title">
+          <div class="section-bar">
+            <div><h2 id="rules-title">Instrumentation rules</h2><span id="rules-summary">0 editable rules</span></div>
+            <label class="inline-search" for="rule-search"><span class="sr-only">Search rules</span><input id="rule-search" type="search" placeholder="Search rules, services, or functions" autocomplete="off"></label>
+          </div>
+          <div class="rule-catalog-head"><span>Rule</span><span>Service</span><span>Functions</span><span>Attachment</span></div>
+          <div id="rule-catalog-rows"><div class="empty-state">No instrumentation rules are active.</div></div>
+        </section>
+
+        <section class="rule-editor" id="rule-editor" aria-labelledby="rule-editor-title">
+          <div class="rule-editor-empty" id="rule-editor-empty"><strong>Select a rule to inspect or modify it</strong><span>API rules are editable; configuration rules are shown as read-only.</span></div>
+          <div id="rule-editor-content" hidden>
+            <div class="editor-heading">
+              <div><p class="eyebrow">Rule definition</p><h2 id="rule-editor-title">Rule</h2></div>
+              <div class="editor-controls">
+                <span id="editor-validation">No unsaved changes.</span>
+                <div class="editor-actions"><button class="secondary-button" id="duplicate-rule" type="button">Duplicate</button><button class="danger-button" id="delete-rule" type="button">Delete</button><button class="secondary-button" id="discard-rule-changes" type="button">Discard changes</button><button class="primary-button" id="save-rule-changes" type="button">Save changes</button></div>
+              </div>
+            </div>
+            <div class="editor-fields">
+              <label class="stacked-field" for="editor-rule-id"><span>Rule name</span><input id="editor-rule-id" type="text" maxlength="80" spellcheck="false"></label>
+              <label class="stacked-field" for="editor-selector"><span>Service selector</span><textarea id="editor-selector" rows="3" spellcheck="false"></textarea></label>
+            </div>
+            <div class="member-heading"><div><h3>Member functions</h3><span id="member-count">0 functions</span></div><button class="secondary-button" id="add-rule-functions" type="button">Add functions</button></div>
+            <div class="member-table">
+              <div class="member-head"><span>Function</span><span>Span name</span><span>Attachment</span><span></span></div>
+              <div id="member-rows"></div>
+            </div>
+          </div>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="settings-dialog">
+    <form method="dialog" class="dialog-shell" id="settings-form">
+      <div class="dialog-heading"><div><p class="eyebrow">Inventory settings</p><h2>Service discovery scope</h2></div><button class="secondary-button" id="close-settings" type="button">Close</button></div>
+      <label class="stacked-field" for="service-selector"><span>OBI service selector</span><textarea id="service-selector" rows="5" spellcheck="false">[{"open_ports":"18080,18082-18083"}]</textarea><small>OBI requires a selector for symbol discovery. Every matching process is grouped into the service inventory.</small></label>
+      <div class="dialog-actions"><button class="primary-button" id="save-settings" value="default">Save and rediscover</button></div>
+    </form>
+  </dialog>
+
+  <script src="symbol-scope.js?v=12"></script>
+  <script src="app.js?v=12"></script>
+</body>
+</html>

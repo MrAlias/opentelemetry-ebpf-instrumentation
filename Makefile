@@ -1028,3 +1028,28 @@ check-store-demo-architecture:
 .PHONY: test-store-demo-architecture
 test-store-demo-architecture:
 	python3 examples/store-demo/test_fix_architecture.py
+
+DYNAMIC_DEMO_DIR := examples/dynamic-instrumentation-demo
+DYNAMIC_DEMO_COMPOSE := docker compose --env-file $(DYNAMIC_DEMO_DIR)/.env --file $(DYNAMIC_DEMO_DIR)/compose.yaml
+
+.PHONY: demo-up
+demo-up:
+	@test -f $(DYNAMIC_DEMO_DIR)/.env || (echo "Copy $(DYNAMIC_DEMO_DIR)/.env.example to .env and add Splunk credentials"; exit 1)
+	$(DYNAMIC_DEMO_COMPOSE) up --build --detach
+
+.PHONY: demo-down
+demo-down:
+	$(DYNAMIC_DEMO_COMPOSE) down --volumes
+
+.PHONY: demo-smoke
+demo-smoke:
+	curl --fail --silent --show-error http://127.0.0.1:18081/healthz
+	curl --fail --silent --show-error http://127.0.0.1:18084/healthz
+	curl --fail --silent --show-error http://127.0.0.1:18085/healthz
+	curl --fail --silent --show-error --output /dev/null --header 'Content-Type: application/json' \
+		--data '{"cart_id":"smoke","coupon":"","sku":"frog-plush"}' http://127.0.0.1:18081/checkout
+	curl --fail --silent --show-error http://127.0.0.1:8090/obi/healthz
+	curl --fail --silent --show-error --output /dev/null --get http://127.0.0.1:8090/obi/v1/dynamic-instrumentation/symbols \
+		--data-urlencode 'service=[{"open_ports":"18080,18082-18083"}]'
+	curl --fail --silent --show-error --output /dev/null http://127.0.0.1:8090/obi/v1/dynamic-instrumentation/rules
+	bash $(DYNAMIC_DEMO_DIR)/verify-trace-chain.sh

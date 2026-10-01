@@ -1,0 +1,42 @@
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+  batch: {}
+
+exporters:
+  otlp_grpc/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+  otlp_http/splunk:
+    traces_endpoint: https://ingest.${env:SPLUNK_REALM}.observability.splunkcloud.com/v2/trace/otlp
+    headers:
+      X-SF-TOKEN: ${env:SPLUNK_ACCESS_TOKEN}
+  signalfx:
+    access_token: ${env:SPLUNK_ACCESS_TOKEN}
+    realm: ${env:SPLUNK_REALM}
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_grpc/tempo, otlp_http/splunk]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [signalfx]

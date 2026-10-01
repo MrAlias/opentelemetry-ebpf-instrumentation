@@ -1,0 +1,39 @@
+log_level: INFO
+
+otel_traces_export:
+  endpoint: http://collector:4317
+  protocol: grpc
+
+otel_metrics_export:
+  endpoint: http://collector:4317
+  protocol: grpc
+
+ebpf:
+  context_propagation: all
+
+discovery:
+  instrument:
+    - open_ports: "18080"
+      name: coupon-checkout
+      namespace: obi-dynamic-demo
+    - open_ports: "18082"
+      name: inventory-java
+      namespace: obi-dynamic-demo
+    - open_ports: "18083"
+      name: inventory-node
+      namespace: obi-dynamic-demo
+
+javaagent:
+  enabled: true
+
+nodejs:
+  enabled: true
+
+dynamic_instrumentation:
+  enabled: true
+  listen_address: 0.0.0.0:8089
+  request_timeout: 10s
+  rules: []
+
+internal_metrics:
+  exporter: otel

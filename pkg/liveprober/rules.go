@@ -34,8 +34,17 @@ type ProbeResult struct {
 	SpanName         string `json:"span_name"`
 	ServiceName      string `json:"service_name"`
 	ServiceNamespace string `json:"service_namespace"`
+	Language         string `json:"language,omitempty"`
 	Status           string `json:"status"`
 	Error            string `json:"error,omitempty"`
+}
+
+type ruleSnapshot struct {
+	ID         string
+	Origin     string
+	Editable   bool
+	Definition config.DynamicInstrumentationRule
+	Results    []ProbeResult
 }
 
 type dynamicKey struct {
@@ -112,7 +121,7 @@ func (m *Manager) SetService(pid int, service svc.Attrs) {
 	if m.closed {
 		return
 	}
-	m.services[pid] = service.UID
+	m.services[pid] = dynamicService{uid: service.UID, language: service.SDKLanguage.String()}
 	for key, attachment := range m.dynamic {
 		if key.pid != pid {
 			continue
@@ -204,6 +213,27 @@ func (m *Manager) RuleResults(id string) ([]ProbeResult, <-chan struct{}) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return slices.Clone(m.rules["api/"+id].results), m.updated
+}
+
+func (m *Manager) listRules() []ruleSnapshot {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rules := make([]ruleSnapshot, 0, len(m.rules))
+	for _, key := range m.ruleIDsLocked() {
+		origin, id, _ := strings.Cut(key, "/")
+		if origin == "config" {
+			id = key
+		}
+		state := m.rules[key]
+		rules = append(rules, ruleSnapshot{
+			ID:         id,
+			Origin:     origin,
+			Editable:   origin == "api",
+			Definition: state.definition,
+			Results:    slices.Clone(state.results),
+		})
+	}
+	return rules
 }
 
 func (m *Manager) ruleIDsLocked() []string {
@@ -386,7 +416,10 @@ func (m *Manager) reconcileLocked() error {
 
 func (m *Manager) resultLocked(pid int, function, name string) ProbeResult {
 	service := m.services[pid]
-	return ProbeResult{PID: pid, Function: function, SpanName: name, ServiceName: service.Name, ServiceNamespace: service.Namespace}
+	return ProbeResult{
+		PID: pid, Function: function, SpanName: name,
+		ServiceName: service.uid.Name, ServiceNamespace: service.uid.Namespace, Language: service.language,
+	}
 }
 
 func (m *Manager) removeDynamicLocked(key dynamicKey) error {
@@ -464,7 +497,7 @@ func (m *Manager) reportInvocationsLocked(cookie uint64, pid int, function strin
 	}
 	service := m.targets[pid].service
 	if service == nil {
-		snapshot := svc.Attrs{UID: m.services[pid]}
+		snapshot := svc.Attrs{UID: m.services[pid].uid}
 		service = func() svc.Attrs { return snapshot }
 	}
 	m.metrics.DynamicProbeInvocations(cookie, &imetrics.DynamicProbeCounter{PID: pid, Function: function, Read: counter.Invocations, Service: service})

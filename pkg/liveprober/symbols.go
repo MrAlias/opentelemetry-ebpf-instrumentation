@@ -15,6 +15,7 @@ type ProcessSymbols struct {
 	PID              int      `json:"pid"`
 	ServiceName      string   `json:"service_name"`
 	ServiceNamespace string   `json:"service_namespace"`
+	Language         string   `json:"language,omitempty"`
 	Symbols          []string `json:"symbols"`
 	Error            string   `json:"error,omitempty"`
 }
@@ -32,7 +33,10 @@ func (m *Manager) symbolQueries(criteria services.GlobDefinitionCriteria) []symb
 	for _, pid := range m.matchingPIDsLocked(criteria) {
 		service := m.services[pid]
 		query := symbolQuery{
-			result:   ProcessSymbols{PID: pid, ServiceName: service.Name, ServiceNamespace: service.Namespace, Symbols: []string{}},
+			result: ProcessSymbols{
+				PID: pid, ServiceName: service.uid.Name, ServiceNamespace: service.uid.Namespace,
+				Language: service.language, Symbols: []string{},
+			},
 			resolver: m.symbols,
 		}
 		if bound, ok := m.targets[pid]; ok {

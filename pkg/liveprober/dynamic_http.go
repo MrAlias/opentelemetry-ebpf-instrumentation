@@ -41,6 +41,73 @@ func readRequest(w http.ResponseWriter, r *http.Request, value any) error {
 	return decodeRuleJSON(data, value)
 }
 
+func ruleResponse(rule ruleSnapshot) (map[string]any, error) {
+	data, err := yaml.Marshal(rule.Definition)
+	if err != nil {
+		return nil, err
+	}
+	var definition map[string]any
+	if err := yaml.Unmarshal(data, &definition); err != nil {
+		return nil, err
+	}
+	definition = compactMap(definition)
+	return map[string]any{
+		"id":       rule.ID,
+		"origin":   rule.Origin,
+		"editable": rule.Editable,
+		"service":  definition["service"],
+		"spans":    definition["spans"],
+		"probes":   rule.Results,
+	}, nil
+}
+
+func compactMap(input map[string]any) map[string]any {
+	result := make(map[string]any, len(input))
+	for key, value := range input {
+		value = compactValue(value)
+		if !emptyValue(value) {
+			result[key] = value
+		}
+	}
+	return result
+}
+
+func compactValue(value any) any {
+	switch value := value.(type) {
+	case map[string]any:
+		return compactMap(value)
+	case []any:
+		result := make([]any, len(value))
+		for i := range value {
+			result[i] = compactValue(value[i])
+		}
+		return result
+	default:
+		return value
+	}
+}
+
+func emptyValue(value any) bool {
+	switch value := value.(type) {
+	case nil:
+		return true
+	case string:
+		return value == ""
+	case bool:
+		return !value
+	case int:
+		return value == 0
+	case uint64:
+		return value == 0
+	case map[string]any:
+		return len(value) == 0
+	case []any:
+		return len(value) == 0
+	default:
+		return false
+	}
+}
+
 func (m *Manager) dynamicRoutes(mux *http.ServeMux) {
 	apply := func(w http.ResponseWriter, r *http.Request) {
 		var rule config.DynamicInstrumentationRule
@@ -98,6 +165,19 @@ func (m *Manager) dynamicRoutes(mux *http.ServeMux) {
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("GET /v1/dynamic-instrumentation/rules", func(w http.ResponseWriter, _ *http.Request) {
+		rules := m.listRules()
+		response := make([]map[string]any, 0, len(rules))
+		for _, rule := range rules {
+			value, err := ruleResponse(rule)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+			response = append(response, value)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"rules": response})
 	})
 	mux.HandleFunc("GET /v1/dynamic-instrumentation/probes", func(w http.ResponseWriter, r *http.Request) {
 		criteria, err := queryServiceCriteria(r)

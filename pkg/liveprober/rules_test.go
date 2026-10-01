@@ -21,6 +21,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.opentelemetry.io/obi/pkg/appolly/app"
+	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
 	"go.opentelemetry.io/obi/pkg/appolly/services"
 	"go.opentelemetry.io/obi/pkg/config"
 )
@@ -129,6 +130,40 @@ func TestDynamicHTTPReportsAttachmentAndRejectsBroadDelete(t *testing.T) {
 		}
 	}
 	require.Empty(t, m.ListFunctions(nil))
+}
+
+func TestDynamicHTTPListsRuleDefinitionsAndOwnership(t *testing.T) {
+	m, _ := dynamicManager(t)
+	m.SetService(123, svc.Attrs{UID: svc.UID{Name: "checkout", Namespace: "demo"}, SDKLanguage: svc.InstrumentableJava})
+	require.NoError(t, m.SetConfigRules([]config.DynamicInstrumentationRule{ruleFor(t, "main.two")}))
+	_, err := m.ApplyRule("checkout", ruleFor(t, "main.one"))
+	require.NoError(t, err)
+
+	request := httptest.NewRequest(http.MethodGet, "/v1/dynamic-instrumentation/rules", nil)
+	response := httptest.NewRecorder()
+	m.Handler().ServeHTTP(response, request)
+
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.JSONEq(t, `{
+		"rules": [
+			{
+				"id": "checkout",
+				"origin": "api",
+				"editable": true,
+				"service": [{"target_pids": [123]}],
+				"spans": [{"name": "custom", "on": {"function_span": "main.one"}}],
+				"probes": [{"pid": 123, "function": "main.one", "span_name": "custom", "service_name": "checkout", "service_namespace": "demo", "language": "java", "status": "attached"}]
+			},
+			{
+				"id": "config/0",
+				"origin": "config",
+				"editable": false,
+				"service": [{"target_pids": [123]}],
+				"spans": [{"name": "custom", "on": {"function_span": "main.two"}}],
+				"probes": [{"pid": 123, "function": "main.two", "span_name": "custom", "service_name": "checkout", "service_namespace": "demo", "language": "java", "status": "attached"}]
+			}
+		]
+	}`, response.Body.String())
 }
 
 func TestWatchConfigAtomicReplaceAndInvalidFile(t *testing.T) {

@@ -88,6 +88,11 @@ type target struct {
 	identity processIdentity
 }
 
+type dynamicService struct {
+	uid      svc.UID
+	language string
+}
+
 type attachment struct {
 	cookie uint64
 	state  ProbeState
@@ -99,7 +104,7 @@ type Manager struct {
 	symbols        SymbolResolver
 	rules          map[string]ruleState
 	matches        map[int]ProcessMatcher
-	services       map[int]svc.UID
+	services       map[int]dynamicService
 	dynamic        map[dynamicKey]*dynamicAttachment
 	suppressed     map[dynamicKey]bool
 	changed        chan struct{}
@@ -120,7 +125,7 @@ type Manager struct {
 func New() *Manager {
 	return &Manager{
 		metrics: imetrics.NoopReporter{},
-		rules:   map[string]ruleState{}, matches: map[int]ProcessMatcher{}, services: map[int]svc.UID{},
+		rules:   map[string]ruleState{}, matches: map[int]ProcessMatcher{}, services: map[int]dynamicService{},
 		dynamic: map[dynamicKey]*dynamicAttachment{}, suppressed: map[dynamicKey]bool{},
 		changed: make(chan struct{}, 1), updated: make(chan struct{}), maxProbes: 1024, requestTimeout: 10 * time.Second,
 

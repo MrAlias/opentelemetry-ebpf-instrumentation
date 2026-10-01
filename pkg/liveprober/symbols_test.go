@@ -51,7 +51,7 @@ func TestSymbolsHTTPBeforeAttachingProbes(t *testing.T) {
 			return false
 		})
 	}
-	m.SetService(123, svc.Attrs{UID: svc.UID{Name: "testserver", Namespace: "demo"}})
+	m.SetService(123, svc.Attrs{UID: svc.UID{Name: "testserver", Namespace: "demo"}, SDKLanguage: svc.InstrumentableGolang})
 	handler := m.Handler()
 	for _, test := range []struct {
 		service string
@@ -81,6 +81,7 @@ func TestSymbolsHTTPBeforeAttachingProbes(t *testing.T) {
 				if process.PID == 123 {
 					require.Equal(t, "testserver", process.ServiceName)
 					require.Equal(t, "demo", process.ServiceNamespace)
+					require.Equal(t, "go", process.Language)
 				}
 			}
 			require.Empty(t, m.rules)

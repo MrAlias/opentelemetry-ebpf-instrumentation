@@ -1,0 +1,139 @@
+Skip to main content
+Grafana
+
+Starred
+
+Dashboards
+
+Explore
+
+Drilldown
+
+Metrics
+
+Logs
+
+Traces
+
+Profiles
+
+Alerting
+
+Connections
+
+Administration
+
+Drilldown
+Profiles
+Search...
+ctrl+k
+Sign in
+All services
+Profile types
+Labels
+Flame graph
+Diff flame graph
+Favorites
+2026-10-05 20:33:44 to 2026-10-05 20:34:44
+Data source
+Pyroscope
+Service
+Profile type
+Filters
+Filter by label values...
+off_cpu (off_cpu) per trace span
+Time series
+Span heatmap
+Span Profile Heatmap
+1
+4
+6
+9
+11
+Top span exemplars
+Tempo data source
+Tempo
+Timestamp	Span ID	Span name	Value	Duration	Trace ID	Actions
+8:33:57 PM	
+b350d0be8c9393eb
+	–	1.00 Bil	–	–	
+Flame graph for obi-poc-waiting (off_cpu)
+Span
+=
+b350d0be8c9393eb
+Explain Flame Graph
+Top Table
+Flame Graph
+Call Tree
+Top Table
+Flame Graph
+Call Tree
+Single
+Split
+Symbol
+Self
+Total
+finish_task_switch.isra.0
+1.00 s
+1.00 s
+schedule
+0 ns
+1.00 s
+do_nanosleep
+0 ns
+1.00 s
+hrtimer_nanosleep
+0 ns
+1.00 s
+__x64_sys_nanosleep
+0 ns
+1.00 s
+x64_sys_call
+0 ns
+1.00 s
+do_syscall_64
+0 ns
+1.00 s
+entry_SYSCALL_64_after_hwframe
+0 ns
+1.00 s
+internal/runtime/syscall/linux.Syscall6
+0 ns
+1.00 s
+syscall.RawSyscall6
+0 ns
+1.00 s
+syscall.Syscall
+0 ns
+1.00 s
+syscall.Nanosleep
+0 ns
+1.00 s
+main.blockingSyscall
+0 ns
+1.00 s
+main.main.func2
+0 ns
+1.00 s
+net/http.HandlerFunc.ServeHTTP
+0 ns
+1.00 s
+net/http.(*ServeMux).ServeHTTP
+0 ns
+1.00 s
+net/http.serverHandler.ServeHTTP
+0 ns
+1.00 s
+net/http.(*conn).serve
+0 ns
+1.00 s
+net/http.(*Server).Serve.gowrap3
+0 ns
+1.00 s
+runtime.goexit
+0 ns
+1.00 s
+total
+0 ns
+1.00 s
+1.00 s | 1.00 Bil samples (Time)

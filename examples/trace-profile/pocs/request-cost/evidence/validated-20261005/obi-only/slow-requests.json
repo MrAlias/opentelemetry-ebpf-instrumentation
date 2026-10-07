@@ -1,0 +1,182 @@
+[
+  {
+    "trace_id": "5f4378323096fca9ea137efa9a767a56",
+    "server_span_id": "2a1b3626d3138c57",
+    "processing_span_id": "d372f2c4b745437d",
+    "duration_ms": 801,
+    "cohort": "slow",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%225f4378323096fca9ea137efa9a767a56%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232560542%22%2C%20%22to%22%3A%20%221791232595542%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232560542&to=1791232595542&showSpanHeatmap=true&var-spanSelector=d372f2c4b745437d",
+    "total_cpu_ns": 0
+  },
+  {
+    "trace_id": "6ece1bcd9b582df19de902419922dc96",
+    "server_span_id": "016aceb5918ef462",
+    "processing_span_id": "538c47083dd67c19",
+    "duration_ms": 801,
+    "cohort": "slow",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%226ece1bcd9b582df19de902419922dc96%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232560542%22%2C%20%22to%22%3A%20%221791232595542%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232560542&to=1791232595542&showSpanHeatmap=true&var-spanSelector=538c47083dd67c19",
+    "total_cpu_ns": 0
+  },
+  {
+    "trace_id": "9d013f15f092d9615ba639f1508af5a2",
+    "server_span_id": "d10a54283e8c3e0c",
+    "processing_span_id": "8e9e52856602a547",
+    "duration_ms": 800,
+    "cohort": "slow",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%229d013f15f092d9615ba639f1508af5a2%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232560542%22%2C%20%22to%22%3A%20%221791232595542%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232560542&to=1791232595542&showSpanHeatmap=true&var-spanSelector=8e9e52856602a547",
+    "total_cpu_ns": 0
+  },
+  {
+    "trace_id": "c558196737e84ad673ed11e92a552061",
+    "server_span_id": "7b4ea2fb49742828",
+    "processing_span_id": "ec331b5a18461687",
+    "duration_ms": 801,
+    "cohort": "slow",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%22c558196737e84ad673ed11e92a552061%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232560542%22%2C%20%22to%22%3A%20%221791232595542%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232560542&to=1791232595542&showSpanHeatmap=true&var-spanSelector=ec331b5a18461687",
+    "total_cpu_ns": 0
+  },
+  {
+    "trace_id": "7163578b98df7771fa001652c54ee0ca",
+    "server_span_id": "a5aae664ec00b700",
+    "processing_span_id": "582c72cb3c9bf72b",
+    "duration_ms": 801,
+    "cohort": "slow",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%227163578b98df7771fa001652c54ee0ca%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232560542%22%2C%20%22to%22%3A%20%221791232595542%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232560542&to=1791232595542&showSpanHeatmap=true&var-spanSelector=582c72cb3c9bf72b",
+    "total_cpu_ns": 0
+  },
+  {
+    "trace_id": "ade10e27d96c01672fcd84b03d8ec230",
+    "server_span_id": "94b1d8672148cc19",
+    "processing_span_id": "29e8822b8d18619a",
+    "duration_ms": 800,
+    "cohort": "slow",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%22ade10e27d96c01672fcd84b03d8ec230%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232560542%22%2C%20%22to%22%3A%20%221791232595542%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232560542&to=1791232595542&showSpanHeatmap=true&var-spanSelector=29e8822b8d18619a",
+    "total_cpu_ns": 0
+  },
+  {
+    "trace_id": "cb0b9e80bffa63763dbd02a05d0668de",
+    "server_span_id": "bc35839468f6e5e8",
+    "processing_span_id": "c4960bb0ace1f4d0",
+    "duration_ms": 801,
+    "cohort": "slow",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%22cb0b9e80bffa63763dbd02a05d0668de%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232560542%22%2C%20%22to%22%3A%20%221791232595542%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232560542&to=1791232595542&showSpanHeatmap=true&var-spanSelector=c4960bb0ace1f4d0",
+    "total_cpu_ns": 0
+  },
+  {
+    "trace_id": "28a56c24fefcaff50532b4d90ac317a1",
+    "server_span_id": "a2226bcaaa65d757",
+    "processing_span_id": "1b54d39c77f6490e",
+    "duration_ms": 800,
+    "cohort": "slow",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%2228a56c24fefcaff50532b4d90ac317a1%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232560542%22%2C%20%22to%22%3A%20%221791232595542%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232560542&to=1791232595542&showSpanHeatmap=true&var-spanSelector=1b54d39c77f6490e",
+    "total_cpu_ns": 0
+  },
+  {
+    "trace_id": "a815dbabb05304621c6b5a09ea8367e5",
+    "server_span_id": "30e69e7986c728ad",
+    "processing_span_id": "4410d7736c6d7e78",
+    "duration_ms": 800,
+    "cohort": "slow",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%22a815dbabb05304621c6b5a09ea8367e5%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232560542%22%2C%20%22to%22%3A%20%221791232595542%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232560542&to=1791232595542&showSpanHeatmap=true&var-spanSelector=4410d7736c6d7e78",
+    "total_cpu_ns": 0
+  },
+  {
+    "trace_id": "92acaf35b82ce0efda5a6b1f7be9be2d",
+    "server_span_id": "843d28ef148382af",
+    "processing_span_id": "d90def0149861bd9",
+    "duration_ms": 801,
+    "cohort": "slow",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%2292acaf35b82ce0efda5a6b1f7be9be2d%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232560542%22%2C%20%22to%22%3A%20%221791232595542%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232560542&to=1791232595542&showSpanHeatmap=true&var-spanSelector=d90def0149861bd9",
+    "total_cpu_ns": 0
+  },
+  {
+    "trace_id": "702292d24f7f6bb0369a6e61b5c812ea",
+    "server_span_id": "46f783e420139681",
+    "processing_span_id": "d0d104d816aa1385",
+    "duration_ms": 800,
+    "cohort": "slow",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%22702292d24f7f6bb0369a6e61b5c812ea%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232560542%22%2C%20%22to%22%3A%20%221791232595542%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232560542&to=1791232595542&showSpanHeatmap=true&var-spanSelector=d0d104d816aa1385",
+    "total_cpu_ns": 0
+  },
+  {
+    "trace_id": "c227c31297e2cf4c77e997371bef6b3e",
+    "server_span_id": "4a9bd0cdc9424329",
+    "processing_span_id": "4907424d9472c160",
+    "duration_ms": 800,
+    "cohort": "slow",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%22c227c31297e2cf4c77e997371bef6b3e%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232560542%22%2C%20%22to%22%3A%20%221791232595542%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232560542&to=1791232595542&showSpanHeatmap=true&var-spanSelector=4907424d9472c160",
+    "total_cpu_ns": 0
+  },
+  {
+    "trace_id": "fece817879abb3d3864ca37b43345038",
+    "server_span_id": "825a7e7844a5ebbc",
+    "processing_span_id": "e3f35ac4c68c7e36",
+    "duration_ms": 800,
+    "cohort": "slow",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%22fece817879abb3d3864ca37b43345038%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232560542%22%2C%20%22to%22%3A%20%221791232595542%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232560542&to=1791232595542&showSpanHeatmap=true&var-spanSelector=e3f35ac4c68c7e36",
+    "total_cpu_ns": 0
+  },
+  {
+    "trace_id": "266184ad17525daa33323f62df7e2eb0",
+    "server_span_id": "b6ff856b03bbf7d7",
+    "processing_span_id": "e0c093ebf9ce03ca",
+    "duration_ms": 800,
+    "cohort": "slow",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%22266184ad17525daa33323f62df7e2eb0%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232560542%22%2C%20%22to%22%3A%20%221791232595542%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232560542&to=1791232595542&showSpanHeatmap=true&var-spanSelector=e0c093ebf9ce03ca",
+    "total_cpu_ns": 0
+  },
+  {
+    "trace_id": "d4290661e4da1f78649cc685b963a795",
+    "server_span_id": "405e8249eed2c85f",
+    "processing_span_id": "0bf1a29ac8033bb9",
+    "duration_ms": 800,
+    "cohort": "slow",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%22d4290661e4da1f78649cc685b963a795%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232560542%22%2C%20%22to%22%3A%20%221791232595542%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232560542&to=1791232595542&showSpanHeatmap=true&var-spanSelector=0bf1a29ac8033bb9",
+    "total_cpu_ns": 0
+  },
+  {
+    "trace_id": "b6d69cd795dcbea3b7d3bff39937cf4d",
+    "server_span_id": "b7c72a407a3fdfa7",
+    "processing_span_id": "8bc00c45a6395463",
+    "duration_ms": 800,
+    "cohort": "slow",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%22b6d69cd795dcbea3b7d3bff39937cf4d%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232560542%22%2C%20%22to%22%3A%20%221791232595542%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232560542&to=1791232595542&showSpanHeatmap=true&var-spanSelector=8bc00c45a6395463",
+    "total_cpu_ns": 0
+  },
+  {
+    "trace_id": "61cc673f23f41373bd4eb000645b7677",
+    "server_span_id": "8da72da08eb12280",
+    "processing_span_id": "c216c68d59b1a56a",
+    "duration_ms": 800,
+    "cohort": "slow",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%2261cc673f23f41373bd4eb000645b7677%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232560542%22%2C%20%22to%22%3A%20%221791232595542%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232560542&to=1791232595542&showSpanHeatmap=true&var-spanSelector=c216c68d59b1a56a",
+    "total_cpu_ns": 0
+  },
+  {
+    "trace_id": "e67da0f9f0c928322688d979f242265d",
+    "server_span_id": "21a7524d0e934af3",
+    "processing_span_id": "3d57576be08e2cd1",
+    "duration_ms": 800,
+    "cohort": "slow",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%22e67da0f9f0c928322688d979f242265d%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232560542%22%2C%20%22to%22%3A%20%221791232595542%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232560542&to=1791232595542&showSpanHeatmap=true&var-spanSelector=3d57576be08e2cd1",
+    "total_cpu_ns": 0
+  }
+]

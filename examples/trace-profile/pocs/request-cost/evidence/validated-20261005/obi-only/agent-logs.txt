@@ -1,0 +1,10 @@
+obi-1  | time=2026-10-05T20:35:40.551Z level=INFO msg="OpenTelemetry eBPF Instrumentation" Version=ai-poc Revision=6d873d705d77e9764adab67502d65695df986e93 "OpenTelemetry SDK Version"=1.46.0
+obi-1  | time=2026-10-05T20:35:40.552Z level=INFO msg="configuration loaded" version=v1
+obi-1  | time=2026-10-05T20:35:40.554Z level=INFO msg="detected Cloud metadata" component=meta.NodeMeta.otelNodeFetcher detector=azurevm.ResourceDetector
+obi-1  | time=2026-10-05T20:35:40.557Z level=INFO msg="detected Cloud metadata" component=meta.NodeMeta.otelNodeFetcher detector=ec2.resourceDetector
+obi-1  | time=2026-10-05T20:35:40.557Z level=INFO msg="starting Application Observability mode"
+obi-1  | time=2026-10-05T20:35:40.557Z level=INFO msg="using hostname" component=traces.ReadDecorator function=instance_ID_hostNamePIDDecorator hostname=a9b6c9d800bb
+obi-1  | time=2026-10-05T20:35:40.581Z level=INFO msg="using hostname" component=traces.ReadDecorator function=instance_ID_hostNamePIDDecorator hostname=a9b6c9d800bb
+obi-1  | time=2026-10-05T20:35:40.581Z level=INFO msg="Starting main node" component=obi.Instrumenter
+obi-1  | time=2026-10-05T20:35:40.582Z level=INFO msg="attaching uprobes as uprobe_multi links"
+obi-1  | time=2026-10-05T20:35:41.869Z level=INFO msg="instrumenting process" component=discover.traceAttacher cmd=/obi-poc-cost pid=3966172 ino=19139942 type=go service=obi-poc-cost logenricher=false

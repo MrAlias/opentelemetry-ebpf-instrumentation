@@ -1,0 +1,30 @@
+[
+  {
+    "name": "shared-lock-profile",
+    "url": "http://localhost:3103/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-interference&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791234152688&to=1791234174708&showSpanHeatmap=true&var-spanSelector=daa29be958d43c10",
+    "expected_text": "obi-poc-interference",
+    "trace_id": "c8e82576135ba5050d49e0ebfb6a31de",
+    "span_id": "daa29be958d43c10"
+  },
+  {
+    "name": "shared-lock-trace",
+    "url": "http://localhost:3103/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%22c8e82576135ba5050d49e0ebfb6a31de%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%222026-10-05T21%3A02%3A32.688000%2B00%3A00%22%2C+%22to%22%3A+%222026-10-05T21%3A02%3A54.708000%2B00%3A00%22%7D%7D%7D",
+    "expected_text": "GET /report",
+    "trace_id": "c8e82576135ba5050d49e0ebfb6a31de",
+    "span_id": "daa29be958d43c10"
+  },
+  {
+    "name": "control-profile",
+    "url": "http://localhost:3103/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-interference&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791234312499&to=1791234334518&showSpanHeatmap=true&var-spanSelector=814221cf79436c71",
+    "expected_text": "obi-poc-interference",
+    "trace_id": "0fc4c8ed2c72cbd645a8e52b6f607451",
+    "span_id": "814221cf79436c71"
+  },
+  {
+    "name": "control-trace",
+    "url": "http://localhost:3103/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%220fc4c8ed2c72cbd645a8e52b6f607451%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%222026-10-05T21%3A05%3A12.499000%2B00%3A00%22%2C+%22to%22%3A+%222026-10-05T21%3A05%3A34.518000%2B00%3A00%22%7D%7D%7D",
+    "expected_text": "GET /report",
+    "trace_id": "0fc4c8ed2c72cbd645a8e52b6f607451",
+    "span_id": "814221cf79436c71"
+  }
+]

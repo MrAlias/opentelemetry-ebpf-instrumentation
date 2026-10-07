@@ -1,0 +1,410 @@
+{
+  "batches": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "cloud.account.id",
+            "value": {
+              "stringValue": "390403870171"
+            }
+          },
+          {
+            "key": "cloud.availability_zone",
+            "value": {
+              "stringValue": "us-west-2a"
+            }
+          },
+          {
+            "key": "cloud.platform",
+            "value": {
+              "stringValue": "aws_ec2"
+            }
+          },
+          {
+            "key": "cloud.provider",
+            "value": {
+              "stringValue": "aws"
+            }
+          },
+          {
+            "key": "cloud.region",
+            "value": {
+              "stringValue": "us-west-2"
+            }
+          },
+          {
+            "key": "host.id",
+            "value": {
+              "stringValue": "i-0e8fbe260a77aba22"
+            }
+          },
+          {
+            "key": "host.image.id",
+            "value": {
+              "stringValue": "ami-0794681e58321386f"
+            }
+          },
+          {
+            "key": "host.name",
+            "value": {
+              "stringValue": "9142bfc1bf48"
+            }
+          },
+          {
+            "key": "host.type",
+            "value": {
+              "stringValue": "c5a.4xlarge"
+            }
+          },
+          {
+            "key": "os.type",
+            "value": {
+              "stringValue": "linux"
+            }
+          },
+          {
+            "key": "otel.scope.name",
+            "value": {
+              "stringValue": "go.opentelemetry.io/obi"
+            }
+          },
+          {
+            "key": "service.instance.id",
+            "value": {
+              "stringValue": "9142bfc1bf48:3950181"
+            }
+          },
+          {
+            "key": "telemetry.distro.name",
+            "value": {
+              "stringValue": "opentelemetry-ebpf-instrumentation"
+            }
+          },
+          {
+            "key": "telemetry.distro.version",
+            "value": {
+              "stringValue": "ai-poc"
+            }
+          },
+          {
+            "key": "telemetry.sdk.language",
+            "value": {
+              "stringValue": "go"
+            }
+          },
+          {
+            "key": "telemetry.sdk.name",
+            "value": {
+              "stringValue": "opentelemetry"
+            }
+          },
+          {
+            "key": "telemetry.sdk.version",
+            "value": {
+              "stringValue": "v1.46.0"
+            }
+          },
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "obi-poc-waiting"
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {},
+          "spans": [
+            {
+              "traceId": "mfoth1j5WDkXA7E8ipX7Gg==",
+              "spanId": "LxlCgHL/T2w=",
+              "parentSpanId": "6nmO8L/ZL4Q=",
+              "name": "GET /delay",
+              "kind": "SPAN_KIND_CLIENT",
+              "startTimeUnixNano": "1791232470478401859",
+              "endTimeUnixNano": "1791232471480020976",
+              "attributes": [
+                {
+                  "key": "service.peer.name",
+                  "value": {
+                    "stringValue": "127.0.0.1:8080"
+                  }
+                },
+                {
+                  "key": "server.port",
+                  "value": {
+                    "intValue": "8080"
+                  }
+                },
+                {
+                  "key": "url.full",
+                  "value": {
+                    "stringValue": "http://127.0.0.1:8080/delay"
+                  }
+                },
+                {
+                  "key": "http.response.status_code",
+                  "value": {
+                    "intValue": "200"
+                  }
+                },
+                {
+                  "key": "url.scheme",
+                  "value": {
+                    "stringValue": "http"
+                  }
+                },
+                {
+                  "key": "http.request.body.size",
+                  "value": {
+                    "intValue": "0"
+                  }
+                },
+                {
+                  "key": "http.response.body.size",
+                  "value": {
+                    "intValue": "10"
+                  }
+                },
+                {
+                  "key": "network.peer.address",
+                  "value": {
+                    "stringValue": "127.0.0.1"
+                  }
+                },
+                {
+                  "key": "network.peer.port",
+                  "value": {
+                    "intValue": "8080"
+                  }
+                },
+                {
+                  "key": "http.request.method",
+                  "value": {
+                    "stringValue": "GET"
+                  }
+                },
+                {
+                  "key": "server.address",
+                  "value": {
+                    "stringValue": "127.0.0.1:8080"
+                  }
+                }
+              ],
+              "status": {}
+            },
+            {
+              "traceId": "mfoth1j5WDkXA7E8ipX7Gg==",
+              "spanId": "eGgzcMxYUDo=",
+              "parentSpanId": "N/pkDDyZ+As=",
+              "name": "in queue",
+              "kind": "SPAN_KIND_INTERNAL",
+              "startTimeUnixNano": "1791232470478693296",
+              "endTimeUnixNano": "1791232470478714196",
+              "status": {}
+            },
+            {
+              "traceId": "mfoth1j5WDkXA7E8ipX7Gg==",
+              "spanId": "IIraKJgZBIQ=",
+              "parentSpanId": "N/pkDDyZ+As=",
+              "name": "processing",
+              "kind": "SPAN_KIND_INTERNAL",
+              "startTimeUnixNano": "1791232470478714196",
+              "endTimeUnixNano": "1791232471480500956",
+              "status": {}
+            },
+            {
+              "traceId": "mfoth1j5WDkXA7E8ipX7Gg==",
+              "spanId": "N/pkDDyZ+As=",
+              "parentSpanId": "LxlCgHL/T2w=",
+              "name": "GET /delay",
+              "kind": "SPAN_KIND_SERVER",
+              "startTimeUnixNano": "1791232470478693296",
+              "endTimeUnixNano": "1791232471480500956",
+              "attributes": [
+                {
+                  "key": "client.address",
+                  "value": {
+                    "stringValue": "127.0.0.1"
+                  }
+                },
+                {
+                  "key": "server.port",
+                  "value": {
+                    "intValue": "8080"
+                  }
+                },
+                {
+                  "key": "http.request.body.size",
+                  "value": {
+                    "intValue": "0"
+                  }
+                },
+                {
+                  "key": "http.response.body.size",
+                  "value": {
+                    "intValue": "0"
+                  }
+                },
+                {
+                  "key": "http.response.status_code",
+                  "value": {
+                    "intValue": "200"
+                  }
+                },
+                {
+                  "key": "url.scheme",
+                  "value": {
+                    "stringValue": "http"
+                  }
+                },
+                {
+                  "key": "network.peer.address",
+                  "value": {
+                    "stringValue": "127.0.0.1"
+                  }
+                },
+                {
+                  "key": "network.peer.port",
+                  "value": {
+                    "intValue": "41186"
+                  }
+                },
+                {
+                  "key": "http.request.method",
+                  "value": {
+                    "stringValue": "GET"
+                  }
+                },
+                {
+                  "key": "url.path",
+                  "value": {
+                    "stringValue": "/delay"
+                  }
+                },
+                {
+                  "key": "server.address",
+                  "value": {
+                    "stringValue": "obi-poc-waiting"
+                  }
+                },
+                {
+                  "key": "http.route",
+                  "value": {
+                    "stringValue": "/delay"
+                  }
+                }
+              ],
+              "status": {}
+            },
+            {
+              "traceId": "mfoth1j5WDkXA7E8ipX7Gg==",
+              "spanId": "q9SEvB/HVBA=",
+              "parentSpanId": "PCsh2xcV4OA=",
+              "name": "in queue",
+              "kind": "SPAN_KIND_INTERNAL",
+              "startTimeUnixNano": "1791232470478329168",
+              "endTimeUnixNano": "1791232470478350958",
+              "status": {}
+            },
+            {
+              "traceId": "mfoth1j5WDkXA7E8ipX7Gg==",
+              "spanId": "6nmO8L/ZL4Q=",
+              "parentSpanId": "PCsh2xcV4OA=",
+              "name": "processing",
+              "kind": "SPAN_KIND_INTERNAL",
+              "startTimeUnixNano": "1791232470478350958",
+              "endTimeUnixNano": "1791232471480616759",
+              "status": {}
+            },
+            {
+              "traceId": "mfoth1j5WDkXA7E8ipX7Gg==",
+              "spanId": "PCsh2xcV4OA=",
+              "name": "GET /downstream",
+              "kind": "SPAN_KIND_SERVER",
+              "startTimeUnixNano": "1791232470478329168",
+              "endTimeUnixNano": "1791232471480616759",
+              "attributes": [
+                {
+                  "key": "client.address",
+                  "value": {
+                    "stringValue": "172.22.0.1"
+                  }
+                },
+                {
+                  "key": "server.port",
+                  "value": {
+                    "intValue": "8080"
+                  }
+                },
+                {
+                  "key": "http.request.body.size",
+                  "value": {
+                    "intValue": "0"
+                  }
+                },
+                {
+                  "key": "http.response.body.size",
+                  "value": {
+                    "intValue": "0"
+                  }
+                },
+                {
+                  "key": "http.response.status_code",
+                  "value": {
+                    "intValue": "200"
+                  }
+                },
+                {
+                  "key": "url.scheme",
+                  "value": {
+                    "stringValue": "http"
+                  }
+                },
+                {
+                  "key": "network.peer.address",
+                  "value": {
+                    "stringValue": "172.22.0.1"
+                  }
+                },
+                {
+                  "key": "network.peer.port",
+                  "value": {
+                    "intValue": "43472"
+                  }
+                },
+                {
+                  "key": "http.request.method",
+                  "value": {
+                    "stringValue": "GET"
+                  }
+                },
+                {
+                  "key": "url.path",
+                  "value": {
+                    "stringValue": "/downstream"
+                  }
+                },
+                {
+                  "key": "server.address",
+                  "value": {
+                    "stringValue": "obi-poc-waiting"
+                  }
+                },
+                {
+                  "key": "http.route",
+                  "value": {
+                    "stringValue": "/downstream"
+                  }
+                }
+              ],
+              "status": {}
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "excluded_from_diagnostic_evidence": true,
+  "work_waits": 10,
+  "waits_during_report_holding_same_resource": 10,
+  "independent_waits": 0,
+  "median_wait_ms": 1900.1455307006836,
+  "note": "Application ground truth only. No application request sequence was associated with an OTel span by timing."
+}

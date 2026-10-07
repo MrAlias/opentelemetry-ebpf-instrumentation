@@ -1,0 +1,360 @@
+{
+  "mode": "profiler",
+  "interval": {
+    "start_ms": 1791233949335,
+    "end_ms": 1791233971352,
+    "start": "2026-10-05T20:59:09.335000+00:00",
+    "end": "2026-10-05T20:59:31.352000+00:00"
+  },
+  "aggregate": {
+    "state": "samples",
+    "total_ns": 20835050838,
+    "self_sum_ns": 20835050838,
+    "functions": [
+      {
+        "name": "main.prepareReport",
+        "self_ns": 19711339536,
+        "cumulative_ns": 19762885926
+      },
+      {
+        "name": "main.finishWork",
+        "self_ns": 1010309244,
+        "cumulative_ns": 1010309244
+      },
+      {
+        "name": "time.now",
+        "self_ns": 41237112,
+        "cumulative_ns": 41237112
+      },
+      {
+        "name": "finish_task_switch.isra.0",
+        "self_ns": 41237112,
+        "cumulative_ns": 41237112
+      },
+      {
+        "name": "_raw_spin_unlock_irqrestore",
+        "self_ns": 20618556,
+        "cumulative_ns": 20618556
+      },
+      {
+        "name": "trace_syscall_exit",
+        "self_ns": 10309278,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "total",
+        "self_ns": 0,
+        "cumulative_ns": 20835050838
+      },
+      {
+        "name": "runtime.goexit",
+        "self_ns": 0,
+        "cumulative_ns": 20773195170
+      },
+      {
+        "name": "runtime.mcall",
+        "self_ns": 0,
+        "cumulative_ns": 20618556
+      },
+      {
+        "name": "runtime.mstart",
+        "self_ns": 0,
+        "cumulative_ns": 41237112
+      },
+      {
+        "name": "net/http.(*Server).Serve.gowrap3",
+        "self_ns": 0,
+        "cumulative_ns": 20773195170
+      },
+      {
+        "name": "runtime.asyncPreempt2.func1",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "runtime.goexit0",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "runtime.mstart0",
+        "self_ns": 0,
+        "cumulative_ns": 41237112
+      },
+      {
+        "name": "net/http.(*conn).serve",
+        "self_ns": 0,
+        "cumulative_ns": 20773195170
+      },
+      {
+        "name": "runtime.goschedImpl",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "runtime.schedule",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "runtime.mstart1",
+        "self_ns": 0,
+        "cumulative_ns": 41237112
+      },
+      {
+        "name": "net/http.serverHandler.ServeHTTP",
+        "self_ns": 0,
+        "cumulative_ns": 20773195170
+      },
+      {
+        "name": "runtime.wakep",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "runtime.findRunnable",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "runtime.sysmon",
+        "self_ns": 0,
+        "cumulative_ns": 82474224
+      },
+      {
+        "name": "net/http.(*ServeMux).ServeHTTP",
+        "self_ns": 0,
+        "cumulative_ns": 20773195170
+      },
+      {
+        "name": "runtime.startm",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "runtime.stopm",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "net/http.HandlerFunc.ServeHTTP",
+        "self_ns": 0,
+        "cumulative_ns": 20773195170
+      },
+      {
+        "name": "runtime.notewakeup",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "runtime.notesleep",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "runtime.usleep",
+        "self_ns": 0,
+        "cumulative_ns": 41237112
+      },
+      {
+        "name": "main.(*application).report-fm",
+        "self_ns": 0,
+        "cumulative_ns": 19762885926
+      },
+      {
+        "name": "main.(*application).work-fm",
+        "self_ns": 0,
+        "cumulative_ns": 1010309244
+      },
+      {
+        "name": "runtime.futexwakeup",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "runtime.futexsleep",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "entry_SYSCALL_64_after_hwframe",
+        "self_ns": 0,
+        "cumulative_ns": 61855668
+      },
+      {
+        "name": "main.(*application).report",
+        "self_ns": 0,
+        "cumulative_ns": 19762885926
+      },
+      {
+        "name": "main.(*application).work",
+        "self_ns": 0,
+        "cumulative_ns": 1010309244
+      },
+      {
+        "name": "runtime.futex",
+        "self_ns": 0,
+        "cumulative_ns": 20618556
+      },
+      {
+        "name": "do_syscall_64",
+        "self_ns": 0,
+        "cumulative_ns": 61855668
+      },
+      {
+        "name": "x64_sys_call",
+        "self_ns": 0,
+        "cumulative_ns": 51546390
+      },
+      {
+        "name": "asm_sysvec_apic_timer_interrupt",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "time.Now",
+        "self_ns": 0,
+        "cumulative_ns": 41237112
+      },
+      {
+        "name": "__x64_sys_nanosleep",
+        "self_ns": 0,
+        "cumulative_ns": 41237112
+      },
+      {
+        "name": "sysvec_apic_timer_interrupt",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "time.runtimeNow",
+        "self_ns": 0,
+        "cumulative_ns": 41237112
+      },
+      {
+        "name": "hrtimer_nanosleep",
+        "self_ns": 0,
+        "cumulative_ns": 41237112
+      },
+      {
+        "name": "irq_exit_rcu",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "__x64_sys_futex",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "do_nanosleep",
+        "self_ns": 0,
+        "cumulative_ns": 41237112
+      },
+      {
+        "name": "__irq_exit_rcu",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "do_futex",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "schedule",
+        "self_ns": 0,
+        "cumulative_ns": 41237112
+      },
+      {
+        "name": "handle_softirqs",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "futex_wake",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "__schedule",
+        "self_ns": 0,
+        "cumulative_ns": 41237112
+      },
+      {
+        "name": "run_timer_softirq",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "wake_up_q",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "tmigr_handle_remote",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "try_to_wake_up",
+        "self_ns": 0,
+        "cumulative_ns": 20618556
+      },
+      {
+        "name": "tmigr_handle_remote_up",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "tmigr_handle_remote_cpu",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "timer_expire_remote",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "__run_timers",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "call_timer_fn",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "process_timeout",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "wake_up_process",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      }
+    ],
+    "unit": "nanoseconds",
+    "note": "Cumulative values overlap; do not sum them. Sampled CPU is not elapsed time."
+  },
+  "trace_search": {
+    "traces": [],
+    "metrics": {
+      "completedJobs": 1,
+      "totalJobs": 1
+    }
+  },
+  "exemplars": [],
+  "available_unique_exemplars": 0,
+  "fetched_traces": [],
+  "returned_exemplars": 0,
+  "truncated": false,
+  "invalid_ids": 0,
+  "trace_search_limit": 200,
+  "profile_url": "http://localhost:3103/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-interference&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791233949335&to=1791233971352&showSpanHeatmap=true",
+  "causal_state": "unresolved_missing_resource_and_owner_events",
+  "note": "Exact CPU/span identity does not establish mutex ownership, waiting, or interference. Exemplars are a bounded selection."
+}

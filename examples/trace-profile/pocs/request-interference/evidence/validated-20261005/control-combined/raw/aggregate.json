@@ -1,0 +1,115 @@
+{
+  "flamegraph": {
+    "names": [
+      "total",
+      "runtime.goexit",
+      "net/http.(*Server).Serve.gowrap3",
+      "net/http.(*conn).serve",
+      "net/http.serverHandler.ServeHTTP",
+      "net/http.(*ServeMux).ServeHTTP",
+      "net/http.HandlerFunc.ServeHTTP",
+      "main.(*application).work-fm",
+      "main.(*application).work",
+      "main.finishWork",
+      "main.(*application).report-fm",
+      "main.(*application).report",
+      "main.prepareReport"
+    ],
+    "levels": [
+      {
+        "values": [
+          "0",
+          "3608247300",
+          "0",
+          "0"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "3608247300",
+          "0",
+          "1"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "3608247300",
+          "0",
+          "2"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "3608247300",
+          "0",
+          "3"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "3608247300",
+          "0",
+          "4"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "3608247300",
+          "0",
+          "5"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "3608247300",
+          "0",
+          "6"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "3412371018",
+          "0",
+          "10",
+          "0",
+          "195876282",
+          "0",
+          "7"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "3412371018",
+          "0",
+          "11",
+          "0",
+          "195876282",
+          "0",
+          "8"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "3412371018",
+          "3412371018",
+          "12",
+          "0",
+          "195876282",
+          "195876282",
+          "9"
+        ]
+      }
+    ],
+    "total": "3608247300",
+    "maxSelf": "3412371018"
+  }
+}

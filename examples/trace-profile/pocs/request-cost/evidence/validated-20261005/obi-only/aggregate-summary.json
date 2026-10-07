@@ -1,0 +1,11 @@
+{
+  "unit": "nanoseconds",
+  "total_ns": 0,
+  "functions": [
+    {
+      "name": "total",
+      "self_ns": 0,
+      "cumulative_ns": 0
+    }
+  ]
+}

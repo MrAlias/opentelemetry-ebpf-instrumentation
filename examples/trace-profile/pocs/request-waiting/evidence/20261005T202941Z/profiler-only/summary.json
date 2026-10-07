@@ -1,0 +1,2117 @@
+{
+  "start_ms": 1791232330984,
+  "end_ms": 1791232390984,
+  "profile_types": [
+    "block:contentions:count:contentions:count",
+    "block:delay:nanoseconds:contentions:count",
+    "goroutines:goroutine:count:goroutine:count",
+    "memory:alloc_objects:count:space:bytes",
+    "memory:alloc_space:bytes:space:bytes",
+    "memory:inuse_objects:count:space:bytes",
+    "memory:inuse_space:bytes:space:bytes",
+    "mutex:contentions:count:contentions:count",
+    "mutex:delay:nanoseconds:contentions:count",
+    "off_cpu:off_cpu:nanoseconds::",
+    "process_cpu:cpu:nanoseconds:cpu:nanoseconds",
+    "process_cpu:samples:count:cpu:nanoseconds"
+  ],
+  "profiles": [
+    {
+      "profile_type": "off_cpu:off_cpu:nanoseconds::",
+      "aggregate": {
+        "unit": "nanoseconds",
+        "total_ns": 143372745984,
+        "self_sum_ns": 143372745984,
+        "functions": [
+          {
+            "function": "finish_task_switch.isra.0",
+            "self_ns": 143372745984,
+            "cumulative_ns": 143372745984
+          },
+          {
+            "function": "total",
+            "self_ns": 0,
+            "cumulative_ns": 143372745984
+          },
+          {
+            "function": "schedule",
+            "self_ns": 0,
+            "cumulative_ns": 143372437218
+          },
+          {
+            "function": "do_syscall_64",
+            "self_ns": 0,
+            "cumulative_ns": 143372079691
+          },
+          {
+            "function": "entry_SYSCALL_64_after_hwframe",
+            "self_ns": 0,
+            "cumulative_ns": 143372079691
+          },
+          {
+            "function": "x64_sys_call",
+            "self_ns": 0,
+            "cumulative_ns": 143360342732
+          },
+          {
+            "function": "runtime.futex",
+            "self_ns": 0,
+            "cumulative_ns": 83719716964
+          },
+          {
+            "function": "runtime.futexsleep",
+            "self_ns": 0,
+            "cumulative_ns": 83713315968
+          },
+          {
+            "function": "__futex_wait",
+            "self_ns": 0,
+            "cumulative_ns": 83712982550
+          },
+          {
+            "function": "__x64_sys_futex",
+            "self_ns": 0,
+            "cumulative_ns": 83712982550
+          },
+          {
+            "function": "do_futex",
+            "self_ns": 0,
+            "cumulative_ns": 83712982550
+          },
+          {
+            "function": "futex_do_wait",
+            "self_ns": 0,
+            "cumulative_ns": 83712982550
+          },
+          {
+            "function": "futex_wait",
+            "self_ns": 0,
+            "cumulative_ns": 83712982550
+          },
+          {
+            "function": "runtime.schedule",
+            "self_ns": 0,
+            "cumulative_ns": 81162829599
+          },
+          {
+            "function": "runtime.findRunnable",
+            "self_ns": 0,
+            "cumulative_ns": 81160550443
+          },
+          {
+            "function": "runtime.mcall",
+            "self_ns": 0,
+            "cumulative_ns": 81152350087
+          },
+          {
+            "function": "runtime.park_m",
+            "self_ns": 0,
+            "cumulative_ns": 75089906899
+          },
+          {
+            "function": "runtime.notesleep",
+            "self_ns": 0,
+            "cumulative_ns": 62105024588
+          },
+          {
+            "function": "runtime.stopm",
+            "self_ns": 0,
+            "cumulative_ns": 62105024588
+          },
+          {
+            "function": "internal/runtime/syscall/linux.Syscall6",
+            "self_ns": 0,
+            "cumulative_ns": 59016208759
+          },
+          {
+            "function": "__x64_sys_nanosleep",
+            "self_ns": 0,
+            "cumulative_ns": 40639132377
+          },
+          {
+            "function": "do_nanosleep",
+            "self_ns": 0,
+            "cumulative_ns": 40639132377
+          },
+          {
+            "function": "hrtimer_nanosleep",
+            "self_ns": 0,
+            "cumulative_ns": 40639132377
+          },
+          {
+            "function": "runtime.goexit",
+            "self_ns": 0,
+            "cumulative_ns": 40014760370
+          },
+          {
+            "function": "net/http.(*Server).Serve.gowrap3",
+            "self_ns": 0,
+            "cumulative_ns": 40012899531
+          },
+          {
+            "function": "net/http.(*conn).serve",
+            "self_ns": 0,
+            "cumulative_ns": 40012899531
+          },
+          {
+            "function": "syscall.Syscall",
+            "self_ns": 0,
+            "cumulative_ns": 40010156223
+          },
+          {
+            "function": "syscall.RawSyscall6",
+            "self_ns": 0,
+            "cumulative_ns": 40009944738
+          },
+          {
+            "function": "net/http.(*ServeMux).ServeHTTP",
+            "self_ns": 0,
+            "cumulative_ns": 40005673108
+          },
+          {
+            "function": "net/http.HandlerFunc.ServeHTTP",
+            "self_ns": 0,
+            "cumulative_ns": 40005673108
+          },
+          {
+            "function": "net/http.serverHandler.ServeHTTP",
+            "self_ns": 0,
+            "cumulative_ns": 40005673108
+          },
+          {
+            "function": "main.blockingSyscall",
+            "self_ns": 0,
+            "cumulative_ns": 40005370461
+          },
+          {
+            "function": "main.main.func2",
+            "self_ns": 0,
+            "cumulative_ns": 40005370461
+          },
+          {
+            "function": "syscall.Nanosleep",
+            "self_ns": 0,
+            "cumulative_ns": 40005370461
+          },
+          {
+            "function": "runtime.sysmon",
+            "self_ns": 0,
+            "cumulative_ns": 22779742925
+          },
+          {
+            "function": "runtime.mstart",
+            "self_ns": 0,
+            "cumulative_ns": 22194620604
+          },
+          {
+            "function": "runtime.mstart0",
+            "self_ns": 0,
+            "cumulative_ns": 22194620604
+          },
+          {
+            "function": "runtime.mstart1",
+            "self_ns": 0,
+            "cumulative_ns": 22194620604
+          },
+          {
+            "function": "runtime.notetsleep",
+            "self_ns": 0,
+            "cumulative_ns": 21607741632
+          },
+          {
+            "function": "runtime.notetsleep_internal",
+            "self_ns": 0,
+            "cumulative_ns": 21607741632
+          },
+          {
+            "function": "internal/runtime/syscall/linux.EpollWait",
+            "self_ns": 0,
+            "cumulative_ns": 19006014165
+          },
+          {
+            "function": "runtime.netpoll",
+            "self_ns": 0,
+            "cumulative_ns": 19006014165
+          },
+          {
+            "function": "__x64_sys_epoll_pwait",
+            "self_ns": 0,
+            "cumulative_ns": 19005860463
+          },
+          {
+            "function": "do_epoll_pwait.part.0",
+            "self_ns": 0,
+            "cumulative_ns": 19005860463
+          },
+          {
+            "function": "do_epoll_wait",
+            "self_ns": 0,
+            "cumulative_ns": 19005860463
+          },
+          {
+            "function": "ep_poll",
+            "self_ns": 0,
+            "cumulative_ns": 19005860463
+          },
+          {
+            "function": "schedule_hrtimeout_range",
+            "self_ns": 0,
+            "cumulative_ns": 19005860463
+          },
+          {
+            "function": "schedule_hrtimeout_range_clock",
+            "self_ns": 0,
+            "cumulative_ns": 19005860463
+          },
+          {
+            "function": "runtime.goexit0",
+            "self_ns": 0,
+            "cumulative_ns": 6062390567
+          },
+          {
+            "function": "runtime.usleep",
+            "self_ns": 0,
+            "cumulative_ns": 633879668
+          },
+          {
+            "function": "runtime.runqgrab",
+            "self_ns": 0,
+            "cumulative_ns": 97496094
+          },
+          {
+            "function": "runtime.stealWork",
+            "self_ns": 0,
+            "cumulative_ns": 48778388
+          },
+          {
+            "function": "runtime.runqsteal",
+            "self_ns": 0,
+            "cumulative_ns": 48748047
+          },
+          {
+            "function": "exit_to_user_mode_loop",
+            "self_ns": 0,
+            "cumulative_ns": 11736959
+          },
+          {
+            "function": "runtime.newstack",
+            "self_ns": 0,
+            "cumulative_ns": 11014923
+          },
+          {
+            "function": "runtime.morestack",
+            "self_ns": 0,
+            "cumulative_ns": 10975602
+          },
+          {
+            "function": "runtime.goschedImpl",
+            "self_ns": 0,
+            "cumulative_ns": 10896601
+          },
+          {
+            "function": "runtime.futexwakeup",
+            "self_ns": 0,
+            "cumulative_ns": 6400996
+          },
+          {
+            "function": "runtime.notewakeup",
+            "self_ns": 0,
+            "cumulative_ns": 6400996
+          },
+          {
+            "function": "runtime.newproc",
+            "self_ns": 0,
+            "cumulative_ns": 5872292
+          },
+          {
+            "function": "runtime.startm",
+            "self_ns": 0,
+            "cumulative_ns": 5679461
+          },
+          {
+            "function": "runtime.wakep",
+            "self_ns": 0,
+            "cumulative_ns": 5653590
+          },
+          {
+            "function": "net/http.(*response).finishRequest",
+            "self_ns": 0,
+            "cumulative_ns": 4271161
+          },
+          {
+            "function": "runtime.systemstack",
+            "self_ns": 0,
+            "cumulative_ns": 4087937
+          },
+          {
+            "function": "bufio.(*Writer).Flush",
+            "self_ns": 0,
+            "cumulative_ns": 3051354
+          },
+          {
+            "function": "internal/poll.(*FD).Write",
+            "self_ns": 0,
+            "cumulative_ns": 3051354
+          },
+          {
+            "function": "net.(*conn).Write",
+            "self_ns": 0,
+            "cumulative_ns": 3051354
+          },
+          {
+            "function": "net.(*netFD).Write",
+            "self_ns": 0,
+            "cumulative_ns": 3051354
+          },
+          {
+            "function": "syscall.write",
+            "self_ns": 0,
+            "cumulative_ns": 3051354
+          },
+          {
+            "function": "net/http.checkConnErrorWriter.Write",
+            "self_ns": 0,
+            "cumulative_ns": 2969433
+          },
+          {
+            "function": "runtime.lock2",
+            "self_ns": 0,
+            "cumulative_ns": 2632684
+          },
+          {
+            "function": "runtime.resetspinning",
+            "self_ns": 0,
+            "cumulative_ns": 2205345
+          },
+          {
+            "function": "runtime.osyield",
+            "self_ns": 0,
+            "cumulative_ns": 2082936
+          },
+          {
+            "function": "__x64_sys_sched_yield",
+            "self_ns": 0,
+            "cumulative_ns": 2058576
+          },
+          {
+            "function": "do_sched_yield",
+            "self_ns": 0,
+            "cumulative_ns": 2058576
+          },
+          {
+            "function": "runtime.newproc.func1",
+            "self_ns": 0,
+            "cumulative_ns": 1598804
+          },
+          {
+            "function": "_.goready.func1",
+            "self_ns": 0,
+            "cumulative_ns": 1475673
+          },
+          {
+            "function": "runtime.ready",
+            "self_ns": 0,
+            "cumulative_ns": 1475673
+          },
+          {
+            "function": "internal/poll.(*FD).Close",
+            "self_ns": 0,
+            "cumulative_ns": 1416339
+          },
+          {
+            "function": "internal/poll.(*FD).decref",
+            "self_ns": 0,
+            "cumulative_ns": 1416339
+          },
+          {
+            "function": "internal/poll.(*FD).destroy",
+            "self_ns": 0,
+            "cumulative_ns": 1416339
+          },
+          {
+            "function": "net.(*conn).Close",
+            "self_ns": 0,
+            "cumulative_ns": 1416339
+          },
+          {
+            "function": "net.(*netFD).Close",
+            "self_ns": 0,
+            "cumulative_ns": 1416339
+          },
+          {
+            "function": "net/http.(*conn).close",
+            "self_ns": 0,
+            "cumulative_ns": 1416339
+          },
+          {
+            "function": "net/http.(*conn).serve.func1",
+            "self_ns": 0,
+            "cumulative_ns": 1416339
+          },
+          {
+            "function": "runtime.deferreturn",
+            "self_ns": 0,
+            "cumulative_ns": 1416339
+          },
+          {
+            "function": "internal/poll.setDeadlineImpl",
+            "self_ns": 0,
+            "cumulative_ns": 1323388
+          },
+          {
+            "function": "net.(*conn).SetReadDeadline",
+            "self_ns": 0,
+            "cumulative_ns": 1323388
+          },
+          {
+            "function": "internal/poll.runtime_pollSetDeadline",
+            "self_ns": 0,
+            "cumulative_ns": 1301728
+          },
+          {
+            "function": "net/http.(*connReader).abortPendingRead",
+            "self_ns": 0,
+            "cumulative_ns": 1301728
+          },
+          {
+            "function": "runtime.netpollgoready",
+            "self_ns": 0,
+            "cumulative_ns": 1301728
+          },
+          {
+            "function": "main.main",
+            "self_ns": 0,
+            "cumulative_ns": 1237086
+          },
+          {
+            "function": "net/http.(*Server).ListenAndServe",
+            "self_ns": 0,
+            "cumulative_ns": 1237086
+          },
+          {
+            "function": "net/http.(*Server).Serve",
+            "self_ns": 0,
+            "cumulative_ns": 1237086
+          },
+          {
+            "function": "runtime.main",
+            "self_ns": 0,
+            "cumulative_ns": 1237086
+          },
+          {
+            "function": "syscall.Close",
+            "self_ns": 0,
+            "cumulative_ns": 1216935
+          },
+          {
+            "function": "net/http.(*connReader).startBackgroundRead",
+            "self_ns": 0,
+            "cumulative_ns": 999591
+          },
+          {
+            "function": "irqentry_exit",
+            "self_ns": 0,
+            "cumulative_ns": 655633
+          },
+          {
+            "function": "runtime.exitsyscall",
+            "self_ns": 0,
+            "cumulative_ns": 652084
+          },
+          {
+            "function": "runtime.exitsyscall.func3",
+            "self_ns": 0,
+            "cumulative_ns": 652084
+          },
+          {
+            "function": "runtime.exitsyscallTryGetP",
+            "self_ns": 0,
+            "cumulative_ns": 652084
+          },
+          {
+            "function": "asm_sysvec_apic_timer_interrupt",
+            "self_ns": 0,
+            "cumulative_ns": 578911
+          },
+          {
+            "function": "sysvec_apic_timer_interrupt",
+            "self_ns": 0,
+            "cumulative_ns": 578911
+          },
+          {
+            "function": "runtime.gcstopm",
+            "self_ns": 0,
+            "cumulative_ns": 564239
+          },
+          {
+            "function": "runtime.semasleep",
+            "self_ns": 0,
+            "cumulative_ns": 549748
+          },
+          {
+            "function": "net.(*TCPListener).Accept",
+            "self_ns": 0,
+            "cumulative_ns": 540090
+          },
+          {
+            "function": "net.(*TCPListener).accept",
+            "self_ns": 0,
+            "cumulative_ns": 540090
+          },
+          {
+            "function": "net.(*netFD).accept",
+            "self_ns": 0,
+            "cumulative_ns": 540090
+          },
+          {
+            "function": "net/http.(*conn).readRequest",
+            "self_ns": 0,
+            "cumulative_ns": 539332
+          },
+          {
+            "function": "net/http.readRequestLimit",
+            "self_ns": 0,
+            "cumulative_ns": 517672
+          },
+          {
+            "function": "internal/poll.(*FD).Read",
+            "self_ns": 0,
+            "cumulative_ns": 517473
+          },
+          {
+            "function": "net.(*conn).Read",
+            "self_ns": 0,
+            "cumulative_ns": 517473
+          },
+          {
+            "function": "net.(*netFD).Read",
+            "self_ns": 0,
+            "cumulative_ns": 517473
+          },
+          {
+            "function": "syscall.read",
+            "self_ns": 0,
+            "cumulative_ns": 517473
+          },
+          {
+            "function": "internal/poll.(*FD).Accept",
+            "self_ns": 0,
+            "cumulative_ns": 516970
+          },
+          {
+            "function": "internal/poll.accept",
+            "self_ns": 0,
+            "cumulative_ns": 516970
+          },
+          {
+            "function": "syscall.Accept4",
+            "self_ns": 0,
+            "cumulative_ns": 516970
+          },
+          {
+            "function": "syscall.Syscall6",
+            "self_ns": 0,
+            "cumulative_ns": 516970
+          },
+          {
+            "function": "syscall.accept4",
+            "self_ns": 0,
+            "cumulative_ns": 516970
+          },
+          {
+            "function": "bufio.(*Reader).ReadLine",
+            "self_ns": 0,
+            "cumulative_ns": 471842
+          },
+          {
+            "function": "bufio.(*Reader).ReadSlice",
+            "self_ns": 0,
+            "cumulative_ns": 471842
+          },
+          {
+            "function": "bufio.(*Reader).fill",
+            "self_ns": 0,
+            "cumulative_ns": 471842
+          },
+          {
+            "function": "net/http.(*connReader).Read",
+            "self_ns": 0,
+            "cumulative_ns": 471842
+          },
+          {
+            "function": "net/textproto.(*Reader).readLineSlice",
+            "self_ns": 0,
+            "cumulative_ns": 471842
+          },
+          {
+            "function": "runtime.retake",
+            "self_ns": 0,
+            "cumulative_ns": 451181
+          },
+          {
+            "function": "runtime.runSafePointFn",
+            "self_ns": 0,
+            "cumulative_ns": 436617
+          },
+          {
+            "function": "runtime.incidlelocked",
+            "self_ns": 0,
+            "cumulative_ns": 401629
+          },
+          {
+            "function": "__x64_sys_write",
+            "self_ns": 0,
+            "cumulative_ns": 308766
+          },
+          {
+            "function": "inet6_sendmsg",
+            "self_ns": 0,
+            "cumulative_ns": 308766
+          },
+          {
+            "function": "ksys_write",
+            "self_ns": 0,
+            "cumulative_ns": 308766
+          },
+          {
+            "function": "mem_cgroup_sk_charge",
+            "self_ns": 0,
+            "cumulative_ns": 308766
+          },
+          {
+            "function": "mod_memcg_state",
+            "self_ns": 0,
+            "cumulative_ns": 308766
+          },
+          {
+            "function": "preempt_schedule",
+            "self_ns": 0,
+            "cumulative_ns": 308766
+          },
+          {
+            "function": "preempt_schedule_thunk",
+            "self_ns": 0,
+            "cumulative_ns": 308766
+          },
+          {
+            "function": "sk_forced_mem_schedule",
+            "self_ns": 0,
+            "cumulative_ns": 308766
+          },
+          {
+            "function": "sock_write_iter",
+            "self_ns": 0,
+            "cumulative_ns": 308766
+          },
+          {
+            "function": "tcp_sendmsg",
+            "self_ns": 0,
+            "cumulative_ns": 308766
+          },
+          {
+            "function": "tcp_sendmsg_locked",
+            "self_ns": 0,
+            "cumulative_ns": 308766
+          },
+          {
+            "function": "tcp_stream_alloc_skb",
+            "self_ns": 0,
+            "cumulative_ns": 308766
+          },
+          {
+            "function": "vfs_write",
+            "self_ns": 0,
+            "cumulative_ns": 308766
+          },
+          {
+            "function": "main.main.func5",
+            "self_ns": 0,
+            "cumulative_ns": 302647
+          },
+          {
+            "function": "net/http.(*Client).do",
+            "self_ns": 0,
+            "cumulative_ns": 302647
+          },
+          {
+            "function": "net/http.(*Client).send",
+            "self_ns": 0,
+            "cumulative_ns": 302647
+          },
+          {
+            "function": "net/http.send",
+            "self_ns": 0,
+            "cumulative_ns": 302647
+          },
+          {
+            "function": "net/http.(*Transport).RoundTrip",
+            "self_ns": 0,
+            "cumulative_ns": 219755
+          },
+          {
+            "function": "net/http.(*Transport).roundTrip",
+            "self_ns": 0,
+            "cumulative_ns": 219755
+          },
+          {
+            "function": "runtime.gcBgMarkStartWorkers.gowrap1",
+            "self_ns": 0,
+            "cumulative_ns": 213534
+          },
+          {
+            "function": "runtime.gcBgMarkWorker",
+            "self_ns": 0,
+            "cumulative_ns": 213534
+          },
+          {
+            "function": "runtime.netpollBreak",
+            "self_ns": 0,
+            "cumulative_ns": 210124
+          },
+          {
+            "function": "runtime.write",
+            "self_ns": 0,
+            "cumulative_ns": 210124
+          },
+          {
+            "function": "runtime.write1",
+            "self_ns": 0,
+            "cumulative_ns": 210124
+          },
+          {
+            "function": "runtime.gcMarkDone",
+            "self_ns": 0,
+            "cumulative_ns": 202874
+          },
+          {
+            "function": "runtime.chansend",
+            "self_ns": 0,
+            "cumulative_ns": 194866
+          },
+          {
+            "function": "runtime.chansend1",
+            "self_ns": 0,
+            "cumulative_ns": 194866
+          },
+          {
+            "function": "net/http.(*Transport).dialConn.gowrap2",
+            "self_ns": 0,
+            "cumulative_ns": 192974
+          },
+          {
+            "function": "net/http.(*persistConn).readLoop",
+            "self_ns": 0,
+            "cumulative_ns": 192974
+          },
+          {
+            "function": "runtime.selectgo",
+            "self_ns": 0,
+            "cumulative_ns": 192974
+          },
+          {
+            "function": "internal/poll.runtime_pollClose",
+            "self_ns": 0,
+            "cumulative_ns": 175694
+          },
+          {
+            "function": "runtime.netpollclose",
+            "self_ns": 0,
+            "cumulative_ns": 175694
+          },
+          {
+            "function": "runtime.send",
+            "self_ns": 0,
+            "cumulative_ns": 173945
+          },
+          {
+            "function": "net/http.maybeDrainBody",
+            "self_ns": 0,
+            "cumulative_ns": 170304
+          },
+          {
+            "function": "runtime.(*timer).maybeAdd",
+            "self_ns": 0,
+            "cumulative_ns": 170304
+          },
+          {
+            "function": "runtime.blockTimerChan",
+            "self_ns": 0,
+            "cumulative_ns": 170304
+          },
+          {
+            "function": "runtime.wakeNetPoller",
+            "self_ns": 0,
+            "cumulative_ns": 170304
+          },
+          {
+            "function": "runtime.forEachP.func1",
+            "self_ns": 0,
+            "cumulative_ns": 149993
+          },
+          {
+            "function": "runtime.forEachPInternal",
+            "self_ns": 0,
+            "cumulative_ns": 149993
+          },
+          {
+            "function": "net/http.(*persistConn).roundTrip",
+            "self_ns": 0,
+            "cumulative_ns": 127794
+          },
+          {
+            "function": "runtime.stopTheWorldWithSema",
+            "self_ns": 0,
+            "cumulative_ns": 124352
+          },
+          {
+            "function": "net/http.(*Transport).dialConn.gowrap3",
+            "self_ns": 0,
+            "cumulative_ns": 104542
+          },
+          {
+            "function": "runtime.gcMarkTermination",
+            "self_ns": 0,
+            "cumulative_ns": 102852
+          },
+          {
+            "function": "context.WithDeadlineCause",
+            "self_ns": 0,
+            "cumulative_ns": 82892
+          },
+          {
+            "function": "net/http.setRequestCancel",
+            "self_ns": 0,
+            "cumulative_ns": 82892
+          },
+          {
+            "function": "net/http.(*persistConn).writeLoop",
+            "self_ns": 0,
+            "cumulative_ns": 81921
+          },
+          {
+            "function": "net/http.persistConnWriter.Write",
+            "self_ns": 0,
+            "cumulative_ns": 81921
+          },
+          {
+            "function": "runtime.(*unwinder).next",
+            "self_ns": 0,
+            "cumulative_ns": 79001
+          },
+          {
+            "function": "runtime.(*unwinder).resolveInternal",
+            "self_ns": 0,
+            "cumulative_ns": 79001
+          },
+          {
+            "function": "runtime.copystack",
+            "self_ns": 0,
+            "cumulative_ns": 79001
+          },
+          {
+            "function": "runtime.pcvalue",
+            "self_ns": 0,
+            "cumulative_ns": 79001
+          },
+          {
+            "function": "runtime.step",
+            "self_ns": 0,
+            "cumulative_ns": 79001
+          },
+          {
+            "function": "runtime.entersyscall",
+            "self_ns": 0,
+            "cumulative_ns": 76371
+          },
+          {
+            "function": "runtime.entersyscallWakeSysmon",
+            "self_ns": 0,
+            "cumulative_ns": 76371
+          },
+          {
+            "function": "runtime.reentersyscall",
+            "self_ns": 0,
+            "cumulative_ns": 76371
+          },
+          {
+            "function": "net/http.(*connReader).startBackgroundRead.deferwrap1",
+            "self_ns": 0,
+            "cumulative_ns": 74162
+          },
+          {
+            "function": "runtime.releasep",
+            "self_ns": 0,
+            "cumulative_ns": 73811
+          },
+          {
+            "function": "net/http.(*Transport).getConn",
+            "self_ns": 0,
+            "cumulative_ns": 71471
+          },
+          {
+            "function": "runtime.gcStart",
+            "self_ns": 0,
+            "cumulative_ns": 71471
+          },
+          {
+            "function": "runtime.gcStart.func2",
+            "self_ns": 0,
+            "cumulative_ns": 71471
+          },
+          {
+            "function": "runtime.makechan",
+            "self_ns": 0,
+            "cumulative_ns": 71471
+          },
+          {
+            "function": "runtime.mallocgc",
+            "self_ns": 0,
+            "cumulative_ns": 71471
+          },
+          {
+            "function": "runtime.mallocgcSmallScanNoHeader",
+            "self_ns": 0,
+            "cumulative_ns": 71471
+          },
+          {
+            "function": "runtime.newobject",
+            "self_ns": 0,
+            "cumulative_ns": 71471
+          },
+          {
+            "function": "net/http.maybeDrainBody.func1",
+            "self_ns": 0,
+            "cumulative_ns": 67072
+          },
+          {
+            "function": "context.(*cancelCtx).propagateCancel",
+            "self_ns": 0,
+            "cumulative_ns": 60712
+          },
+          {
+            "function": "runtime.mapassign",
+            "self_ns": 0,
+            "cumulative_ns": 60712
+          },
+          {
+            "function": "runtime.gcMarkDone.func2",
+            "self_ns": 0,
+            "cumulative_ns": 52881
+          },
+          {
+            "function": "runtime.exitsyscallNoP",
+            "self_ns": 0,
+            "cumulative_ns": 52621
+          },
+          {
+            "function": "asm_sysvec_call_function_single",
+            "self_ns": 0,
+            "cumulative_ns": 51102
+          },
+          {
+            "function": "sysvec_call_function_single",
+            "self_ns": 0,
+            "cumulative_ns": 51102
+          },
+          {
+            "function": "internal/runtime/cgroup.ReadCPULimit",
+            "self_ns": 0,
+            "cumulative_ns": 51042
+          },
+          {
+            "function": "internal/runtime/cgroup.readV2Limit",
+            "self_ns": 0,
+            "cumulative_ns": 51042
+          },
+          {
+            "function": "internal/runtime/syscall/linux.Pread",
+            "self_ns": 0,
+            "cumulative_ns": 51042
+          },
+          {
+            "function": "runtime.adjustCgroupGOMAXPROCS",
+            "self_ns": 0,
+            "cumulative_ns": 51042
+          },
+          {
+            "function": "runtime.defaultGOMAXPROCS",
+            "self_ns": 0,
+            "cumulative_ns": 51042
+          },
+          {
+            "function": "runtime.sysmonUpdateGOMAXPROCS",
+            "self_ns": 0,
+            "cumulative_ns": 51042
+          },
+          {
+            "function": "runtime.injectglist",
+            "self_ns": 0,
+            "cumulative_ns": 48541
+          },
+          {
+            "function": "runtime.injectglist.func1",
+            "self_ns": 0,
+            "cumulative_ns": 48541
+          },
+          {
+            "function": "net/textproto.readMIMEHeader",
+            "self_ns": 0,
+            "cumulative_ns": 45830
+          },
+          {
+            "function": "net/http.(*connReader).backgroundRead",
+            "self_ns": 0,
+            "cumulative_ns": 45631
+          },
+          {
+            "function": "net/http.(*connReader).startBackgroundRead.gowrap2",
+            "self_ns": 0,
+            "cumulative_ns": 45631
+          },
+          {
+            "function": "asm_exc_page_fault",
+            "self_ns": 0,
+            "cumulative_ns": 36280
+          },
+          {
+            "function": "exc_page_fault",
+            "self_ns": 0,
+            "cumulative_ns": 36280
+          },
+          {
+            "function": "runtime.unlock2",
+            "self_ns": 0,
+            "cumulative_ns": 25001
+          },
+          {
+            "function": "runtime.preemptone",
+            "self_ns": 0,
+            "cumulative_ns": 24551
+          },
+          {
+            "function": "runtime.pidleget",
+            "self_ns": 0,
+            "cumulative_ns": 23760
+          },
+          {
+            "function": "net/http.(*Server).trackConn",
+            "self_ns": 0,
+            "cumulative_ns": 23621
+          },
+          {
+            "function": "net/http.(*conn).setState",
+            "self_ns": 0,
+            "cumulative_ns": 23621
+          },
+          {
+            "function": "internal/poll.(*FD).Init",
+            "self_ns": 0,
+            "cumulative_ns": 23120
+          },
+          {
+            "function": "internal/poll.(*pollDesc).init",
+            "self_ns": 0,
+            "cumulative_ns": 23120
+          },
+          {
+            "function": "internal/poll.runtime_pollOpen",
+            "self_ns": 0,
+            "cumulative_ns": 23120
+          },
+          {
+            "function": "runtime.netpollopen",
+            "self_ns": 0,
+            "cumulative_ns": 23120
+          },
+          {
+            "function": "net/http.(*Request).write",
+            "self_ns": 0,
+            "cumulative_ns": 22621
+          },
+          {
+            "function": "runtime.nanotime1",
+            "self_ns": 0,
+            "cumulative_ns": 22180
+          },
+          {
+            "function": "time.Until",
+            "self_ns": 0,
+            "cumulative_ns": 22180
+          },
+          {
+            "function": "time.runtimeNano",
+            "self_ns": 0,
+            "cumulative_ns": 22180
+          },
+          {
+            "function": "runtime.(*pollDesc).publishInfo",
+            "self_ns": 0,
+            "cumulative_ns": 21660
+          },
+          {
+            "function": "internal/bytealg.IndexByteString",
+            "self_ns": 0,
+            "cumulative_ns": 20490
+          },
+          {
+            "function": "net/http.(*Transport).connectMethodForRequest",
+            "self_ns": 0,
+            "cumulative_ns": 20490
+          },
+          {
+            "function": "net/http.canonicalAddr",
+            "self_ns": 0,
+            "cumulative_ns": 20490
+          },
+          {
+            "function": "net/textproto.canonicalMIMEHeaderKey",
+            "self_ns": 0,
+            "cumulative_ns": 20210
+          },
+          {
+            "function": "runtime.mapaccess1_faststr",
+            "self_ns": 0,
+            "cumulative_ns": 20210
+          },
+          {
+            "function": "runtime.mapaccess2_faststr",
+            "self_ns": 0,
+            "cumulative_ns": 20210
+          },
+          {
+            "function": "do_user_addr_fault",
+            "self_ns": 0,
+            "cumulative_ns": 10660
+          },
+          {
+            "function": "down_read_killable",
+            "self_ns": 0,
+            "cumulative_ns": 10660
+          },
+          {
+            "function": "lock_mm_and_find_vma",
+            "self_ns": 0,
+            "cumulative_ns": 10660
+          },
+          {
+            "function": "runtime.(*spanQueue).drain",
+            "self_ns": 0,
+            "cumulative_ns": 10660
+          },
+          {
+            "function": "runtime.(*spanQueue).put",
+            "self_ns": 0,
+            "cumulative_ns": 10660
+          },
+          {
+            "function": "runtime.(*spanQueue).tryDrain",
+            "self_ns": 0,
+            "cumulative_ns": 10660
+          },
+          {
+            "function": "runtime.gcBgMarkWorker.func2",
+            "self_ns": 0,
+            "cumulative_ns": 10660
+          },
+          {
+            "function": "runtime.gcDrain",
+            "self_ns": 0,
+            "cumulative_ns": 10660
+          },
+          {
+            "function": "runtime.scanObject",
+            "self_ns": 0,
+            "cumulative_ns": 10660
+          },
+          {
+            "function": "runtime.tryDeferToSpanScan",
+            "self_ns": 0,
+            "cumulative_ns": 10660
+          },
+          {
+            "function": "rwsem_down_read_slowpath",
+            "self_ns": 0,
+            "cumulative_ns": 10660
+          },
+          {
+            "function": "schedule_preempt_disabled",
+            "self_ns": 0,
+            "cumulative_ns": 10660
+          }
+        ]
+      },
+      "profile_url": "http://localhost:3102/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-waiting&var-dataSource=pyroscope&var-profileMetricId=off_cpu%3Aoff_cpu%3Ananoseconds%3A%3A&explorationType=flame-graph&from=1791232330984&to=1791232390984&showSpanHeatmap=true",
+      "links": [],
+      "state": "no_exemplars"
+    },
+    {
+      "profile_type": "process_cpu:cpu:nanoseconds:cpu:nanoseconds",
+      "aggregate": {
+        "unit": "nanoseconds",
+        "total_ns": 247422672,
+        "self_sum_ns": 247422672,
+        "functions": [
+          {
+            "function": "total",
+            "self_ns": 0,
+            "cumulative_ns": 247422672
+          },
+          {
+            "function": "do_syscall_64",
+            "self_ns": 0,
+            "cumulative_ns": 185567004
+          },
+          {
+            "function": "entry_SYSCALL_64_after_hwframe",
+            "self_ns": 0,
+            "cumulative_ns": 185567004
+          },
+          {
+            "function": "x64_sys_call",
+            "self_ns": 10309278,
+            "cumulative_ns": 185567004
+          },
+          {
+            "function": "runtime.sysmon",
+            "self_ns": 0,
+            "cumulative_ns": 164948448
+          },
+          {
+            "function": "__schedule",
+            "self_ns": 0,
+            "cumulative_ns": 103092780
+          },
+          {
+            "function": "finish_task_switch.isra.0",
+            "self_ns": 103092780,
+            "cumulative_ns": 103092780
+          },
+          {
+            "function": "schedule",
+            "self_ns": 0,
+            "cumulative_ns": 103092780
+          },
+          {
+            "function": "__x64_sys_nanosleep",
+            "self_ns": 0,
+            "cumulative_ns": 92783502
+          },
+          {
+            "function": "do_nanosleep",
+            "self_ns": 10309278,
+            "cumulative_ns": 92783502
+          },
+          {
+            "function": "hrtimer_nanosleep",
+            "self_ns": 0,
+            "cumulative_ns": 92783502
+          },
+          {
+            "function": "runtime.goexit",
+            "self_ns": 0,
+            "cumulative_ns": 92783502
+          },
+          {
+            "function": "net/http.(*Server).Serve.gowrap3",
+            "self_ns": 0,
+            "cumulative_ns": 82474224
+          },
+          {
+            "function": "net/http.(*conn).serve",
+            "self_ns": 0,
+            "cumulative_ns": 82474224
+          },
+          {
+            "function": "runtime.mstart",
+            "self_ns": 0,
+            "cumulative_ns": 82474224
+          },
+          {
+            "function": "runtime.mstart0",
+            "self_ns": 0,
+            "cumulative_ns": 82474224
+          },
+          {
+            "function": "runtime.mstart1",
+            "self_ns": 0,
+            "cumulative_ns": 82474224
+          },
+          {
+            "function": "runtime.usleep",
+            "self_ns": 0,
+            "cumulative_ns": 82474224
+          },
+          {
+            "function": "internal/runtime/syscall/linux.Syscall6",
+            "self_ns": 0,
+            "cumulative_ns": 72164946
+          },
+          {
+            "function": "runtime.findRunnable",
+            "self_ns": 0,
+            "cumulative_ns": 61855668
+          },
+          {
+            "function": "runtime.mcall",
+            "self_ns": 0,
+            "cumulative_ns": 61855668
+          },
+          {
+            "function": "runtime.schedule",
+            "self_ns": 0,
+            "cumulative_ns": 61855668
+          },
+          {
+            "function": "syscall.RawSyscall6",
+            "self_ns": 0,
+            "cumulative_ns": 51546390
+          },
+          {
+            "function": "syscall.Syscall",
+            "self_ns": 0,
+            "cumulative_ns": 51546390
+          },
+          {
+            "function": "__netif_receive_skb",
+            "self_ns": 0,
+            "cumulative_ns": 41237112
+          },
+          {
+            "function": "__netif_receive_skb_one_core",
+            "self_ns": 0,
+            "cumulative_ns": 41237112
+          },
+          {
+            "function": "runtime.stopm",
+            "self_ns": 0,
+            "cumulative_ns": 41237112
+          },
+          {
+            "function": "__dev_queue_xmit",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "__do_softirq",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "__ip_finish_output",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "__ip_queue_xmit",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "__local_bh_enable_ip",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "__napi_poll",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "__tcp_push_pending_frames",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "__tcp_transmit_skb",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "_raw_spin_unlock_irqrestore",
+            "self_ns": 30927834,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "bufio.(*Writer).Flush",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "do_softirq.part.0",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "handle_softirqs",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "ip_finish_output",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "ip_finish_output2",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "ip_local_deliver",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "ip_local_deliver_finish",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "ip_local_out",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "ip_output",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "ip_protocol_deliver_rcu",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "ip_queue_xmit",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "ip_rcv",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "neigh_hh_output",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "net/http.(*ServeMux).ServeHTTP",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "net/http.HandlerFunc.ServeHTTP",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "net/http.serverHandler.ServeHTTP",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "net_rx_action",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "process_backlog",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "runtime.futex",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "runtime.futexsleep",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "runtime.goexit0",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "runtime.notesleep",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "runtime.park_m",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "tcp_rcv_established",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "tcp_v4_do_rcv",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "tcp_v4_rcv",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "tcp_write_xmit",
+            "self_ns": 0,
+            "cumulative_ns": 30927834
+          },
+          {
+            "function": "__futex_wait",
+            "self_ns": 0,
+            "cumulative_ns": 20618556
+          },
+          {
+            "function": "__wake_up_sync_key",
+            "self_ns": 0,
+            "cumulative_ns": 20618556
+          },
+          {
+            "function": "__x64_sys_epoll_pwait",
+            "self_ns": 10309278,
+            "cumulative_ns": 20618556
+          },
+          {
+            "function": "__x64_sys_futex",
+            "self_ns": 0,
+            "cumulative_ns": 20618556
+          },
+          {
+            "function": "__x64_sys_write",
+            "self_ns": 0,
+            "cumulative_ns": 20618556
+          },
+          {
+            "function": "do_futex",
+            "self_ns": 0,
+            "cumulative_ns": 20618556
+          },
+          {
+            "function": "futex_do_wait",
+            "self_ns": 0,
+            "cumulative_ns": 20618556
+          },
+          {
+            "function": "futex_wait",
+            "self_ns": 0,
+            "cumulative_ns": 20618556
+          },
+          {
+            "function": "internal/poll.(*FD).Write",
+            "self_ns": 0,
+            "cumulative_ns": 20618556
+          },
+          {
+            "function": "internal/runtime/syscall/linux.EpollWait",
+            "self_ns": 0,
+            "cumulative_ns": 20618556
+          },
+          {
+            "function": "ksys_write",
+            "self_ns": 0,
+            "cumulative_ns": 20618556
+          },
+          {
+            "function": "main.main.func5",
+            "self_ns": 0,
+            "cumulative_ns": 20618556
+          },
+          {
+            "function": "net.(*conn).Write",
+            "self_ns": 0,
+            "cumulative_ns": 20618556
+          },
+          {
+            "function": "net.(*netFD).Write",
+            "self_ns": 0,
+            "cumulative_ns": 20618556
+          },
+          {
+            "function": "net/http.(*Client).do",
+            "self_ns": 0,
+            "cumulative_ns": 20618556
+          },
+          {
+            "function": "net/http.(*Client).send",
+            "self_ns": 0,
+            "cumulative_ns": 20618556
+          },
+          {
+            "function": "net/http.(*response).finishRequest",
+            "self_ns": 0,
+            "cumulative_ns": 20618556
+          },
+          {
+            "function": "net/http.send",
+            "self_ns": 0,
+            "cumulative_ns": 20618556
+          },
+          {
+            "function": "runtime.netpoll",
+            "self_ns": 0,
+            "cumulative_ns": 20618556
+          },
+          {
+            "function": "sock_def_readable",
+            "self_ns": 0,
+            "cumulative_ns": 20618556
+          },
+          {
+            "function": "sock_write_iter",
+            "self_ns": 0,
+            "cumulative_ns": 20618556
+          },
+          {
+            "function": "syscall.write",
+            "self_ns": 0,
+            "cumulative_ns": 20618556
+          },
+          {
+            "function": "tcp_data_queue",
+            "self_ns": 0,
+            "cumulative_ns": 20618556
+          },
+          {
+            "function": "tcp_data_ready",
+            "self_ns": 0,
+            "cumulative_ns": 20618556
+          },
+          {
+            "function": "tcp_push",
+            "self_ns": 0,
+            "cumulative_ns": 20618556
+          },
+          {
+            "function": "tcp_sendmsg",
+            "self_ns": 0,
+            "cumulative_ns": 20618556
+          },
+          {
+            "function": "tcp_sendmsg_locked",
+            "self_ns": 0,
+            "cumulative_ns": 20618556
+          },
+          {
+            "function": "vfs_write",
+            "self_ns": 0,
+            "cumulative_ns": 20618556
+          },
+          {
+            "function": "__fput",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "__netif_receive_skb_core.constprop.0",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "__sock_release",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "__tcp_close",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "__wake_up",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "__x64_sys_close",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "__x64_sys_read",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "br_handle_frame",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "br_handle_frame_finish",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "br_pass_frame_up",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "bufio.(*Reader).Peek",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "bufio.(*Reader).fill",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "cleanup_module",
+            "self_ns": 10309278,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "context.(*cancelCtx).propagateCancel",
+            "self_ns": 10309278,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "context.WithCancel",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "do_epoll_pwait.part.0",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "do_epoll_wait",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "ep_item_poll.isra.0",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "ep_poll",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "ep_send_events",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "fput_close_sync",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "inet6_release",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "inet6_sendmsg",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "inet_release",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "inet_sendmsg",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "internal/poll.(*FD).Close",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "internal/poll.(*FD).Read",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "internal/poll.(*FD).decref",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "internal/poll.(*FD).destroy",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "ksys_read",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "main.blockingSyscall",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "main.main.func2",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "net.(*conn).Close",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "net.(*conn).Read",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "net.(*netFD).Close",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "net.(*netFD).Read",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "net/http.(*Transport).RoundTrip",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "net/http.(*Transport).dialConn.gowrap3",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "net/http.(*Transport).getConn",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "net/http.(*Transport).roundTrip",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "net/http.(*chunkWriter).Write",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "net/http.(*chunkWriter).writeHeader",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "net/http.(*conn).close",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "net/http.(*conn).readRequest",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "net/http.(*conn).serve.func1",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "net/http.(*connReader).Read",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "net/http.(*connReader).startBackgroundRead.gowrap2",
+            "self_ns": 10309278,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "net/http.(*persistConn).writeLoop",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "net/http.checkConnErrorWriter.Write",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "net/http.persistConnWriter.Write",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "net/http.readRequestLimit",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "net/textproto.readMIMEHeader",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "netif_receive_skb",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "runtime.(*mcache).nextFree",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "runtime.(*mcache).refill",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "runtime.(*mcentral).cacheSpan",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "runtime.(*spanSet).pop",
+            "self_ns": 10309278,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "runtime.acquirep",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "runtime.acquirepNoTrace",
+            "self_ns": 10309278,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "runtime.deferreturn",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "runtime.mallocgc",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "runtime.mallocgcSmallScanNoHeader",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "runtime.mapaccess1_faststr",
+            "self_ns": 10309278,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "runtime.newobject",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "sock_close",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "sock_def_wakeup",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "sock_poll",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "sock_read_iter",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "sock_recvmsg",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "syscall.Close",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "syscall.Nanosleep",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "syscall.read",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "tcp_close",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "tcp_fin",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "tcp_poll",
+            "self_ns": 10309278,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "tcp_send_fin",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "time.Time.AppendFormat",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "time.Time.appendFormat",
+            "self_ns": 10309278,
+            "cumulative_ns": 10309278
+          },
+          {
+            "function": "vfs_read",
+            "self_ns": 0,
+            "cumulative_ns": 10309278
+          }
+        ]
+      },
+      "profile_url": "http://localhost:3102/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-waiting&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232330984&to=1791232390984&showSpanHeatmap=true",
+      "links": [],
+      "state": "no_exemplars"
+    }
+  ],
+  "traces": [],
+  "note": "Heatmap exemplars and trace search are bounded selections; no exact links is missing evidence, not proof of no wait.",
+  "trace_search_limit": 100,
+  "trace_retrieval_limit": 30,
+  "trace_search_returned": 0,
+  "trace_retrieval_truncated": false
+}

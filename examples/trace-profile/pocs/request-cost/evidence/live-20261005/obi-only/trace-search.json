@@ -1,0 +1,6741 @@
+{
+  "traces": [
+    {
+      "traceID": "4f2c097c567aec00768ba4c532f95283",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232165912552721",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "3bf93af2dadb36a5",
+            "startTimeUnixNano": "1791232165912552721",
+            "durationNanos": "28261",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "866b91afba1c1693",
+            "startTimeUnixNano": "1791232165912580982",
+            "durationNanos": "150227325",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "e66f62fa90b910c3",
+            "startTimeUnixNano": "1791232165912552721",
+            "durationNanos": "150255586",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "3bf93af2dadb36a5",
+              "startTimeUnixNano": "1791232165912552721",
+              "durationNanos": "28261",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "866b91afba1c1693",
+              "startTimeUnixNano": "1791232165912580982",
+              "durationNanos": "150227325",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "e66f62fa90b910c3",
+              "startTimeUnixNano": "1791232165912552721",
+              "durationNanos": "150255586",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "d97a1d0409498000a7a48e0d3d5ca99c",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232165611094667",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "d5a10e7fbe57d99c",
+            "startTimeUnixNano": "1791232165611094667",
+            "durationNanos": "25730",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "f9dc8527e8a6dcfa",
+            "startTimeUnixNano": "1791232165611120397",
+            "durationNanos": "150234676",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "25cd867a533d4782",
+            "startTimeUnixNano": "1791232165611094667",
+            "durationNanos": "150260406",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "d5a10e7fbe57d99c",
+              "startTimeUnixNano": "1791232165611094667",
+              "durationNanos": "25730",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "f9dc8527e8a6dcfa",
+              "startTimeUnixNano": "1791232165611120397",
+              "durationNanos": "150234676",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "25cd867a533d4782",
+              "startTimeUnixNano": "1791232165611094667",
+              "durationNanos": "150260406",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "d38efc8e6af12d297b873c42a5c74834",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /report",
+      "startTimeUnixNano": "1791232165582697586",
+      "durationMs": 2000,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "c7447d3aeb90ddac",
+            "startTimeUnixNano": "1791232165582697586",
+            "durationNanos": "21740",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "a1f6ed10556a8675",
+            "startTimeUnixNano": "1791232165582719326",
+            "durationNanos": "2000192236",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "6fd77346c3f9f3f8",
+            "startTimeUnixNano": "1791232165582697586",
+            "durationNanos": "2000213976",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "c7447d3aeb90ddac",
+              "startTimeUnixNano": "1791232165582697586",
+              "durationNanos": "21740",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "a1f6ed10556a8675",
+              "startTimeUnixNano": "1791232165582719326",
+              "durationNanos": "2000192236",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "6fd77346c3f9f3f8",
+              "startTimeUnixNano": "1791232165582697586",
+              "durationNanos": "2000213976",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "4f2f04d39c8e2eb518e8fd0c8ba0fc0b",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /report",
+      "startTimeUnixNano": "1791232165582691625",
+      "durationMs": 2000,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "9519bd4eada6df1f",
+            "startTimeUnixNano": "1791232165582691625",
+            "durationNanos": "41321",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "8b6de019fb960651",
+            "startTimeUnixNano": "1791232165582732946",
+            "durationNanos": "2000245067",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "77867a1f5899c1d9",
+            "startTimeUnixNano": "1791232165582691625",
+            "durationNanos": "2000286388",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "9519bd4eada6df1f",
+              "startTimeUnixNano": "1791232165582691625",
+              "durationNanos": "41321",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "8b6de019fb960651",
+              "startTimeUnixNano": "1791232165582732946",
+              "durationNanos": "2000245067",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "77867a1f5899c1d9",
+              "startTimeUnixNano": "1791232165582691625",
+              "durationNanos": "2000286388",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "b76d842031cacd35c4f9c5c0bd4f5b7a",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232165309889898",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "ac694974179e381f",
+            "startTimeUnixNano": "1791232165309889898",
+            "durationNanos": "28031",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "27dcbc67e446a58c",
+            "startTimeUnixNano": "1791232165309917929",
+            "durationNanos": "150343668",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "892d98b06bb89a58",
+            "startTimeUnixNano": "1791232165309889898",
+            "durationNanos": "150371699",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "ac694974179e381f",
+              "startTimeUnixNano": "1791232165309889898",
+              "durationNanos": "28031",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "27dcbc67e446a58c",
+              "startTimeUnixNano": "1791232165309917929",
+              "durationNanos": "150343668",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "892d98b06bb89a58",
+              "startTimeUnixNano": "1791232165309889898",
+              "durationNanos": "150371699",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "e1bca5fdd422286faae8164c7b513276",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232164358455599",
+      "durationMs": 800,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "c055831b210fcf90",
+            "startTimeUnixNano": "1791232164358455599",
+            "durationNanos": "30091",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "9d389ee268256af9",
+            "startTimeUnixNano": "1791232164358485690",
+            "durationNanos": "800344233",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "53d2d8d77e7cd63a",
+            "startTimeUnixNano": "1791232164358455599",
+            "durationNanos": "800374324",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "c055831b210fcf90",
+              "startTimeUnixNano": "1791232164358455599",
+              "durationNanos": "30091",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "9d389ee268256af9",
+              "startTimeUnixNano": "1791232164358485690",
+              "durationNanos": "800344233",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "53d2d8d77e7cd63a",
+              "startTimeUnixNano": "1791232164358455599",
+              "durationNanos": "800374324",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "f7ed159ad34e2fdbaf03d78ed35cd61e",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232164057089247",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "b7e8470f8bfade01",
+            "startTimeUnixNano": "1791232164057089247",
+            "durationNanos": "27001",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "3ddb4007fcf2be74",
+            "startTimeUnixNano": "1791232164057116248",
+            "durationNanos": "150240325",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "ae24600c5c6e125b",
+            "startTimeUnixNano": "1791232164057089247",
+            "durationNanos": "150267326",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "b7e8470f8bfade01",
+              "startTimeUnixNano": "1791232164057089247",
+              "durationNanos": "27001",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "3ddb4007fcf2be74",
+              "startTimeUnixNano": "1791232164057116248",
+              "durationNanos": "150240325",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "ae24600c5c6e125b",
+              "startTimeUnixNano": "1791232164057089247",
+              "durationNanos": "150267326",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "8c2a0b58878a73713b76ecf2e6ccce8d",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232163755598982",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "453bcff8e885e262",
+            "startTimeUnixNano": "1791232163755598982",
+            "durationNanos": "28030",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "6da04562d1f9e262",
+            "startTimeUnixNano": "1791232163755627012",
+            "durationNanos": "150304847",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "943755b5201f233e",
+            "startTimeUnixNano": "1791232163755598982",
+            "durationNanos": "150332877",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "453bcff8e885e262",
+              "startTimeUnixNano": "1791232163755598982",
+              "durationNanos": "28030",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "6da04562d1f9e262",
+              "startTimeUnixNano": "1791232163755627012",
+              "durationNanos": "150304847",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "943755b5201f233e",
+              "startTimeUnixNano": "1791232163755598982",
+              "durationNanos": "150332877",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "92cf62a316706fa53335ee1a4588da24",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232163454128747",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "303318a870455f13",
+            "startTimeUnixNano": "1791232163454128747",
+            "durationNanos": "29390",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "d1b406396904fb14",
+            "startTimeUnixNano": "1791232163454158137",
+            "durationNanos": "150268986",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "f2c59e9a141bf67a",
+            "startTimeUnixNano": "1791232163454128747",
+            "durationNanos": "150298376",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "303318a870455f13",
+              "startTimeUnixNano": "1791232163454128747",
+              "durationNanos": "29390",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "d1b406396904fb14",
+              "startTimeUnixNano": "1791232163454158137",
+              "durationNanos": "150268986",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "f2c59e9a141bf67a",
+              "startTimeUnixNano": "1791232163454128747",
+              "durationNanos": "150298376",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "eb423d1c4e48b58ae2ad152d1ca691e5",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /report",
+      "startTimeUnixNano": "1791232163431109287",
+      "durationMs": 2000,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "47c9aea100c64cc3",
+            "startTimeUnixNano": "1791232163431109287",
+            "durationNanos": "18740",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "943ff82140cc5e7d",
+            "startTimeUnixNano": "1791232163431128027",
+            "durationNanos": "2000228486",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "07cf81669a9f6f18",
+            "startTimeUnixNano": "1791232163431109287",
+            "durationNanos": "2000247226",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "47c9aea100c64cc3",
+              "startTimeUnixNano": "1791232163431109287",
+              "durationNanos": "18740",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "943ff82140cc5e7d",
+              "startTimeUnixNano": "1791232163431128027",
+              "durationNanos": "2000228486",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "07cf81669a9f6f18",
+              "startTimeUnixNano": "1791232163431109287",
+              "durationNanos": "2000247226",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "db27eab1130ab039c5cabc056b21e18",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /report",
+      "startTimeUnixNano": "1791232163431098366",
+      "durationMs": 2000,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "3cd88bb50c440b65",
+            "startTimeUnixNano": "1791232163431098366",
+            "durationNanos": "28721",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "940fc699e1f0a6a7",
+            "startTimeUnixNano": "1791232163431127087",
+            "durationNanos": "2000216056",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "a6c5619f5b928e8e",
+            "startTimeUnixNano": "1791232163431098366",
+            "durationNanos": "2000244777",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "3cd88bb50c440b65",
+              "startTimeUnixNano": "1791232163431098366",
+              "durationNanos": "28721",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "940fc699e1f0a6a7",
+              "startTimeUnixNano": "1791232163431127087",
+              "durationNanos": "2000216056",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "a6c5619f5b928e8e",
+              "startTimeUnixNano": "1791232163431098366",
+              "durationNanos": "2000244777",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "daa9f581909a11bbe025917dee185b1f",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232162502890062",
+      "durationMs": 800,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "a9c90d60efd5d795",
+            "startTimeUnixNano": "1791232162502890062",
+            "durationNanos": "29481",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "0fefdc8d0eb063a2",
+            "startTimeUnixNano": "1791232162502919543",
+            "durationNanos": "800291172",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "e040277e9ef36999",
+            "startTimeUnixNano": "1791232162502890062",
+            "durationNanos": "800320653",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "a9c90d60efd5d795",
+              "startTimeUnixNano": "1791232162502890062",
+              "durationNanos": "29481",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "0fefdc8d0eb063a2",
+              "startTimeUnixNano": "1791232162502919543",
+              "durationNanos": "800291172",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "e040277e9ef36999",
+              "startTimeUnixNano": "1791232162502890062",
+              "durationNanos": "800320653",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "5c92a98701e9f39e9e8007dd2afdcd4a",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232162201325575",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "35adcf3fb833a38d",
+            "startTimeUnixNano": "1791232162201325575",
+            "durationNanos": "29081",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "77cdd9dc6ef04644",
+            "startTimeUnixNano": "1791232162201354656",
+            "durationNanos": "150257916",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "989ba09a526442e4",
+            "startTimeUnixNano": "1791232162201325575",
+            "durationNanos": "150286997",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "35adcf3fb833a38d",
+              "startTimeUnixNano": "1791232162201325575",
+              "durationNanos": "29081",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "77cdd9dc6ef04644",
+              "startTimeUnixNano": "1791232162201354656",
+              "durationNanos": "150257916",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "989ba09a526442e4",
+              "startTimeUnixNano": "1791232162201325575",
+              "durationNanos": "150286997",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "b5efcddd2f7bbeb16fb77f21774a802",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232161899709687",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "2050f99a9f76dc55",
+            "startTimeUnixNano": "1791232161899709687",
+            "durationNanos": "30731",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "1237d1f393f56707",
+            "startTimeUnixNano": "1791232161899740418",
+            "durationNanos": "150257105",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "0684198fd53d0ea2",
+            "startTimeUnixNano": "1791232161899709687",
+            "durationNanos": "150287836",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "2050f99a9f76dc55",
+              "startTimeUnixNano": "1791232161899709687",
+              "durationNanos": "30731",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "1237d1f393f56707",
+              "startTimeUnixNano": "1791232161899740418",
+              "durationNanos": "150257105",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "0684198fd53d0ea2",
+              "startTimeUnixNano": "1791232161899709687",
+              "durationNanos": "150287836",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "7b97801f3b30ddbbf9a682706319e90b",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232161598157120",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "b4d994aa53f822b6",
+            "startTimeUnixNano": "1791232161598157120",
+            "durationNanos": "37931",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "3c6f910f5637fa6e",
+            "startTimeUnixNano": "1791232161598195051",
+            "durationNanos": "150344598",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "355daa435a654be2",
+            "startTimeUnixNano": "1791232161598157120",
+            "durationNanos": "150382529",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "b4d994aa53f822b6",
+              "startTimeUnixNano": "1791232161598157120",
+              "durationNanos": "37931",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "3c6f910f5637fa6e",
+              "startTimeUnixNano": "1791232161598195051",
+              "durationNanos": "150344598",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "355daa435a654be2",
+              "startTimeUnixNano": "1791232161598157120",
+              "durationNanos": "150382529",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "85783f26cdff181fda1c9dbff7154b76",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /report",
+      "startTimeUnixNano": "1791232161279548558",
+      "durationMs": 2000,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "458080b1789c56ff",
+            "startTimeUnixNano": "1791232161279548558",
+            "durationNanos": "18191",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "b032a371ecf37129",
+            "startTimeUnixNano": "1791232161279566749",
+            "durationNanos": "2000224426",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "2a21365c2af02efd",
+            "startTimeUnixNano": "1791232161279548558",
+            "durationNanos": "2000242617",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "458080b1789c56ff",
+              "startTimeUnixNano": "1791232161279548558",
+              "durationNanos": "18191",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "b032a371ecf37129",
+              "startTimeUnixNano": "1791232161279566749",
+              "durationNanos": "2000224426",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "2a21365c2af02efd",
+              "startTimeUnixNano": "1791232161279548558",
+              "durationNanos": "2000242617",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "b791ceeacf69f99cf9ce39a52caa3e5",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /report",
+      "startTimeUnixNano": "1791232161279506977",
+      "durationMs": 2000,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "5bc6be5dd68307db",
+            "startTimeUnixNano": "1791232161279506977",
+            "durationNanos": "28291",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "754d4d65c7df3e34",
+            "startTimeUnixNano": "1791232161279535268",
+            "durationNanos": "2000236596",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "437e382e6576b02b",
+            "startTimeUnixNano": "1791232161279506977",
+            "durationNanos": "2000264887",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "5bc6be5dd68307db",
+              "startTimeUnixNano": "1791232161279506977",
+              "durationNanos": "28291",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "754d4d65c7df3e34",
+              "startTimeUnixNano": "1791232161279535268",
+              "durationNanos": "2000236596",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "437e382e6576b02b",
+              "startTimeUnixNano": "1791232161279506977",
+              "durationNanos": "2000264887",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "ed720c166f3b609ba3bf1abaf6fa9dba",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232160646773612",
+      "durationMs": 800,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "b8f93275a5975989",
+            "startTimeUnixNano": "1791232160646773612",
+            "durationNanos": "26981",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "036d49b659a4c597",
+            "startTimeUnixNano": "1791232160646800593",
+            "durationNanos": "800283661",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "b1a00b341728f4aa",
+            "startTimeUnixNano": "1791232160646773612",
+            "durationNanos": "800310642",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "b8f93275a5975989",
+              "startTimeUnixNano": "1791232160646773612",
+              "durationNanos": "26981",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "036d49b659a4c597",
+              "startTimeUnixNano": "1791232160646800593",
+              "durationNanos": "800283661",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "b1a00b341728f4aa",
+              "startTimeUnixNano": "1791232160646773612",
+              "durationNanos": "800310642",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "846cec978ca92937bbc052afa82eca02",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232160345269657",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "b17243402faecb39",
+            "startTimeUnixNano": "1791232160345269657",
+            "durationNanos": "29990",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "47ec88a15566e1cf",
+            "startTimeUnixNano": "1791232160345299647",
+            "durationNanos": "150332578",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "d58fe36350886672",
+            "startTimeUnixNano": "1791232160345269657",
+            "durationNanos": "150362568",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "b17243402faecb39",
+              "startTimeUnixNano": "1791232160345269657",
+              "durationNanos": "29990",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "47ec88a15566e1cf",
+              "startTimeUnixNano": "1791232160345299647",
+              "durationNanos": "150332578",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "d58fe36350886672",
+              "startTimeUnixNano": "1791232160345269657",
+              "durationNanos": "150362568",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "873544658443cbb4751a36144e4a641a",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232160043747680",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "a1e95f04ef85acdc",
+            "startTimeUnixNano": "1791232160043747680",
+            "durationNanos": "33621",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "8cab66806805a2cc",
+            "startTimeUnixNano": "1791232160043781301",
+            "durationNanos": "150225605",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "adeb048be67a2ab7",
+            "startTimeUnixNano": "1791232160043747680",
+            "durationNanos": "150259226",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "a1e95f04ef85acdc",
+              "startTimeUnixNano": "1791232160043747680",
+              "durationNanos": "33621",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "8cab66806805a2cc",
+              "startTimeUnixNano": "1791232160043781301",
+              "durationNanos": "150225605",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "adeb048be67a2ab7",
+              "startTimeUnixNano": "1791232160043747680",
+              "durationNanos": "150259226",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "214525b31fe2a8381c2f1cc5955db1f8",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232159742274615",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "d13bb33eb528fd8c",
+            "startTimeUnixNano": "1791232159742274615",
+            "durationNanos": "31671",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "f800c3154d106f1e",
+            "startTimeUnixNano": "1791232159742306286",
+            "durationNanos": "150268736",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "f154e286a4691336",
+            "startTimeUnixNano": "1791232159742274615",
+            "durationNanos": "150300407",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "d13bb33eb528fd8c",
+              "startTimeUnixNano": "1791232159742274615",
+              "durationNanos": "31671",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "f800c3154d106f1e",
+              "startTimeUnixNano": "1791232159742306286",
+              "durationNanos": "150268736",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "f154e286a4691336",
+              "startTimeUnixNano": "1791232159742274615",
+              "durationNanos": "150300407",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "45c5c5d8fa7c045b723bf137b60698ce",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /report",
+      "startTimeUnixNano": "1791232159127770764",
+      "durationMs": 2000,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "06453ea1dbc916f4",
+            "startTimeUnixNano": "1791232159127770764",
+            "durationNanos": "18891",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "327a5271dbdad0d2",
+            "startTimeUnixNano": "1791232159127789655",
+            "durationNanos": "2000258727",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "4c3ee372f845af61",
+            "startTimeUnixNano": "1791232159127770764",
+            "durationNanos": "2000277618",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "06453ea1dbc916f4",
+              "startTimeUnixNano": "1791232159127770764",
+              "durationNanos": "18891",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "327a5271dbdad0d2",
+              "startTimeUnixNano": "1791232159127789655",
+              "durationNanos": "2000258727",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "4c3ee372f845af61",
+              "startTimeUnixNano": "1791232159127770764",
+              "durationNanos": "2000277618",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "df83c1bcaec5302c258a3867918042ce",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /report",
+      "startTimeUnixNano": "1791232159127755744",
+      "durationMs": 2000,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "917d8a4c9049eb0f",
+            "startTimeUnixNano": "1791232159127755744",
+            "durationNanos": "30201",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "10e83dba6b505aa8",
+            "startTimeUnixNano": "1791232159127785945",
+            "durationNanos": "2000262377",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "02665e76a7b1a96a",
+            "startTimeUnixNano": "1791232159127755744",
+            "durationNanos": "2000292578",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "917d8a4c9049eb0f",
+              "startTimeUnixNano": "1791232159127755744",
+              "durationNanos": "30201",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "10e83dba6b505aa8",
+              "startTimeUnixNano": "1791232159127785945",
+              "durationNanos": "2000262377",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "02665e76a7b1a96a",
+              "startTimeUnixNano": "1791232159127755744",
+              "durationNanos": "2000292578",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "34988703c287bb6dd7d5352ac7b365d4",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232158790847307",
+      "durationMs": 800,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "4c45bfd7c3a9a7b9",
+            "startTimeUnixNano": "1791232158790847307",
+            "durationNanos": "27341",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "935629c358b4f99e",
+            "startTimeUnixNano": "1791232158790874648",
+            "durationNanos": "800209159",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "c5cd7e8e28087a0b",
+            "startTimeUnixNano": "1791232158790847307",
+            "durationNanos": "800236500",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "4c45bfd7c3a9a7b9",
+              "startTimeUnixNano": "1791232158790847307",
+              "durationNanos": "27341",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "935629c358b4f99e",
+              "startTimeUnixNano": "1791232158790874648",
+              "durationNanos": "800209159",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "c5cd7e8e28087a0b",
+              "startTimeUnixNano": "1791232158790847307",
+              "durationNanos": "800236500",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "4ca8e75e5eb06af6b1457a99e6581949",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232158489305130",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "c643a12584e818b2",
+            "startTimeUnixNano": "1791232158489305130",
+            "durationNanos": "27971",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "391abdc679d93117",
+            "startTimeUnixNano": "1791232158489333101",
+            "durationNanos": "150335978",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "ddaca80204797edb",
+            "startTimeUnixNano": "1791232158489305130",
+            "durationNanos": "150363949",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "c643a12584e818b2",
+              "startTimeUnixNano": "1791232158489305130",
+              "durationNanos": "27971",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "391abdc679d93117",
+              "startTimeUnixNano": "1791232158489333101",
+              "durationNanos": "150335978",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "ddaca80204797edb",
+              "startTimeUnixNano": "1791232158489305130",
+              "durationNanos": "150363949",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "ef800e4a3210d45011103d6aed8927d1",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232158187727833",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "387751ddc5d9d841",
+            "startTimeUnixNano": "1791232158187727833",
+            "durationNanos": "28230",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "ce529576bb21d449",
+            "startTimeUnixNano": "1791232158187756063",
+            "durationNanos": "150313178",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "2ac70f6c8395a85b",
+            "startTimeUnixNano": "1791232158187727833",
+            "durationNanos": "150341408",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "387751ddc5d9d841",
+              "startTimeUnixNano": "1791232158187727833",
+              "durationNanos": "28230",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "ce529576bb21d449",
+              "startTimeUnixNano": "1791232158187756063",
+              "durationNanos": "150313178",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "2ac70f6c8395a85b",
+              "startTimeUnixNano": "1791232158187727833",
+              "durationNanos": "150341408",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "e1dd779f591aeff3439d21105ec0d8f5",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232157886397771",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "872d77b531b87e02",
+            "startTimeUnixNano": "1791232157886397771",
+            "durationNanos": "27391",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "1898977314841263",
+            "startTimeUnixNano": "1791232157886425162",
+            "durationNanos": "150200664",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "abf9e44fa6340ab9",
+            "startTimeUnixNano": "1791232157886397771",
+            "durationNanos": "150228055",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "872d77b531b87e02",
+              "startTimeUnixNano": "1791232157886397771",
+              "durationNanos": "27391",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "1898977314841263",
+              "startTimeUnixNano": "1791232157886425162",
+              "durationNanos": "150200664",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "abf9e44fa6340ab9",
+              "startTimeUnixNano": "1791232157886397771",
+              "durationNanos": "150228055",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "105ffb9fe7dc439e82ade6783dc2f747",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /report",
+      "startTimeUnixNano": "1791232156976244176",
+      "durationMs": 2000,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "7cbd32d0e9352efd",
+            "startTimeUnixNano": "1791232156976244176",
+            "durationNanos": "19230",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "2edcc0fd7b53b64e",
+            "startTimeUnixNano": "1791232156976263406",
+            "durationNanos": "2000169145",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "975f5a9110fd76cf",
+            "startTimeUnixNano": "1791232156976244176",
+            "durationNanos": "2000188375",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "7cbd32d0e9352efd",
+              "startTimeUnixNano": "1791232156976244176",
+              "durationNanos": "19230",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "2edcc0fd7b53b64e",
+              "startTimeUnixNano": "1791232156976263406",
+              "durationNanos": "2000169145",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "975f5a9110fd76cf",
+              "startTimeUnixNano": "1791232156976244176",
+              "durationNanos": "2000188375",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "9e9d197b67cb45dc96e97db7ad4c1ad9",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /report",
+      "startTimeUnixNano": "1791232156976214866",
+      "durationMs": 2000,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "9c46a71d0e56dffc",
+            "startTimeUnixNano": "1791232156976214866",
+            "durationNanos": "30901",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "10f70c19a0b9b18d",
+            "startTimeUnixNano": "1791232156976245767",
+            "durationNanos": "2000195295",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "c2566e302842b582",
+            "startTimeUnixNano": "1791232156976214866",
+            "durationNanos": "2000226196",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "9c46a71d0e56dffc",
+              "startTimeUnixNano": "1791232156976214866",
+              "durationNanos": "30901",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "10f70c19a0b9b18d",
+              "startTimeUnixNano": "1791232156976245767",
+              "durationNanos": "2000195295",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "c2566e302842b582",
+              "startTimeUnixNano": "1791232156976214866",
+              "durationNanos": "2000226196",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "aede9b18445cd3755f4c9d381fc15e09",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232156934970732",
+      "durationMs": 800,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "9708ed30d29570a2",
+            "startTimeUnixNano": "1791232156934970732",
+            "durationNanos": "30361",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "86b3bbc20e81f113",
+            "startTimeUnixNano": "1791232156935001093",
+            "durationNanos": "800260141",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "6970bd596e2d02e5",
+            "startTimeUnixNano": "1791232156934970732",
+            "durationNanos": "800290502",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "9708ed30d29570a2",
+              "startTimeUnixNano": "1791232156934970732",
+              "durationNanos": "30361",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "86b3bbc20e81f113",
+              "startTimeUnixNano": "1791232156935001093",
+              "durationNanos": "800260141",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "6970bd596e2d02e5",
+              "startTimeUnixNano": "1791232156934970732",
+              "durationNanos": "800290502",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "27f9f16011644b2173b6c57a2917a525",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232156633413885",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "ad3a4e51af87d33f",
+            "startTimeUnixNano": "1791232156633413885",
+            "durationNanos": "33471",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "5ed0c6df70d5d4e0",
+            "startTimeUnixNano": "1791232156633447356",
+            "durationNanos": "150248216",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "4e15b834dd7d2c24",
+            "startTimeUnixNano": "1791232156633413885",
+            "durationNanos": "150281687",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "ad3a4e51af87d33f",
+              "startTimeUnixNano": "1791232156633413885",
+              "durationNanos": "33471",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "5ed0c6df70d5d4e0",
+              "startTimeUnixNano": "1791232156633447356",
+              "durationNanos": "150248216",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "4e15b834dd7d2c24",
+              "startTimeUnixNano": "1791232156633413885",
+              "durationNanos": "150281687",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "8aa6e3595cf5476b998c4770e04e87f5",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232156331909540",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "e6ea9ccd2cd98f84",
+            "startTimeUnixNano": "1791232156331909540",
+            "durationNanos": "27890",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "8f7bcd2919120009",
+            "startTimeUnixNano": "1791232156331937430",
+            "durationNanos": "150284907",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "ae1375473eadbf4c",
+            "startTimeUnixNano": "1791232156331909540",
+            "durationNanos": "150312797",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "e6ea9ccd2cd98f84",
+              "startTimeUnixNano": "1791232156331909540",
+              "durationNanos": "27890",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "8f7bcd2919120009",
+              "startTimeUnixNano": "1791232156331937430",
+              "durationNanos": "150284907",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "ae1375473eadbf4c",
+              "startTimeUnixNano": "1791232156331909540",
+              "durationNanos": "150312797",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "213ddd0ade3bef308e84bf88068ba028",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232156030619647",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "3708aecfef31638e",
+            "startTimeUnixNano": "1791232156030619647",
+            "durationNanos": "26871",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "f703d77ffca704b6",
+            "startTimeUnixNano": "1791232156030646518",
+            "durationNanos": "150215936",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "c81e2c2e3fb9b326",
+            "startTimeUnixNano": "1791232156030619647",
+            "durationNanos": "150242807",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "3708aecfef31638e",
+              "startTimeUnixNano": "1791232156030619647",
+              "durationNanos": "26871",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "f703d77ffca704b6",
+              "startTimeUnixNano": "1791232156030646518",
+              "durationNanos": "150215936",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "c81e2c2e3fb9b326",
+              "startTimeUnixNano": "1791232156030619647",
+              "durationNanos": "150242807",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "d3f0ac75fdb189c289ba870925896302",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232155079184273",
+      "durationMs": 800,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "fe59d1aca4ab1a9d",
+            "startTimeUnixNano": "1791232155079184273",
+            "durationNanos": "34831",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "8e28dc4ab4232308",
+            "startTimeUnixNano": "1791232155079219104",
+            "durationNanos": "800279576",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "462f4446c22ed531",
+            "startTimeUnixNano": "1791232155079184273",
+            "durationNanos": "800314407",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "fe59d1aca4ab1a9d",
+              "startTimeUnixNano": "1791232155079184273",
+              "durationNanos": "34831",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "8e28dc4ab4232308",
+              "startTimeUnixNano": "1791232155079219104",
+              "durationNanos": "800279576",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "462f4446c22ed531",
+              "startTimeUnixNano": "1791232155079184273",
+              "durationNanos": "800314407",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "4fc8af8ab17cb9a3ccbe7c2451f4be0e",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /report",
+      "startTimeUnixNano": "1791232154824754211",
+      "durationMs": 2000,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "ce7990928b032233",
+            "startTimeUnixNano": "1791232154824754211",
+            "durationNanos": "21960",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "45e8a5921830751e",
+            "startTimeUnixNano": "1791232154824776171",
+            "durationNanos": "2000251987",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "baa1248d7171d921",
+            "startTimeUnixNano": "1791232154824754211",
+            "durationNanos": "2000273947",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "ce7990928b032233",
+              "startTimeUnixNano": "1791232154824754211",
+              "durationNanos": "21960",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "45e8a5921830751e",
+              "startTimeUnixNano": "1791232154824776171",
+              "durationNanos": "2000251987",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "baa1248d7171d921",
+              "startTimeUnixNano": "1791232154824754211",
+              "durationNanos": "2000273947",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "5dcf88286af8d00acd47d90eac599d34",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /report",
+      "startTimeUnixNano": "1791232154824720380",
+      "durationMs": 2000,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "03c779216d07a2a0",
+            "startTimeUnixNano": "1791232154824720380",
+            "durationNanos": "35761",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "86d667ad8388410b",
+            "startTimeUnixNano": "1791232154824756141",
+            "durationNanos": "2000192675",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "59d8e0e283280f4d",
+            "startTimeUnixNano": "1791232154824720380",
+            "durationNanos": "2000228436",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "03c779216d07a2a0",
+              "startTimeUnixNano": "1791232154824720380",
+              "durationNanos": "35761",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "86d667ad8388410b",
+              "startTimeUnixNano": "1791232154824756141",
+              "durationNanos": "2000192675",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "59d8e0e283280f4d",
+              "startTimeUnixNano": "1791232154824720380",
+              "durationNanos": "2000228436",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "b50d386eddb6da0c254c3442f4b25dcf",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232154777756717",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "260f02747f82f369",
+            "startTimeUnixNano": "1791232154777756717",
+            "durationNanos": "27571",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "d96ed68d8bc27232",
+            "startTimeUnixNano": "1791232154777784288",
+            "durationNanos": "150279357",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "80049ee663e540a2",
+            "startTimeUnixNano": "1791232154777756717",
+            "durationNanos": "150306928",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "260f02747f82f369",
+              "startTimeUnixNano": "1791232154777756717",
+              "durationNanos": "27571",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "d96ed68d8bc27232",
+              "startTimeUnixNano": "1791232154777784288",
+              "durationNanos": "150279357",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "80049ee663e540a2",
+              "startTimeUnixNano": "1791232154777756717",
+              "durationNanos": "150306928",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "85c4fe2f7a4022d82621e325068f6173",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232154476298541",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "f490293579bb0dd4",
+            "startTimeUnixNano": "1791232154476298541",
+            "durationNanos": "28370",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "a43dfe13f88d41b4",
+            "startTimeUnixNano": "1791232154476326911",
+            "durationNanos": "150234117",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "a0faec85352259b7",
+            "startTimeUnixNano": "1791232154476298541",
+            "durationNanos": "150262487",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "f490293579bb0dd4",
+              "startTimeUnixNano": "1791232154476298541",
+              "durationNanos": "28370",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "a43dfe13f88d41b4",
+              "startTimeUnixNano": "1791232154476326911",
+              "durationNanos": "150234117",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "a0faec85352259b7",
+              "startTimeUnixNano": "1791232154476298541",
+              "durationNanos": "150262487",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "2cef15f0fd89f26f27123e4938fea01d",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232154174804223",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "56aab46ac4ce9c16",
+            "startTimeUnixNano": "1791232154174804223",
+            "durationNanos": "33161",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "b2efacced60615c2",
+            "startTimeUnixNano": "1791232154174837384",
+            "durationNanos": "150308018",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "e8404536b60b4904",
+            "startTimeUnixNano": "1791232154174804223",
+            "durationNanos": "150341179",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "56aab46ac4ce9c16",
+              "startTimeUnixNano": "1791232154174804223",
+              "durationNanos": "33161",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "b2efacced60615c2",
+              "startTimeUnixNano": "1791232154174837384",
+              "durationNanos": "150308018",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "e8404536b60b4904",
+              "startTimeUnixNano": "1791232154174804223",
+              "durationNanos": "150341179",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "725ca75fbf956452b7ccf1e0d19cf78",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232153223405590",
+      "durationMs": 800,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "1df68a534691dfb3",
+            "startTimeUnixNano": "1791232153223405590",
+            "durationNanos": "31940",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "63f96b784e66b72e",
+            "startTimeUnixNano": "1791232153223437530",
+            "durationNanos": "800256146",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "d11b222ed8ddd7aa",
+            "startTimeUnixNano": "1791232153223405590",
+            "durationNanos": "800288086",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "1df68a534691dfb3",
+              "startTimeUnixNano": "1791232153223405590",
+              "durationNanos": "31940",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "63f96b784e66b72e",
+              "startTimeUnixNano": "1791232153223437530",
+              "durationNanos": "800256146",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "d11b222ed8ddd7aa",
+              "startTimeUnixNano": "1791232153223405590",
+              "durationNanos": "800288086",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "ead1ec8444a4e1641db335c1e9a8a79b",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232152921903642",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "30dda01caf57e2a4",
+            "startTimeUnixNano": "1791232152921903642",
+            "durationNanos": "28641",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "7f97cf8c20d948fa",
+            "startTimeUnixNano": "1791232152921932283",
+            "durationNanos": "150296267",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "bde5665ed2a6c677",
+            "startTimeUnixNano": "1791232152921903642",
+            "durationNanos": "150324908",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "30dda01caf57e2a4",
+              "startTimeUnixNano": "1791232152921903642",
+              "durationNanos": "28641",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "7f97cf8c20d948fa",
+              "startTimeUnixNano": "1791232152921932283",
+              "durationNanos": "150296267",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "bde5665ed2a6c677",
+              "startTimeUnixNano": "1791232152921903642",
+              "durationNanos": "150324908",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "a2444165d806447801a89d4b43434e5b",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /report",
+      "startTimeUnixNano": "1791232152673138238",
+      "durationMs": 2000,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "29a9021ef201e0e1",
+            "startTimeUnixNano": "1791232152673138238",
+            "durationNanos": "21210",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "5c7ee693b8d33442",
+            "startTimeUnixNano": "1791232152673159448",
+            "durationNanos": "2000301201",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "59a148499f7cecd5",
+            "startTimeUnixNano": "1791232152673138238",
+            "durationNanos": "2000322411",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "29a9021ef201e0e1",
+              "startTimeUnixNano": "1791232152673138238",
+              "durationNanos": "21210",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "5c7ee693b8d33442",
+              "startTimeUnixNano": "1791232152673159448",
+              "durationNanos": "2000301201",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "59a148499f7cecd5",
+              "startTimeUnixNano": "1791232152673138238",
+              "durationNanos": "2000322411",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "86db0bb197ec5f97c907f02f9307fa35",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /report",
+      "startTimeUnixNano": "1791232152673126117",
+      "durationMs": 2000,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "072ba41324ee2db4",
+            "startTimeUnixNano": "1791232152673126117",
+            "durationNanos": "62351",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "b06e4f14c9ce294d",
+            "startTimeUnixNano": "1791232152673188468",
+            "durationNanos": "2000164547",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "15cbce61568b1134",
+            "startTimeUnixNano": "1791232152673126117",
+            "durationNanos": "2000226898",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "072ba41324ee2db4",
+              "startTimeUnixNano": "1791232152673126117",
+              "durationNanos": "62351",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "b06e4f14c9ce294d",
+              "startTimeUnixNano": "1791232152673188468",
+              "durationNanos": "2000164547",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "15cbce61568b1134",
+              "startTimeUnixNano": "1791232152673126117",
+              "durationNanos": "2000226898",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "814c2979272412e6bcb56993e01a705c",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232152620306142",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "110e7a68b6d01258",
+            "startTimeUnixNano": "1791232152620306142",
+            "durationNanos": "30231",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "6ec0b76f75a2f8d9",
+            "startTimeUnixNano": "1791232152620336373",
+            "durationNanos": "150389700",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "e1e03db0d8add0ed",
+            "startTimeUnixNano": "1791232152620306142",
+            "durationNanos": "150419931",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "110e7a68b6d01258",
+              "startTimeUnixNano": "1791232152620306142",
+              "durationNanos": "30231",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "6ec0b76f75a2f8d9",
+              "startTimeUnixNano": "1791232152620336373",
+              "durationNanos": "150389700",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "e1e03db0d8add0ed",
+              "startTimeUnixNano": "1791232152620306142",
+              "durationNanos": "150419931",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "9a5fdd0e9d6143dd51742429c3c445e9",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232152318734243",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "90b5891985a6ad80",
+            "startTimeUnixNano": "1791232152318734243",
+            "durationNanos": "32611",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "58d0f9f05101e126",
+            "startTimeUnixNano": "1791232152318766854",
+            "durationNanos": "150229206",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "356ea592b34f2d71",
+            "startTimeUnixNano": "1791232152318734243",
+            "durationNanos": "150261817",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "90b5891985a6ad80",
+              "startTimeUnixNano": "1791232152318734243",
+              "durationNanos": "32611",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "58d0f9f05101e126",
+              "startTimeUnixNano": "1791232152318766854",
+              "durationNanos": "150229206",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "356ea592b34f2d71",
+              "startTimeUnixNano": "1791232152318734243",
+              "durationNanos": "150261817",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "b54646468705eb718278bb5d63ac76e5",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232151367360670",
+      "durationMs": 800,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "0c2d7c244e68de1a",
+            "startTimeUnixNano": "1791232151367360670",
+            "durationNanos": "46931",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "69b6332d1fc1944a",
+            "startTimeUnixNano": "1791232151367407601",
+            "durationNanos": "800192834",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "feb7dcf57bad9ccc",
+            "startTimeUnixNano": "1791232151367360670",
+            "durationNanos": "800239765",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "0c2d7c244e68de1a",
+              "startTimeUnixNano": "1791232151367360670",
+              "durationNanos": "46931",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "69b6332d1fc1944a",
+              "startTimeUnixNano": "1791232151367407601",
+              "durationNanos": "800192834",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "feb7dcf57bad9ccc",
+              "startTimeUnixNano": "1791232151367360670",
+              "durationNanos": "800239765",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "34c1bb2fdcdbfcc3d24388454621cf9f",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232151066036287",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "54e25633860c99c0",
+            "startTimeUnixNano": "1791232151066036287",
+            "durationNanos": "28440",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "d2ec595ce2348bec",
+            "startTimeUnixNano": "1791232151066064727",
+            "durationNanos": "150194826",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "c09a83a48a640f5b",
+            "startTimeUnixNano": "1791232151066036287",
+            "durationNanos": "150223266",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "54e25633860c99c0",
+              "startTimeUnixNano": "1791232151066036287",
+              "durationNanos": "28440",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "d2ec595ce2348bec",
+              "startTimeUnixNano": "1791232151066064727",
+              "durationNanos": "150194826",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "c09a83a48a640f5b",
+              "startTimeUnixNano": "1791232151066036287",
+              "durationNanos": "150223266",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "cd8cb1886a8c3de69796e1bc72fc3cfe",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232150764521933",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "dd0822c26bf4d9fa",
+            "startTimeUnixNano": "1791232150764521933",
+            "durationNanos": "28811",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "7edc0753b5eb3101",
+            "startTimeUnixNano": "1791232150764550744",
+            "durationNanos": "150299733",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "efc85769d9b24554",
+            "startTimeUnixNano": "1791232150764521933",
+            "durationNanos": "150328544",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "dd0822c26bf4d9fa",
+              "startTimeUnixNano": "1791232150764521933",
+              "durationNanos": "28811",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "7edc0753b5eb3101",
+              "startTimeUnixNano": "1791232150764550744",
+              "durationNanos": "150299733",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "efc85769d9b24554",
+              "startTimeUnixNano": "1791232150764521933",
+              "durationNanos": "150328544",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "4c742082e120486153d7d67541420ddd",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /report",
+      "startTimeUnixNano": "1791232150521471746",
+      "durationMs": 2000,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "343957ac71d1e7f8",
+            "startTimeUnixNano": "1791232150521471746",
+            "durationNanos": "17810",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "16a8c2f6988be150",
+            "startTimeUnixNano": "1791232150521489556",
+            "durationNanos": "2000217307",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "fd87943545cc184c",
+            "startTimeUnixNano": "1791232150521471746",
+            "durationNanos": "2000235117",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "343957ac71d1e7f8",
+              "startTimeUnixNano": "1791232150521471746",
+              "durationNanos": "17810",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "16a8c2f6988be150",
+              "startTimeUnixNano": "1791232150521489556",
+              "durationNanos": "2000217307",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "fd87943545cc184c",
+              "startTimeUnixNano": "1791232150521471746",
+              "durationNanos": "2000235117",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "796f8450bb443b11d44a3a7d611d58b3",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /report",
+      "startTimeUnixNano": "1791232150521439145",
+      "durationMs": 2000,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "28e8a696b38af94b",
+            "startTimeUnixNano": "1791232150521439145",
+            "durationNanos": "28861",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "5b26f6f61bcd13e3",
+            "startTimeUnixNano": "1791232150521468006",
+            "durationNanos": "2000238937",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "3f377af9f96a0ff8",
+            "startTimeUnixNano": "1791232150521439145",
+            "durationNanos": "2000267798",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "28e8a696b38af94b",
+              "startTimeUnixNano": "1791232150521439145",
+              "durationNanos": "28861",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "5b26f6f61bcd13e3",
+              "startTimeUnixNano": "1791232150521468006",
+              "durationNanos": "2000238937",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "3f377af9f96a0ff8",
+              "startTimeUnixNano": "1791232150521439145",
+              "durationNanos": "2000267798",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "dbaff370ad4a2966787d93109647b7e1",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232150463066795",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "48ec35bf3a56083a",
+            "startTimeUnixNano": "1791232150463066795",
+            "durationNanos": "34991",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "61ecf26c48fbc756",
+            "startTimeUnixNano": "1791232150463101786",
+            "durationNanos": "150304654",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "95cbfb540a905993",
+            "startTimeUnixNano": "1791232150463066795",
+            "durationNanos": "150339645",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "48ec35bf3a56083a",
+              "startTimeUnixNano": "1791232150463066795",
+              "durationNanos": "34991",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "61ecf26c48fbc756",
+              "startTimeUnixNano": "1791232150463101786",
+              "durationNanos": "150304654",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "95cbfb540a905993",
+              "startTimeUnixNano": "1791232150463066795",
+              "durationNanos": "150339645",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "27e70a9145283663c304a4e1bd63b20f",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232149511618823",
+      "durationMs": 800,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "2fd711f31b9e4661",
+            "startTimeUnixNano": "1791232149511618823",
+            "durationNanos": "25880",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "36cf180057479c47",
+            "startTimeUnixNano": "1791232149511644703",
+            "durationNanos": "800219897",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "564a0c31c00d0f3d",
+            "startTimeUnixNano": "1791232149511618823",
+            "durationNanos": "800245777",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "2fd711f31b9e4661",
+              "startTimeUnixNano": "1791232149511618823",
+              "durationNanos": "25880",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "36cf180057479c47",
+              "startTimeUnixNano": "1791232149511644703",
+              "durationNanos": "800219897",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "564a0c31c00d0f3d",
+              "startTimeUnixNano": "1791232149511618823",
+              "durationNanos": "800245777",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "2225347f18b5d82db6c51703918e8b0d",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232149210398990",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "ee3d597eabbbff8f",
+            "startTimeUnixNano": "1791232149210398990",
+            "durationNanos": "26901",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "366812b888811a2e",
+            "startTimeUnixNano": "1791232149210425891",
+            "durationNanos": "150172761",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "bcdb9d60faed8ea6",
+            "startTimeUnixNano": "1791232149210398990",
+            "durationNanos": "150199662",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "ee3d597eabbbff8f",
+              "startTimeUnixNano": "1791232149210398990",
+              "durationNanos": "26901",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "366812b888811a2e",
+              "startTimeUnixNano": "1791232149210425891",
+              "durationNanos": "150172761",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "bcdb9d60faed8ea6",
+              "startTimeUnixNano": "1791232149210398990",
+              "durationNanos": "150199662",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "c050b2bbd589e434c01a96d8c6a64d80",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232148908806409",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "25d5a525f3edc7ae",
+            "startTimeUnixNano": "1791232148908806409",
+            "durationNanos": "27531",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "749dbc8b816bf73e",
+            "startTimeUnixNano": "1791232148908833940",
+            "durationNanos": "150417546",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "ab3a4b7d9b656680",
+            "startTimeUnixNano": "1791232148908806409",
+            "durationNanos": "150445077",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "25d5a525f3edc7ae",
+              "startTimeUnixNano": "1791232148908806409",
+              "durationNanos": "27531",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "749dbc8b816bf73e",
+              "startTimeUnixNano": "1791232148908833940",
+              "durationNanos": "150417546",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "ab3a4b7d9b656680",
+              "startTimeUnixNano": "1791232148908806409",
+              "durationNanos": "150445077",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "ff57c6ad679e7b92835f85502bafd26e",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232148607190267",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "854d3ae05beb6f0c",
+            "startTimeUnixNano": "1791232148607190267",
+            "durationNanos": "27841",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "66fff36a5fb2044f",
+            "startTimeUnixNano": "1791232148607218108",
+            "durationNanos": "150287463",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "bfd573d62f38fa07",
+            "startTimeUnixNano": "1791232148607190267",
+            "durationNanos": "150315304",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "854d3ae05beb6f0c",
+              "startTimeUnixNano": "1791232148607190267",
+              "durationNanos": "27841",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "66fff36a5fb2044f",
+              "startTimeUnixNano": "1791232148607218108",
+              "durationNanos": "150287463",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "bfd573d62f38fa07",
+              "startTimeUnixNano": "1791232148607190267",
+              "durationNanos": "150315304",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "ac5c3aedaacf70942fdc01248be3d796",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /report",
+      "startTimeUnixNano": "1791232148369843886",
+      "durationMs": 2000,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "eb939aa456912e5c",
+            "startTimeUnixNano": "1791232148369843886",
+            "durationNanos": "19391",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "dbc444f48da9005d",
+            "startTimeUnixNano": "1791232148369863277",
+            "durationNanos": "2000216259",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "7f8d56a0642a23d1",
+            "startTimeUnixNano": "1791232148369843886",
+            "durationNanos": "2000235650",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "eb939aa456912e5c",
+              "startTimeUnixNano": "1791232148369843886",
+              "durationNanos": "19391",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "dbc444f48da9005d",
+              "startTimeUnixNano": "1791232148369863277",
+              "durationNanos": "2000216259",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "7f8d56a0642a23d1",
+              "startTimeUnixNano": "1791232148369843886",
+              "durationNanos": "2000235650",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "e1b7a543853762894f108d0253acbea8",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /report",
+      "startTimeUnixNano": "1791232148369803766",
+      "durationMs": 2000,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "8126d01766ab6711",
+            "startTimeUnixNano": "1791232148369803766",
+            "durationNanos": "30830",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "39643ebd538e0326",
+            "startTimeUnixNano": "1791232148369834596",
+            "durationNanos": "2000215179",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "0e6402727ee38d68",
+            "startTimeUnixNano": "1791232148369803766",
+            "durationNanos": "2000246009",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "8126d01766ab6711",
+              "startTimeUnixNano": "1791232148369803766",
+              "durationNanos": "30830",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "39643ebd538e0326",
+              "startTimeUnixNano": "1791232148369834596",
+              "durationNanos": "2000215179",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "0e6402727ee38d68",
+              "startTimeUnixNano": "1791232148369803766",
+              "durationNanos": "2000246009",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "848813cdeddc45284dfd0a959b018120",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232147655615542",
+      "durationMs": 800,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "ccf17321890e913b",
+            "startTimeUnixNano": "1791232147655615542",
+            "durationNanos": "26610",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "5e8206b39e6ca893",
+            "startTimeUnixNano": "1791232147655642152",
+            "durationNanos": "800331470",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "724e61eb44591953",
+            "startTimeUnixNano": "1791232147655615542",
+            "durationNanos": "800358080",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "ccf17321890e913b",
+              "startTimeUnixNano": "1791232147655615542",
+              "durationNanos": "26610",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "5e8206b39e6ca893",
+              "startTimeUnixNano": "1791232147655642152",
+              "durationNanos": "800331470",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "724e61eb44591953",
+              "startTimeUnixNano": "1791232147655615542",
+              "durationNanos": "800358080",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "f46f37eed0b3853cbc013bf6b08532ea",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232147354144563",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "f22fe3cff35666e4",
+            "startTimeUnixNano": "1791232147354144563",
+            "durationNanos": "51271",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "2044073e97d19fca",
+            "startTimeUnixNano": "1791232147354195834",
+            "durationNanos": "150264353",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "68cc3870ae2dfeea",
+            "startTimeUnixNano": "1791232147354144563",
+            "durationNanos": "150315624",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "f22fe3cff35666e4",
+              "startTimeUnixNano": "1791232147354144563",
+              "durationNanos": "51271",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "2044073e97d19fca",
+              "startTimeUnixNano": "1791232147354195834",
+              "durationNanos": "150264353",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "68cc3870ae2dfeea",
+              "startTimeUnixNano": "1791232147354144563",
+              "durationNanos": "150315624",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "30914d3c6ee00124d7a8c4e71dba3c04",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232147052464130",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "a822492d08c82e75",
+            "startTimeUnixNano": "1791232147052464130",
+            "durationNanos": "29391",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "6c45b7611a23a575",
+            "startTimeUnixNano": "1791232147052493521",
+            "durationNanos": "150374495",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "5f2f0718ca13ca54",
+            "startTimeUnixNano": "1791232147052464130",
+            "durationNanos": "150403886",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "a822492d08c82e75",
+              "startTimeUnixNano": "1791232147052464130",
+              "durationNanos": "29391",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "6c45b7611a23a575",
+              "startTimeUnixNano": "1791232147052493521",
+              "durationNanos": "150374495",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "5f2f0718ca13ca54",
+              "startTimeUnixNano": "1791232147052464130",
+              "durationNanos": "150403886",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "a017cc69be0f8dbcc823e2a8036a6af7",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232146751005372",
+      "durationMs": 150,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "7f8040957c19d8d5",
+            "startTimeUnixNano": "1791232146751005372",
+            "durationNanos": "28581",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "91b409c9476bc33b",
+            "startTimeUnixNano": "1791232146751033953",
+            "durationNanos": "150345444",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "12d22eff7c262a6d",
+            "startTimeUnixNano": "1791232146751005372",
+            "durationNanos": "150374025",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "7f8040957c19d8d5",
+              "startTimeUnixNano": "1791232146751005372",
+              "durationNanos": "28581",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "91b409c9476bc33b",
+              "startTimeUnixNano": "1791232146751033953",
+              "durationNanos": "150345444",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "12d22eff7c262a6d",
+              "startTimeUnixNano": "1791232146751005372",
+              "durationNanos": "150374025",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "eba37158f2805900e8dd1950a6168de6",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /report",
+      "startTimeUnixNano": "1791232146218136205",
+      "durationMs": 2000,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "fa17281c815f2b47",
+            "startTimeUnixNano": "1791232146218136205",
+            "durationNanos": "43331",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "4e158bad6132e375",
+            "startTimeUnixNano": "1791232146218179536",
+            "durationNanos": "2000209309",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "87f8147215fa3430",
+            "startTimeUnixNano": "1791232146218136205",
+            "durationNanos": "2000252640",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "fa17281c815f2b47",
+              "startTimeUnixNano": "1791232146218136205",
+              "durationNanos": "43331",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "4e158bad6132e375",
+              "startTimeUnixNano": "1791232146218179536",
+              "durationNanos": "2000209309",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "87f8147215fa3430",
+              "startTimeUnixNano": "1791232146218136205",
+              "durationNanos": "2000252640",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "6f53798a4ce2984c2254f74b8108f0cf",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /report",
+      "startTimeUnixNano": "1791232146218053603",
+      "durationMs": 2000,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "91a04c9efcce0173",
+            "startTimeUnixNano": "1791232146218053603",
+            "durationNanos": "28511",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "23f223b5a0a4735f",
+            "startTimeUnixNano": "1791232146218082114",
+            "durationNanos": "2000280990",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "3979dba43340f948",
+            "startTimeUnixNano": "1791232146218053603",
+            "durationNanos": "2000309501",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "91a04c9efcce0173",
+              "startTimeUnixNano": "1791232146218053603",
+              "durationNanos": "28511",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "23f223b5a0a4735f",
+              "startTimeUnixNano": "1791232146218082114",
+              "durationNanos": "2000280990",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "3979dba43340f948",
+              "startTimeUnixNano": "1791232146218053603",
+              "durationNanos": "2000309501",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "4da84865531eee67a0a4c24b0ff8c4ef",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791232145799524458",
+      "durationMs": 800,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "f154ccf67e22c1a7",
+            "startTimeUnixNano": "1791232145799524458",
+            "durationNanos": "26781",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "10256e8f51c658e6",
+            "startTimeUnixNano": "1791232145799551239",
+            "durationNanos": "800246887",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "3f83ccbef54565ea",
+            "startTimeUnixNano": "1791232145799524458",
+            "durationNanos": "800273668",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "f154ccf67e22c1a7",
+              "startTimeUnixNano": "1791232145799524458",
+              "durationNanos": "26781",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "10256e8f51c658e6",
+              "startTimeUnixNano": "1791232145799551239",
+              "durationNanos": "800246887",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "3f83ccbef54565ea",
+              "startTimeUnixNano": "1791232145799524458",
+              "durationNanos": "800273668",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "a89d5890ff009e0894af7be39099069f",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /report",
+      "startTimeUnixNano": "1791232144066371173",
+      "durationMs": 2000,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "bd7037bf265969cd",
+            "startTimeUnixNano": "1791232144066371173",
+            "durationNanos": "28211",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "f4fbdc7ff6be7378",
+            "startTimeUnixNano": "1791232144066399384",
+            "durationNanos": "2000277000",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "188a2221a6828243",
+            "startTimeUnixNano": "1791232144066371173",
+            "durationNanos": "2000305211",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "bd7037bf265969cd",
+              "startTimeUnixNano": "1791232144066371173",
+              "durationNanos": "28211",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "f4fbdc7ff6be7378",
+              "startTimeUnixNano": "1791232144066399384",
+              "durationNanos": "2000277000",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "188a2221a6828243",
+              "startTimeUnixNano": "1791232144066371173",
+              "durationNanos": "2000305211",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "7705239ee8e5a0876a01c341da416835",
+      "rootServiceName": "obi-poc-cost",
+      "rootTraceName": "GET /report",
+      "startTimeUnixNano": "1791232144066296861",
+      "durationMs": 2000,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "0d9bbb82f068f249",
+            "startTimeUnixNano": "1791232144066296861",
+            "durationNanos": "29151",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "828489aecf0e48c3",
+            "startTimeUnixNano": "1791232144066326012",
+            "durationNanos": "2000280250",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "1f8de7f9a4118152",
+            "startTimeUnixNano": "1791232144066296861",
+            "durationNanos": "2000309401",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-cost"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "0d9bbb82f068f249",
+              "startTimeUnixNano": "1791232144066296861",
+              "durationNanos": "29151",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "828489aecf0e48c3",
+              "startTimeUnixNano": "1791232144066326012",
+              "durationNanos": "2000280250",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "1f8de7f9a4118152",
+              "startTimeUnixNano": "1791232144066296861",
+              "durationNanos": "2000309401",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-cost": {
+          "spanCount": 3
+        }
+      }
+    }
+  ],
+  "metrics": {
+    "inspectedBytes": "62602",
+    "completedJobs": 1,
+    "totalJobs": 1
+  }
+}

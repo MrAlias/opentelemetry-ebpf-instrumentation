@@ -1,0 +1,160 @@
+{
+  "mode": "profiler",
+  "interval": {
+    "start_ms": 1791234099611,
+    "end_ms": 1791234121627,
+    "start": "2026-10-05T21:01:39.611000+00:00",
+    "end": "2026-10-05T21:02:01.627000+00:00"
+  },
+  "aggregate": {
+    "state": "samples",
+    "total_ns": 18680411736,
+    "self_sum_ns": 18680411736,
+    "functions": [
+      {
+        "name": "main.prepareReport",
+        "self_ns": 17742267438,
+        "cumulative_ns": 17762885994
+      },
+      {
+        "name": "main.finishWork",
+        "self_ns": 907216464,
+        "cumulative_ns": 907216464
+      },
+      {
+        "name": "irqentry_exit",
+        "self_ns": 10309278,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "time.now",
+        "self_ns": 10309278,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "fmt.(*fmt).fmtInteger",
+        "self_ns": 10309278,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "total",
+        "self_ns": 0,
+        "cumulative_ns": 18680411736
+      },
+      {
+        "name": "runtime.goexit",
+        "self_ns": 0,
+        "cumulative_ns": 18680411736
+      },
+      {
+        "name": "net/http.(*Server).Serve.gowrap3",
+        "self_ns": 0,
+        "cumulative_ns": 18680411736
+      },
+      {
+        "name": "net/http.(*conn).serve",
+        "self_ns": 0,
+        "cumulative_ns": 18680411736
+      },
+      {
+        "name": "net/http.serverHandler.ServeHTTP",
+        "self_ns": 0,
+        "cumulative_ns": 18680411736
+      },
+      {
+        "name": "net/http.(*ServeMux).ServeHTTP",
+        "self_ns": 0,
+        "cumulative_ns": 18680411736
+      },
+      {
+        "name": "net/http.HandlerFunc.ServeHTTP",
+        "self_ns": 0,
+        "cumulative_ns": 18680411736
+      },
+      {
+        "name": "main.(*application).report-fm",
+        "self_ns": 0,
+        "cumulative_ns": 17762885994
+      },
+      {
+        "name": "main.(*application).work-fm",
+        "self_ns": 0,
+        "cumulative_ns": 917525742
+      },
+      {
+        "name": "main.(*application).report",
+        "self_ns": 0,
+        "cumulative_ns": 17762885994
+      },
+      {
+        "name": "main.(*application).work",
+        "self_ns": 0,
+        "cumulative_ns": 917525742
+      },
+      {
+        "name": "main.groundTruth",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "asm_sysvec_reschedule_ipi",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "time.Now",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "fmt.Sprintf",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "sysvec_reschedule_ipi",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "time.runtimeNow",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "fmt.(*pp).doPrintf",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "fmt.(*pp).printArg",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      },
+      {
+        "name": "fmt.(*pp).fmtPointer",
+        "self_ns": 0,
+        "cumulative_ns": 10309278
+      }
+    ],
+    "unit": "nanoseconds",
+    "note": "Cumulative values overlap; do not sum them. Sampled CPU is not elapsed time."
+  },
+  "trace_search": {
+    "traces": [],
+    "metrics": {
+      "completedJobs": 1,
+      "totalJobs": 1
+    }
+  },
+  "exemplars": [],
+  "available_unique_exemplars": 0,
+  "fetched_traces": [],
+  "returned_exemplars": 0,
+  "truncated": false,
+  "invalid_ids": 0,
+  "trace_search_limit": 200,
+  "profile_url": "http://localhost:3103/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-interference&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791234099611&to=1791234121627&showSpanHeatmap=true",
+  "causal_state": "unresolved_missing_resource_and_owner_events",
+  "note": "Exact CPU/span identity does not establish mutex ownership, waiting, or interference. Exemplars are a bounded selection."
+}

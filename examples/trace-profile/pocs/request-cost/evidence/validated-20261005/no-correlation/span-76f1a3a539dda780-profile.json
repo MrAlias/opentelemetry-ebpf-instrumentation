@@ -1,0 +1,17 @@
+{
+  "flamegraph": {
+    "names": [
+      "total"
+    ],
+    "levels": [
+      {
+        "values": [
+          "0",
+          "0",
+          "0",
+          "0"
+        ]
+      }
+    ]
+  }
+}

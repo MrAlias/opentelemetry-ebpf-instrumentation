@@ -1,0 +1,267 @@
+{
+  "flamegraph": {
+    "names": [
+      "total",
+      "runtime.goexit",
+      "net/http.(*Server).Serve.gowrap3",
+      "net/http.(*conn).serve",
+      "net/http.serverHandler.ServeHTTP",
+      "net/http.(*ServeMux).ServeHTTP",
+      "net/http.HandlerFunc.ServeHTTP",
+      "main.main.func2",
+      "main.blockingSyscall",
+      "syscall.Nanosleep",
+      "syscall.Syscall",
+      "syscall.RawSyscall6",
+      "internal/runtime/syscall/linux.Syscall6",
+      "entry_SYSCALL_64_after_hwframe",
+      "do_syscall_64",
+      "x64_sys_call",
+      "__x64_sys_nanosleep",
+      "hrtimer_nanosleep",
+      "do_nanosleep",
+      "schedule",
+      "finish_task_switch.isra.0",
+      "net/http.(*response).finishRequest",
+      "bufio.(*Writer).Flush",
+      "net/http.checkConnErrorWriter.Write",
+      "net.(*conn).Write",
+      "net.(*netFD).Write",
+      "internal/poll.(*FD).Write",
+      "syscall.write",
+      "exit_to_user_mode_loop"
+    ],
+    "levels": [
+      {
+        "values": [
+          "0",
+          "1000181775",
+          "0",
+          "0"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "1000181775",
+          "0",
+          "1"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "1000181775",
+          "0",
+          "2"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "1000181775",
+          "0",
+          "3"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "76932",
+          "0",
+          "21",
+          "0",
+          "1000104843",
+          "0",
+          "4"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "76932",
+          "0",
+          "22",
+          "0",
+          "1000104843",
+          "0",
+          "5"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "76932",
+          "0",
+          "23",
+          "0",
+          "1000104843",
+          "0",
+          "6"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "76932",
+          "0",
+          "24",
+          "0",
+          "1000104843",
+          "0",
+          "7"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "76932",
+          "0",
+          "25",
+          "0",
+          "1000104843",
+          "0",
+          "8"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "76932",
+          "0",
+          "26",
+          "0",
+          "1000104843",
+          "0",
+          "9"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "76932",
+          "0",
+          "27",
+          "0",
+          "1000104843",
+          "0",
+          "10"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "76932",
+          "0",
+          "10",
+          "0",
+          "1000104843",
+          "0",
+          "11"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "76932",
+          "0",
+          "11",
+          "0",
+          "1000104843",
+          "0",
+          "12"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "76932",
+          "0",
+          "12",
+          "0",
+          "1000104843",
+          "0",
+          "13"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "76932",
+          "0",
+          "13",
+          "0",
+          "1000104843",
+          "0",
+          "14"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "76932",
+          "0",
+          "14",
+          "0",
+          "1000104843",
+          "0",
+          "15"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "76932",
+          "0",
+          "28",
+          "0",
+          "1000104843",
+          "0",
+          "16"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "76932",
+          "0",
+          "19",
+          "0",
+          "1000104843",
+          "0",
+          "17"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "76932",
+          "76932",
+          "20",
+          "0",
+          "1000104843",
+          "0",
+          "18"
+        ]
+      },
+      {
+        "values": [
+          "76932",
+          "1000104843",
+          "0",
+          "19"
+        ]
+      },
+      {
+        "values": [
+          "76932",
+          "1000104843",
+          "1000104843",
+          "20"
+        ]
+      }
+    ],
+    "total": "1000181775",
+    "maxSelf": "1000104843"
+  }
+}

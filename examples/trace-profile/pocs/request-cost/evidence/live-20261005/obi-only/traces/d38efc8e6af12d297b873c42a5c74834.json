@@ -1,0 +1,228 @@
+{
+  "batches": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "cloud.account.id",
+            "value": {
+              "stringValue": "390403870171"
+            }
+          },
+          {
+            "key": "cloud.availability_zone",
+            "value": {
+              "stringValue": "us-west-2a"
+            }
+          },
+          {
+            "key": "cloud.platform",
+            "value": {
+              "stringValue": "aws_ec2"
+            }
+          },
+          {
+            "key": "cloud.provider",
+            "value": {
+              "stringValue": "aws"
+            }
+          },
+          {
+            "key": "cloud.region",
+            "value": {
+              "stringValue": "us-west-2"
+            }
+          },
+          {
+            "key": "host.id",
+            "value": {
+              "stringValue": "i-0e8fbe260a77aba22"
+            }
+          },
+          {
+            "key": "host.image.id",
+            "value": {
+              "stringValue": "ami-0794681e58321386f"
+            }
+          },
+          {
+            "key": "host.name",
+            "value": {
+              "stringValue": "bf996520b299"
+            }
+          },
+          {
+            "key": "host.type",
+            "value": {
+              "stringValue": "c5a.4xlarge"
+            }
+          },
+          {
+            "key": "os.type",
+            "value": {
+              "stringValue": "linux"
+            }
+          },
+          {
+            "key": "otel.scope.name",
+            "value": {
+              "stringValue": "go.opentelemetry.io/obi"
+            }
+          },
+          {
+            "key": "service.instance.id",
+            "value": {
+              "stringValue": "bf996520b299:3937680"
+            }
+          },
+          {
+            "key": "telemetry.distro.name",
+            "value": {
+              "stringValue": "opentelemetry-ebpf-instrumentation"
+            }
+          },
+          {
+            "key": "telemetry.distro.version",
+            "value": {
+              "stringValue": "ai-poc"
+            }
+          },
+          {
+            "key": "telemetry.sdk.language",
+            "value": {
+              "stringValue": "go"
+            }
+          },
+          {
+            "key": "telemetry.sdk.name",
+            "value": {
+              "stringValue": "opentelemetry"
+            }
+          },
+          {
+            "key": "telemetry.sdk.version",
+            "value": {
+              "stringValue": "v1.46.0"
+            }
+          },
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "obi-poc-cost"
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {},
+          "spans": [
+            {
+              "traceId": "0478jmrxLSl7hzxCpcdINA==",
+              "spanId": "x0R9OuuQ3aw=",
+              "parentSpanId": "b9dzRsP58/g=",
+              "name": "in queue",
+              "kind": "SPAN_KIND_INTERNAL",
+              "startTimeUnixNano": "1791232165582697586",
+              "endTimeUnixNano": "1791232165582719326",
+              "status": {}
+            },
+            {
+              "traceId": "0478jmrxLSl7hzxCpcdINA==",
+              "spanId": "ofbtEFVqhnU=",
+              "parentSpanId": "b9dzRsP58/g=",
+              "name": "processing",
+              "kind": "SPAN_KIND_INTERNAL",
+              "startTimeUnixNano": "1791232165582719326",
+              "endTimeUnixNano": "1791232167582911562",
+              "status": {}
+            },
+            {
+              "traceId": "0478jmrxLSl7hzxCpcdINA==",
+              "spanId": "b9dzRsP58/g=",
+              "name": "GET /report",
+              "kind": "SPAN_KIND_SERVER",
+              "startTimeUnixNano": "1791232165582697586",
+              "endTimeUnixNano": "1791232167582911562",
+              "attributes": [
+                {
+                  "key": "client.address",
+                  "value": {
+                    "stringValue": "172.22.0.1"
+                  }
+                },
+                {
+                  "key": "server.port",
+                  "value": {
+                    "intValue": "8080"
+                  }
+                },
+                {
+                  "key": "http.request.body.size",
+                  "value": {
+                    "intValue": "0"
+                  }
+                },
+                {
+                  "key": "http.response.body.size",
+                  "value": {
+                    "intValue": "0"
+                  }
+                },
+                {
+                  "key": "http.response.status_code",
+                  "value": {
+                    "intValue": "200"
+                  }
+                },
+                {
+                  "key": "url.scheme",
+                  "value": {
+                    "stringValue": "http"
+                  }
+                },
+                {
+                  "key": "network.peer.address",
+                  "value": {
+                    "stringValue": "172.22.0.1"
+                  }
+                },
+                {
+                  "key": "network.peer.port",
+                  "value": {
+                    "intValue": "56572"
+                  }
+                },
+                {
+                  "key": "http.request.method",
+                  "value": {
+                    "stringValue": "GET"
+                  }
+                },
+                {
+                  "key": "url.path",
+                  "value": {
+                    "stringValue": "/report"
+                  }
+                },
+                {
+                  "key": "server.address",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                },
+                {
+                  "key": "http.route",
+                  "value": {
+                    "stringValue": "/report"
+                  }
+                }
+              ],
+              "status": {}
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

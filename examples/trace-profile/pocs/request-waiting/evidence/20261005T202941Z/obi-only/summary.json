@@ -1,0 +1,5680 @@
+{
+  "start_ms": 1791232237707,
+  "end_ms": 1791232297707,
+  "profile_types": [
+    "block:contentions:count:contentions:count",
+    "block:delay:nanoseconds:contentions:count",
+    "goroutines:goroutine:count:goroutine:count",
+    "memory:alloc_objects:count:space:bytes",
+    "memory:alloc_space:bytes:space:bytes",
+    "memory:inuse_objects:count:space:bytes",
+    "memory:inuse_space:bytes:space:bytes",
+    "mutex:contentions:count:contentions:count",
+    "mutex:delay:nanoseconds:contentions:count",
+    "process_cpu:cpu:nanoseconds:cpu:nanoseconds",
+    "process_cpu:samples:count:cpu:nanoseconds"
+  ],
+  "profiles": [
+    {
+      "profile_type": "process_cpu:cpu:nanoseconds:cpu:nanoseconds",
+      "aggregate": {
+        "unit": "nanoseconds",
+        "total_ns": 0,
+        "self_sum_ns": 0,
+        "functions": [
+          {
+            "function": "total",
+            "self_ns": 0,
+            "cumulative_ns": 0
+          }
+        ]
+      },
+      "profile_url": "http://localhost:3102/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-waiting&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232237707&to=1791232297707&showSpanHeatmap=true",
+      "links": [],
+      "state": "no_exemplars"
+    }
+  ],
+  "traces": [
+    {
+      "trace_id": "7fd3aa7b0b658ad11fb6af29a888a640",
+      "trace_url": "http://localhost:3102/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%227fd3aa7b0b658ad11fb6af29a888a640%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%221791232237707%22%2C+%22to%22%3A+%221791232297707%22%7D%7D%7D",
+      "spans": [
+        {
+          "traceId": "f9OqewtlitEftq8pqIimQA==",
+          "spanId": "36eAzT7O8H8=",
+          "parentSpanId": "TjrKu1AY4+4=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232262941395102",
+          "endTimeUnixNano": "1791232262941412092",
+          "status": {}
+        },
+        {
+          "traceId": "f9OqewtlitEftq8pqIimQA==",
+          "spanId": "qgUbGA9RpWg=",
+          "parentSpanId": "TjrKu1AY4+4=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232262941412092",
+          "endTimeUnixNano": "1791232263942151056",
+          "status": {}
+        },
+        {
+          "traceId": "f9OqewtlitEftq8pqIimQA==",
+          "spanId": "TjrKu1AY4+4=",
+          "parentSpanId": "QgCNAsXciJE=",
+          "name": "GET /delay",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232262941395102",
+          "endTimeUnixNano": "1791232263942151056",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "41176"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/delay"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/delay"
+              }
+            }
+          ],
+          "status": {}
+        },
+        {
+          "traceId": "f9OqewtlitEftq8pqIimQA==",
+          "spanId": "QgCNAsXciJE=",
+          "parentSpanId": "OBlBrUk1I9k=",
+          "name": "GET /delay",
+          "kind": "SPAN_KIND_CLIENT",
+          "startTimeUnixNano": "1791232262941222298",
+          "endTimeUnixNano": "1791232263942253468",
+          "attributes": [
+            {
+              "key": "service.peer.name",
+              "value": {
+                "stringValue": "127.0.0.1:8080"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "url.full",
+              "value": {
+                "stringValue": "http://127.0.0.1:8080/delay"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "10"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "127.0.0.1:8080"
+              }
+            }
+          ],
+          "status": {}
+        },
+        {
+          "traceId": "f9OqewtlitEftq8pqIimQA==",
+          "spanId": "Pb2/lEmzX88=",
+          "parentSpanId": "4w4/36KxMiM=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232262941133026",
+          "endTimeUnixNano": "1791232262941159636",
+          "status": {}
+        },
+        {
+          "traceId": "f9OqewtlitEftq8pqIimQA==",
+          "spanId": "OBlBrUk1I9k=",
+          "parentSpanId": "4w4/36KxMiM=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232262941159636",
+          "endTimeUnixNano": "1791232263942477254",
+          "status": {}
+        },
+        {
+          "traceId": "f9OqewtlitEftq8pqIimQA==",
+          "spanId": "4w4/36KxMiM=",
+          "name": "GET /downstream",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232262941133026",
+          "endTimeUnixNano": "1791232263942477254",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "36810"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/downstream"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/downstream"
+              }
+            }
+          ],
+          "status": {}
+        }
+      ]
+    },
+    {
+      "trace_id": "50c94c3b61764445eadf1ff356a6bf53",
+      "trace_url": "http://localhost:3102/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%2250c94c3b61764445eadf1ff356a6bf53%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%221791232237707%22%2C+%22to%22%3A+%221791232297707%22%7D%7D%7D",
+      "spans": [
+        {
+          "traceId": "UMlMO2F2REXq3x/zVqa/Uw==",
+          "spanId": "KUIiwCGTQ6g=",
+          "parentSpanId": "DY8panZwrms=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232262906827248",
+          "endTimeUnixNano": "1791232262906848648",
+          "status": {}
+        },
+        {
+          "traceId": "UMlMO2F2REXq3x/zVqa/Uw==",
+          "spanId": "o4hDVFzjXHc=",
+          "parentSpanId": "DY8panZwrms=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232262906848648",
+          "endTimeUnixNano": "1791232263907108932",
+          "status": {}
+        },
+        {
+          "traceId": "UMlMO2F2REXq3x/zVqa/Uw==",
+          "spanId": "DY8panZwrms=",
+          "name": "GET /syscall",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232262906827248",
+          "endTimeUnixNano": "1791232263907108932",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "36774"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/syscall"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/syscall"
+              }
+            }
+          ],
+          "status": {}
+        }
+      ]
+    },
+    {
+      "trace_id": "2951a64788a8f988b955330846f73d4e",
+      "trace_url": "http://localhost:3102/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%222951a64788a8f988b955330846f73d4e%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%221791232237707%22%2C+%22to%22%3A+%221791232297707%22%7D%7D%7D",
+      "spans": [
+        {
+          "traceId": "KVGmR4io+Yi5VTMIRvc9Tg==",
+          "spanId": "Mr4U3o9Iay4=",
+          "parentSpanId": "v3i1YI8K8sg=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232262906800197",
+          "endTimeUnixNano": "1791232262906826378",
+          "status": {}
+        },
+        {
+          "traceId": "KVGmR4io+Yi5VTMIRvc9Tg==",
+          "spanId": "q+I7LL6L3HU=",
+          "parentSpanId": "v3i1YI8K8sg=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232262906826378",
+          "endTimeUnixNano": "1791232263907105552",
+          "status": {}
+        },
+        {
+          "traceId": "KVGmR4io+Yi5VTMIRvc9Tg==",
+          "spanId": "v3i1YI8K8sg=",
+          "name": "GET /syscall",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232262906800197",
+          "endTimeUnixNano": "1791232263907105552",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "36784"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/syscall"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/syscall"
+              }
+            }
+          ],
+          "status": {}
+        }
+      ]
+    },
+    {
+      "trace_id": "2534000ff605f7e01c48ba0204ef965d",
+      "trace_url": "http://localhost:3102/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%222534000ff605f7e01c48ba0204ef965d%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%221791232237707%22%2C+%22to%22%3A+%221791232297707%22%7D%7D%7D",
+      "spans": [
+        {
+          "traceId": "JTQAD/YF9+AcSLoCBO+WXQ==",
+          "spanId": "uhzxqibjoTQ=",
+          "parentSpanId": "H+KA6R01Mq8=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232261938691250",
+          "endTimeUnixNano": "1791232261938715881",
+          "status": {}
+        },
+        {
+          "traceId": "JTQAD/YF9+AcSLoCBO+WXQ==",
+          "spanId": "kgCev/cS6pc=",
+          "parentSpanId": "H+KA6R01Mq8=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232261938715881",
+          "endTimeUnixNano": "1791232262939505940",
+          "status": {}
+        },
+        {
+          "traceId": "JTQAD/YF9+AcSLoCBO+WXQ==",
+          "spanId": "H+KA6R01Mq8=",
+          "parentSpanId": "zxJS2nFSDLU=",
+          "name": "GET /delay",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232261938691250",
+          "endTimeUnixNano": "1791232262939505940",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "41176"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/delay"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/delay"
+              }
+            }
+          ],
+          "status": {}
+        },
+        {
+          "traceId": "JTQAD/YF9+AcSLoCBO+WXQ==",
+          "spanId": "zxJS2nFSDLU=",
+          "parentSpanId": "Vl1gNF1eftY=",
+          "name": "GET /delay",
+          "kind": "SPAN_KIND_CLIENT",
+          "startTimeUnixNano": "1791232261938491344",
+          "endTimeUnixNano": "1791232262939595752",
+          "attributes": [
+            {
+              "key": "service.peer.name",
+              "value": {
+                "stringValue": "127.0.0.1:8080"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "url.full",
+              "value": {
+                "stringValue": "http://127.0.0.1:8080/delay"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "10"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "127.0.0.1:8080"
+              }
+            }
+          ],
+          "status": {}
+        },
+        {
+          "traceId": "JTQAD/YF9+AcSLoCBO+WXQ==",
+          "spanId": "ontWtclpwoo=",
+          "parentSpanId": "ZFylVmL9hvs=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232261938443263",
+          "endTimeUnixNano": "1791232261938459983",
+          "status": {}
+        },
+        {
+          "traceId": "JTQAD/YF9+AcSLoCBO+WXQ==",
+          "spanId": "Vl1gNF1eftY=",
+          "parentSpanId": "ZFylVmL9hvs=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232261938459983",
+          "endTimeUnixNano": "1791232262939814139",
+          "status": {}
+        },
+        {
+          "traceId": "JTQAD/YF9+AcSLoCBO+WXQ==",
+          "spanId": "ZFylVmL9hvs=",
+          "name": "GET /downstream",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232261938443263",
+          "endTimeUnixNano": "1791232262939814139",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "36748"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/downstream"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/downstream"
+              }
+            }
+          ],
+          "status": {}
+        }
+      ]
+    },
+    {
+      "trace_id": "2ecec1704c88f984109e67e1c55ea705",
+      "trace_url": "http://localhost:3102/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%222ecec1704c88f984109e67e1c55ea705%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%221791232237707%22%2C+%22to%22%3A+%221791232297707%22%7D%7D%7D",
+      "spans": [
+        {
+          "traceId": "Ls7BcEyI+YQQnmfhxV6nBQ==",
+          "spanId": "+i2tYud5EFE=",
+          "parentSpanId": "utxmBDwDbPQ=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232261938694320",
+          "endTimeUnixNano": "1791232261938711911",
+          "status": {}
+        },
+        {
+          "traceId": "Ls7BcEyI+YQQnmfhxV6nBQ==",
+          "spanId": "NKbrDmm89cw=",
+          "parentSpanId": "utxmBDwDbPQ=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232261938711911",
+          "endTimeUnixNano": "1791232262939525590",
+          "status": {}
+        },
+        {
+          "traceId": "Ls7BcEyI+YQQnmfhxV6nBQ==",
+          "spanId": "utxmBDwDbPQ=",
+          "parentSpanId": "5wzsCnzYh68=",
+          "name": "GET /delay",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232261938694320",
+          "endTimeUnixNano": "1791232262939525590",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "41186"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/delay"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/delay"
+              }
+            }
+          ],
+          "status": {}
+        },
+        {
+          "traceId": "Ls7BcEyI+YQQnmfhxV6nBQ==",
+          "spanId": "5wzsCnzYh68=",
+          "parentSpanId": "urRPHThKQyw=",
+          "name": "GET /delay",
+          "kind": "SPAN_KIND_CLIENT",
+          "startTimeUnixNano": "1791232261938507515",
+          "endTimeUnixNano": "1791232262939597233",
+          "attributes": [
+            {
+              "key": "service.peer.name",
+              "value": {
+                "stringValue": "127.0.0.1:8080"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "url.full",
+              "value": {
+                "stringValue": "http://127.0.0.1:8080/delay"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "10"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "127.0.0.1:8080"
+              }
+            }
+          ],
+          "status": {}
+        },
+        {
+          "traceId": "Ls7BcEyI+YQQnmfhxV6nBQ==",
+          "spanId": "PVSxmT7zjZY=",
+          "parentSpanId": "nLL6GQMb4LE=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232261938405922",
+          "endTimeUnixNano": "1791232261938438863",
+          "status": {}
+        },
+        {
+          "traceId": "Ls7BcEyI+YQQnmfhxV6nBQ==",
+          "spanId": "urRPHThKQyw=",
+          "parentSpanId": "nLL6GQMb4LE=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232261938438863",
+          "endTimeUnixNano": "1791232262939823269",
+          "status": {}
+        },
+        {
+          "traceId": "Ls7BcEyI+YQQnmfhxV6nBQ==",
+          "spanId": "nLL6GQMb4LE=",
+          "name": "GET /downstream",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232261938405922",
+          "endTimeUnixNano": "1791232262939823269",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "36764"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/downstream"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/downstream"
+              }
+            }
+          ],
+          "status": {}
+        }
+      ]
+    },
+    {
+      "trace_id": "1c1fdaed0e089ec69c3c13f9cd9bcbf2",
+      "trace_url": "http://localhost:3102/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%221c1fdaed0e089ec69c3c13f9cd9bcbf2%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%221791232237707%22%2C+%22to%22%3A+%221791232297707%22%7D%7D%7D",
+      "spans": [
+        {
+          "traceId": "HB/a7Q4InsacPBP5zZvL8g==",
+          "spanId": "QQeeCKsUgHs=",
+          "parentSpanId": "MONBLPoNwlI=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232260936063018",
+          "endTimeUnixNano": "1791232260936087519",
+          "status": {}
+        },
+        {
+          "traceId": "HB/a7Q4InsacPBP5zZvL8g==",
+          "spanId": "rqt9maR1kDk=",
+          "parentSpanId": "MONBLPoNwlI=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232260936087519",
+          "endTimeUnixNano": "1791232261936918539",
+          "status": {}
+        },
+        {
+          "traceId": "HB/a7Q4InsacPBP5zZvL8g==",
+          "spanId": "MONBLPoNwlI=",
+          "parentSpanId": "SBv+j8IZONo=",
+          "name": "GET /delay",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232260936063018",
+          "endTimeUnixNano": "1791232261936918539",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "41176"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/delay"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/delay"
+              }
+            }
+          ],
+          "status": {}
+        },
+        {
+          "traceId": "HB/a7Q4InsacPBP5zZvL8g==",
+          "spanId": "SBv+j8IZONo=",
+          "parentSpanId": "pEhV4aYlaas=",
+          "name": "GET /delay",
+          "kind": "SPAN_KIND_CLIENT",
+          "startTimeUnixNano": "1791232260935767290",
+          "endTimeUnixNano": "1791232261936976201",
+          "attributes": [
+            {
+              "key": "service.peer.name",
+              "value": {
+                "stringValue": "127.0.0.1:8080"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "url.full",
+              "value": {
+                "stringValue": "http://127.0.0.1:8080/delay"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "10"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "127.0.0.1:8080"
+              }
+            }
+          ],
+          "status": {}
+        },
+        {
+          "traceId": "HB/a7Q4InsacPBP5zZvL8g==",
+          "spanId": "QIuhkh8hBzo=",
+          "parentSpanId": "TyZAGnIbBYw=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232260935704628",
+          "endTimeUnixNano": "1791232260935722819",
+          "status": {}
+        },
+        {
+          "traceId": "HB/a7Q4InsacPBP5zZvL8g==",
+          "spanId": "pEhV4aYlaas=",
+          "parentSpanId": "TyZAGnIbBYw=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232260935722819",
+          "endTimeUnixNano": "1791232261937184477",
+          "status": {}
+        },
+        {
+          "traceId": "HB/a7Q4InsacPBP5zZvL8g==",
+          "spanId": "TyZAGnIbBYw=",
+          "name": "GET /downstream",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232260935704628",
+          "endTimeUnixNano": "1791232261937184477",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "36710"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/downstream"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/downstream"
+              }
+            }
+          ],
+          "status": {}
+        }
+      ]
+    },
+    {
+      "trace_id": "675118411359b56ebaf8028d858dcaf4",
+      "trace_url": "http://localhost:3102/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%22675118411359b56ebaf8028d858dcaf4%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%221791232237707%22%2C+%22to%22%3A+%221791232297707%22%7D%7D%7D",
+      "spans": [
+        {
+          "traceId": "Z1EYQRNZtW66+AKNhY3K9A==",
+          "spanId": "Kx3ddqHa8L0=",
+          "parentSpanId": "Ics+CS5+8nk=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232260935968896",
+          "endTimeUnixNano": "1791232260935987856",
+          "status": {}
+        },
+        {
+          "traceId": "Z1EYQRNZtW66+AKNhY3K9A==",
+          "spanId": "UH7goTcJP+c=",
+          "parentSpanId": "Ics+CS5+8nk=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232260935987856",
+          "endTimeUnixNano": "1791232261936919000",
+          "status": {}
+        },
+        {
+          "traceId": "Z1EYQRNZtW66+AKNhY3K9A==",
+          "spanId": "Ics+CS5+8nk=",
+          "parentSpanId": "AacMMzVGCQQ=",
+          "name": "GET /delay",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232260935968896",
+          "endTimeUnixNano": "1791232261936919000",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "41186"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/delay"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/delay"
+              }
+            }
+          ],
+          "status": {}
+        },
+        {
+          "traceId": "Z1EYQRNZtW66+AKNhY3K9A==",
+          "spanId": "AacMMzVGCQQ=",
+          "parentSpanId": "28rLj2AAAIU=",
+          "name": "GET /delay",
+          "kind": "SPAN_KIND_CLIENT",
+          "startTimeUnixNano": "1791232260935766630",
+          "endTimeUnixNano": "1791232261936990312",
+          "attributes": [
+            {
+              "key": "service.peer.name",
+              "value": {
+                "stringValue": "127.0.0.1:8080"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "url.full",
+              "value": {
+                "stringValue": "http://127.0.0.1:8080/delay"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "10"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "127.0.0.1:8080"
+              }
+            }
+          ],
+          "status": {}
+        },
+        {
+          "traceId": "Z1EYQRNZtW66+AKNhY3K9A==",
+          "spanId": "ivF5SMo7BxY=",
+          "parentSpanId": "0a+tqqAgMrE=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232260935703128",
+          "endTimeUnixNano": "1791232260935728919",
+          "status": {}
+        },
+        {
+          "traceId": "Z1EYQRNZtW66+AKNhY3K9A==",
+          "spanId": "28rLj2AAAIU=",
+          "parentSpanId": "0a+tqqAgMrE=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232260935728919",
+          "endTimeUnixNano": "1791232261937194387",
+          "status": {}
+        },
+        {
+          "traceId": "Z1EYQRNZtW66+AKNhY3K9A==",
+          "spanId": "0a+tqqAgMrE=",
+          "name": "GET /downstream",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232260935703128",
+          "endTimeUnixNano": "1791232261937194387",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "36712"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/downstream"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/downstream"
+              }
+            }
+          ],
+          "status": {}
+        }
+      ]
+    },
+    {
+      "trace_id": "63d473090df9494c0103fdf9e9ee6957",
+      "trace_url": "http://localhost:3102/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%2263d473090df9494c0103fdf9e9ee6957%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%221791232237707%22%2C+%22to%22%3A+%221791232297707%22%7D%7D%7D",
+      "spans": [
+        {
+          "traceId": "Y9RzCQ35SUwBA/356e5pVw==",
+          "spanId": "iCh88ryCekk=",
+          "parentSpanId": "h7SNR0gQ0Nk=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232260907575996",
+          "endTimeUnixNano": "1791232260907602477",
+          "status": {}
+        },
+        {
+          "traceId": "Y9RzCQ35SUwBA/356e5pVw==",
+          "spanId": "hG0F4rl1WhM=",
+          "parentSpanId": "h7SNR0gQ0Nk=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232260907602477",
+          "endTimeUnixNano": "1791232261908550380",
+          "status": {}
+        },
+        {
+          "traceId": "Y9RzCQ35SUwBA/356e5pVw==",
+          "spanId": "h7SNR0gQ0Nk=",
+          "name": "GET /runtime",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232260907575996",
+          "endTimeUnixNano": "1791232261908550380",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "36708"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/runtime"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/runtime"
+              }
+            }
+          ],
+          "status": {}
+        }
+      ]
+    },
+    {
+      "trace_id": "6c6f0230c8a3a4b3623d7afc2294b585",
+      "trace_url": "http://localhost:3102/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%226c6f0230c8a3a4b3623d7afc2294b585%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%221791232237707%22%2C+%22to%22%3A+%221791232297707%22%7D%7D%7D",
+      "spans": [
+        {
+          "traceId": "bG8CMMijpLNiPXr8IpS1hQ==",
+          "spanId": "MBchHi7RQ/s=",
+          "parentSpanId": "AEdINCcDQK0=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232259933505459",
+          "endTimeUnixNano": "1791232259933531540",
+          "status": {}
+        },
+        {
+          "traceId": "bG8CMMijpLNiPXr8IpS1hQ==",
+          "spanId": "NPxEwNz0YM0=",
+          "parentSpanId": "AEdINCcDQK0=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232259933531540",
+          "endTimeUnixNano": "1791232260933868926",
+          "status": {}
+        },
+        {
+          "traceId": "bG8CMMijpLNiPXr8IpS1hQ==",
+          "spanId": "AEdINCcDQK0=",
+          "parentSpanId": "VPZ1tbKNcCg=",
+          "name": "GET /delay",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232259933505459",
+          "endTimeUnixNano": "1791232260933868926",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "41176"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/delay"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/delay"
+              }
+            }
+          ],
+          "status": {}
+        },
+        {
+          "traceId": "bG8CMMijpLNiPXr8IpS1hQ==",
+          "spanId": "VPZ1tbKNcCg=",
+          "parentSpanId": "BX79XpQtqTY=",
+          "name": "GET /delay",
+          "kind": "SPAN_KIND_CLIENT",
+          "startTimeUnixNano": "1791232259933350494",
+          "endTimeUnixNano": "1791232260933959098",
+          "attributes": [
+            {
+              "key": "service.peer.name",
+              "value": {
+                "stringValue": "127.0.0.1:8080"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "url.full",
+              "value": {
+                "stringValue": "http://127.0.0.1:8080/delay"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "10"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "127.0.0.1:8080"
+              }
+            }
+          ],
+          "status": {}
+        },
+        {
+          "traceId": "bG8CMMijpLNiPXr8IpS1hQ==",
+          "spanId": "9IGQZveOxGQ=",
+          "parentSpanId": "sYWVIxRvsSI=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232259933303433",
+          "endTimeUnixNano": "1791232259933320594",
+          "status": {}
+        },
+        {
+          "traceId": "bG8CMMijpLNiPXr8IpS1hQ==",
+          "spanId": "BX79XpQtqTY=",
+          "parentSpanId": "sYWVIxRvsSI=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232259933320594",
+          "endTimeUnixNano": "1791232260934204625",
+          "status": {}
+        },
+        {
+          "traceId": "bG8CMMijpLNiPXr8IpS1hQ==",
+          "spanId": "sYWVIxRvsSI=",
+          "name": "GET /downstream",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232259933303433",
+          "endTimeUnixNano": "1791232260934204625",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "36684"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/downstream"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/downstream"
+              }
+            }
+          ],
+          "status": {}
+        }
+      ]
+    },
+    {
+      "trace_id": "43867136fbd6ddc8ec424caa823418a9",
+      "trace_url": "http://localhost:3102/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%2243867136fbd6ddc8ec424caa823418a9%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%221791232237707%22%2C+%22to%22%3A+%221791232297707%22%7D%7D%7D",
+      "spans": [
+        {
+          "traceId": "Q4ZxNvvW3cjsQkyqgjQYqQ==",
+          "spanId": "1lBTiFJ2a4E=",
+          "parentSpanId": "oz3JaFiyhs8=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232259933425767",
+          "endTimeUnixNano": "1791232259933442587",
+          "status": {}
+        },
+        {
+          "traceId": "Q4ZxNvvW3cjsQkyqgjQYqQ==",
+          "spanId": "DsXmkG1wkJQ=",
+          "parentSpanId": "oz3JaFiyhs8=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232259933442587",
+          "endTimeUnixNano": "1791232260933876926",
+          "status": {}
+        },
+        {
+          "traceId": "Q4ZxNvvW3cjsQkyqgjQYqQ==",
+          "spanId": "oz3JaFiyhs8=",
+          "parentSpanId": "bSCJNr5988s=",
+          "name": "GET /delay",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232259933425767",
+          "endTimeUnixNano": "1791232260933876926",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "41186"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/delay"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/delay"
+              }
+            }
+          ],
+          "status": {}
+        },
+        {
+          "traceId": "Q4ZxNvvW3cjsQkyqgjQYqQ==",
+          "spanId": "bSCJNr5988s=",
+          "parentSpanId": "j+5Z9PLRiCQ=",
+          "name": "GET /delay",
+          "kind": "SPAN_KIND_CLIENT",
+          "startTimeUnixNano": "1791232259933237191",
+          "endTimeUnixNano": "1791232260933966179",
+          "attributes": [
+            {
+              "key": "service.peer.name",
+              "value": {
+                "stringValue": "127.0.0.1:8080"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "url.full",
+              "value": {
+                "stringValue": "http://127.0.0.1:8080/delay"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "10"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "127.0.0.1:8080"
+              }
+            }
+          ],
+          "status": {}
+        },
+        {
+          "traceId": "Q4ZxNvvW3cjsQkyqgjQYqQ==",
+          "spanId": "CLVAaJgKf2s=",
+          "parentSpanId": "UPCLyEfWM3Y=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232259933083427",
+          "endTimeUnixNano": "1791232259933112768",
+          "status": {}
+        },
+        {
+          "traceId": "Q4ZxNvvW3cjsQkyqgjQYqQ==",
+          "spanId": "j+5Z9PLRiCQ=",
+          "parentSpanId": "UPCLyEfWM3Y=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232259933112768",
+          "endTimeUnixNano": "1791232260934209106",
+          "status": {}
+        },
+        {
+          "traceId": "Q4ZxNvvW3cjsQkyqgjQYqQ==",
+          "spanId": "UPCLyEfWM3Y=",
+          "name": "GET /downstream",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232259933083427",
+          "endTimeUnixNano": "1791232260934209106",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "36676"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/downstream"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/downstream"
+              }
+            }
+          ],
+          "status": {}
+        }
+      ]
+    },
+    {
+      "trace_id": "39d088d3559ccd6169f7d6b4b9456f99",
+      "trace_url": "http://localhost:3102/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%2239d088d3559ccd6169f7d6b4b9456f99%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%221791232237707%22%2C+%22to%22%3A+%221791232297707%22%7D%7D%7D",
+      "spans": [
+        {
+          "traceId": "OdCI01WczWFp99a0uUVvmQ==",
+          "spanId": "2Ppc9e2gjGU=",
+          "parentSpanId": "lHLH5EdT0nE=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232259905571172",
+          "endTimeUnixNano": "1791232259905588512",
+          "status": {}
+        },
+        {
+          "traceId": "OdCI01WczWFp99a0uUVvmQ==",
+          "spanId": "TuhcV9Nq5lk=",
+          "parentSpanId": "lHLH5EdT0nE=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232259905588512",
+          "endTimeUnixNano": "1791232260906480585",
+          "status": {}
+        },
+        {
+          "traceId": "OdCI01WczWFp99a0uUVvmQ==",
+          "spanId": "lHLH5EdT0nE=",
+          "name": "GET /runtime",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232259905571172",
+          "endTimeUnixNano": "1791232260906480585",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "36660"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/runtime"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/runtime"
+              }
+            }
+          ],
+          "status": {}
+        }
+      ]
+    },
+    {
+      "trace_id": "755a9e6c6a55c44c669290d8836a1e49",
+      "trace_url": "http://localhost:3102/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%22755a9e6c6a55c44c669290d8836a1e49%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%221791232237707%22%2C+%22to%22%3A+%221791232297707%22%7D%7D%7D",
+      "spans": [
+        {
+          "traceId": "dVqebGpVxExmkpDYg2oeSQ==",
+          "spanId": "GxNeglDbm0w=",
+          "parentSpanId": "6Q4olswZiwQ=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232259905512840",
+          "endTimeUnixNano": "1791232259905543341",
+          "status": {}
+        },
+        {
+          "traceId": "dVqebGpVxExmkpDYg2oeSQ==",
+          "spanId": "8Ot7omCtCxE=",
+          "parentSpanId": "6Q4olswZiwQ=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232259905543341",
+          "endTimeUnixNano": "1791232260906485605",
+          "status": {}
+        },
+        {
+          "traceId": "dVqebGpVxExmkpDYg2oeSQ==",
+          "spanId": "6Q4olswZiwQ=",
+          "name": "GET /runtime",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232259905512840",
+          "endTimeUnixNano": "1791232260906485605",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "36644"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/runtime"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/runtime"
+              }
+            }
+          ],
+          "status": {}
+        }
+      ]
+    },
+    {
+      "trace_id": "597dfe13647b441f5633d429bb136215",
+      "trace_url": "http://localhost:3102/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%22597dfe13647b441f5633d429bb136215%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%221791232237707%22%2C+%22to%22%3A+%221791232297707%22%7D%7D%7D",
+      "spans": [
+        {
+          "traceId": "WX3+E2R7RB9WM9QpuxNiFQ==",
+          "spanId": "On7rB9qY+Bw=",
+          "parentSpanId": "0TpGqtLgVSA=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232259903334058",
+          "endTimeUnixNano": "1791232259903359099",
+          "status": {}
+        },
+        {
+          "traceId": "WX3+E2R7RB9WM9QpuxNiFQ==",
+          "spanId": "x+xbdMZGw4Q=",
+          "parentSpanId": "0TpGqtLgVSA=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232259903359099",
+          "endTimeUnixNano": "1791232260903528720",
+          "status": {}
+        },
+        {
+          "traceId": "WX3+E2R7RB9WM9QpuxNiFQ==",
+          "spanId": "0TpGqtLgVSA=",
+          "name": "GET /syscall",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232259903334058",
+          "endTimeUnixNano": "1791232260903528720",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "36640"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/syscall"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/syscall"
+              }
+            }
+          ],
+          "status": {}
+        }
+      ]
+    },
+    {
+      "trace_id": "3ef169a2c540479371415e6834de9e33",
+      "trace_url": "http://localhost:3102/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%223ef169a2c540479371415e6834de9e33%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%221791232237707%22%2C+%22to%22%3A+%221791232297707%22%7D%7D%7D",
+      "spans": [
+        {
+          "traceId": "PvFposVAR5NxQV5oNN6eMw==",
+          "spanId": "sKpnj5JY5Es=",
+          "parentSpanId": "oAkA+r9W7iU=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232259902037141",
+          "endTimeUnixNano": "1791232259902062692",
+          "status": {}
+        },
+        {
+          "traceId": "PvFposVAR5NxQV5oNN6eMw==",
+          "spanId": "E7+1nvvhEgw=",
+          "parentSpanId": "oAkA+r9W7iU=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232259902062692",
+          "endTimeUnixNano": "1791232260902414519",
+          "status": {}
+        },
+        {
+          "traceId": "PvFposVAR5NxQV5oNN6eMw==",
+          "spanId": "oAkA+r9W7iU=",
+          "name": "GET /syscall",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232259902037141",
+          "endTimeUnixNano": "1791232260902414519",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "36630"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/syscall"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/syscall"
+              }
+            }
+          ],
+          "status": {}
+        }
+      ]
+    },
+    {
+      "trace_id": "8070ea979ca20b0a165c25a33a627347",
+      "trace_url": "http://localhost:3102/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%228070ea979ca20b0a165c25a33a627347%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%221791232237707%22%2C+%22to%22%3A+%221791232297707%22%7D%7D%7D",
+      "spans": [
+        {
+          "traceId": "gHDql5yiCwoWXCWjOmJzRw==",
+          "spanId": "e7/2f9Pn3wo=",
+          "parentSpanId": "aBBkX8AOItE=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232258931569167",
+          "endTimeUnixNano": "1791232258931587028",
+          "status": {}
+        },
+        {
+          "traceId": "gHDql5yiCwoWXCWjOmJzRw==",
+          "spanId": "rtOrDTz8wbE=",
+          "parentSpanId": "aBBkX8AOItE=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232258931587028",
+          "endTimeUnixNano": "1791232259931767849",
+          "status": {}
+        },
+        {
+          "traceId": "gHDql5yiCwoWXCWjOmJzRw==",
+          "spanId": "aBBkX8AOItE=",
+          "parentSpanId": "c0+bVmhOA5w=",
+          "name": "GET /delay",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232258931569167",
+          "endTimeUnixNano": "1791232259931767849",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "41186"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/delay"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/delay"
+              }
+            }
+          ],
+          "status": {}
+        },
+        {
+          "traceId": "gHDql5yiCwoWXCWjOmJzRw==",
+          "spanId": "c0+bVmhOA5w=",
+          "parentSpanId": "wdYyBr6Spec=",
+          "name": "GET /delay",
+          "kind": "SPAN_KIND_CLIENT",
+          "startTimeUnixNano": "1791232258931423333",
+          "endTimeUnixNano": "1791232259931835441",
+          "attributes": [
+            {
+              "key": "service.peer.name",
+              "value": {
+                "stringValue": "127.0.0.1:8080"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "url.full",
+              "value": {
+                "stringValue": "http://127.0.0.1:8080/delay"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "10"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "127.0.0.1:8080"
+              }
+            }
+          ],
+          "status": {}
+        },
+        {
+          "traceId": "gHDql5yiCwoWXCWjOmJzRw==",
+          "spanId": "SpSdu7plrYM=",
+          "parentSpanId": "SfKMf1QoSo8=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232258931361001",
+          "endTimeUnixNano": "1791232258931378082",
+          "status": {}
+        },
+        {
+          "traceId": "gHDql5yiCwoWXCWjOmJzRw==",
+          "spanId": "wdYyBr6Spec=",
+          "parentSpanId": "SfKMf1QoSo8=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232258931378082",
+          "endTimeUnixNano": "1791232259931998826",
+          "status": {}
+        },
+        {
+          "traceId": "gHDql5yiCwoWXCWjOmJzRw==",
+          "spanId": "SfKMf1QoSo8=",
+          "name": "GET /downstream",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232258931361001",
+          "endTimeUnixNano": "1791232259931998826",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "36602"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/downstream"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/downstream"
+              }
+            }
+          ],
+          "status": {}
+        }
+      ]
+    },
+    {
+      "trace_id": "1ece5bdb4f07fc0b92f296da6e6549c8",
+      "trace_url": "http://localhost:3102/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%221ece5bdb4f07fc0b92f296da6e6549c8%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%221791232237707%22%2C+%22to%22%3A+%221791232297707%22%7D%7D%7D",
+      "spans": [
+        {
+          "traceId": "Hs5b208H/AuS8pbabmVJyA==",
+          "spanId": "IXkYCPjlVBQ=",
+          "parentSpanId": "hvFSD3VHnjk=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232258931562257",
+          "endTimeUnixNano": "1791232258931581977",
+          "status": {}
+        },
+        {
+          "traceId": "Hs5b208H/AuS8pbabmVJyA==",
+          "spanId": "/OZc+4KxMCc=",
+          "parentSpanId": "hvFSD3VHnjk=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232258931581977",
+          "endTimeUnixNano": "1791232259931752409",
+          "status": {}
+        },
+        {
+          "traceId": "Hs5b208H/AuS8pbabmVJyA==",
+          "spanId": "hvFSD3VHnjk=",
+          "parentSpanId": "XM4a3Xmm6Io=",
+          "name": "GET /delay",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232258931562257",
+          "endTimeUnixNano": "1791232259931752409",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "41176"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/delay"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/delay"
+              }
+            }
+          ],
+          "status": {}
+        },
+        {
+          "traceId": "Hs5b208H/AuS8pbabmVJyA==",
+          "spanId": "XM4a3Xmm6Io=",
+          "parentSpanId": "9x93XBHsXl8=",
+          "name": "GET /delay",
+          "kind": "SPAN_KIND_CLIENT",
+          "startTimeUnixNano": "1791232258931386692",
+          "endTimeUnixNano": "1791232259931805370",
+          "attributes": [
+            {
+              "key": "service.peer.name",
+              "value": {
+                "stringValue": "127.0.0.1:8080"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "url.full",
+              "value": {
+                "stringValue": "http://127.0.0.1:8080/delay"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "10"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "127.0.0.1:8080"
+              }
+            }
+          ],
+          "status": {}
+        },
+        {
+          "traceId": "Hs5b208H/AuS8pbabmVJyA==",
+          "spanId": "egXU83/ZGjc=",
+          "parentSpanId": "Cic3jdiUcMk=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232258931323640",
+          "endTimeUnixNano": "1791232258931349241",
+          "status": {}
+        },
+        {
+          "traceId": "Hs5b208H/AuS8pbabmVJyA==",
+          "spanId": "9x93XBHsXl8=",
+          "parentSpanId": "Cic3jdiUcMk=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232258931349241",
+          "endTimeUnixNano": "1791232259932005196",
+          "status": {}
+        },
+        {
+          "traceId": "Hs5b208H/AuS8pbabmVJyA==",
+          "spanId": "Cic3jdiUcMk=",
+          "name": "GET /downstream",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232258931323640",
+          "endTimeUnixNano": "1791232259932005196",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "36614"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/downstream"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/downstream"
+              }
+            }
+          ],
+          "status": {}
+        }
+      ]
+    },
+    {
+      "trace_id": "31124d3942caa57aac3df10ca3199dd4",
+      "trace_url": "http://localhost:3102/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%2231124d3942caa57aac3df10ca3199dd4%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%221791232237707%22%2C+%22to%22%3A+%221791232297707%22%7D%7D%7D",
+      "spans": [
+        {
+          "traceId": "MRJNOULKpXqsPfEMoxmd1A==",
+          "spanId": "fntpYrC60uQ=",
+          "parentSpanId": "9HuywDZcbK4=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232258900520951",
+          "endTimeUnixNano": "1791232258900548602",
+          "status": {}
+        },
+        {
+          "traceId": "MRJNOULKpXqsPfEMoxmd1A==",
+          "spanId": "QvI7gAZA3OA=",
+          "parentSpanId": "9HuywDZcbK4=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232258900548602",
+          "endTimeUnixNano": "1791232259900887948",
+          "status": {}
+        },
+        {
+          "traceId": "MRJNOULKpXqsPfEMoxmd1A==",
+          "spanId": "9HuywDZcbK4=",
+          "name": "GET /syscall",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232258900520951",
+          "endTimeUnixNano": "1791232259900887948",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "36558"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/syscall"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/syscall"
+              }
+            }
+          ],
+          "status": {}
+        }
+      ]
+    },
+    {
+      "trace_id": "2890f494fd35f0c9d22046df4faaba94",
+      "trace_url": "http://localhost:3102/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%222890f494fd35f0c9d22046df4faaba94%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%221791232237707%22%2C+%22to%22%3A+%221791232297707%22%7D%7D%7D",
+      "spans": [
+        {
+          "traceId": "KJD0lP018MnSIEbfT6q6lA==",
+          "spanId": "JA2ElQZTAuI=",
+          "parentSpanId": "BoQngnJBeK0=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232257902454110",
+          "endTimeUnixNano": "1791232257902470580",
+          "status": {}
+        },
+        {
+          "traceId": "KJD0lP018MnSIEbfT6q6lA==",
+          "spanId": "CRXTRnPUfe4=",
+          "parentSpanId": "BoQngnJBeK0=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232257902470580",
+          "endTimeUnixNano": "1791232258902639332",
+          "status": {}
+        },
+        {
+          "traceId": "KJD0lP018MnSIEbfT6q6lA==",
+          "spanId": "BoQngnJBeK0=",
+          "name": "GET /runtime",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232257902454110",
+          "endTimeUnixNano": "1791232258902639332",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "36530"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/runtime"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/runtime"
+              }
+            }
+          ],
+          "status": {}
+        }
+      ]
+    },
+    {
+      "trace_id": "607b7a55c6718d7f71bd352ad418d0f8",
+      "trace_url": "http://localhost:3102/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%22607b7a55c6718d7f71bd352ad418d0f8%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%221791232237707%22%2C+%22to%22%3A+%221791232297707%22%7D%7D%7D",
+      "spans": [
+        {
+          "traceId": "YHt6VcZxjX9xvTUq1BjQ+A==",
+          "spanId": "L1ufT+SzI1o=",
+          "parentSpanId": "smNXWoaYD/Q=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232257902416279",
+          "endTimeUnixNano": "1791232257902444230",
+          "status": {}
+        },
+        {
+          "traceId": "YHt6VcZxjX9xvTUq1BjQ+A==",
+          "spanId": "Dpy6KZkEtxI=",
+          "parentSpanId": "smNXWoaYD/Q=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232257902444230",
+          "endTimeUnixNano": "1791232258902631401",
+          "status": {}
+        },
+        {
+          "traceId": "YHt6VcZxjX9xvTUq1BjQ+A==",
+          "spanId": "smNXWoaYD/Q=",
+          "name": "GET /runtime",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232257902416279",
+          "endTimeUnixNano": "1791232258902631401",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "36528"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/runtime"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/runtime"
+              }
+            }
+          ],
+          "status": {}
+        }
+      ]
+    },
+    {
+      "trace_id": "31136be8d33db1cf46012e0d493b1208",
+      "trace_url": "http://localhost:3102/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%2231136be8d33db1cf46012e0d493b1208%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%221791232237707%22%2C+%22to%22%3A+%221791232297707%22%7D%7D%7D",
+      "spans": [
+        {
+          "traceId": "MRNr6NM9sc9GAS4NSTsSCA==",
+          "spanId": "ZoziC+2zwHk=",
+          "parentSpanId": "I44BAPonZlI=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232257899060263",
+          "endTimeUnixNano": "1791232257899088624",
+          "status": {}
+        },
+        {
+          "traceId": "MRNr6NM9sc9GAS4NSTsSCA==",
+          "spanId": "hS4sVE0vcWU=",
+          "parentSpanId": "I44BAPonZlI=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232257899088624",
+          "endTimeUnixNano": "1791232258899403299",
+          "status": {}
+        },
+        {
+          "traceId": "MRNr6NM9sc9GAS4NSTsSCA==",
+          "spanId": "I44BAPonZlI=",
+          "name": "GET /syscall",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232257899060263",
+          "endTimeUnixNano": "1791232258899403299",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "36504"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/syscall"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/syscall"
+              }
+            }
+          ],
+          "status": {}
+        }
+      ]
+    },
+    {
+      "trace_id": "32a7d30b13089efc30cbccb688429863",
+      "trace_url": "http://localhost:3102/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%2232a7d30b13089efc30cbccb688429863%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%221791232237707%22%2C+%22to%22%3A+%221791232297707%22%7D%7D%7D",
+      "spans": [
+        {
+          "traceId": "MqfTCxMInvwwy8y2iEKYYw==",
+          "spanId": "vRN052e0x7M=",
+          "parentSpanId": "ahd8224pL14=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232256926739346",
+          "endTimeUnixNano": "1791232256926760397",
+          "status": {}
+        },
+        {
+          "traceId": "MqfTCxMInvwwy8y2iEKYYw==",
+          "spanId": "lA2gT6c5Bw0=",
+          "parentSpanId": "ahd8224pL14=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232256926760397",
+          "endTimeUnixNano": "1791232257927608107",
+          "status": {}
+        },
+        {
+          "traceId": "MqfTCxMInvwwy8y2iEKYYw==",
+          "spanId": "ahd8224pL14=",
+          "parentSpanId": "rn7vaxl7H2Y=",
+          "name": "GET /delay",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232256926739346",
+          "endTimeUnixNano": "1791232257927608107",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "41186"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/delay"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/delay"
+              }
+            }
+          ],
+          "status": {}
+        },
+        {
+          "traceId": "MqfTCxMInvwwy8y2iEKYYw==",
+          "spanId": "rn7vaxl7H2Y=",
+          "parentSpanId": "PI+LPhgZKTY=",
+          "name": "GET /delay",
+          "kind": "SPAN_KIND_CLIENT",
+          "startTimeUnixNano": "1791232256926569421",
+          "endTimeUnixNano": "1791232257927705370",
+          "attributes": [
+            {
+              "key": "service.peer.name",
+              "value": {
+                "stringValue": "127.0.0.1:8080"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "url.full",
+              "value": {
+                "stringValue": "http://127.0.0.1:8080/delay"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "10"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "127.0.0.1:8080"
+              }
+            }
+          ],
+          "status": {}
+        },
+        {
+          "traceId": "MqfTCxMInvwwy8y2iEKYYw==",
+          "spanId": "10Vi8snNG8E=",
+          "parentSpanId": "2yycSNI6KwY=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232256926514750",
+          "endTimeUnixNano": "1791232256926530860",
+          "status": {}
+        },
+        {
+          "traceId": "MqfTCxMInvwwy8y2iEKYYw==",
+          "spanId": "PI+LPhgZKTY=",
+          "parentSpanId": "2yycSNI6KwY=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232256926530860",
+          "endTimeUnixNano": "1791232257927884855",
+          "status": {}
+        },
+        {
+          "traceId": "MqfTCxMInvwwy8y2iEKYYw==",
+          "spanId": "2yycSNI6KwY=",
+          "name": "GET /downstream",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232256926514750",
+          "endTimeUnixNano": "1791232257927884855",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "36500"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/downstream"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/downstream"
+              }
+            }
+          ],
+          "status": {}
+        }
+      ]
+    },
+    {
+      "trace_id": "10cf784a5e42b81407a21ba9a36a22ae",
+      "trace_url": "http://localhost:3102/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%2210cf784a5e42b81407a21ba9a36a22ae%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%221791232237707%22%2C+%22to%22%3A+%221791232297707%22%7D%7D%7D",
+      "spans": [
+        {
+          "traceId": "EM94Sl5CuBQHohupo2oirg==",
+          "spanId": "SmuTHrXmd7c=",
+          "parentSpanId": "Kjpr55J14Nk=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232256926710565",
+          "endTimeUnixNano": "1791232256926731996",
+          "status": {}
+        },
+        {
+          "traceId": "EM94Sl5CuBQHohupo2oirg==",
+          "spanId": "r5Br/peT8jc=",
+          "parentSpanId": "Kjpr55J14Nk=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232256926731996",
+          "endTimeUnixNano": "1791232257927653979",
+          "status": {}
+        },
+        {
+          "traceId": "EM94Sl5CuBQHohupo2oirg==",
+          "spanId": "Kjpr55J14Nk=",
+          "parentSpanId": "JRtdnGQ9ZTM=",
+          "name": "GET /delay",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232256926710565",
+          "endTimeUnixNano": "1791232257927653979",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "41176"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/delay"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/delay"
+              }
+            }
+          ],
+          "status": {}
+        },
+        {
+          "traceId": "EM94Sl5CuBQHohupo2oirg==",
+          "spanId": "JRtdnGQ9ZTM=",
+          "parentSpanId": "fX2X9pUBRSk=",
+          "name": "GET /delay",
+          "kind": "SPAN_KIND_CLIENT",
+          "startTimeUnixNano": "1791232256926516410",
+          "endTimeUnixNano": "1791232257927702660",
+          "attributes": [
+            {
+              "key": "service.peer.name",
+              "value": {
+                "stringValue": "127.0.0.1:8080"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "url.full",
+              "value": {
+                "stringValue": "http://127.0.0.1:8080/delay"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "10"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "127.0.0.1:8080"
+              }
+            }
+          ],
+          "status": {}
+        },
+        {
+          "traceId": "EM94Sl5CuBQHohupo2oirg==",
+          "spanId": "gvIlJZuYWcg=",
+          "parentSpanId": "5K4qa8qH62M=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232256926459528",
+          "endTimeUnixNano": "1791232256926476389",
+          "status": {}
+        },
+        {
+          "traceId": "EM94Sl5CuBQHohupo2oirg==",
+          "spanId": "fX2X9pUBRSk=",
+          "parentSpanId": "5K4qa8qH62M=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232256926476389",
+          "endTimeUnixNano": "1791232257927905526",
+          "status": {}
+        },
+        {
+          "traceId": "EM94Sl5CuBQHohupo2oirg==",
+          "spanId": "5K4qa8qH62M=",
+          "name": "GET /downstream",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232256926459528",
+          "endTimeUnixNano": "1791232257927905526",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "36484"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/downstream"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/downstream"
+              }
+            }
+          ],
+          "status": {}
+        }
+      ]
+    },
+    {
+      "trace_id": "68510619f81c982376f0c1ca723cd4b9",
+      "trace_url": "http://localhost:3102/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%2268510619f81c982376f0c1ca723cd4b9%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%221791232237707%22%2C+%22to%22%3A+%221791232297707%22%7D%7D%7D",
+      "spans": [
+        {
+          "traceId": "aFEGGfgcmCN28MHKcjzUuQ==",
+          "spanId": "SjGua+ztMDk=",
+          "parentSpanId": "A3nVhciHvIY=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232256900745414",
+          "endTimeUnixNano": "1791232256900771245",
+          "status": {}
+        },
+        {
+          "traceId": "aFEGGfgcmCN28MHKcjzUuQ==",
+          "spanId": "iHNqY23aWK4=",
+          "parentSpanId": "A3nVhciHvIY=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232256900771245",
+          "endTimeUnixNano": "1791232257901250966",
+          "status": {}
+        },
+        {
+          "traceId": "aFEGGfgcmCN28MHKcjzUuQ==",
+          "spanId": "A3nVhciHvIY=",
+          "name": "GET /runtime",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232256900745414",
+          "endTimeUnixNano": "1791232257901250966",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "36476"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/runtime"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/runtime"
+              }
+            }
+          ],
+          "status": {}
+        }
+      ]
+    },
+    {
+      "trace_id": "218ccf636e9feba0b16191036cda7fd0",
+      "trace_url": "http://localhost:3102/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%22218ccf636e9feba0b16191036cda7fd0%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%221791232237707%22%2C+%22to%22%3A+%221791232297707%22%7D%7D%7D",
+      "spans": [
+        {
+          "traceId": "IYzPY26f66CxYZEDbNp/0A==",
+          "spanId": "xu8jAzkPVKM=",
+          "parentSpanId": "9W4ry3QYK7M=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232256900361934",
+          "endTimeUnixNano": "1791232256900397855",
+          "status": {}
+        },
+        {
+          "traceId": "IYzPY26f66CxYZEDbNp/0A==",
+          "spanId": "MXbM+DlA65Q=",
+          "parentSpanId": "9W4ry3QYK7M=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232256900397855",
+          "endTimeUnixNano": "1791232257900604777",
+          "status": {}
+        },
+        {
+          "traceId": "IYzPY26f66CxYZEDbNp/0A==",
+          "spanId": "9W4ry3QYK7M=",
+          "name": "GET /syscall",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232256900361934",
+          "endTimeUnixNano": "1791232257900604777",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "36468"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/syscall"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/syscall"
+              }
+            }
+          ],
+          "status": {}
+        }
+      ]
+    },
+    {
+      "trace_id": "5e7f58e39e6d819392276c6c14f45a55",
+      "trace_url": "http://localhost:3102/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%225e7f58e39e6d819392276c6c14f45a55%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%221791232237707%22%2C+%22to%22%3A+%221791232297707%22%7D%7D%7D",
+      "spans": [
+        {
+          "traceId": "Xn9Y455tgZOSJ2xsFPRaVQ==",
+          "spanId": "5vkMwsIsrgA=",
+          "parentSpanId": "oTKq3IjaWPw=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232256897666427",
+          "endTimeUnixNano": "1791232256897693267",
+          "status": {}
+        },
+        {
+          "traceId": "Xn9Y455tgZOSJ2xsFPRaVQ==",
+          "spanId": "2tUknsnHlFI=",
+          "parentSpanId": "oTKq3IjaWPw=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232256897693267",
+          "endTimeUnixNano": "1791232257898009593",
+          "status": {}
+        },
+        {
+          "traceId": "Xn9Y455tgZOSJ2xsFPRaVQ==",
+          "spanId": "oTKq3IjaWPw=",
+          "name": "GET /syscall",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232256897666427",
+          "endTimeUnixNano": "1791232257898009593",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "36462"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/syscall"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/syscall"
+              }
+            }
+          ],
+          "status": {}
+        }
+      ]
+    },
+    {
+      "trace_id": "7063ceb6ae5a2f98c6e3a2772183cfcf",
+      "trace_url": "http://localhost:3102/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%227063ceb6ae5a2f98c6e3a2772183cfcf%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%221791232237707%22%2C+%22to%22%3A+%221791232297707%22%7D%7D%7D",
+      "spans": [
+        {
+          "traceId": "cGPOtq5aL5jG46J3IYPPzw==",
+          "spanId": "dE4yErniuyA=",
+          "parentSpanId": "usc1BSsr7p0=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232255924456814",
+          "endTimeUnixNano": "1791232255924473995",
+          "status": {}
+        },
+        {
+          "traceId": "cGPOtq5aL5jG46J3IYPPzw==",
+          "spanId": "EU3rBd34YkU=",
+          "parentSpanId": "usc1BSsr7p0=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232255924473995",
+          "endTimeUnixNano": "1791232256925134230",
+          "status": {}
+        },
+        {
+          "traceId": "cGPOtq5aL5jG46J3IYPPzw==",
+          "spanId": "usc1BSsr7p0=",
+          "parentSpanId": "Jq5hESC7VEM=",
+          "name": "GET /delay",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232255924456814",
+          "endTimeUnixNano": "1791232256925134230",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "41186"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/delay"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/delay"
+              }
+            }
+          ],
+          "status": {}
+        },
+        {
+          "traceId": "cGPOtq5aL5jG46J3IYPPzw==",
+          "spanId": "Jq5hESC7VEM=",
+          "parentSpanId": "w35ThQQrfnA=",
+          "name": "GET /delay",
+          "kind": "SPAN_KIND_CLIENT",
+          "startTimeUnixNano": "1791232255924299020",
+          "endTimeUnixNano": "1791232256925194422",
+          "attributes": [
+            {
+              "key": "service.peer.name",
+              "value": {
+                "stringValue": "127.0.0.1:8080"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "url.full",
+              "value": {
+                "stringValue": "http://127.0.0.1:8080/delay"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "10"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "127.0.0.1:8080"
+              }
+            }
+          ],
+          "status": {}
+        },
+        {
+          "traceId": "cGPOtq5aL5jG46J3IYPPzw==",
+          "spanId": "NkmfY/efUNw=",
+          "parentSpanId": "ft0i1BAPMUA=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232255924222018",
+          "endTimeUnixNano": "1791232255924261349",
+          "status": {}
+        },
+        {
+          "traceId": "cGPOtq5aL5jG46J3IYPPzw==",
+          "spanId": "w35ThQQrfnA=",
+          "parentSpanId": "ft0i1BAPMUA=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232255924261349",
+          "endTimeUnixNano": "1791232256925380057",
+          "status": {}
+        },
+        {
+          "traceId": "cGPOtq5aL5jG46J3IYPPzw==",
+          "spanId": "ft0i1BAPMUA=",
+          "name": "GET /downstream",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232255924222018",
+          "endTimeUnixNano": "1791232256925380057",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "36438"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/downstream"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/downstream"
+              }
+            }
+          ],
+          "status": {}
+        }
+      ]
+    },
+    {
+      "trace_id": "798202e83982c7d9c71a0a68316a3019",
+      "trace_url": "http://localhost:3102/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%22798202e83982c7d9c71a0a68316a3019%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%221791232237707%22%2C+%22to%22%3A+%221791232297707%22%7D%7D%7D",
+      "spans": [
+        {
+          "traceId": "eYIC6DmCx9nHGgpoMWowGQ==",
+          "spanId": "Y6YXUOo7SRw=",
+          "parentSpanId": "v76wZCCEAp4=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232255899559834",
+          "endTimeUnixNano": "1791232255899584515",
+          "status": {}
+        },
+        {
+          "traceId": "eYIC6DmCx9nHGgpoMWowGQ==",
+          "spanId": "w1YakUAF2qU=",
+          "parentSpanId": "v76wZCCEAp4=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232255899584515",
+          "endTimeUnixNano": "1791232256899902301",
+          "status": {}
+        },
+        {
+          "traceId": "eYIC6DmCx9nHGgpoMWowGQ==",
+          "spanId": "v76wZCCEAp4=",
+          "name": "GET /runtime",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232255899559834",
+          "endTimeUnixNano": "1791232256899902301",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "36422"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/runtime"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/runtime"
+              }
+            }
+          ],
+          "status": {}
+        }
+      ]
+    },
+    {
+      "trace_id": "777edb3ce1b13f69f21b1fefcfae0a7c",
+      "trace_url": "http://localhost:3102/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%22777edb3ce1b13f69f21b1fefcfae0a7c%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%221791232237707%22%2C+%22to%22%3A+%221791232297707%22%7D%7D%7D",
+      "spans": [
+        {
+          "traceId": "d37bPOGxP2nyGx/vz64KfA==",
+          "spanId": "cBAm371oVyQ=",
+          "parentSpanId": "Va8RX6arnRQ=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232255899221044",
+          "endTimeUnixNano": "1791232255899245835",
+          "status": {}
+        },
+        {
+          "traceId": "d37bPOGxP2nyGx/vz64KfA==",
+          "spanId": "iB4gQ4eAbIM=",
+          "parentSpanId": "Va8RX6arnRQ=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232255899245835",
+          "endTimeUnixNano": "1791232256899396276",
+          "status": {}
+        },
+        {
+          "traceId": "d37bPOGxP2nyGx/vz64KfA==",
+          "spanId": "Va8RX6arnRQ=",
+          "name": "GET /runtime",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232255899221044",
+          "endTimeUnixNano": "1791232256899396276",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "36410"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/runtime"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/runtime"
+              }
+            }
+          ],
+          "status": {}
+        }
+      ]
+    },
+    {
+      "trace_id": "431c50a60ead94cea2048f1f63eeb00e",
+      "trace_url": "http://localhost:3102/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%22431c50a60ead94cea2048f1f63eeb00e%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%221791232237707%22%2C+%22to%22%3A+%221791232297707%22%7D%7D%7D",
+      "spans": [
+        {
+          "traceId": "QxxQpg6tlM6iBI8fY+6wDg==",
+          "spanId": "3UalAAsHlDQ=",
+          "parentSpanId": "MMO25+qmu5U=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232255899017899",
+          "endTimeUnixNano": "1791232255899049869",
+          "status": {}
+        },
+        {
+          "traceId": "QxxQpg6tlM6iBI8fY+6wDg==",
+          "spanId": "jQCkzw7KJtM=",
+          "parentSpanId": "MMO25+qmu5U=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232255899049869",
+          "endTimeUnixNano": "1791232256899268832",
+          "status": {}
+        },
+        {
+          "traceId": "QxxQpg6tlM6iBI8fY+6wDg==",
+          "spanId": "MMO25+qmu5U=",
+          "name": "GET /syscall",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232255899017899",
+          "endTimeUnixNano": "1791232256899268832",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "36406"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/syscall"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/syscall"
+              }
+            }
+          ],
+          "status": {}
+        }
+      ]
+    },
+    {
+      "trace_id": "4e0476e180c9685a45b89e1a05059b7b",
+      "trace_url": "http://localhost:3102/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%224e0476e180c9685a45b89e1a05059b7b%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%221791232237707%22%2C+%22to%22%3A+%221791232297707%22%7D%7D%7D",
+      "spans": [
+        {
+          "traceId": "TgR24YDJaFpFuJ4aBQWbew==",
+          "spanId": "3PJn0wysh40=",
+          "parentSpanId": "VrXh1RhT1w8=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232254922126571",
+          "endTimeUnixNano": "1791232254922151702",
+          "status": {}
+        },
+        {
+          "traceId": "TgR24YDJaFpFuJ4aBQWbew==",
+          "spanId": "mOsCrxVNzVg=",
+          "parentSpanId": "VrXh1RhT1w8=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232254922151702",
+          "endTimeUnixNano": "1791232255922795867",
+          "status": {}
+        },
+        {
+          "traceId": "TgR24YDJaFpFuJ4aBQWbew==",
+          "spanId": "VrXh1RhT1w8=",
+          "parentSpanId": "rzGlmDUJKFg=",
+          "name": "GET /delay",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232254922126571",
+          "endTimeUnixNano": "1791232255922795867",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "41186"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/delay"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/delay"
+              }
+            }
+          ],
+          "status": {}
+        },
+        {
+          "traceId": "TgR24YDJaFpFuJ4aBQWbew==",
+          "spanId": "rzGlmDUJKFg=",
+          "parentSpanId": "paYtr4mnqJM=",
+          "name": "GET /delay",
+          "kind": "SPAN_KIND_CLIENT",
+          "startTimeUnixNano": "1791232254921928476",
+          "endTimeUnixNano": "1791232255922861079",
+          "attributes": [
+            {
+              "key": "service.peer.name",
+              "value": {
+                "stringValue": "127.0.0.1:8080"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "url.full",
+              "value": {
+                "stringValue": "http://127.0.0.1:8080/delay"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "10"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "127.0.0.1:8080"
+              }
+            }
+          ],
+          "status": {}
+        },
+        {
+          "traceId": "TgR24YDJaFpFuJ4aBQWbew==",
+          "spanId": "X/zfY7vt4VM=",
+          "parentSpanId": "j10Hog1DVv8=",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232254921862044",
+          "endTimeUnixNano": "1791232254921887974",
+          "status": {}
+        },
+        {
+          "traceId": "TgR24YDJaFpFuJ4aBQWbew==",
+          "spanId": "paYtr4mnqJM=",
+          "parentSpanId": "j10Hog1DVv8=",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "startTimeUnixNano": "1791232254921887974",
+          "endTimeUnixNano": "1791232255923035224",
+          "status": {}
+        },
+        {
+          "traceId": "TgR24YDJaFpFuJ4aBQWbew==",
+          "spanId": "j10Hog1DVv8=",
+          "name": "GET /downstream",
+          "kind": "SPAN_KIND_SERVER",
+          "startTimeUnixNano": "1791232254921862044",
+          "endTimeUnixNano": "1791232255923035224",
+          "attributes": [
+            {
+              "key": "client.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "http.request.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.body.size",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            },
+            {
+              "key": "url.scheme",
+              "value": {
+                "stringValue": "http"
+              }
+            },
+            {
+              "key": "network.peer.address",
+              "value": {
+                "stringValue": "172.22.0.1"
+              }
+            },
+            {
+              "key": "network.peer.port",
+              "value": {
+                "intValue": "59644"
+              }
+            },
+            {
+              "key": "http.request.method",
+              "value": {
+                "stringValue": "GET"
+              }
+            },
+            {
+              "key": "url.path",
+              "value": {
+                "stringValue": "/downstream"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "obi-poc-waiting"
+              }
+            },
+            {
+              "key": "http.route",
+              "value": {
+                "stringValue": "/downstream"
+              }
+            }
+          ],
+          "status": {}
+        }
+      ]
+    }
+  ],
+  "note": "Heatmap exemplars and trace search are bounded selections; no exact links is missing evidence, not proof of no wait.",
+  "trace_search_limit": 100,
+  "trace_retrieval_limit": 30,
+  "trace_search_returned": 100,
+  "trace_retrieval_truncated": true
+}

@@ -1,0 +1,66 @@
+[
+  {
+    "name": "ordinary-trace",
+    "url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%22572b19b7a7b8b81392fc0884d8808dba%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232703564%22%2C%20%22to%22%3A%20%221791232738564%22%7D%7D%7D",
+    "trace_id": "572b19b7a7b8b81392fc0884d8808dba",
+    "span_id": "eb706806a811d12a",
+    "final_url": "http://localhost:3101/explore?schemaVersion=1&panes=%7B%22hqh%22:%7B%22datasource%22:%22tempo%22,%22queries%22:%5B%7B%22refId%22:%22A%22,%22queryType%22:%22traceql%22,%22query%22:%22572b19b7a7b8b81392fc0884d8808dba%22,%22datasource%22:%7B%22type%22:%22tempo%22,%22uid%22:%22tempo%22%7D,%22serviceMapUseNativeHistograms%22:false%7D%5D,%22range%22:%7B%22from%22:%221791232703564%22,%22to%22:%221791232738564%22%7D,%22panelsState%22:%7B%22trace%22:%7B%22spanFilters%22:%7B%22spanNameOperator%22:%22%3D%22,%22serviceNameOperator%22:%22%3D%22,%22fromOperator%22:%22%3E%22,%22toOperator%22:%22%3C%22,%22tags%22:%5B%7B%22id%22:%224e421971-420%22,%22operator%22:%22%3D%22%7D%5D%7D%7D%7D,%22compact%22:false%7D%7D&orgId=1",
+    "trace_id_visible": true,
+    "http_errors": [
+      {
+        "url": "http://localhost:3101/api/user/stars",
+        "status": 401
+      }
+    ]
+  },
+  {
+    "name": "ordinary-profile",
+    "url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232703564&to=1791232738564&showSpanHeatmap=true&var-spanSelector=eb706806a811d12a",
+    "trace_id": "572b19b7a7b8b81392fc0884d8808dba",
+    "span_id": "eb706806a811d12a",
+    "final_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&from=2026-10-05T20%3A38%3A23.564Z&to=2026-10-05T20%3A38%3A58.564Z&showSpanHeatmap=true&var-spanSelector=eb706806a811d12a&explorationType=flame-graph&timezone=browser&searchText=&panelType=time-series&layout=grid&hideNoData=off&var-groupBy=&var-profileIdSelector=&var-filters=&maxNodes=16384",
+    "trace_id_visible": null,
+    "http_errors": [
+      {
+        "url": "http://localhost:3101/api/user/stars",
+        "status": 401
+      },
+      {
+        "url": "http://localhost:3101/api/datasources/proxy/uid/pyroscope/settings.v1.RecordingRulesService/ListRecordingRules",
+        "status": 404
+      }
+    ]
+  },
+  {
+    "name": "slow-trace",
+    "url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%228e8498797abf524988c892b30e2e0bb5%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232703564%22%2C%20%22to%22%3A%20%221791232738564%22%7D%7D%7D",
+    "trace_id": "8e8498797abf524988c892b30e2e0bb5",
+    "span_id": "c8ac7d377a88f29b",
+    "final_url": "http://localhost:3101/explore?schemaVersion=1&panes=%7B%22lmo%22:%7B%22datasource%22:%22tempo%22,%22queries%22:%5B%7B%22refId%22:%22A%22,%22queryType%22:%22traceql%22,%22query%22:%228e8498797abf524988c892b30e2e0bb5%22,%22datasource%22:%7B%22type%22:%22tempo%22,%22uid%22:%22tempo%22%7D,%22serviceMapUseNativeHistograms%22:false%7D%5D,%22range%22:%7B%22from%22:%221791232703564%22,%22to%22:%221791232738564%22%7D,%22panelsState%22:%7B%22trace%22:%7B%22spanFilters%22:%7B%22spanNameOperator%22:%22%3D%22,%22serviceNameOperator%22:%22%3D%22,%22fromOperator%22:%22%3E%22,%22toOperator%22:%22%3C%22,%22tags%22:%5B%7B%22id%22:%22b71f73ae-6a1%22,%22operator%22:%22%3D%22%7D%5D%7D%7D%7D,%22compact%22:false%7D%7D&orgId=1",
+    "trace_id_visible": true,
+    "http_errors": [
+      {
+        "url": "http://localhost:3101/api/user/stars",
+        "status": 401
+      }
+    ]
+  },
+  {
+    "name": "slow-profile",
+    "url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232703564&to=1791232738564&showSpanHeatmap=true&var-spanSelector=c8ac7d377a88f29b",
+    "trace_id": "8e8498797abf524988c892b30e2e0bb5",
+    "span_id": "c8ac7d377a88f29b",
+    "final_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&from=2026-10-05T20%3A38%3A23.564Z&to=2026-10-05T20%3A38%3A58.564Z&showSpanHeatmap=true&var-spanSelector=c8ac7d377a88f29b&explorationType=flame-graph&timezone=browser&searchText=&panelType=time-series&layout=grid&hideNoData=off&var-groupBy=&var-profileIdSelector=&var-filters=&maxNodes=16384",
+    "trace_id_visible": null,
+    "http_errors": [
+      {
+        "url": "http://localhost:3101/api/user/stars",
+        "status": 401
+      },
+      {
+        "url": "http://localhost:3101/api/datasources/proxy/uid/pyroscope/settings.v1.RecordingRulesService/ListRecordingRules",
+        "status": 404
+      }
+    ]
+  }
+]

@@ -1,0 +1,621 @@
+{
+  "traces": [
+    {
+      "traceID": "f8d07dac2d2609a433e04118efd0d499",
+      "rootServiceName": "obi-poc-interference",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791234314803526909",
+      "durationMs": 2000,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "73c13e432f099b24",
+            "startTimeUnixNano": "1791234314803526909",
+            "durationNanos": "21250",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-interference"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "8093087cfe44f05d",
+            "startTimeUnixNano": "1791234314803548159",
+            "durationNanos": "2000463993",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-interference"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "eaa93d79fd70992c",
+            "startTimeUnixNano": "1791234314803526909",
+            "durationNanos": "2000485243",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-interference"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "73c13e432f099b24",
+              "startTimeUnixNano": "1791234314803526909",
+              "durationNanos": "21250",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "8093087cfe44f05d",
+              "startTimeUnixNano": "1791234314803548159",
+              "durationNanos": "2000463993",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "eaa93d79fd70992c",
+              "startTimeUnixNano": "1791234314803526909",
+              "durationNanos": "2000485243",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-interference": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "f3fb9049c2ae210304a753a3a2db86f6",
+      "rootServiceName": "obi-poc-interference",
+      "rootTraceName": "GET /report",
+      "startTimeUnixNano": "1791234314703389453",
+      "durationMs": 2000,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "8546c8cb96ae23e4",
+            "startTimeUnixNano": "1791234314703389453",
+            "durationNanos": "27571",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-interference"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "39b9db3826bac3cc",
+            "startTimeUnixNano": "1791234314703417024",
+            "durationNanos": "2000353650",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-interference"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "415f0e328c9b234a",
+            "startTimeUnixNano": "1791234314703389453",
+            "durationNanos": "2000381221",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-interference"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "8546c8cb96ae23e4",
+              "startTimeUnixNano": "1791234314703389453",
+              "durationNanos": "27571",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "39b9db3826bac3cc",
+              "startTimeUnixNano": "1791234314703417024",
+              "durationNanos": "2000353650",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "415f0e328c9b234a",
+              "startTimeUnixNano": "1791234314703389453",
+              "durationNanos": "2000381221",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-interference": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "cedf216887f55003de5fe528ba1f5741",
+      "rootServiceName": "obi-poc-interference",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791234312600356398",
+      "durationMs": 2001,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "643a6716b9956c15",
+            "startTimeUnixNano": "1791234312600356398",
+            "durationNanos": "18861",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-interference"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "4406b55f551d7d33",
+            "startTimeUnixNano": "1791234312600375259",
+            "durationNanos": "2001391924",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-interference"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "215dff801f09ee79",
+            "startTimeUnixNano": "1791234312600356398",
+            "durationNanos": "2001410785",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-interference"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "643a6716b9956c15",
+              "startTimeUnixNano": "1791234312600356398",
+              "durationNanos": "18861",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "4406b55f551d7d33",
+              "startTimeUnixNano": "1791234312600375259",
+              "durationNanos": "2001391924",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "215dff801f09ee79",
+              "startTimeUnixNano": "1791234312600356398",
+              "durationNanos": "2001410785",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-interference": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "96a795a080e17269d42a4526f8d7f30f",
+      "rootServiceName": "obi-poc-interference",
+      "rootTraceName": "GET /report",
+      "startTimeUnixNano": "1791234312500003548",
+      "durationMs": 2000,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "777f77e6f083fac6",
+            "startTimeUnixNano": "1791234312500003548",
+            "durationNanos": "28771",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-interference"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "90788b347b023673",
+            "startTimeUnixNano": "1791234312500032319",
+            "durationNanos": "2000332779",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-interference"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "aaa3a67c4c3561b5",
+            "startTimeUnixNano": "1791234312500003548",
+            "durationNanos": "2000361550",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-interference"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "777f77e6f083fac6",
+              "startTimeUnixNano": "1791234312500003548",
+              "durationNanos": "28771",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "90788b347b023673",
+              "startTimeUnixNano": "1791234312500032319",
+              "durationNanos": "2000332779",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "aaa3a67c4c3561b5",
+              "startTimeUnixNano": "1791234312500003548",
+              "durationNanos": "2000361550",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-interference": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "dd02564277b103670299308bd83eeb13",
+      "rootServiceName": "obi-poc-interference",
+      "rootTraceName": "GET /work",
+      "startTimeUnixNano": "1791234310397971696",
+      "durationMs": 2000,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "09f4872e31db42e2",
+            "startTimeUnixNano": "1791234310397971696",
+            "durationNanos": "18971",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-interference"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "07af3767b00b6de4",
+            "startTimeUnixNano": "1791234310397990667",
+            "durationNanos": "2000397454",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-interference"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "ad5727de4f216cd0",
+            "startTimeUnixNano": "1791234310397971696",
+            "durationNanos": "2000416425",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-interference"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "09f4872e31db42e2",
+              "startTimeUnixNano": "1791234310397971696",
+              "durationNanos": "18971",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "07af3767b00b6de4",
+              "startTimeUnixNano": "1791234310397990667",
+              "durationNanos": "2000397454",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "ad5727de4f216cd0",
+              "startTimeUnixNano": "1791234310397971696",
+              "durationNanos": "2000416425",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-interference": {
+          "spanCount": 3
+        }
+      }
+    },
+    {
+      "traceID": "5c6dbb91f04f0b21676dbc94d917edb2",
+      "rootServiceName": "obi-poc-interference",
+      "rootTraceName": "GET /report",
+      "startTimeUnixNano": "1791234310297823212",
+      "durationMs": 2000,
+      "spanSet": {
+        "spans": [
+          {
+            "spanID": "dc42909193fd50b4",
+            "startTimeUnixNano": "1791234310297823212",
+            "durationNanos": "26790",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-interference"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "0f05a4186f4fc0f6",
+            "startTimeUnixNano": "1791234310297850002",
+            "durationNanos": "2000357104",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-interference"
+                }
+              }
+            ]
+          },
+          {
+            "spanID": "c54601d5f98d11b0",
+            "startTimeUnixNano": "1791234310297823212",
+            "durationNanos": "2000383894",
+            "attributes": [
+              {
+                "key": "service.name",
+                "value": {
+                  "stringValue": "obi-poc-interference"
+                }
+              }
+            ]
+          }
+        ],
+        "matched": 3
+      },
+      "spanSets": [
+        {
+          "spans": [
+            {
+              "spanID": "dc42909193fd50b4",
+              "startTimeUnixNano": "1791234310297823212",
+              "durationNanos": "26790",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "0f05a4186f4fc0f6",
+              "startTimeUnixNano": "1791234310297850002",
+              "durationNanos": "2000357104",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "c54601d5f98d11b0",
+              "startTimeUnixNano": "1791234310297823212",
+              "durationNanos": "2000383894",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        }
+      ],
+      "serviceStats": {
+        "obi-poc-interference": {
+          "spanCount": 3
+        }
+      }
+    }
+  ],
+  "metrics": {
+    "inspectedBytes": "23255",
+    "completedJobs": 1,
+    "totalJobs": 1
+  }
+}

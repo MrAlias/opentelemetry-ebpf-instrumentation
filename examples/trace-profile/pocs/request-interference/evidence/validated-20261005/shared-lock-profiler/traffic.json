@@ -1,0 +1,260 @@
+{
+  "before_attachment": [
+    {
+      "path": "/report",
+      "start_ms": 1791234081712,
+      "status": 200,
+      "end_ms": 1791234083714,
+      "duration_ms": 2001.3344229664654
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234081813,
+      "status": 200,
+      "end_ms": 1791234083814,
+      "duration_ms": 2001.016166061163
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791234083914,
+      "status": 200,
+      "end_ms": 1791234085915,
+      "duration_ms": 2001.2605509255081
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234084014,
+      "status": 200,
+      "end_ms": 1791234086015,
+      "duration_ms": 2001.2000801507384
+    }
+  ],
+  "during_attachment": [
+    {
+      "path": "/report",
+      "start_ms": 1791234086400,
+      "status": 200,
+      "end_ms": 1791234088401,
+      "duration_ms": 2001.419153995812
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234086500,
+      "status": 200,
+      "end_ms": 1791234088501,
+      "duration_ms": 2000.960614066571
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791234088602,
+      "status": 200,
+      "end_ms": 1791234090603,
+      "duration_ms": 2001.3164121191949
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234088702,
+      "status": 200,
+      "end_ms": 1791234090703,
+      "duration_ms": 2001.2970410753042
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791234090803,
+      "status": 200,
+      "end_ms": 1791234092804,
+      "duration_ms": 2001.2734120246023
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234090903,
+      "status": 200,
+      "end_ms": 1791234092904,
+      "duration_ms": 2001.180819934234
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791234093005,
+      "status": 200,
+      "end_ms": 1791234095006,
+      "duration_ms": 2001.3944460079074
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234093105,
+      "status": 200,
+      "end_ms": 1791234095106,
+      "duration_ms": 2001.3333200477064
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791234095206,
+      "status": 200,
+      "end_ms": 1791234097208,
+      "duration_ms": 2001.4064710121602
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234095306,
+      "status": 200,
+      "end_ms": 1791234097308,
+      "duration_ms": 2001.386985881254
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791234097408,
+      "status": 200,
+      "end_ms": 1791234099409,
+      "duration_ms": 2001.3505031820387
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234097508,
+      "status": 200,
+      "end_ms": 1791234099509,
+      "duration_ms": 2001.3285230379552
+    }
+  ],
+  "after_attachment": [
+    {
+      "path": "/report",
+      "start_ms": 1791234099611,
+      "status": 200,
+      "end_ms": 1791234101612,
+      "duration_ms": 2001.4027678407729
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234099711,
+      "status": 200,
+      "end_ms": 1791234101712,
+      "duration_ms": 2001.0871421545744
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791234101812,
+      "status": 200,
+      "end_ms": 1791234103814,
+      "duration_ms": 2001.3766360934824
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234101913,
+      "status": 200,
+      "end_ms": 1791234103914,
+      "duration_ms": 2001.3669859617949
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791234104014,
+      "status": 200,
+      "end_ms": 1791234106016,
+      "duration_ms": 2001.3826158829033
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234104114,
+      "status": 200,
+      "end_ms": 1791234106116,
+      "duration_ms": 2001.3576650526375
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791234106216,
+      "status": 200,
+      "end_ms": 1791234108217,
+      "duration_ms": 2001.3496349565685
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234106316,
+      "status": 200,
+      "end_ms": 1791234108317,
+      "duration_ms": 2001.2284030672163
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791234108417,
+      "status": 200,
+      "end_ms": 1791234110419,
+      "duration_ms": 2001.3623959384859
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234108518,
+      "status": 200,
+      "end_ms": 1791234110519,
+      "duration_ms": 2001.3228349853307
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791234110619,
+      "status": 200,
+      "end_ms": 1791234112621,
+      "duration_ms": 2001.4839901123196
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234110719,
+      "status": 200,
+      "end_ms": 1791234112721,
+      "duration_ms": 2001.4595401007682
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791234112821,
+      "status": 200,
+      "end_ms": 1791234114822,
+      "duration_ms": 2001.2703519314528
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234112921,
+      "status": 200,
+      "end_ms": 1791234114922,
+      "duration_ms": 2001.154480036348
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791234115022,
+      "status": 200,
+      "end_ms": 1791234117023,
+      "duration_ms": 2001.2475510593504
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234115122,
+      "status": 200,
+      "end_ms": 1791234117124,
+      "duration_ms": 2001.254241913557
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791234117224,
+      "status": 200,
+      "end_ms": 1791234119225,
+      "duration_ms": 2001.3282930012792
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234117324,
+      "status": 200,
+      "end_ms": 1791234119325,
+      "duration_ms": 2001.2676920741796
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791234119425,
+      "status": 200,
+      "end_ms": 1791234121427,
+      "duration_ms": 2001.2062811292708
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234119525,
+      "status": 200,
+      "end_ms": 1791234121527,
+      "duration_ms": 2001.23869208619
+    }
+  ]
+}

@@ -1,0 +1,104 @@
+Skip to main content
+Grafana
+
+Starred
+
+Dashboards
+
+Explore
+
+Drilldown
+
+Metrics
+
+Logs
+
+Traces
+
+Profiles
+
+Alerting
+
+Connections
+
+Administration
+
+Explore
+Tempo
+Search...
+ctrl+k
+Sign in
+Explore
+Outline
+Go queryless
+Split
+Add
+Queries
+Traces
+A
+(Tempo)
+Query type
+Search
+TraceQL
+Service Graph
+Import trace
+Build complex queries using TraceQL to select a list of traces.
+Documentation
+134a4f627d053b5f6a144f02fe6c7358
+Search Options
+Limit: 20
+Spans Limit: 3
+Table Format: Traces
+|
+Streaming: Disabled
+Metrics Options
+Step: auto
+Type: Range
+|
+Streaming: Disabled
+Add query
+Query history
+Query inspector
+Trace
+obi-poc-waiting: GET /syscall
+GET
+200
+Feedback
+Share
+Trace ID
+134a4f627d053b5f6a144f02fe6c7358
+Start time
+2026-10-05 20:33:57.208
+(9 minutes ago)
+Duration
+1s
+Services
+1
+Route
+/syscall
+Overview
+0μs
+250.09ms
+500.17ms
+750.26ms
+1s
+Filters
+Critical path
+Errors
+High latency
+3 spans
+Show all spans
+Service & Operation
+0μs
+250.09ms
+500.17ms
+750.26ms
+1s
+obi-poc-waiting GET /syscall (1s)
+1s
+-
+in queue (19.81μs)
+19.81μs
+-
+processing (1s)
+1s

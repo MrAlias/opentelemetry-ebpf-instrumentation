@@ -1,0 +1,59 @@
+name: obi-poc-interference
+
+services:
+  app:
+    build: ./app
+    image: obi-poc-interference-app:local
+    environment:
+      SCENARIO: ${SCENARIO:-shared-lock}
+    ports: ["127.0.0.1:8183:8080"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+  obi:
+    image: ${OBI_IMAGE:-obi-ai-investigation:6d873d7}
+    pull_policy: never
+    profiles: [diagnostics]
+    privileged: true
+    pid: host
+    environment:
+      OTEL_SERVICE_NAME: obi-poc-interference
+      OTEL_EBPF_EXECUTABLE_PATH: obi-poc-interference$
+      OTEL_EBPF_BPF_FS_PATH: /sys/fs/bpf/obi-poc-interference
+      OTEL_EBPF_DISCOVERY_POLL_INTERVAL: 500ms
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://lgtm:4317
+      OTEL_EXPORTER_OTLP_TRACES_PROTOCOL: grpc
+    volumes:
+      - /sys/fs/bpf:/sys/fs/bpf
+      - /sys/kernel/security:/sys/kernel/security:ro
+
+  profiler:
+    image: otel/opentelemetry-collector-ebpf-profiler:0.160.0@sha256:40bc11043fdef9f7744631d6ca60d44e63b4c2a356ec0a21a02a4a5f28ebff70
+    profiles: [diagnostics]
+    command: [--config=/etc/profiler.yaml, --feature-gates=service.profilesSupport]
+    privileged: true
+    pid: host
+    environment:
+      OBI_PROCESS_CTX: ${OBI_PROCESS_CTX:-true}
+    volumes:
+      - ./profiler.yaml:/etc/profiler.yaml:ro
+      - /sys/fs/bpf:/sys/fs/bpf
+      - /sys/kernel/debug:/sys/kernel/debug:ro
+      - /sys/fs/cgroup:/sys/fs/cgroup:ro
+      - /proc:/proc:ro
+
+  lgtm:
+    image: grafana/otel-lgtm:0.33.1@sha256:d6c52678ab5b7144f27ae569fd778608121c0f4a10eb411983750a0d67c1fbe3
+    environment:
+      GF_FEATURE_TOGGLES_ENABLE: profilesHeatmap
+      GF_SERVER_ROOT_URL: http://localhost:3103/
+    ports: ["127.0.0.1:3103:3000"]
+    volumes:
+      - ./collector.yaml:/otel-lgtm/otelcol-config.yaml:ro
+      - ./pyroscope.yaml:/otel-lgtm/pyroscope-config.yaml:ro
+      - ./datasources.yaml:/otel-lgtm/grafana/conf/provisioning/datasources/grafana-datasources.yaml:ro
+      - backend:/data
+
+volumes:
+  backend: {}

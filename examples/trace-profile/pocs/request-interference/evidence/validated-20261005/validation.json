@@ -1,0 +1,24 @@
+{
+  "fixture_go_build_and_test": "passed; fixture has no unit tests",
+  "python_tests": {
+    "passed": 7
+  },
+  "compose_config": "passed",
+  "exact_ids": {
+    "shared-lock": {
+      "verified": 12,
+      "returned": 12
+    },
+    "control": {
+      "verified": 4,
+      "returned": 4
+    }
+  },
+  "replay_phases_passed": 6,
+  "browser_pages_loaded": 4,
+  "node_syntax": "passed",
+  "owned_markdown": "passed",
+  "full_make_lint_markdown": "failed only pre-existing talk-proposals.md:9 trailing space",
+  "delivered_runner_sha256": "226b0bff502f4ccbb291beb7098dc6a22fdde15d4f9014ba314033e1bd17406f",
+  "pilot_archive_sha256": "b16f65e113e63757f134bba7d8700f00a0b2749b310f43551ac47267812639b7"
+}

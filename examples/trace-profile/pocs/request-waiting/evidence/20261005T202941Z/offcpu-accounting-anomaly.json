@@ -1,0 +1,11 @@
+{
+  "span_id": "5a05eabc06facabc",
+  "trace_id": "a4b9fe2b98afb1b120a716005bcdb99f",
+  "span_start_ns": 1791232436206521192,
+  "span_end_ns": 1791232437206858125,
+  "exemplar_timestamp_ms": 1791232432909,
+  "exemplar_value_ns": 1830984411,
+  "profile_total_ns": 1830984411,
+  "interval_start_if_single_contiguous_duration_ns": 1791232431078015589,
+  "note": "Heatmap value may aggregate multiple samples; inferred start is illustrative, not proof of a particular event interval. ExactID establishes a tag, not duration ownership."
+}

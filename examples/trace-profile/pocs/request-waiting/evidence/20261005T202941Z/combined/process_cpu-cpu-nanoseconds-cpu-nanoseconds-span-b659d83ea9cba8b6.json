@@ -1,0 +1,181 @@
+{
+  "flamegraph": {
+    "names": [
+      "total",
+      "runtime.goexit",
+      "net/http.(*Server).Serve.gowrap3",
+      "net/http.(*conn).serve",
+      "net/http.serverHandler.ServeHTTP",
+      "net/http.(*ServeMux).ServeHTTP",
+      "net/http.HandlerFunc.ServeHTTP",
+      "main.main.func5",
+      "net/http.(*Client).do",
+      "net/http.(*Client).send",
+      "net/http.send",
+      "net/http.(*Transport).RoundTrip",
+      "net/http.(*Transport).roundTrip",
+      "net/http.(*persistConn).roundTrip",
+      "runtime.chansend1",
+      "runtime.chansend",
+      "runtime.send",
+      "runtime.sendDirect",
+      "runtime.memmove"
+    ],
+    "levels": [
+      {
+        "values": [
+          "0",
+          "10309278",
+          "0",
+          "0"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "10309278",
+          "0",
+          "1"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "10309278",
+          "0",
+          "2"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "10309278",
+          "0",
+          "3"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "10309278",
+          "0",
+          "4"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "10309278",
+          "0",
+          "5"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "10309278",
+          "0",
+          "6"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "10309278",
+          "0",
+          "7"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "10309278",
+          "0",
+          "8"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "10309278",
+          "0",
+          "9"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "10309278",
+          "0",
+          "10"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "10309278",
+          "0",
+          "11"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "10309278",
+          "0",
+          "12"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "10309278",
+          "0",
+          "13"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "10309278",
+          "0",
+          "14"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "10309278",
+          "0",
+          "15"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "10309278",
+          "0",
+          "16"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "10309278",
+          "0",
+          "17"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "10309278",
+          "10309278",
+          "18"
+        ]
+      }
+    ],
+    "total": "10309278",
+    "maxSelf": "10309278"
+  }
+}

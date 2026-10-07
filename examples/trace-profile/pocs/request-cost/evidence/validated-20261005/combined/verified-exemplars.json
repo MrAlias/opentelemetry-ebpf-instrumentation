@@ -1,0 +1,1110 @@
+[
+  {
+    "timestamp": "1791232704178",
+    "spanId": "693bdf00e6dde92c",
+    "value": "804123684",
+    "labels": [
+      {
+        "name": "__profile_type__",
+        "value": "process_cpu:cpu:nanoseconds:cpu:nanoseconds"
+      },
+      {
+        "name": "__service_name__",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "__name__",
+        "value": "process_cpu"
+      },
+      {
+        "name": "__otel__",
+        "value": "true"
+      },
+      {
+        "name": "__period_type__",
+        "value": "cpu"
+      },
+      {
+        "name": "__period_unit__",
+        "value": "nanoseconds"
+      },
+      {
+        "name": "__type__",
+        "value": "cpu"
+      },
+      {
+        "name": "__unit__",
+        "value": "nanoseconds"
+      },
+      {
+        "name": "container.id",
+        "value": "b19c96fdb2a2c9dc5c0a075c27fea39f9ce93a037588fe7e81121f1b01f0fad2"
+      },
+      {
+        "name": "process.executable.name",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "process.executable.path",
+        "value": "/obi-poc-cost"
+      },
+      {
+        "name": "process.pid",
+        "value": "3966172"
+      },
+      {
+        "name": "service_name",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "thread.name",
+        "value": "obi-poc-cost"
+      }
+    ],
+    "traceId": "bfcfa0e8c3777ded956f5983974c8a5f",
+    "normalized_trace_id": "bfcfa0e8c3777ded956f5983974c8a5f",
+    "normalized_span_id": "693bdf00e6dde92c",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%22bfcfa0e8c3777ded956f5983974c8a5f%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232703564%22%2C%20%22to%22%3A%20%221791232738564%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232703564&to=1791232738564&showSpanHeatmap=true&var-spanSelector=693bdf00e6dde92c"
+  },
+  {
+    "timestamp": "1791232704178",
+    "spanId": "c8ac7d377a88f29b",
+    "value": "175257726",
+    "labels": [
+      {
+        "name": "__profile_type__",
+        "value": "process_cpu:cpu:nanoseconds:cpu:nanoseconds"
+      },
+      {
+        "name": "__service_name__",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "__name__",
+        "value": "process_cpu"
+      },
+      {
+        "name": "__otel__",
+        "value": "true"
+      },
+      {
+        "name": "__period_type__",
+        "value": "cpu"
+      },
+      {
+        "name": "__period_unit__",
+        "value": "nanoseconds"
+      },
+      {
+        "name": "__type__",
+        "value": "cpu"
+      },
+      {
+        "name": "__unit__",
+        "value": "nanoseconds"
+      },
+      {
+        "name": "container.id",
+        "value": "b19c96fdb2a2c9dc5c0a075c27fea39f9ce93a037588fe7e81121f1b01f0fad2"
+      },
+      {
+        "name": "process.executable.name",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "process.executable.path",
+        "value": "/obi-poc-cost"
+      },
+      {
+        "name": "process.pid",
+        "value": "3966172"
+      },
+      {
+        "name": "service_name",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "thread.name",
+        "value": "obi-poc-cost"
+      }
+    ],
+    "traceId": "8e8498797abf524988c892b30e2e0bb5",
+    "normalized_trace_id": "8e8498797abf524988c892b30e2e0bb5",
+    "normalized_span_id": "c8ac7d377a88f29b",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%228e8498797abf524988c892b30e2e0bb5%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232703564%22%2C%20%22to%22%3A%20%221791232738564%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232703564&to=1791232738564&showSpanHeatmap=true&var-spanSelector=c8ac7d377a88f29b"
+  },
+  {
+    "timestamp": "1791232708673",
+    "spanId": "0bb08d1ac1d27630",
+    "value": "463917510",
+    "labels": [
+      {
+        "name": "__profile_type__",
+        "value": "process_cpu:cpu:nanoseconds:cpu:nanoseconds"
+      },
+      {
+        "name": "__service_name__",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "__name__",
+        "value": "process_cpu"
+      },
+      {
+        "name": "__otel__",
+        "value": "true"
+      },
+      {
+        "name": "__period_type__",
+        "value": "cpu"
+      },
+      {
+        "name": "__period_unit__",
+        "value": "nanoseconds"
+      },
+      {
+        "name": "__type__",
+        "value": "cpu"
+      },
+      {
+        "name": "__unit__",
+        "value": "nanoseconds"
+      },
+      {
+        "name": "container.id",
+        "value": "b19c96fdb2a2c9dc5c0a075c27fea39f9ce93a037588fe7e81121f1b01f0fad2"
+      },
+      {
+        "name": "cpu.logical_number",
+        "value": "8"
+      },
+      {
+        "name": "process.executable.name",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "process.executable.path",
+        "value": "/obi-poc-cost"
+      },
+      {
+        "name": "process.pid",
+        "value": "3966172"
+      },
+      {
+        "name": "service_name",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "thread.id",
+        "value": "3966259"
+      },
+      {
+        "name": "thread.name",
+        "value": "obi-poc-cost"
+      }
+    ],
+    "traceId": "d1424ed09e1754c84b0a54b453f65663",
+    "normalized_trace_id": "d1424ed09e1754c84b0a54b453f65663",
+    "normalized_span_id": "0bb08d1ac1d27630",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%22d1424ed09e1754c84b0a54b453f65663%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232703564%22%2C%20%22to%22%3A%20%221791232738564%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232703564&to=1791232738564&showSpanHeatmap=true&var-spanSelector=0bb08d1ac1d27630"
+  },
+  {
+    "timestamp": "1791232708673",
+    "spanId": "4201cb070c020413",
+    "value": "154639170",
+    "labels": [
+      {
+        "name": "__profile_type__",
+        "value": "process_cpu:cpu:nanoseconds:cpu:nanoseconds"
+      },
+      {
+        "name": "__service_name__",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "__name__",
+        "value": "process_cpu"
+      },
+      {
+        "name": "__otel__",
+        "value": "true"
+      },
+      {
+        "name": "__period_type__",
+        "value": "cpu"
+      },
+      {
+        "name": "__period_unit__",
+        "value": "nanoseconds"
+      },
+      {
+        "name": "__type__",
+        "value": "cpu"
+      },
+      {
+        "name": "__unit__",
+        "value": "nanoseconds"
+      },
+      {
+        "name": "container.id",
+        "value": "b19c96fdb2a2c9dc5c0a075c27fea39f9ce93a037588fe7e81121f1b01f0fad2"
+      },
+      {
+        "name": "process.executable.name",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "process.executable.path",
+        "value": "/obi-poc-cost"
+      },
+      {
+        "name": "process.pid",
+        "value": "3966172"
+      },
+      {
+        "name": "service_name",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "thread.name",
+        "value": "obi-poc-cost"
+      }
+    ],
+    "traceId": "3e2cd170b54e0c3a04e88685246109a0",
+    "normalized_trace_id": "3e2cd170b54e0c3a04e88685246109a0",
+    "normalized_span_id": "4201cb070c020413",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%223e2cd170b54e0c3a04e88685246109a0%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232703564%22%2C%20%22to%22%3A%20%221791232738564%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232703564&to=1791232738564&showSpanHeatmap=true&var-spanSelector=4201cb070c020413"
+  },
+  {
+    "timestamp": "1791232708673",
+    "spanId": "c8ac7d377a88f29b",
+    "value": "639175236",
+    "labels": [
+      {
+        "name": "__profile_type__",
+        "value": "process_cpu:cpu:nanoseconds:cpu:nanoseconds"
+      },
+      {
+        "name": "__service_name__",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "__name__",
+        "value": "process_cpu"
+      },
+      {
+        "name": "__otel__",
+        "value": "true"
+      },
+      {
+        "name": "__period_type__",
+        "value": "cpu"
+      },
+      {
+        "name": "__period_unit__",
+        "value": "nanoseconds"
+      },
+      {
+        "name": "__type__",
+        "value": "cpu"
+      },
+      {
+        "name": "__unit__",
+        "value": "nanoseconds"
+      },
+      {
+        "name": "container.id",
+        "value": "b19c96fdb2a2c9dc5c0a075c27fea39f9ce93a037588fe7e81121f1b01f0fad2"
+      },
+      {
+        "name": "process.executable.name",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "process.executable.path",
+        "value": "/obi-poc-cost"
+      },
+      {
+        "name": "process.pid",
+        "value": "3966172"
+      },
+      {
+        "name": "service_name",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "thread.name",
+        "value": "obi-poc-cost"
+      }
+    ],
+    "traceId": "8e8498797abf524988c892b30e2e0bb5",
+    "normalized_trace_id": "8e8498797abf524988c892b30e2e0bb5",
+    "normalized_span_id": "c8ac7d377a88f29b",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%228e8498797abf524988c892b30e2e0bb5%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232703564%22%2C%20%22to%22%3A%20%221791232738564%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232703564&to=1791232738564&showSpanHeatmap=true&var-spanSelector=c8ac7d377a88f29b"
+  },
+  {
+    "timestamp": "1791232708673",
+    "spanId": "5ff7753fb3f291ad",
+    "value": "804123684",
+    "labels": [
+      {
+        "name": "__profile_type__",
+        "value": "process_cpu:cpu:nanoseconds:cpu:nanoseconds"
+      },
+      {
+        "name": "__service_name__",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "__name__",
+        "value": "process_cpu"
+      },
+      {
+        "name": "__otel__",
+        "value": "true"
+      },
+      {
+        "name": "__period_type__",
+        "value": "cpu"
+      },
+      {
+        "name": "__period_unit__",
+        "value": "nanoseconds"
+      },
+      {
+        "name": "__type__",
+        "value": "cpu"
+      },
+      {
+        "name": "__unit__",
+        "value": "nanoseconds"
+      },
+      {
+        "name": "container.id",
+        "value": "b19c96fdb2a2c9dc5c0a075c27fea39f9ce93a037588fe7e81121f1b01f0fad2"
+      },
+      {
+        "name": "process.executable.name",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "process.executable.path",
+        "value": "/obi-poc-cost"
+      },
+      {
+        "name": "process.pid",
+        "value": "3966172"
+      },
+      {
+        "name": "service_name",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "thread.name",
+        "value": "obi-poc-cost"
+      }
+    ],
+    "traceId": "6ef8c121f9cfb0e3407d020af09451c3",
+    "normalized_trace_id": "6ef8c121f9cfb0e3407d020af09451c3",
+    "normalized_span_id": "5ff7753fb3f291ad",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%226ef8c121f9cfb0e3407d020af09451c3%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232703564%22%2C%20%22to%22%3A%20%221791232738564%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232703564&to=1791232738564&showSpanHeatmap=true&var-spanSelector=5ff7753fb3f291ad"
+  },
+  {
+    "timestamp": "1791232718683",
+    "spanId": "763bf0794b6b8849",
+    "value": "804123684",
+    "labels": [
+      {
+        "name": "__profile_type__",
+        "value": "process_cpu:cpu:nanoseconds:cpu:nanoseconds"
+      },
+      {
+        "name": "__service_name__",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "__name__",
+        "value": "process_cpu"
+      },
+      {
+        "name": "__otel__",
+        "value": "true"
+      },
+      {
+        "name": "__period_type__",
+        "value": "cpu"
+      },
+      {
+        "name": "__period_unit__",
+        "value": "nanoseconds"
+      },
+      {
+        "name": "__type__",
+        "value": "cpu"
+      },
+      {
+        "name": "__unit__",
+        "value": "nanoseconds"
+      },
+      {
+        "name": "container.id",
+        "value": "b19c96fdb2a2c9dc5c0a075c27fea39f9ce93a037588fe7e81121f1b01f0fad2"
+      },
+      {
+        "name": "process.executable.name",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "process.executable.path",
+        "value": "/obi-poc-cost"
+      },
+      {
+        "name": "process.pid",
+        "value": "3966172"
+      },
+      {
+        "name": "service_name",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "thread.name",
+        "value": "obi-poc-cost"
+      }
+    ],
+    "traceId": "289fd9f2f9c5a7a29d11f58c05a0b7bf",
+    "normalized_trace_id": "289fd9f2f9c5a7a29d11f58c05a0b7bf",
+    "normalized_span_id": "763bf0794b6b8849",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%22289fd9f2f9c5a7a29d11f58c05a0b7bf%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232703564%22%2C%20%22to%22%3A%20%221791232738564%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232703564&to=1791232738564&showSpanHeatmap=true&var-spanSelector=763bf0794b6b8849"
+  },
+  {
+    "timestamp": "1791232718683",
+    "spanId": "eb706806a811d12a",
+    "value": "154639170",
+    "labels": [
+      {
+        "name": "__profile_type__",
+        "value": "process_cpu:cpu:nanoseconds:cpu:nanoseconds"
+      },
+      {
+        "name": "__service_name__",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "__name__",
+        "value": "process_cpu"
+      },
+      {
+        "name": "__otel__",
+        "value": "true"
+      },
+      {
+        "name": "__period_type__",
+        "value": "cpu"
+      },
+      {
+        "name": "__period_unit__",
+        "value": "nanoseconds"
+      },
+      {
+        "name": "__type__",
+        "value": "cpu"
+      },
+      {
+        "name": "__unit__",
+        "value": "nanoseconds"
+      },
+      {
+        "name": "container.id",
+        "value": "b19c96fdb2a2c9dc5c0a075c27fea39f9ce93a037588fe7e81121f1b01f0fad2"
+      },
+      {
+        "name": "process.executable.name",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "process.executable.path",
+        "value": "/obi-poc-cost"
+      },
+      {
+        "name": "process.pid",
+        "value": "3966172"
+      },
+      {
+        "name": "service_name",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "thread.name",
+        "value": "obi-poc-cost"
+      }
+    ],
+    "traceId": "572b19b7a7b8b81392fc0884d8808dba",
+    "normalized_trace_id": "572b19b7a7b8b81392fc0884d8808dba",
+    "normalized_span_id": "eb706806a811d12a",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%22572b19b7a7b8b81392fc0884d8808dba%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232703564%22%2C%20%22to%22%3A%20%221791232738564%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232703564&to=1791232738564&showSpanHeatmap=true&var-spanSelector=eb706806a811d12a"
+  },
+  {
+    "timestamp": "1791232724425",
+    "spanId": "035a0dd4c0d7b9be",
+    "value": "20618556",
+    "labels": [
+      {
+        "name": "__profile_type__",
+        "value": "process_cpu:cpu:nanoseconds:cpu:nanoseconds"
+      },
+      {
+        "name": "__service_name__",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "__name__",
+        "value": "process_cpu"
+      },
+      {
+        "name": "__otel__",
+        "value": "true"
+      },
+      {
+        "name": "__period_type__",
+        "value": "cpu"
+      },
+      {
+        "name": "__period_unit__",
+        "value": "nanoseconds"
+      },
+      {
+        "name": "__type__",
+        "value": "cpu"
+      },
+      {
+        "name": "__unit__",
+        "value": "nanoseconds"
+      },
+      {
+        "name": "container.id",
+        "value": "b19c96fdb2a2c9dc5c0a075c27fea39f9ce93a037588fe7e81121f1b01f0fad2"
+      },
+      {
+        "name": "process.executable.name",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "process.executable.path",
+        "value": "/obi-poc-cost"
+      },
+      {
+        "name": "process.pid",
+        "value": "3966172"
+      },
+      {
+        "name": "service_name",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "thread.id",
+        "value": "3967190"
+      },
+      {
+        "name": "thread.name",
+        "value": "obi-poc-cost"
+      }
+    ],
+    "traceId": "82396739cc848dda3bb5aef373311257",
+    "normalized_trace_id": "82396739cc848dda3bb5aef373311257",
+    "normalized_span_id": "035a0dd4c0d7b9be",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%2282396739cc848dda3bb5aef373311257%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232703564%22%2C%20%22to%22%3A%20%221791232738564%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232703564&to=1791232738564&showSpanHeatmap=true&var-spanSelector=035a0dd4c0d7b9be"
+  },
+  {
+    "timestamp": "1791232724425",
+    "spanId": "f1f3029a282e8536",
+    "value": "804123684",
+    "labels": [
+      {
+        "name": "__profile_type__",
+        "value": "process_cpu:cpu:nanoseconds:cpu:nanoseconds"
+      },
+      {
+        "name": "__service_name__",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "__name__",
+        "value": "process_cpu"
+      },
+      {
+        "name": "__otel__",
+        "value": "true"
+      },
+      {
+        "name": "__period_type__",
+        "value": "cpu"
+      },
+      {
+        "name": "__period_unit__",
+        "value": "nanoseconds"
+      },
+      {
+        "name": "__type__",
+        "value": "cpu"
+      },
+      {
+        "name": "__unit__",
+        "value": "nanoseconds"
+      },
+      {
+        "name": "container.id",
+        "value": "b19c96fdb2a2c9dc5c0a075c27fea39f9ce93a037588fe7e81121f1b01f0fad2"
+      },
+      {
+        "name": "process.executable.name",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "process.executable.path",
+        "value": "/obi-poc-cost"
+      },
+      {
+        "name": "process.pid",
+        "value": "3966172"
+      },
+      {
+        "name": "service_name",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "thread.id",
+        "value": "3967190"
+      },
+      {
+        "name": "thread.name",
+        "value": "obi-poc-cost"
+      }
+    ],
+    "traceId": "23d6c29c5de7986887397f4ee70f342c",
+    "normalized_trace_id": "23d6c29c5de7986887397f4ee70f342c",
+    "normalized_span_id": "f1f3029a282e8536",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%2223d6c29c5de7986887397f4ee70f342c%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232703564%22%2C%20%22to%22%3A%20%221791232738564%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232703564&to=1791232738564&showSpanHeatmap=true&var-spanSelector=f1f3029a282e8536"
+  },
+  {
+    "timestamp": "1791232724425",
+    "spanId": "e90093255c81271a",
+    "value": "154639170",
+    "labels": [
+      {
+        "name": "__profile_type__",
+        "value": "process_cpu:cpu:nanoseconds:cpu:nanoseconds"
+      },
+      {
+        "name": "__service_name__",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "__name__",
+        "value": "process_cpu"
+      },
+      {
+        "name": "__otel__",
+        "value": "true"
+      },
+      {
+        "name": "__period_type__",
+        "value": "cpu"
+      },
+      {
+        "name": "__period_unit__",
+        "value": "nanoseconds"
+      },
+      {
+        "name": "__type__",
+        "value": "cpu"
+      },
+      {
+        "name": "__unit__",
+        "value": "nanoseconds"
+      },
+      {
+        "name": "container.id",
+        "value": "b19c96fdb2a2c9dc5c0a075c27fea39f9ce93a037588fe7e81121f1b01f0fad2"
+      },
+      {
+        "name": "process.executable.name",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "process.executable.path",
+        "value": "/obi-poc-cost"
+      },
+      {
+        "name": "process.pid",
+        "value": "3966172"
+      },
+      {
+        "name": "service_name",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "thread.name",
+        "value": "obi-poc-cost"
+      }
+    ],
+    "traceId": "42d2a9d6d184ef04da5ebb3a3b11c226",
+    "normalized_trace_id": "42d2a9d6d184ef04da5ebb3a3b11c226",
+    "normalized_span_id": "e90093255c81271a",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%2242d2a9d6d184ef04da5ebb3a3b11c226%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232703564%22%2C%20%22to%22%3A%20%221791232738564%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232703564&to=1791232738564&showSpanHeatmap=true&var-spanSelector=e90093255c81271a"
+  },
+  {
+    "timestamp": "1791232730178",
+    "spanId": "84bf1a6ee42ed845",
+    "value": "793814406",
+    "labels": [
+      {
+        "name": "__profile_type__",
+        "value": "process_cpu:cpu:nanoseconds:cpu:nanoseconds"
+      },
+      {
+        "name": "__service_name__",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "__name__",
+        "value": "process_cpu"
+      },
+      {
+        "name": "__otel__",
+        "value": "true"
+      },
+      {
+        "name": "__period_type__",
+        "value": "cpu"
+      },
+      {
+        "name": "__period_unit__",
+        "value": "nanoseconds"
+      },
+      {
+        "name": "__type__",
+        "value": "cpu"
+      },
+      {
+        "name": "__unit__",
+        "value": "nanoseconds"
+      },
+      {
+        "name": "container.id",
+        "value": "b19c96fdb2a2c9dc5c0a075c27fea39f9ce93a037588fe7e81121f1b01f0fad2"
+      },
+      {
+        "name": "process.executable.name",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "process.executable.path",
+        "value": "/obi-poc-cost"
+      },
+      {
+        "name": "process.pid",
+        "value": "3966172"
+      },
+      {
+        "name": "service_name",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "thread.name",
+        "value": "obi-poc-cost"
+      }
+    ],
+    "traceId": "0398b442d295fe7b06830f98d2e5c31c",
+    "normalized_trace_id": "0398b442d295fe7b06830f98d2e5c31c",
+    "normalized_span_id": "84bf1a6ee42ed845",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%220398b442d295fe7b06830f98d2e5c31c%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232703564%22%2C%20%22to%22%3A%20%221791232738564%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232703564&to=1791232738564&showSpanHeatmap=true&var-spanSelector=84bf1a6ee42ed845"
+  },
+  {
+    "timestamp": "1791232730178",
+    "spanId": "366d6587971c273f",
+    "value": "690721626",
+    "labels": [
+      {
+        "name": "__profile_type__",
+        "value": "process_cpu:cpu:nanoseconds:cpu:nanoseconds"
+      },
+      {
+        "name": "__service_name__",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "__name__",
+        "value": "process_cpu"
+      },
+      {
+        "name": "__otel__",
+        "value": "true"
+      },
+      {
+        "name": "__period_type__",
+        "value": "cpu"
+      },
+      {
+        "name": "__period_unit__",
+        "value": "nanoseconds"
+      },
+      {
+        "name": "__type__",
+        "value": "cpu"
+      },
+      {
+        "name": "__unit__",
+        "value": "nanoseconds"
+      },
+      {
+        "name": "container.id",
+        "value": "b19c96fdb2a2c9dc5c0a075c27fea39f9ce93a037588fe7e81121f1b01f0fad2"
+      },
+      {
+        "name": "process.executable.name",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "process.executable.path",
+        "value": "/obi-poc-cost"
+      },
+      {
+        "name": "process.pid",
+        "value": "3966172"
+      },
+      {
+        "name": "service_name",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "thread.name",
+        "value": "obi-poc-cost"
+      }
+    ],
+    "traceId": "84ca11091e7f5e4b89422305aa7e2043",
+    "normalized_trace_id": "84ca11091e7f5e4b89422305aa7e2043",
+    "normalized_span_id": "366d6587971c273f",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%2284ca11091e7f5e4b89422305aa7e2043%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232703564%22%2C%20%22to%22%3A%20%221791232738564%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232703564&to=1791232738564&showSpanHeatmap=true&var-spanSelector=366d6587971c273f"
+  },
+  {
+    "timestamp": "1791232730178",
+    "spanId": "44d5723cdfd11a0a",
+    "value": "154639170",
+    "labels": [
+      {
+        "name": "__profile_type__",
+        "value": "process_cpu:cpu:nanoseconds:cpu:nanoseconds"
+      },
+      {
+        "name": "__service_name__",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "__name__",
+        "value": "process_cpu"
+      },
+      {
+        "name": "__otel__",
+        "value": "true"
+      },
+      {
+        "name": "__period_type__",
+        "value": "cpu"
+      },
+      {
+        "name": "__period_unit__",
+        "value": "nanoseconds"
+      },
+      {
+        "name": "__type__",
+        "value": "cpu"
+      },
+      {
+        "name": "__unit__",
+        "value": "nanoseconds"
+      },
+      {
+        "name": "container.id",
+        "value": "b19c96fdb2a2c9dc5c0a075c27fea39f9ce93a037588fe7e81121f1b01f0fad2"
+      },
+      {
+        "name": "process.executable.name",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "process.executable.path",
+        "value": "/obi-poc-cost"
+      },
+      {
+        "name": "process.pid",
+        "value": "3966172"
+      },
+      {
+        "name": "service_name",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "thread.name",
+        "value": "obi-poc-cost"
+      }
+    ],
+    "traceId": "3e13b11c0ea5a68dd68f1207083ae703",
+    "normalized_trace_id": "3e13b11c0ea5a68dd68f1207083ae703",
+    "normalized_span_id": "44d5723cdfd11a0a",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%223e13b11c0ea5a68dd68f1207083ae703%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232703564%22%2C%20%22to%22%3A%20%221791232738564%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232703564&to=1791232738564&showSpanHeatmap=true&var-spanSelector=44d5723cdfd11a0a"
+  },
+  {
+    "timestamp": "1791232735173",
+    "spanId": "8159cf10bf6a3327",
+    "value": "793814406",
+    "labels": [
+      {
+        "name": "__profile_type__",
+        "value": "process_cpu:cpu:nanoseconds:cpu:nanoseconds"
+      },
+      {
+        "name": "__service_name__",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "__name__",
+        "value": "process_cpu"
+      },
+      {
+        "name": "__otel__",
+        "value": "true"
+      },
+      {
+        "name": "__period_type__",
+        "value": "cpu"
+      },
+      {
+        "name": "__period_unit__",
+        "value": "nanoseconds"
+      },
+      {
+        "name": "__type__",
+        "value": "cpu"
+      },
+      {
+        "name": "__unit__",
+        "value": "nanoseconds"
+      },
+      {
+        "name": "container.id",
+        "value": "b19c96fdb2a2c9dc5c0a075c27fea39f9ce93a037588fe7e81121f1b01f0fad2"
+      },
+      {
+        "name": "process.executable.name",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "process.executable.path",
+        "value": "/obi-poc-cost"
+      },
+      {
+        "name": "process.pid",
+        "value": "3966172"
+      },
+      {
+        "name": "service_name",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "thread.id",
+        "value": "3966257"
+      },
+      {
+        "name": "thread.name",
+        "value": "obi-poc-cost"
+      }
+    ],
+    "traceId": "e74d6c9f0151ff9246be1887bb2c1859",
+    "normalized_trace_id": "e74d6c9f0151ff9246be1887bb2c1859",
+    "normalized_span_id": "8159cf10bf6a3327",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%22e74d6c9f0151ff9246be1887bb2c1859%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232703564%22%2C%20%22to%22%3A%20%221791232738564%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232703564&to=1791232738564&showSpanHeatmap=true&var-spanSelector=8159cf10bf6a3327"
+  },
+  {
+    "timestamp": "1791232735173",
+    "spanId": "366d6587971c273f",
+    "value": "103092780",
+    "labels": [
+      {
+        "name": "__profile_type__",
+        "value": "process_cpu:cpu:nanoseconds:cpu:nanoseconds"
+      },
+      {
+        "name": "__service_name__",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "__name__",
+        "value": "process_cpu"
+      },
+      {
+        "name": "__otel__",
+        "value": "true"
+      },
+      {
+        "name": "__period_type__",
+        "value": "cpu"
+      },
+      {
+        "name": "__period_unit__",
+        "value": "nanoseconds"
+      },
+      {
+        "name": "__type__",
+        "value": "cpu"
+      },
+      {
+        "name": "__unit__",
+        "value": "nanoseconds"
+      },
+      {
+        "name": "container.id",
+        "value": "b19c96fdb2a2c9dc5c0a075c27fea39f9ce93a037588fe7e81121f1b01f0fad2"
+      },
+      {
+        "name": "process.executable.name",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "process.executable.path",
+        "value": "/obi-poc-cost"
+      },
+      {
+        "name": "process.pid",
+        "value": "3966172"
+      },
+      {
+        "name": "service_name",
+        "value": "obi-poc-cost"
+      },
+      {
+        "name": "thread.name",
+        "value": "obi-poc-cost"
+      }
+    ],
+    "traceId": "84ca11091e7f5e4b89422305aa7e2043",
+    "normalized_trace_id": "84ca11091e7f5e4b89422305aa7e2043",
+    "normalized_span_id": "366d6587971c273f",
+    "trace_url": "http://localhost:3101/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A%20%7B%22datasource%22%3A%20%22tempo%22%2C%20%22queries%22%3A%20%5B%7B%22refId%22%3A%20%22A%22%2C%20%22queryType%22%3A%20%22traceql%22%2C%20%22query%22%3A%20%2284ca11091e7f5e4b89422305aa7e2043%22%7D%5D%2C%20%22range%22%3A%20%7B%22from%22%3A%20%221791232703564%22%2C%20%22to%22%3A%20%221791232738564%22%7D%7D%7D",
+    "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232703564&to=1791232738564&showSpanHeatmap=true&var-spanSelector=366d6587971c273f"
+  }
+]

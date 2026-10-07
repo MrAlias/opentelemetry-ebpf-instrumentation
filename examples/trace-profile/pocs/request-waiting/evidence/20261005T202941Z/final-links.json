@@ -1,0 +1,10 @@
+[
+  {
+    "name": "waiting-offcpu-span",
+    "url": "http://localhost:3102/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-waiting&var-dataSource=pyroscope&var-profileMetricId=off_cpu%3Aoff_cpu%3Ananoseconds%3A%3A&explorationType=flame-graph&from=1791232424315&to=1791232484315&showSpanHeatmap=true&var-spanSelector=b350d0be8c9393eb"
+  },
+  {
+    "name": "waiting-exact-trace",
+    "url": "http://localhost:3102/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%22134a4f627d053b5f6a144f02fe6c7358%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%221791232424315%22%2C+%22to%22%3A+%221791232484315%22%7D%7D%7D"
+  }
+]

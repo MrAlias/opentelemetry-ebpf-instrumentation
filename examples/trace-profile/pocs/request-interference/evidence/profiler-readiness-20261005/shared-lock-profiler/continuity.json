@@ -1,0 +1,53 @@
+{
+  "before": {
+    "container_id": "da205ba91b09742c27ad8aebd2a5447db91df7959e1250daf5a8ab09ead64b5a",
+    "pid": 3989251,
+    "started_at": "2026-10-05T20:58:50.803631912Z",
+    "pid_mode": ""
+  },
+  "after": {
+    "container_id": "da205ba91b09742c27ad8aebd2a5447db91df7959e1250daf5a8ab09ead64b5a",
+    "pid": 3989251,
+    "started_at": "2026-10-05T20:58:50.803631912Z",
+    "pid_mode": ""
+  },
+  "unchanged": true,
+  "attachment_ms": 1791233935610,
+  "before_traffic": {
+    "/work": {
+      "completed": 2,
+      "errors": 0,
+      "median_ms": 2001.208564499393
+    },
+    "/report": {
+      "completed": 2,
+      "errors": 0,
+      "median_ms": 2001.409441465512
+    }
+  },
+  "after_traffic": {
+    "/work": {
+      "completed": 10,
+      "errors": 0,
+      "median_ms": 2001.329930499196
+    },
+    "/report": {
+      "completed": 10,
+      "errors": 0,
+      "median_ms": 2001.3286985922605
+    }
+  },
+  "attachment_traffic": {
+    "/work": {
+      "completed": 6,
+      "errors": 0,
+      "median_ms": 2001.2594375293702
+    },
+    "/report": {
+      "completed": 6,
+      "errors": 0,
+      "median_ms": 2001.27806852106
+    }
+  },
+  "note": "Small observation, not an overhead benchmark. Scenario changes recreate app between experiments; attachment does not."
+}

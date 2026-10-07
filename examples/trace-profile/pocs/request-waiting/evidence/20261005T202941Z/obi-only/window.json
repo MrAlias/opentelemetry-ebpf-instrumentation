@@ -1,0 +1,12 @@
+{
+  "attached_at": "2026-10-05T20:30:23.932159+00:00",
+  "start_ms": 1791232237707,
+  "end_ms": 1791232297707,
+  "application": {
+    "id": "9b7f3fcf6ba1b06b523adc6a464973e4a89b674f09f3c42f4263c93beb26aad9",
+    "pid": 3950181,
+    "started_at": "2026-10-05T20:30:05.142858279Z",
+    "pid_mode": ""
+  },
+  "application_unchanged": true
+}

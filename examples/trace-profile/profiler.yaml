@@ -1,0 +1,19 @@
+receivers:
+  profiling:
+    samples_per_second: 97
+    reporter_interval: 5s
+    monitor_interval: 5s
+    bpf_fs_root: /sys/fs/bpf
+    obi_process_ctx: ${env:OBI_PROCESS_CTX}
+
+exporters:
+  otlp_grpc:
+    endpoint: lgtm:4317
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    profiles:
+      receivers: [profiling]
+      exporters: [otlp_grpc]

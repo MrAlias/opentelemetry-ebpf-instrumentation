@@ -1,0 +1,9 @@
+{
+  "attempts": 1,
+  "expected_data_available": true,
+  "expected_http_completions": 20,
+  "trace_search_count": 6,
+  "trace_count_matches_completions": false,
+  "retry_limit_seconds": 120,
+  "note": "Only the fixed saved interval was queried; later traffic cannot supply an answer."
+}

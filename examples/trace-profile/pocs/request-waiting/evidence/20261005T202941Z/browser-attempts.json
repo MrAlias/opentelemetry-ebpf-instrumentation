@@ -1,0 +1,19 @@
+[
+  {
+    "state": "failed",
+    "method": "local Playwright1.63.0",
+    "error": "Missing cached chromium_headless_shell-1243 executable",
+    "result": "No browser screenshot captured"
+  },
+  {
+    "state": "failed",
+    "method": "cached mcr.microsoft.com/playwright:v1.63.0-noble container",
+    "error": "page.goto net::ERR_CONNECTION_REFUSED at localhost3102",
+    "result": "Browser validation raced successful automatic Compose cleanup"
+  },
+  {
+    "state": "verified",
+    "method": "cached mcr.microsoft.com/playwright:v1.63.0-noble; Playwright1.63.0",
+    "result": "Selected offCPU flamegraph and exact /syscall trace rendered; screenshots/bodytext saved. Backend-only reopen under coordinated flock; own project cleaned afterward."
+  }
+]

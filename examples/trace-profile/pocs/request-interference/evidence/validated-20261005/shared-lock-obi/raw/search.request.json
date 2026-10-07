@@ -1,0 +1,4 @@
+{
+  "path": "/api/datasources/proxy/uid/tempo/api/search?q=%7Bresource.service.name%3D%22obi-poc-interference%22%7D&start=1791234046&end=1791234069&limit=200",
+  "body": null
+}

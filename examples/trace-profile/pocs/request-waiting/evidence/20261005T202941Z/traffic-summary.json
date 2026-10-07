@@ -1,0 +1,94 @@
+{
+  "obi-only": {
+    "/syscall": {
+      "completed": 118,
+      "errors": 0,
+      "latency_unit": "seconds",
+      "median": 1.001383473048918,
+      "p95": 1.001722923014313
+    },
+    "/runtime": {
+      "completed": 118,
+      "errors": 0,
+      "latency_unit": "seconds",
+      "median": 1.001465881592594,
+      "p95": 1.0018422969151288
+    },
+    "/downstream": {
+      "completed": 118,
+      "errors": 0,
+      "latency_unit": "seconds",
+      "median": 1.0023198724957183,
+      "p95": 1.0028175190091133
+    }
+  },
+  "combined": {
+    "/syscall": {
+      "completed": 118,
+      "errors": 0,
+      "latency_unit": "seconds",
+      "median": 1.0016173655167222,
+      "p95": 1.0026465191040188
+    },
+    "/runtime": {
+      "completed": 116,
+      "errors": 0,
+      "latency_unit": "seconds",
+      "median": 1.0019212943734601,
+      "p95": 1.0035792591515929
+    },
+    "/downstream": {
+      "completed": 118,
+      "errors": 0,
+      "latency_unit": "seconds",
+      "median": 1.0027133099501953,
+      "p95": 1.0038528051227331
+    }
+  },
+  "profiler-only": {
+    "/syscall": {
+      "completed": 118,
+      "errors": 0,
+      "latency_unit": "seconds",
+      "median": 1.00141909183003,
+      "p95": 1.0040742829442024
+    },
+    "/runtime": {
+      "completed": 118,
+      "errors": 0,
+      "latency_unit": "seconds",
+      "median": 1.0018435890087858,
+      "p95": 1.0040478450246155
+    },
+    "/downstream": {
+      "completed": 118,
+      "errors": 0,
+      "latency_unit": "seconds",
+      "median": 1.0021513821557164,
+      "p95": 1.005011975998059
+    }
+  },
+  "before_first_attachment": {
+    "/syscall": {
+      "completed": 10,
+      "errors": 0,
+      "latency_unit": "seconds",
+      "median": 1.0016091610305011,
+      "p95": 1.0021482231095433
+    },
+    "/runtime": {
+      "completed": 10,
+      "errors": 0,
+      "latency_unit": "seconds",
+      "median": 1.0016285214805976,
+      "p95": 1.0024620711337775
+    },
+    "/downstream": {
+      "completed": 10,
+      "errors": 0,
+      "latency_unit": "seconds",
+      "median": 1.0016370810335502,
+      "p95": 1.003079226007685
+    }
+  }
+}

@@ -1,0 +1,104 @@
+Skip to main content
+Grafana
+
+Starred
+
+Dashboards
+
+Explore
+
+Drilldown
+
+Metrics
+
+Logs
+
+Traces
+
+Profiles
+
+Alerting
+
+Connections
+
+Administration
+
+Explore
+Tempo
+Search...
+ctrl+k
+Sign in
+Explore
+Outline
+Go queryless
+Split
+Add
+Queries
+Traces
+A
+(Tempo)
+Query type
+Search
+TraceQL
+Service Graph
+Import trace
+Build complex queries using TraceQL to select a list of traces.
+Documentation
+8e8498797abf524988c892b30e2e0bb5
+Search Options
+Limit: 20
+Spans Limit: 3
+Table Format: Traces
+|
+Streaming: Disabled
+Metrics Options
+Step: auto
+Type: Range
+|
+Streaming: Disabled
+Add query
+Query history
+Query inspector
+Trace
+obi-poc-cost: GET /work
+GET
+200
+Feedback
+Share
+Trace ID
+8e8498797abf524988c892b30e2e0bb5
+Start time
+2026-10-05 20:38:28.492
+(a minute ago)
+Duration
+800.4ms
+Services
+1
+Route
+/work
+Overview
+0μs
+200.1ms
+400.2ms
+600.3ms
+800.4ms
+Filters
+Critical path
+Errors
+High latency
+3 spans
+Show all spans
+Service & Operation
+0μs
+200.1ms
+400.2ms
+600.3ms
+800.4ms
+obi-poc-cost GET /work (800.4ms)
+800.4ms
+-
+in queue (29.13μs)
+29.13μs
+-
+processing (800.37ms)
+800.37ms

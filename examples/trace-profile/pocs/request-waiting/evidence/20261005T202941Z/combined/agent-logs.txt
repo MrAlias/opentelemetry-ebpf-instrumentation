@@ -1,0 +1,123 @@
+obi-1       | time=2026-10-05T20:30:25.719Z level=INFO msg="OpenTelemetry eBPF Instrumentation" Version=ai-poc Revision=6d873d705d77e9764adab67502d65695df986e93 "OpenTelemetry SDK Version"=1.46.0
+profiler-1  | 2026-10-05T20:33:32.339Z	info	otelconftelemetry/tracer.go:47	Internal trace telemetry disabled	{"resource": {"service.instance.id": "a66426c5-77e4-4182-849d-1d4b4ee963cb", "service.name": "otelcol-ebpf-profiler", "service.version": "0.160.0"}}
+profiler-1  | 2026-10-05T20:33:32.340Z	info	builders/builders.go:28	Development component. May change in the future.	{"resource": {"service.instance.id": "a66426c5-77e4-4182-849d-1d4b4ee963cb", "service.name": "otelcol-ebpf-profiler", "service.version": "0.160.0"}, "otelcol.component.id": "profiling", "otelcol.component.kind": "receiver", "otelcol.signal": "profiles"}
+profiler-1  | 2026-10-05T20:33:32.345Z	info	service@v0.160.0/service.go:261	Starting otelcol-ebpf-profiler...	{"resource": {"service.instance.id": "a66426c5-77e4-4182-849d-1d4b4ee963cb", "service.name": "otelcol-ebpf-profiler", "service.version": "0.160.0"}, "Version": "0.160.0", "NumCPU": 16}
+profiler-1  | 2026-10-05T20:33:32.345Z	info	extensions/extensions.go:44	Starting extensions...	{"resource": {"service.instance.id": "a66426c5-77e4-4182-849d-1d4b4ee963cb", "service.name": "otelcol-ebpf-profiler", "service.version": "0.160.0"}}
+profiler-1  | 2026-10-05T20:33:32.606Z	info	Using shared map for OBI span/trace ID communication	{"resource": {"service.instance.id": "a66426c5-77e4-4182-849d-1d4b4ee963cb", "service.name": "otelcol-ebpf-profiler", "service.version": "0.160.0"}, "otelcol.component.id": "profiling", "otelcol.component.kind": "receiver", "otelcol.signal": "profiles"}
+profiler-1  | 2026-10-05T20:33:38.298Z	info	Supports LPM trie eBPF map batch operations	{"resource": {"service.instance.id": "a66426c5-77e4-4182-849d-1d4b4ee963cb", "service.name": "otelcol-ebpf-profiler", "service.version": "0.160.0"}, "otelcol.component.id": "profiling", "otelcol.component.kind": "receiver", "otelcol.signal": "profiles"}
+obi-1       | time=2026-10-05T20:30:25.719Z level=INFO msg="configuration loaded" version=v1
+profiler-1  | 2026-10-05T20:33:38.298Z	info	eBPF tracer loaded	{"resource": {"service.instance.id": "a66426c5-77e4-4182-849d-1d4b4ee963cb", "service.name": "otelcol-ebpf-profiler", "service.version": "0.160.0"}, "otelcol.component.id": "profiling", "otelcol.component.kind": "receiver", "otelcol.signal": "profiles"}
+obi-1       | time=2026-10-05T20:30:25.724Z level=INFO msg="detected Cloud metadata" component=meta.NodeMeta.otelNodeFetcher detector=azurevm.ResourceDetector
+obi-1       | time=2026-10-05T20:30:25.727Z level=INFO msg="detected Cloud metadata" component=meta.NodeMeta.otelNodeFetcher detector=ec2.resourceDetector
+obi-1       | time=2026-10-05T20:30:25.730Z level=INFO msg="starting Application Observability mode"
+obi-1       | time=2026-10-05T20:30:25.730Z level=INFO msg="using hostname" component=traces.ReadDecorator function=instance_ID_hostNamePIDDecorator hostname=9142bfc1bf48
+obi-1       | time=2026-10-05T20:30:25.753Z level=INFO msg="using hostname" component=traces.ReadDecorator function=instance_ID_hostNamePIDDecorator hostname=9142bfc1bf48
+obi-1       | time=2026-10-05T20:30:25.753Z level=INFO msg="Starting main node" component=obi.Instrumenter
+obi-1       | time=2026-10-05T20:30:25.754Z level=INFO msg="attaching uprobes as uprobe_multi links"
+obi-1       | time=2026-10-05T20:30:26.997Z level=INFO msg="instrumenting process" component=discover.traceAttacher cmd=/obi-poc-waiting pid=3950181 ino=19141619 type=go service=obi-poc-waiting logenricher=false
+obi-1       | time=2026-10-05T20:31:58.315Z level=INFO msg="exiting auto-instrumenter" component=obi.Instrumenter
+obi-1       | time=2026-10-05T20:31:58.395Z level=INFO msg="OpenTelemetry eBPF Instrumentation successfully exiting"
+obi-1       | time=2026-10-05T20:33:32.176Z level=INFO msg="OpenTelemetry eBPF Instrumentation" Version=ai-poc Revision=6d873d705d77e9764adab67502d65695df986e93 "OpenTelemetry SDK Version"=1.46.0
+obi-1       | time=2026-10-05T20:33:32.176Z level=INFO msg="configuration loaded" version=v1
+obi-1       | time=2026-10-05T20:33:32.180Z level=INFO msg="detected Cloud metadata" component=meta.NodeMeta.otelNodeFetcher detector=azurevm.ResourceDetector
+profiler-1  | 2026-10-05T20:33:38.309Z	info	Attached tracer program	{"resource": {"service.instance.id": "a66426c5-77e4-4182-849d-1d4b4ee963cb", "service.name": "otelcol-ebpf-profiler", "service.version": "0.160.0"}, "otelcol.component.id": "profiling", "otelcol.component.kind": "receiver", "otelcol.signal": "profiles"}
+profiler-1  | 2026-10-05T20:33:38.321Z	warn	Failed to attach to finish_task_switch.isra.0.cold: creating tracefs event (arch-specific fallback for "finish_task_switch.isra.0.cold"): creating probe entry on tracefs: open /sys/kernel/debug/tracing/kprobe_events: read-only file system	{"resource": {"service.instance.id": "a66426c5-77e4-4182-849d-1d4b4ee963cb", "service.name": "otelcol-ebpf-profiler", "service.version": "0.160.0"}, "otelcol.component.id": "profiling", "otelcol.component.kind": "receiver", "otelcol.signal": "profiles"}
+profiler-1  | 2026-10-05T20:33:38.321Z	info	Enabled off-cpu profiling with p=1.000000	{"resource": {"service.instance.id": "a66426c5-77e4-4182-849d-1d4b4ee963cb", "service.name": "otelcol-ebpf-profiler", "service.version": "0.160.0"}, "otelcol.component.id": "profiling", "otelcol.component.kind": "receiver", "otelcol.signal": "profiles"}
+obi-1       | time=2026-10-05T20:33:32.182Z level=INFO msg="detected Cloud metadata" component=meta.NodeMeta.otelNodeFetcher detector=ec2.resourceDetector
+obi-1       | time=2026-10-05T20:33:32.182Z level=INFO msg="starting Application Observability mode"
+obi-1       | time=2026-10-05T20:33:32.182Z level=INFO msg="using hostname" component=traces.ReadDecorator function=instance_ID_hostNamePIDDecorator hostname=9142bfc1bf48
+obi-1       | time=2026-10-05T20:33:32.206Z level=INFO msg="using hostname" component=traces.ReadDecorator function=instance_ID_hostNamePIDDecorator hostname=9142bfc1bf48
+obi-1       | time=2026-10-05T20:33:32.207Z level=INFO msg="Starting main node" component=obi.Instrumenter
+obi-1       | time=2026-10-05T20:33:32.208Z level=INFO msg="attaching uprobes as uprobe_multi links"
+obi-1       | time=2026-10-05T20:33:33.652Z level=INFO msg="instrumenting process" component=discover.traceAttacher cmd=/obi-poc-waiting pid=3950181 ino=19141619 type=go service=obi-poc-waiting logenricher=false
+profiler-1  | 2026-10-05T20:33:38.322Z	info	Attached sched monitor	{"resource": {"service.instance.id": "a66426c5-77e4-4182-849d-1d4b4ee963cb", "service.name": "otelcol-ebpf-profiler", "service.version": "0.160.0"}, "otelcol.component.id": "profiling", "otelcol.component.kind": "receiver", "otelcol.signal": "profiles"}
+profiler-1  | 2026-10-05T20:33:38.322Z	info	Attached prctl monitor	{"resource": {"service.instance.id": "a66426c5-77e4-4182-849d-1d4b4ee963cb", "service.name": "otelcol-ebpf-profiler", "service.version": "0.160.0"}, "otelcol.component.id": "profiling", "otelcol.component.kind": "receiver", "otelcol.signal": "profiles"}
+profiler-1  | 2026-10-05T20:33:38.402Z	info	service@v0.160.0/service.go:284	Everything is ready. Begin running and processing data.	{"resource": {"service.instance.id": "a66426c5-77e4-4182-849d-1d4b4ee963cb", "service.name": "otelcol-ebpf-profiler", "service.version": "0.160.0"}}
+profiler-1  | 2026-10-05T20:34:28.302Z	error	Failed to unload interpreter for PID 3962621: failed to remove info: delete: key does not exist	{"resource": {"service.instance.id": "a66426c5-77e4-4182-849d-1d4b4ee963cb", "service.name": "otelcol-ebpf-profiler", "service.version": "0.160.0"}, "otelcol.component.id": "profiling", "otelcol.component.kind": "receiver", "otelcol.signal": "profiles"}
+profiler-1  | go.opentelemetry.io/ebpf-profiler/internal/log.Errorf
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/internal/log/logging.go:69
+profiler-1  | go.opentelemetry.io/ebpf-profiler/processmanager.(*ProcessManager).processRemovedInterpreters
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/processmanager/processinfo.go:358
+profiler-1  | go.opentelemetry.io/ebpf-profiler/processmanager.(*ProcessManager).processPIDExit
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/processmanager/processinfo.go:497
+profiler-1  | go.opentelemetry.io/ebpf-profiler/processmanager.(*ProcessManager).SynchronizeProcess
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/processmanager/processinfo.go:718
+profiler-1  | go.opentelemetry.io/ebpf-profiler/tracer.(*Tracer).processPIDEvents
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/tracer/events.go:57
+profiler-1  | 2026-10-05T20:34:28.331Z	error	Failed to unload interpreter for PID 3962585: failed to remove info: delete: key does not exist	{"resource": {"service.instance.id": "a66426c5-77e4-4182-849d-1d4b4ee963cb", "service.name": "otelcol-ebpf-profiler", "service.version": "0.160.0"}, "otelcol.component.id": "profiling", "otelcol.component.kind": "receiver", "otelcol.signal": "profiles"}
+profiler-1  | go.opentelemetry.io/ebpf-profiler/internal/log.Errorf
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/internal/log/logging.go:69
+profiler-1  | go.opentelemetry.io/ebpf-profiler/processmanager.(*ProcessManager).processRemovedInterpreters
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/processmanager/processinfo.go:358
+profiler-1  | go.opentelemetry.io/ebpf-profiler/processmanager.(*ProcessManager).processPIDExit
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/processmanager/processinfo.go:497
+profiler-1  | go.opentelemetry.io/ebpf-profiler/processmanager.(*ProcessManager).SynchronizeProcess
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/processmanager/processinfo.go:718
+profiler-1  | go.opentelemetry.io/ebpf-profiler/tracer.(*Tracer).processPIDEvents
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/tracer/events.go:57
+profiler-1  | 2026-10-05T20:34:28.352Z	error	Failed to unload interpreter for PID 3962611: failed to remove info: delete: key does not exist	{"resource": {"service.instance.id": "a66426c5-77e4-4182-849d-1d4b4ee963cb", "service.name": "otelcol-ebpf-profiler", "service.version": "0.160.0"}, "otelcol.component.id": "profiling", "otelcol.component.kind": "receiver", "otelcol.signal": "profiles"}
+profiler-1  | go.opentelemetry.io/ebpf-profiler/internal/log.Errorf
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/internal/log/logging.go:69
+profiler-1  | go.opentelemetry.io/ebpf-profiler/processmanager.(*ProcessManager).processRemovedInterpreters
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/processmanager/processinfo.go:358
+profiler-1  | go.opentelemetry.io/ebpf-profiler/processmanager.(*ProcessManager).processPIDExit
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/processmanager/processinfo.go:497
+profiler-1  | go.opentelemetry.io/ebpf-profiler/processmanager.(*ProcessManager).SynchronizeProcess
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/processmanager/processinfo.go:718
+profiler-1  | go.opentelemetry.io/ebpf-profiler/tracer.(*Tracer).processPIDEvents
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/tracer/events.go:57
+profiler-1  | 2026-10-05T20:34:31.245Z	error	Failed to unload interpreter for PID 3963273: failed to remove info: delete: key does not exist	{"resource": {"service.instance.id": "a66426c5-77e4-4182-849d-1d4b4ee963cb", "service.name": "otelcol-ebpf-profiler", "service.version": "0.160.0"}, "otelcol.component.id": "profiling", "otelcol.component.kind": "receiver", "otelcol.signal": "profiles"}
+profiler-1  | go.opentelemetry.io/ebpf-profiler/internal/log.Errorf
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/internal/log/logging.go:69
+profiler-1  | go.opentelemetry.io/ebpf-profiler/processmanager.(*ProcessManager).processRemovedInterpreters
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/processmanager/processinfo.go:358
+profiler-1  | go.opentelemetry.io/ebpf-profiler/processmanager.(*ProcessManager).processPIDExit
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/processmanager/processinfo.go:497
+profiler-1  | go.opentelemetry.io/ebpf-profiler/processmanager.(*ProcessManager).SynchronizeProcess
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/processmanager/processinfo.go:718
+profiler-1  | go.opentelemetry.io/ebpf-profiler/tracer.(*Tracer).processPIDEvents
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/tracer/events.go:57
+profiler-1  | 2026-10-05T20:34:31.601Z	error	Failed to unload interpreter for PID 3963497: failed to remove info: delete: key does not exist	{"resource": {"service.instance.id": "a66426c5-77e4-4182-849d-1d4b4ee963cb", "service.name": "otelcol-ebpf-profiler", "service.version": "0.160.0"}, "otelcol.component.id": "profiling", "otelcol.component.kind": "receiver", "otelcol.signal": "profiles"}
+profiler-1  | go.opentelemetry.io/ebpf-profiler/internal/log.Errorf
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/internal/log/logging.go:69
+profiler-1  | go.opentelemetry.io/ebpf-profiler/processmanager.(*ProcessManager).processRemovedInterpreters
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/processmanager/processinfo.go:358
+profiler-1  | go.opentelemetry.io/ebpf-profiler/processmanager.(*ProcessManager).processPIDExit
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/processmanager/processinfo.go:497
+profiler-1  | go.opentelemetry.io/ebpf-profiler/processmanager.(*ProcessManager).SynchronizeProcess
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/processmanager/processinfo.go:718
+profiler-1  | go.opentelemetry.io/ebpf-profiler/tracer.(*Tracer).processPIDEvents
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/tracer/events.go:57
+profiler-1  | 2026-10-05T20:34:33.060Z	error	Failed to unload interpreter for PID 3964120: failed to remove info: delete: key does not exist	{"resource": {"service.instance.id": "a66426c5-77e4-4182-849d-1d4b4ee963cb", "service.name": "otelcol-ebpf-profiler", "service.version": "0.160.0"}, "otelcol.component.id": "profiling", "otelcol.component.kind": "receiver", "otelcol.signal": "profiles"}
+profiler-1  | go.opentelemetry.io/ebpf-profiler/internal/log.Errorf
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/internal/log/logging.go:69
+profiler-1  | go.opentelemetry.io/ebpf-profiler/processmanager.(*ProcessManager).processRemovedInterpreters
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/processmanager/processinfo.go:358
+profiler-1  | go.opentelemetry.io/ebpf-profiler/processmanager.(*ProcessManager).processPIDExit
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/processmanager/processinfo.go:497
+profiler-1  | go.opentelemetry.io/ebpf-profiler/processmanager.(*ProcessManager).SynchronizeProcess
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/processmanager/processinfo.go:718
+profiler-1  | go.opentelemetry.io/ebpf-profiler/tracer.(*Tracer).processPIDEvents
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/tracer/events.go:57
+profiler-1  | 2026-10-05T20:34:33.124Z	error	Failed to unload interpreter for PID 3964218: failed to remove info: delete: key does not exist	{"resource": {"service.instance.id": "a66426c5-77e4-4182-849d-1d4b4ee963cb", "service.name": "otelcol-ebpf-profiler", "service.version": "0.160.0"}, "otelcol.component.id": "profiling", "otelcol.component.kind": "receiver", "otelcol.signal": "profiles"}
+profiler-1  | go.opentelemetry.io/ebpf-profiler/internal/log.Errorf
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/internal/log/logging.go:69
+profiler-1  | go.opentelemetry.io/ebpf-profiler/processmanager.(*ProcessManager).processRemovedInterpreters
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/processmanager/processinfo.go:358
+profiler-1  | go.opentelemetry.io/ebpf-profiler/processmanager.(*ProcessManager).processPIDExit
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/processmanager/processinfo.go:497
+profiler-1  | go.opentelemetry.io/ebpf-profiler/processmanager.(*ProcessManager).SynchronizeProcess
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/processmanager/processinfo.go:718
+profiler-1  | go.opentelemetry.io/ebpf-profiler/tracer.(*Tracer).processPIDEvents
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/tracer/events.go:57
+profiler-1  | 2026-10-05T20:34:33.669Z	error	Failed to unload interpreter for PID 3964156: failed to remove info: delete: key does not exist	{"resource": {"service.instance.id": "a66426c5-77e4-4182-849d-1d4b4ee963cb", "service.name": "otelcol-ebpf-profiler", "service.version": "0.160.0"}, "otelcol.component.id": "profiling", "otelcol.component.kind": "receiver", "otelcol.signal": "profiles"}
+profiler-1  | go.opentelemetry.io/ebpf-profiler/internal/log.Errorf
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/internal/log/logging.go:69
+profiler-1  | go.opentelemetry.io/ebpf-profiler/processmanager.(*ProcessManager).processRemovedInterpreters
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/processmanager/processinfo.go:358
+profiler-1  | go.opentelemetry.io/ebpf-profiler/processmanager.(*ProcessManager).processPIDExit
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/processmanager/processinfo.go:497
+profiler-1  | go.opentelemetry.io/ebpf-profiler/processmanager.(*ProcessManager).SynchronizeProcess
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/processmanager/processinfo.go:718
+profiler-1  | go.opentelemetry.io/ebpf-profiler/tracer.(*Tracer).processPIDEvents
+profiler-1  | 	go.opentelemetry.io/ebpf-profiler@v0.0.202633/tracer/events.go:57

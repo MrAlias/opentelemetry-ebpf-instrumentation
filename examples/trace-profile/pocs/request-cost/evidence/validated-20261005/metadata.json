@@ -1,0 +1,61 @@
+{
+  "obi_revision": "6d873d705d77e9764adab67502d65695df986e93",
+  "kernel": "7.0.0-1012-aws",
+  "images": {
+    "app": {
+      "id": "sha256:3ee27b6c5265dbe9137617c6e732137db18c80983887b12e28c19f34c50c7835",
+      "digests": [
+        "obi-poc-cost-app@sha256:3ee27b6c5265dbe9137617c6e732137db18c80983887b12e28c19f34c50c7835"
+      ]
+    },
+    "lgtm": {
+      "id": "sha256:d6c52678ab5b7144f27ae569fd778608121c0f4a10eb411983750a0d67c1fbe3",
+      "digests": [
+        "grafana/otel-lgtm@sha256:d6c52678ab5b7144f27ae569fd778608121c0f4a10eb411983750a0d67c1fbe3"
+      ]
+    },
+    "obi": {
+      "id": "sha256:dc7edc1d3c3dd0d71983b0091af830baab2635b9e48a3341b04cd6c550996b72",
+      "digests": [
+        "obi-ai-investigation@sha256:dc7edc1d3c3dd0d71983b0091af830baab2635b9e48a3341b04cd6c550996b72"
+      ]
+    },
+    "profiler": {
+      "id": "sha256:40bc11043fdef9f7744631d6ca60d44e63b4c2a356ec0a21a02a4a5f28ebff70",
+      "digests": [
+        "otel/opentelemetry-collector-ebpf-profiler@sha256:40bc11043fdef9f7744631d6ca60d44e63b4c2a356ec0a21a02a4a5f28ebff70"
+      ]
+    }
+  },
+  "docker": "29.8.0 / 29.8.0",
+  "python": "Python 3.12.3",
+  "application_before": {
+    "id": "b19c96fdb2a2c9dc5c0a075c27fea39f9ce93a037588fe7e81121f1b01f0fad2",
+    "pid": 3966172,
+    "started_at": "2026-10-05T20:35:12.63287411Z",
+    "pid_mode": ""
+  },
+  "background_containers": [
+    "obi-poc-cost-lgtm-1",
+    "obi-poc-cost-app-1",
+    "obi-ai-investigation-profiler-1",
+    "obi-ai-investigation-app-1",
+    "obi-ai-investigation-obi-1",
+    "obi-ai-investigation-lgtm-1",
+    "trace-profile-profiler-1",
+    "trace-profile-lgtm-1",
+    "trace-profile-obi-1",
+    "trace-profile-app-1",
+    "obi-dynamic-instrumentation-demo-inventory-java-1",
+    "obi-dynamic-instrumentation-demo-inventory-node-1",
+    "obi-dynamic-instrumentation-demo-loadgen-1",
+    "obi-dynamic-instrumentation-demo-checkout-1",
+    "obi-dynamic-instrumentation-demo-obi-1",
+    "obi-dynamic-instrumentation-demo-ui-1",
+    "obi-dynamic-instrumentation-demo-collector-1",
+    "obi-dynamic-instrumentation-demo-tempo-1"
+  ],
+  "checkout_revision": "6d873d705d77e9764adab67502d65695df986e93",
+  "browser_image": "mcr.microsoft.com/playwright:v1.63.0-noble",
+  "same_window_refresh_ms": 1791232874499
+}

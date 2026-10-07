@@ -1,0 +1,29 @@
+[
+  {
+    "phase": "initial_collection_after_15s_export_wait",
+    "source": "recorded runner console output",
+    "observed": {
+      "ordinary_requests": 31,
+      "slow_requests": 10,
+      "verified_exemplars": 0
+    }
+  },
+  {
+    "phase": "same_window_refresh",
+    "refresh_ms": 1791232874499,
+    "target_traces": 74,
+    "cohorts": {
+      "ordinary": {
+        "requests": 56,
+        "requests_with_samples": 0,
+        "mean_cpu_ns_per_request": 0.0
+      },
+      "slow": {
+        "requests": 18,
+        "requests_with_samples": 0,
+        "mean_cpu_ns_per_request": 0.0
+      }
+    },
+    "verified_exemplars": 0
+  }
+]

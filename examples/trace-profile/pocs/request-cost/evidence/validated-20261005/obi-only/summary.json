@@ -1,0 +1,73 @@
+{
+  "mode": "obi-only",
+  "trace_state": "traces",
+  "profile_state": "profiler_not_running",
+  "correlation_state": "no_verified_exemplars",
+  "interval_ms": {
+    "start": 1791232560542,
+    "end": 1791232595542
+  },
+  "aggregate": {
+    "unit": "nanoseconds",
+    "total_ns": 0,
+    "functions": [
+      {
+        "name": "total",
+        "self_ns": 0,
+        "cumulative_ns": 0
+      }
+    ]
+  },
+  "cohorts": {
+    "ordinary": {
+      "unit": "nanoseconds",
+      "total_ns": 0,
+      "functions": [
+        {
+          "name": "total",
+          "self_ns": 0,
+          "cumulative_ns": 0,
+          "self_ns_per_request": 0.0
+        }
+      ],
+      "requests": 57,
+      "traces_available": 57,
+      "truncated": false,
+      "requests_with_samples": 0,
+      "mean_cpu_ns_per_request": 0.0,
+      "mean_wall_ms": 150.43859649122808,
+      "median_wall_ms": 150
+    },
+    "slow": {
+      "unit": "nanoseconds",
+      "total_ns": 0,
+      "functions": [
+        {
+          "name": "total",
+          "self_ns": 0,
+          "cumulative_ns": 0,
+          "self_ns_per_request": 0.0
+        }
+      ],
+      "requests": 18,
+      "traces_available": 18,
+      "truncated": false,
+      "requests_with_samples": 0,
+      "mean_cpu_ns_per_request": 0.0,
+      "mean_wall_ms": 800.3333333333334,
+      "median_wall_ms": 800.0
+    }
+  },
+  "invalid_exemplar_ids": 0,
+  "verified_work_exemplars": 0,
+  "trace_search_limit": 1000,
+  "trace_search_truncated": false,
+  "profile_url": "http://localhost:3101/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-cost&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791232560542&to=1791232595542&showSpanHeatmap=true",
+  "scope": "Whole completed /work spans within the window; slow >=400ms, ordinary <400ms. CPU is sampled execution, not wall time. Request averages include selected spans without samples. The cohorts exclude partial spans and traces without one exact processing child. Exemplars are a bounded selection, not an exhaustive request census.",
+  "visibility": {
+    "expected_completed_work_requests": 75,
+    "target_traces": 75,
+    "state": "available",
+    "note": "Final same-window requery after live collection. One no-correlation request remains unaccounted for; client/server interval differences or incomplete telemetry are unresolved."
+  }
+}

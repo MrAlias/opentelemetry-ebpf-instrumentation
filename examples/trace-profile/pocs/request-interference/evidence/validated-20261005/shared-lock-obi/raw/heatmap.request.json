@@ -1,0 +1,12 @@
+{
+  "path": "/api/datasources/proxy/uid/pyroscope/querier.v1.QuerierService/SelectHeatmap",
+  "body": {
+    "profileTypeID": "process_cpu:cpu:nanoseconds:cpu:nanoseconds",
+    "labelSelector": "{service_name=\"obi-poc-interference\"}",
+    "start": 1791234046820,
+    "end": 1791234068839,
+    "step": 5,
+    "queryType": "HEATMAP_QUERY_TYPE_SPAN",
+    "exemplarType": "EXEMPLAR_TYPE_SPAN"
+  }
+}

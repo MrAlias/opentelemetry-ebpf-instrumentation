@@ -1,0 +1,104 @@
+Skip to main content
+Grafana
+
+Starred
+
+Dashboards
+
+Explore
+
+Drilldown
+
+Metrics
+
+Logs
+
+Traces
+
+Profiles
+
+Alerting
+
+Connections
+
+Administration
+
+Explore
+Tempo
+Search...
+ctrl+k
+Sign in
+Explore
+Outline
+Go queryless
+Split
+Add
+Queries
+Traces
+A
+(Tempo)
+Query type
+Search
+TraceQL
+Service Graph
+Import trace
+Build complex queries using TraceQL to select a list of traces.
+Documentation
+0fc4c8ed2c72cbd645a8e52b6f607451
+Search Options
+Limit: 20
+Spans Limit: 3
+Table Format: Traces
+|
+Streaming: Disabled
+Metrics Options
+Step: auto
+Type: Range
+|
+Streaming: Disabled
+Add query
+Query history
+Query inspector
+Trace
+obi-poc-interference: GET /report
+GET
+200
+Feedback
+Share
+Trace ID
+0fc4c8ed2c72cbd645a8e52b6f607451
+Start time
+2026-10-05 21:05:32.317
+(2 minutes ago)
+Duration
+2s
+Services
+1
+Route
+/report
+Overview
+0μs
+500.1ms
+1s
+1.5s
+2s
+Filters
+Critical path
+Errors
+High latency
+3 spans
+Show all spans
+Service & Operation
+0μs
+500.1ms
+1s
+1.5s
+2s
+obi-poc-interference GET /report (2s)
+2s
+-
+in queue (28.96μs)
+28.96μs
+-
+processing (2s)
+2s

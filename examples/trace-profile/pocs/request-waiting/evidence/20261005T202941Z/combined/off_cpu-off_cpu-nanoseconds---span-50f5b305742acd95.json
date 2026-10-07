@@ -1,0 +1,181 @@
+{
+  "flamegraph": {
+    "names": [
+      "total",
+      "runtime.goexit",
+      "net/http.(*Server).Serve.gowrap3",
+      "net/http.(*conn).serve",
+      "net/http.(*response).finishRequest",
+      "bufio.(*Writer).Flush",
+      "net/http.checkConnErrorWriter.Write",
+      "net.(*conn).Write",
+      "net.(*netFD).Write",
+      "internal/poll.(*FD).Write",
+      "syscall.write",
+      "syscall.Syscall",
+      "syscall.RawSyscall6",
+      "internal/runtime/syscall/linux.Syscall6",
+      "entry_SYSCALL_64_after_hwframe",
+      "do_syscall_64",
+      "exit_to_user_mode_loop",
+      "schedule",
+      "finish_task_switch.isra.0"
+    ],
+    "levels": [
+      {
+        "values": [
+          "0",
+          "938900",
+          "0",
+          "0"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "938900",
+          "0",
+          "1"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "938900",
+          "0",
+          "2"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "938900",
+          "0",
+          "3"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "938900",
+          "0",
+          "4"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "938900",
+          "0",
+          "5"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "938900",
+          "0",
+          "6"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "938900",
+          "0",
+          "7"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "938900",
+          "0",
+          "8"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "938900",
+          "0",
+          "9"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "938900",
+          "0",
+          "10"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "938900",
+          "0",
+          "11"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "938900",
+          "0",
+          "12"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "938900",
+          "0",
+          "13"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "938900",
+          "0",
+          "14"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "938900",
+          "0",
+          "15"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "938900",
+          "0",
+          "16"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "938900",
+          "0",
+          "17"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "938900",
+          "938900",
+          "18"
+        ]
+      }
+    ],
+    "total": "938900",
+    "maxSelf": "938900"
+  }
+}

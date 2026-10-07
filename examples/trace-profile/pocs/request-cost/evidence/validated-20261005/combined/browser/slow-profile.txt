@@ -1,0 +1,111 @@
+Skip to main content
+Grafana
+
+Starred
+
+Dashboards
+
+Explore
+
+Drilldown
+
+Metrics
+
+Logs
+
+Traces
+
+Profiles
+
+Alerting
+
+Connections
+
+Administration
+
+Drilldown
+Profiles
+Search...
+ctrl+k
+Sign in
+All services
+Profile types
+Labels
+Flame graph
+Diff flame graph
+Favorites
+2026-10-05 20:38:23 to 2026-10-05 20:38:58
+Data source
+Pyroscope
+Service
+Profile type
+Filters
+Filter by label values...
+CPU time consumed per trace span
+Time series
+Span heatmap
+Span Profile Heatmap
+1
+3
+6
+8
+10
+Top span exemplars
+Tempo data source
+Tempo
+Timestamp	Span ID	Span name	CPU time consumed	Duration	Trace ID	Actions
+8:38:28 PM	
+c8ac7d377a88f29b
+		639.18 ms	800.37 ms	
+8e84987…
+	
+
+8:38:24 PM	
+c8ac7d377a88f29b
+		175.26 ms	800.37 ms	
+8e84987…
+	
+Flame graph for obi-poc-cost (cpu)
+Span
+=
+c8ac7d377a88f29b
+Explain Flame Graph
+Top Table
+Flame Graph
+Call Tree
+Top Table
+Flame Graph
+Call Tree
+Single
+Split
+Symbol
+Self
+Total
+main.rebuildEntry
+814 ms
+814 ms
+main.main.func1
+0 ns
+814 ms
+net/http.HandlerFunc.ServeHTTP
+0 ns
+814 ms
+net/http.(*ServeMux).ServeHTTP
+0 ns
+814 ms
+net/http.serverHandler.ServeHTTP
+0 ns
+814 ms
+net/http.(*conn).serve
+0 ns
+814 ms
+net/http.(*Server).Serve.gowrap3
+0 ns
+814 ms
+runtime.goexit
+0 ns
+814 ms
+total
+0 ns
+814 ms
+814 ms | 814 Mil samples (Time)

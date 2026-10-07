@@ -1,0 +1,26 @@
+[
+  {
+    "name": "shared-lock-profile",
+    "url": "http://localhost:3103/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-interference&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&from=2026-10-05T21%3A02%3A32.688Z&to=2026-10-05T21%3A02%3A54.708Z&showSpanHeatmap=true&var-spanSelector=daa29be958d43c10&explorationType=flame-graph&timezone=browser&searchText=&panelType=time-series&layout=grid&hideNoData=off&var-groupBy=&var-profileIdSelector=&var-filters=&maxNodes=16384",
+    "status": 200,
+    "loaded_expected_text": true
+  },
+  {
+    "name": "shared-lock-trace",
+    "url": "http://localhost:3103/explore?schemaVersion=1&panes=%7B%227wv%22:%7B%22datasource%22:%22tempo%22,%22queries%22:%5B%7B%22refId%22:%22A%22,%22queryType%22:%22traceql%22,%22query%22:%22c8e82576135ba5050d49e0ebfb6a31de%22,%22datasource%22:%7B%22type%22:%22tempo%22,%22uid%22:%22tempo%22%7D,%22serviceMapUseNativeHistograms%22:false%7D%5D,%22range%22:%7B%22from%22:%221791234152688%22,%22to%22:%221791234174708%22%7D,%22panelsState%22:%7B%22trace%22:%7B%22spanFilters%22:%7B%22spanNameOperator%22:%22%3D%22,%22serviceNameOperator%22:%22%3D%22,%22fromOperator%22:%22%3E%22,%22toOperator%22:%22%3C%22,%22tags%22:%5B%7B%22id%22:%227928bbad-713%22,%22operator%22:%22%3D%22%7D%5D%7D%7D%7D,%22compact%22:false%7D%7D&orgId=1",
+    "status": 200,
+    "loaded_expected_text": true
+  },
+  {
+    "name": "control-profile",
+    "url": "http://localhost:3103/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-interference&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&from=2026-10-05T21%3A05%3A12.499Z&to=2026-10-05T21%3A05%3A34.518Z&showSpanHeatmap=true&var-spanSelector=814221cf79436c71&explorationType=flame-graph&timezone=browser&searchText=&panelType=time-series&layout=grid&hideNoData=off&var-groupBy=&var-profileIdSelector=&var-filters=&maxNodes=16384",
+    "status": 200,
+    "loaded_expected_text": true
+  },
+  {
+    "name": "control-trace",
+    "url": "http://localhost:3103/explore?schemaVersion=1&panes=%7B%22qjc%22:%7B%22datasource%22:%22tempo%22,%22queries%22:%5B%7B%22refId%22:%22A%22,%22queryType%22:%22traceql%22,%22query%22:%220fc4c8ed2c72cbd645a8e52b6f607451%22,%22datasource%22:%7B%22type%22:%22tempo%22,%22uid%22:%22tempo%22%7D,%22serviceMapUseNativeHistograms%22:false%7D%5D,%22range%22:%7B%22from%22:%221791234312499%22,%22to%22:%221791234334518%22%7D,%22panelsState%22:%7B%22trace%22:%7B%22spanFilters%22:%7B%22spanNameOperator%22:%22%3D%22,%22serviceNameOperator%22:%22%3D%22,%22fromOperator%22:%22%3E%22,%22toOperator%22:%22%3C%22,%22tags%22:%5B%7B%22id%22:%22a26b0a6c-de4%22,%22operator%22:%22%3D%22%7D%5D%7D%7D%7D,%22compact%22:false%7D%7D&orgId=1",
+    "status": 200,
+    "loaded_expected_text": true
+  }
+]

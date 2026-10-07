@@ -1,0 +1,108 @@
+{
+  "created_at": "2026-10-05T20:30:18.731331+00:00",
+  "platform": "Linux-7.0.0-1012-aws-x86_64-with-glibc2.39",
+  "application_before": {
+    "id": "9b7f3fcf6ba1b06b523adc6a464973e4a89b674f09f3c42f4263c93beb26aad9",
+    "pid": 3950181,
+    "started_at": "2026-10-05T20:30:05.142858279Z",
+    "pid_mode": ""
+  },
+  "images": "[{\"ID\":\"sha256:0105aea9d841346107422244ad9070f495221f8acfce0fcc7a9ff5e9693cf3bb\",\"ContainerName\":\"obi-poc-waiting-app-1\",\"Repository\":\"obi-poc-waiting-app\",\"Tag\":\"local\",\"Platform\":\"linux/amd64\",\"Size\":14674040,\"Created\":\"2026-10-05T20:28:18.812027727Z\",\"LastTagTime\":\"2026-10-05T20:30:03.957263179Z\"},{\"ID\":\"sha256:d6c52678ab5b7144f27ae569fd778608121c0f4a10eb411983750a0d67c1fbe3\",\"ContainerName\":\"obi-poc-waiting-lgtm-1\",\"Repository\":\"grafana/otel-lgtm\",\"Tag\":\"\",\"Platform\":\"linux/amd64\",\"Size\":3636883920,\"Created\":\"2026-09-17T10:08:25Z\",\"LastTagTime\":\"2026-10-02T16:50:50.970680803Z\"}]\n\n",
+  "docker_version": "{\"Client\":{\"Platform\":{\"Name\":\"Docker Engine - Community\"},\"Version\":\"29.8.0\",\"ApiVersion\":\"1.56\",\"DefaultAPIVersion\":\"1.56\",\"GitCommit\":\"88096ef\",\"GoVersion\":\"go1.26.8\",\"Os\":\"linux\",\"Arch\":\"amd64\",\"BuildTime\":\"Thu Sep  3 21:50:08 2026\",\"Context\":\"default\"},\"Server\":{\"Platform\":{\"Name\":\"Docker Engine - Community\"},\"Version\":\"29.8.0\",\"ApiVersion\":\"1.56\",\"MinAPIVersion\":\"1.40\",\"Os\":\"linux\",\"Arch\":\"amd64\",\"Components\":[{\"Name\":\"Engine\",\"Version\":\"29.8.0\",\"Details\":{\"ApiVersion\":\"1.56\",\"Arch\":\"amd64\",\"BuildTime\":\"Thu Sep  3 21:50:08 2026\",\"Experimental\":\"false\",\"GitCommit\":\"3ce5872\",\"GoVersion\":\"go1.26.8\",\"KernelVersion\":\"7.0.0-1012-aws\",\"MinAPIVersion\":\"1.40\",\"Module\":\"github.com/moby/moby/v2\",\"ModuleVersion\":\"v2.0.0+unknown\",\"Os\":\"linux\"}},{\"Name\":\"containerd\",\"Version\":\"v2.3.5\",\"Details\":{\"GitCommit\":\"1294c24a7da8e5a793ed378161673abe94118892\"}},{\"Name\":\"runc\",\"Version\":\"1.5.1\",\"Details\":{\"GitCommit\":\"v1.5.1-0-g8f2685a4\"}},{\"Name\":\"docker-init\",\"Version\":\"0.19.0\",\"Details\":{\"GitCommit\":\"de40ad0\"}}],\"GitCommit\":\"3ce5872\",\"GoVersion\":\"go1.26.8\",\"KernelVersion\":\"7.0.0-1012-aws\",\"BuildTime\":\"2026-09-03T21:50:08.000000000+00:00\"}}\n",
+  "other_containers": "obi-poc-waiting-lgtm-1\nobi-poc-waiting-app-1\nobi-ai-investigation-profiler-1\nobi-ai-investigation-app-1\nobi-ai-investigation-obi-1\nobi-ai-investigation-lgtm-1\ntrace-profile-profiler-1\ntrace-profile-lgtm-1\ntrace-profile-obi-1\ntrace-profile-app-1\nobi-dynamic-instrumentation-demo-inventory-java-1\nobi-dynamic-instrumentation-demo-inventory-node-1\nobi-dynamic-instrumentation-demo-loadgen-1\nobi-dynamic-instrumentation-demo-checkout-1\nobi-dynamic-instrumentation-demo-obi-1\nobi-dynamic-instrumentation-demo-ui-1\nobi-dynamic-instrumentation-demo-collector-1\nobi-dynamic-instrumentation-demo-tempo-1\n",
+  "checkout_revision": "6d873d705d77e9764adab67502d65695df986e93",
+  "reference_obi_revision": "6d873d705d77e9764adab67502d65695df986e93",
+  "configured_images": {
+    "app": {
+      "configured_image": "obi-poc-waiting-app:local",
+      "inspection": {
+        "id": "sha256:0105aea9d841346107422244ad9070f495221f8acfce0fcc7a9ff5e9693cf3bb",
+        "digests": [
+          "obi-poc-waiting-app@sha256:0105aea9d841346107422244ad9070f495221f8acfce0fcc7a9ff5e9693cf3bb"
+        ],
+        "labels": {
+          "com.docker.compose.project": "obi-poc-waiting",
+          "com.docker.compose.service": "app",
+          "com.docker.compose.version": "5.5.1"
+        }
+      },
+      "state": "available"
+    },
+    "obi": {
+      "configured_image": "obi-ai-investigation:6d873d7",
+      "inspection": {
+        "id": "sha256:dc7edc1d3c3dd0d71983b0091af830baab2635b9e48a3341b04cd6c550996b72",
+        "digests": [
+          "obi-ai-investigation@sha256:dc7edc1d3c3dd0d71983b0091af830baab2635b9e48a3341b04cd6c550996b72"
+        ],
+        "labels": {
+          "maintainer": "The OpenTelemetry Authors"
+        }
+      },
+      "state": "available"
+    },
+    "profiler": {
+      "configured_image": "otel/opentelemetry-collector-ebpf-profiler:0.160.0@sha256:40bc11043fdef9f7744631d6ca60d44e63b4c2a356ec0a21a02a4a5f28ebff70",
+      "inspection": {
+        "id": "sha256:40bc11043fdef9f7744631d6ca60d44e63b4c2a356ec0a21a02a4a5f28ebff70",
+        "digests": [
+          "otel/opentelemetry-collector-ebpf-profiler@sha256:40bc11043fdef9f7744631d6ca60d44e63b4c2a356ec0a21a02a4a5f28ebff70"
+        ],
+        "labels": {
+          "org.opencontainers.image.created": "2026-09-02T22:42:35Z",
+          "org.opencontainers.image.licenses": "Apache-2.0",
+          "org.opencontainers.image.name": "opentelemetry-collector-releases",
+          "org.opencontainers.image.revision": "5c31bfdc7e8a68aed5e173673c6946299a694ee6",
+          "org.opencontainers.image.source": "https://github.com/open-telemetry/opentelemetry-collector-releases",
+          "org.opencontainers.image.version": "0.160.0"
+        }
+      },
+      "state": "available"
+    },
+    "lgtm": {
+      "configured_image": "grafana/otel-lgtm:0.33.1@sha256:d6c52678ab5b7144f27ae569fd778608121c0f4a10eb411983750a0d67c1fbe3",
+      "inspection": {
+        "id": "sha256:d6c52678ab5b7144f27ae569fd778608121c0f4a10eb411983750a0d67c1fbe3",
+        "digests": [
+          "grafana/otel-lgtm@sha256:d6c52678ab5b7144f27ae569fd778608121c0f4a10eb411983750a0d67c1fbe3"
+        ],
+        "labels": {
+          "architecture": "x86_64",
+          "build-date": "",
+          "com.redhat.component": "ubi9-micro-container",
+          "com.redhat.license_terms": "https://www.redhat.com/en/about/red-hat-end-user-license-agreements#UBI",
+          "cpe": "",
+          "description": "An open source backend for OpenTelemetry that's intended for development, demo, and testing environments.",
+          "distribution-scope": "public",
+          "io.buildah.version": "",
+          "io.k8s.description": "An open source backend for OpenTelemetry that's intended for development, demo, and testing environments.",
+          "io.k8s.display-name": "Grafana LGTM",
+          "io.openshift.expose-services": "",
+          "maintainer": "Grafana Labs",
+          "name": "grafana/otel-lgtm",
+          "org.opencontainers.image.authors": "Grafana Labs",
+          "org.opencontainers.image.created": "2026-09-18T09:05:49.227Z",
+          "org.opencontainers.image.description": "An OpenTelemetry backend in a Docker container image",
+          "org.opencontainers.image.documentation": "https://github.com/grafana/docker-otel-lgtm/blob/main/README.md",
+          "org.opencontainers.image.licenses": "Apache-2.0",
+          "org.opencontainers.image.ref.name": "v0.33.1",
+          "org.opencontainers.image.revision": "854956d121d6e9e228a75769637d994fee49cd98",
+          "org.opencontainers.image.source": "https://github.com/grafana/docker-otel-lgtm",
+          "org.opencontainers.image.title": "docker-otel-lgtm",
+          "org.opencontainers.image.url": "https://github.com/grafana/docker-otel-lgtm",
+          "org.opencontainers.image.vendor": "Grafana Labs",
+          "org.opencontainers.image.version": "0.33.1",
+          "release": "",
+          "summary": "An OpenTelemetry backend in a Docker image",
+          "url": "https://github.com/grafana/docker-otel-lgtm",
+          "vcs-ref": "854956d121d6e9e228a75769637d994fee49cd98",
+          "vcs-type": "git",
+          "vendor": "Grafana Labs",
+          "version": "v0.33.1"
+        }
+      },
+      "state": "available"
+    }
+  },
+  "image_inspection_note": "Image metadata inspected after collection. The source checkout revision does not prove the image was built from that revision; the validated cached OBI image reference and immutable image ID are recorded separately."
+}

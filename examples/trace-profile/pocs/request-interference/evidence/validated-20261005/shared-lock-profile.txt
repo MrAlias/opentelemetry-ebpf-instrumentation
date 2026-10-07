@@ -1,0 +1,124 @@
+Skip to main content
+Grafana
+
+Starred
+
+Dashboards
+
+Explore
+
+Drilldown
+
+Metrics
+
+Logs
+
+Traces
+
+Profiles
+
+Alerting
+
+Connections
+
+Administration
+
+Drilldown
+Profiles
+Search...
+ctrl+k
+Sign in
+All services
+Profile types
+Labels
+Flame graph
+Diff flame graph
+Favorites
+2026-10-05 21:02:32 to 2026-10-05 21:02:54
+Data source
+Pyroscope
+Service
+Profile type
+Filters
+Filter by label values...
+CPU time consumed per trace span
+Time series
+Span heatmap
+Span Profile Heatmap
+1
+2
+3
+Top span exemplars
+Tempo data source
+Tempo
+Timestamp	Span ID	Span name	CPU time consumed	Duration	Trace ID	Actions
+9:02:33 PM	
+daa29be958d43c10
+		2.00 s	2.00 s	
+c8e8257…
+	
+Flame graph for obi-poc-interference (cpu)
+Span
+=
+daa29be958d43c10
+Explain Flame Graph
+Top Table
+Flame Graph
+Call Tree
+Top Table
+Flame Graph
+Call Tree
+Single
+Split
+Symbol
+Self
+Total
+main.prepareReport
+1.99 s
+1.99 s
+exit_to_user_mode_loop
+10.3 ms
+10.3 ms
+exc_int3
+0 ns
+10.3 ms
+asm_exc_int3
+0 ns
+10.3 ms
+runtime.casgstatus
+0 ns
+10.3 ms
+runtime.asyncPreempt2.func1
+0 ns
+10.3 ms
+runtime.mcall
+0 ns
+10.3 ms
+main.(*application).report
+0 ns
+1.99 s
+main.(*application).report-fm
+0 ns
+1.99 s
+net/http.HandlerFunc.ServeHTTP
+0 ns
+1.99 s
+net/http.(*ServeMux).ServeHTTP
+0 ns
+1.99 s
+net/http.serverHandler.ServeHTTP
+0 ns
+1.99 s
+net/http.(*conn).serve
+0 ns
+1.99 s
+net/http.(*Server).Serve.gowrap3
+0 ns
+1.99 s
+runtime.goexit
+0 ns
+1.99 s
+total
+0 ns
+2.00 s
+2.00 s | 2.00 Bil samples (Time)

@@ -1,0 +1,1039 @@
+{
+  "mode": "obi",
+  "interval": {
+    "start_ms": 1791234206426,
+    "end_ms": 1791234228445,
+    "start": "2026-10-05T21:03:26.426000+00:00",
+    "end": "2026-10-05T21:03:48.445000+00:00"
+  },
+  "aggregate": {
+    "state": "no_matching_samples",
+    "total_ns": 0,
+    "self_sum_ns": 0,
+    "functions": [
+      {
+        "name": "total",
+        "self_ns": 0,
+        "cumulative_ns": 0
+      }
+    ],
+    "unit": "nanoseconds",
+    "note": "Cumulative values overlap; do not sum them. Sampled CPU is not elapsed time."
+  },
+  "trace_search": {
+    "traces": [
+      {
+        "traceID": "c017dcf858a6a702663a67d268b0b2c8",
+        "rootServiceName": "obi-poc-interference",
+        "rootTraceName": "GET /work",
+        "startTimeUnixNano": "1791234208729629693",
+        "durationMs": 2000,
+        "spanSet": {
+          "spans": [
+            {
+              "spanID": "458152e90802aa4b",
+              "startTimeUnixNano": "1791234208729629693",
+              "durationNanos": "19830",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "bf4063a440120ac5",
+              "startTimeUnixNano": "1791234208729649523",
+              "durationNanos": "2000416581",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "10c4ca181b53348e",
+              "startTimeUnixNano": "1791234208729629693",
+              "durationNanos": "2000436411",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        },
+        "spanSets": [
+          {
+            "spans": [
+              {
+                "spanID": "458152e90802aa4b",
+                "startTimeUnixNano": "1791234208729629693",
+                "durationNanos": "19830",
+                "attributes": [
+                  {
+                    "key": "service.name",
+                    "value": {
+                      "stringValue": "obi-poc-interference"
+                    }
+                  }
+                ]
+              },
+              {
+                "spanID": "bf4063a440120ac5",
+                "startTimeUnixNano": "1791234208729649523",
+                "durationNanos": "2000416581",
+                "attributes": [
+                  {
+                    "key": "service.name",
+                    "value": {
+                      "stringValue": "obi-poc-interference"
+                    }
+                  }
+                ]
+              },
+              {
+                "spanID": "10c4ca181b53348e",
+                "startTimeUnixNano": "1791234208729629693",
+                "durationNanos": "2000436411",
+                "attributes": [
+                  {
+                    "key": "service.name",
+                    "value": {
+                      "stringValue": "obi-poc-interference"
+                    }
+                  }
+                ]
+              }
+            ],
+            "matched": 3
+          }
+        ],
+        "serviceStats": {
+          "obi-poc-interference": {
+            "spanCount": 3
+          }
+        }
+      },
+      {
+        "traceID": "85a4aa960592d59feb0f376361f9558d",
+        "rootServiceName": "obi-poc-interference",
+        "rootTraceName": "GET /report",
+        "startTimeUnixNano": "1791234208629540765",
+        "durationMs": 2000,
+        "spanSet": {
+          "spans": [
+            {
+              "spanID": "2dec51c67450b6e7",
+              "startTimeUnixNano": "1791234208629540765",
+              "durationNanos": "25940",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "27f59a3ab30bec6b",
+              "startTimeUnixNano": "1791234208629566705",
+              "durationNanos": "2000332269",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "aff744dd16ef8aa1",
+              "startTimeUnixNano": "1791234208629540765",
+              "durationNanos": "2000358209",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        },
+        "spanSets": [
+          {
+            "spans": [
+              {
+                "spanID": "2dec51c67450b6e7",
+                "startTimeUnixNano": "1791234208629540765",
+                "durationNanos": "25940",
+                "attributes": [
+                  {
+                    "key": "service.name",
+                    "value": {
+                      "stringValue": "obi-poc-interference"
+                    }
+                  }
+                ]
+              },
+              {
+                "spanID": "27f59a3ab30bec6b",
+                "startTimeUnixNano": "1791234208629566705",
+                "durationNanos": "2000332269",
+                "attributes": [
+                  {
+                    "key": "service.name",
+                    "value": {
+                      "stringValue": "obi-poc-interference"
+                    }
+                  }
+                ]
+              },
+              {
+                "spanID": "aff744dd16ef8aa1",
+                "startTimeUnixNano": "1791234208629540765",
+                "durationNanos": "2000358209",
+                "attributes": [
+                  {
+                    "key": "service.name",
+                    "value": {
+                      "stringValue": "obi-poc-interference"
+                    }
+                  }
+                ]
+              }
+            ],
+            "matched": 3
+          }
+        ],
+        "serviceStats": {
+          "obi-poc-interference": {
+            "spanCount": 3
+          }
+        }
+      },
+      {
+        "traceID": "9d933e0646a2b2e6604606e1595d6c41",
+        "rootServiceName": "obi-poc-interference",
+        "rootTraceName": "GET /work",
+        "startTimeUnixNano": "1791234206527742949",
+        "durationMs": 2000,
+        "spanSet": {
+          "spans": [
+            {
+              "spanID": "9192f5135d5bba43",
+              "startTimeUnixNano": "1791234206527742949",
+              "durationNanos": "19341",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "d3cf819afc950984",
+              "startTimeUnixNano": "1791234206527762290",
+              "durationNanos": "2000512692",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "35d30a2b132daf6e",
+              "startTimeUnixNano": "1791234206527742949",
+              "durationNanos": "2000532033",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        },
+        "spanSets": [
+          {
+            "spans": [
+              {
+                "spanID": "9192f5135d5bba43",
+                "startTimeUnixNano": "1791234206527742949",
+                "durationNanos": "19341",
+                "attributes": [
+                  {
+                    "key": "service.name",
+                    "value": {
+                      "stringValue": "obi-poc-interference"
+                    }
+                  }
+                ]
+              },
+              {
+                "spanID": "d3cf819afc950984",
+                "startTimeUnixNano": "1791234206527762290",
+                "durationNanos": "2000512692",
+                "attributes": [
+                  {
+                    "key": "service.name",
+                    "value": {
+                      "stringValue": "obi-poc-interference"
+                    }
+                  }
+                ]
+              },
+              {
+                "spanID": "35d30a2b132daf6e",
+                "startTimeUnixNano": "1791234206527742949",
+                "durationNanos": "2000532033",
+                "attributes": [
+                  {
+                    "key": "service.name",
+                    "value": {
+                      "stringValue": "obi-poc-interference"
+                    }
+                  }
+                ]
+              }
+            ],
+            "matched": 3
+          }
+        ],
+        "serviceStats": {
+          "obi-poc-interference": {
+            "spanCount": 3
+          }
+        }
+      },
+      {
+        "traceID": "b173adf5610091065d66c60e0a03533f",
+        "rootServiceName": "obi-poc-interference",
+        "rootTraceName": "GET /report",
+        "startTimeUnixNano": "1791234206427304909",
+        "durationMs": 2000,
+        "spanSet": {
+          "spans": [
+            {
+              "spanID": "ac54b996b77db29b",
+              "startTimeUnixNano": "1791234206427304909",
+              "durationNanos": "29551",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "abc5e4edf9011c62",
+              "startTimeUnixNano": "1791234206427334460",
+              "durationNanos": "2000304703",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "2b1e77afc59f4a40",
+              "startTimeUnixNano": "1791234206427304909",
+              "durationNanos": "2000334254",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        },
+        "spanSets": [
+          {
+            "spans": [
+              {
+                "spanID": "ac54b996b77db29b",
+                "startTimeUnixNano": "1791234206427304909",
+                "durationNanos": "29551",
+                "attributes": [
+                  {
+                    "key": "service.name",
+                    "value": {
+                      "stringValue": "obi-poc-interference"
+                    }
+                  }
+                ]
+              },
+              {
+                "spanID": "abc5e4edf9011c62",
+                "startTimeUnixNano": "1791234206427334460",
+                "durationNanos": "2000304703",
+                "attributes": [
+                  {
+                    "key": "service.name",
+                    "value": {
+                      "stringValue": "obi-poc-interference"
+                    }
+                  }
+                ]
+              },
+              {
+                "spanID": "2b1e77afc59f4a40",
+                "startTimeUnixNano": "1791234206427304909",
+                "durationNanos": "2000334254",
+                "attributes": [
+                  {
+                    "key": "service.name",
+                    "value": {
+                      "stringValue": "obi-poc-interference"
+                    }
+                  }
+                ]
+              }
+            ],
+            "matched": 3
+          }
+        ],
+        "serviceStats": {
+          "obi-poc-interference": {
+            "spanCount": 3
+          }
+        }
+      },
+      {
+        "traceID": "f062e6d22044a43f58e5d751261dfc2b",
+        "rootServiceName": "obi-poc-interference",
+        "rootTraceName": "GET /work",
+        "startTimeUnixNano": "1791234204325097815",
+        "durationMs": 2000,
+        "spanSet": {
+          "spans": [
+            {
+              "spanID": "04e933cfef5b34b0",
+              "startTimeUnixNano": "1791234204325097815",
+              "durationNanos": "19461",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "35aca27ee42afeef",
+              "startTimeUnixNano": "1791234204325117276",
+              "durationNanos": "2000530508",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "d7dfeca9ccfdc7bb",
+              "startTimeUnixNano": "1791234204325097815",
+              "durationNanos": "2000549969",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        },
+        "spanSets": [
+          {
+            "spans": [
+              {
+                "spanID": "04e933cfef5b34b0",
+                "startTimeUnixNano": "1791234204325097815",
+                "durationNanos": "19461",
+                "attributes": [
+                  {
+                    "key": "service.name",
+                    "value": {
+                      "stringValue": "obi-poc-interference"
+                    }
+                  }
+                ]
+              },
+              {
+                "spanID": "35aca27ee42afeef",
+                "startTimeUnixNano": "1791234204325117276",
+                "durationNanos": "2000530508",
+                "attributes": [
+                  {
+                    "key": "service.name",
+                    "value": {
+                      "stringValue": "obi-poc-interference"
+                    }
+                  }
+                ]
+              },
+              {
+                "spanID": "d7dfeca9ccfdc7bb",
+                "startTimeUnixNano": "1791234204325097815",
+                "durationNanos": "2000549969",
+                "attributes": [
+                  {
+                    "key": "service.name",
+                    "value": {
+                      "stringValue": "obi-poc-interference"
+                    }
+                  }
+                ]
+              }
+            ],
+            "matched": 3
+          }
+        ],
+        "serviceStats": {
+          "obi-poc-interference": {
+            "spanCount": 3
+          }
+        }
+      },
+      {
+        "traceID": "b37548147533de142f8ef3c8e6810e3e",
+        "rootServiceName": "obi-poc-interference",
+        "rootTraceName": "GET /report",
+        "startTimeUnixNano": "1791234204225066874",
+        "durationMs": 2000,
+        "spanSet": {
+          "spans": [
+            {
+              "spanID": "79524b7b70e5874b",
+              "startTimeUnixNano": "1791234204225066874",
+              "durationNanos": "28381",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "883551e86546aed7",
+              "startTimeUnixNano": "1791234204225095255",
+              "durationNanos": "2000317134",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            },
+            {
+              "spanID": "6013a23d3ac14270",
+              "startTimeUnixNano": "1791234204225066874",
+              "durationNanos": "2000345515",
+              "attributes": [
+                {
+                  "key": "service.name",
+                  "value": {
+                    "stringValue": "obi-poc-interference"
+                  }
+                }
+              ]
+            }
+          ],
+          "matched": 3
+        },
+        "spanSets": [
+          {
+            "spans": [
+              {
+                "spanID": "79524b7b70e5874b",
+                "startTimeUnixNano": "1791234204225066874",
+                "durationNanos": "28381",
+                "attributes": [
+                  {
+                    "key": "service.name",
+                    "value": {
+                      "stringValue": "obi-poc-interference"
+                    }
+                  }
+                ]
+              },
+              {
+                "spanID": "883551e86546aed7",
+                "startTimeUnixNano": "1791234204225095255",
+                "durationNanos": "2000317134",
+                "attributes": [
+                  {
+                    "key": "service.name",
+                    "value": {
+                      "stringValue": "obi-poc-interference"
+                    }
+                  }
+                ]
+              },
+              {
+                "spanID": "6013a23d3ac14270",
+                "startTimeUnixNano": "1791234204225066874",
+                "durationNanos": "2000345515",
+                "attributes": [
+                  {
+                    "key": "service.name",
+                    "value": {
+                      "stringValue": "obi-poc-interference"
+                    }
+                  }
+                ]
+              }
+            ],
+            "matched": 3
+          }
+        ],
+        "serviceStats": {
+          "obi-poc-interference": {
+            "spanCount": 3
+          }
+        }
+      }
+    ],
+    "metrics": {
+      "inspectedBytes": "23266",
+      "completedJobs": 1,
+      "totalJobs": 1
+    }
+  },
+  "exemplars": [],
+  "available_unique_exemplars": 0,
+  "fetched_traces": [
+    {
+      "trace_id": "85a4aa960592d59feb0f376361f9558d",
+      "trace_url": "http://localhost:3103/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%2285a4aa960592d59feb0f376361f9558d%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%222026-10-05T21%3A03%3A26.426000%2B00%3A00%22%2C+%22to%22%3A+%222026-10-05T21%3A03%3A48.445000%2B00%3A00%22%7D%7D%7D",
+      "spans": [
+        {
+          "span_id": "2dec51c67450b6e7",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "attributes": {},
+          "duration_ms": 0.02594
+        },
+        {
+          "span_id": "27f59a3ab30bec6b",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "attributes": {},
+          "duration_ms": 2000.332269
+        },
+        {
+          "span_id": "aff744dd16ef8aa1",
+          "name": "GET /report",
+          "kind": "SPAN_KIND_SERVER",
+          "attributes": {
+            "client.address": {
+              "stringValue": "172.22.0.1"
+            },
+            "server.port": {
+              "intValue": "8080"
+            },
+            "http.request.body.size": {
+              "intValue": "0"
+            },
+            "http.response.body.size": {
+              "intValue": "0"
+            },
+            "http.response.status_code": {
+              "intValue": "200"
+            },
+            "url.scheme": {
+              "stringValue": "http"
+            },
+            "network.peer.address": {
+              "stringValue": "172.22.0.1"
+            },
+            "network.peer.port": {
+              "intValue": "45790"
+            },
+            "http.request.method": {
+              "stringValue": "GET"
+            },
+            "url.path": {
+              "stringValue": "/report"
+            },
+            "server.address": {
+              "stringValue": "obi-poc-interference"
+            },
+            "http.route": {
+              "stringValue": "/report"
+            }
+          },
+          "duration_ms": 2000.358209
+        }
+      ]
+    },
+    {
+      "trace_id": "9d933e0646a2b2e6604606e1595d6c41",
+      "trace_url": "http://localhost:3103/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%229d933e0646a2b2e6604606e1595d6c41%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%222026-10-05T21%3A03%3A26.426000%2B00%3A00%22%2C+%22to%22%3A+%222026-10-05T21%3A03%3A48.445000%2B00%3A00%22%7D%7D%7D",
+      "spans": [
+        {
+          "span_id": "9192f5135d5bba43",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "attributes": {},
+          "duration_ms": 0.019341
+        },
+        {
+          "span_id": "d3cf819afc950984",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "attributes": {},
+          "duration_ms": 2000.512692
+        },
+        {
+          "span_id": "35d30a2b132daf6e",
+          "name": "GET /work",
+          "kind": "SPAN_KIND_SERVER",
+          "attributes": {
+            "client.address": {
+              "stringValue": "172.22.0.1"
+            },
+            "server.port": {
+              "intValue": "8080"
+            },
+            "http.request.body.size": {
+              "intValue": "0"
+            },
+            "http.response.body.size": {
+              "intValue": "0"
+            },
+            "http.response.status_code": {
+              "intValue": "200"
+            },
+            "url.scheme": {
+              "stringValue": "http"
+            },
+            "network.peer.address": {
+              "stringValue": "172.22.0.1"
+            },
+            "network.peer.port": {
+              "intValue": "45786"
+            },
+            "http.request.method": {
+              "stringValue": "GET"
+            },
+            "url.path": {
+              "stringValue": "/work"
+            },
+            "server.address": {
+              "stringValue": "obi-poc-interference"
+            },
+            "http.route": {
+              "stringValue": "/work"
+            }
+          },
+          "duration_ms": 2000.532033
+        }
+      ]
+    },
+    {
+      "trace_id": "b173adf5610091065d66c60e0a03533f",
+      "trace_url": "http://localhost:3103/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%22b173adf5610091065d66c60e0a03533f%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%222026-10-05T21%3A03%3A26.426000%2B00%3A00%22%2C+%22to%22%3A+%222026-10-05T21%3A03%3A48.445000%2B00%3A00%22%7D%7D%7D",
+      "spans": [
+        {
+          "span_id": "ac54b996b77db29b",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "attributes": {},
+          "duration_ms": 0.029551
+        },
+        {
+          "span_id": "abc5e4edf9011c62",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "attributes": {},
+          "duration_ms": 2000.304703
+        },
+        {
+          "span_id": "2b1e77afc59f4a40",
+          "name": "GET /report",
+          "kind": "SPAN_KIND_SERVER",
+          "attributes": {
+            "client.address": {
+              "stringValue": "172.22.0.1"
+            },
+            "server.port": {
+              "intValue": "8080"
+            },
+            "http.request.body.size": {
+              "intValue": "0"
+            },
+            "http.response.body.size": {
+              "intValue": "0"
+            },
+            "http.response.status_code": {
+              "intValue": "200"
+            },
+            "url.scheme": {
+              "stringValue": "http"
+            },
+            "network.peer.address": {
+              "stringValue": "172.22.0.1"
+            },
+            "network.peer.port": {
+              "intValue": "45770"
+            },
+            "http.request.method": {
+              "stringValue": "GET"
+            },
+            "url.path": {
+              "stringValue": "/report"
+            },
+            "server.address": {
+              "stringValue": "obi-poc-interference"
+            },
+            "http.route": {
+              "stringValue": "/report"
+            }
+          },
+          "duration_ms": 2000.334254
+        }
+      ]
+    },
+    {
+      "trace_id": "b37548147533de142f8ef3c8e6810e3e",
+      "trace_url": "http://localhost:3103/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%22b37548147533de142f8ef3c8e6810e3e%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%222026-10-05T21%3A03%3A26.426000%2B00%3A00%22%2C+%22to%22%3A+%222026-10-05T21%3A03%3A48.445000%2B00%3A00%22%7D%7D%7D",
+      "spans": [
+        {
+          "span_id": "79524b7b70e5874b",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "attributes": {},
+          "duration_ms": 0.028381
+        },
+        {
+          "span_id": "883551e86546aed7",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "attributes": {},
+          "duration_ms": 2000.317134
+        },
+        {
+          "span_id": "6013a23d3ac14270",
+          "name": "GET /report",
+          "kind": "SPAN_KIND_SERVER",
+          "attributes": {
+            "client.address": {
+              "stringValue": "172.22.0.1"
+            },
+            "server.port": {
+              "intValue": "8080"
+            },
+            "http.request.body.size": {
+              "intValue": "0"
+            },
+            "http.response.body.size": {
+              "intValue": "0"
+            },
+            "http.response.status_code": {
+              "intValue": "200"
+            },
+            "url.scheme": {
+              "stringValue": "http"
+            },
+            "network.peer.address": {
+              "stringValue": "172.22.0.1"
+            },
+            "network.peer.port": {
+              "intValue": "60542"
+            },
+            "http.request.method": {
+              "stringValue": "GET"
+            },
+            "url.path": {
+              "stringValue": "/report"
+            },
+            "server.address": {
+              "stringValue": "obi-poc-interference"
+            },
+            "http.route": {
+              "stringValue": "/report"
+            }
+          },
+          "duration_ms": 2000.345515
+        }
+      ]
+    },
+    {
+      "trace_id": "c017dcf858a6a702663a67d268b0b2c8",
+      "trace_url": "http://localhost:3103/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%22c017dcf858a6a702663a67d268b0b2c8%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%222026-10-05T21%3A03%3A26.426000%2B00%3A00%22%2C+%22to%22%3A+%222026-10-05T21%3A03%3A48.445000%2B00%3A00%22%7D%7D%7D",
+      "spans": [
+        {
+          "span_id": "458152e90802aa4b",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "attributes": {},
+          "duration_ms": 0.01983
+        },
+        {
+          "span_id": "bf4063a440120ac5",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "attributes": {},
+          "duration_ms": 2000.416581
+        },
+        {
+          "span_id": "10c4ca181b53348e",
+          "name": "GET /work",
+          "kind": "SPAN_KIND_SERVER",
+          "attributes": {
+            "client.address": {
+              "stringValue": "172.22.0.1"
+            },
+            "server.port": {
+              "intValue": "8080"
+            },
+            "http.request.body.size": {
+              "intValue": "0"
+            },
+            "http.response.body.size": {
+              "intValue": "0"
+            },
+            "http.response.status_code": {
+              "intValue": "200"
+            },
+            "url.scheme": {
+              "stringValue": "http"
+            },
+            "network.peer.address": {
+              "stringValue": "172.22.0.1"
+            },
+            "network.peer.port": {
+              "intValue": "45804"
+            },
+            "http.request.method": {
+              "stringValue": "GET"
+            },
+            "url.path": {
+              "stringValue": "/work"
+            },
+            "server.address": {
+              "stringValue": "obi-poc-interference"
+            },
+            "http.route": {
+              "stringValue": "/work"
+            }
+          },
+          "duration_ms": 2000.436411
+        }
+      ]
+    },
+    {
+      "trace_id": "f062e6d22044a43f58e5d751261dfc2b",
+      "trace_url": "http://localhost:3103/explore?schemaVersion=1&orgId=1&panes=%7B%22trace%22%3A+%7B%22datasource%22%3A+%22tempo%22%2C+%22queries%22%3A+%5B%7B%22refId%22%3A+%22A%22%2C+%22queryType%22%3A+%22traceql%22%2C+%22query%22%3A+%22f062e6d22044a43f58e5d751261dfc2b%22%7D%5D%2C+%22range%22%3A+%7B%22from%22%3A+%222026-10-05T21%3A03%3A26.426000%2B00%3A00%22%2C+%22to%22%3A+%222026-10-05T21%3A03%3A48.445000%2B00%3A00%22%7D%7D%7D",
+      "spans": [
+        {
+          "span_id": "04e933cfef5b34b0",
+          "name": "in queue",
+          "kind": "SPAN_KIND_INTERNAL",
+          "attributes": {},
+          "duration_ms": 0.019461
+        },
+        {
+          "span_id": "35aca27ee42afeef",
+          "name": "processing",
+          "kind": "SPAN_KIND_INTERNAL",
+          "attributes": {},
+          "duration_ms": 2000.530508
+        },
+        {
+          "span_id": "d7dfeca9ccfdc7bb",
+          "name": "GET /work",
+          "kind": "SPAN_KIND_SERVER",
+          "attributes": {
+            "client.address": {
+              "stringValue": "172.22.0.1"
+            },
+            "server.port": {
+              "intValue": "8080"
+            },
+            "http.request.body.size": {
+              "intValue": "0"
+            },
+            "http.response.body.size": {
+              "intValue": "0"
+            },
+            "http.response.status_code": {
+              "intValue": "200"
+            },
+            "url.scheme": {
+              "stringValue": "http"
+            },
+            "network.peer.address": {
+              "stringValue": "172.22.0.1"
+            },
+            "network.peer.port": {
+              "intValue": "60556"
+            },
+            "http.request.method": {
+              "stringValue": "GET"
+            },
+            "url.path": {
+              "stringValue": "/work"
+            },
+            "server.address": {
+              "stringValue": "obi-poc-interference"
+            },
+            "http.route": {
+              "stringValue": "/work"
+            }
+          },
+          "duration_ms": 2000.549969
+        }
+      ]
+    }
+  ],
+  "returned_exemplars": 0,
+  "truncated": false,
+  "invalid_ids": 0,
+  "trace_search_limit": 200,
+  "profile_url": "http://localhost:3103/a/grafana-pyroscope-app/explore?var-serviceName=obi-poc-interference&var-dataSource=pyroscope&var-profileMetricId=process_cpu%3Acpu%3Ananoseconds%3Acpu%3Ananoseconds&explorationType=flame-graph&from=1791234206426&to=1791234228445&showSpanHeatmap=true",
+  "causal_state": "unresolved_missing_resource_and_owner_events",
+  "note": "Exact CPU/span identity does not establish mutex ownership, waiting, or interference. Exemplars are a bounded selection."
+}

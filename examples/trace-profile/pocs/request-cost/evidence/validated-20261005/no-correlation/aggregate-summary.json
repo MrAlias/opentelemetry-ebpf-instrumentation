@@ -1,0 +1,861 @@
+{
+  "unit": "nanoseconds",
+  "total_ns": 77391749946,
+  "functions": [
+    {
+      "name": "main.exportReport",
+      "self_ns": 56608245498,
+      "cumulative_ns": 56731956834
+    },
+    {
+      "name": "main.rebuildEntry",
+      "self_ns": 13051545948,
+      "cumulative_ns": 13092783060
+    },
+    {
+      "name": "main.readEntry",
+      "self_ns": 7350515214,
+      "cumulative_ns": 7350515214
+    },
+    {
+      "name": "time.now",
+      "self_ns": 51546390,
+      "cumulative_ns": 51546390
+    },
+    {
+      "name": "_raw_spin_unlock_irqrestore",
+      "self_ns": 51546390,
+      "cumulative_ns": 51546390
+    },
+    {
+      "name": "irqentry_exit",
+      "self_ns": 30927834,
+      "cumulative_ns": 30927834
+    },
+    {
+      "name": "runtime.casgstatus",
+      "self_ns": 20618556,
+      "cumulative_ns": 30927834
+    },
+    {
+      "name": "sched_balance_update_blocked_averages",
+      "self_ns": 20618556,
+      "cumulative_ns": 20618556
+    },
+    {
+      "name": "runtime.(*itabTableType).find",
+      "self_ns": 10309278,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "internal/runtime/maps.(*Map).getWithoutKeySmallFastStr",
+      "self_ns": 10309278,
+      "cumulative_ns": 20618556
+    },
+    {
+      "name": "internal/runtime/maps.memHashAES",
+      "self_ns": 10309278,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "runtime.nanotime1",
+      "self_ns": 10309278,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "runtime.futex",
+      "self_ns": 10309278,
+      "cumulative_ns": 20618556
+    },
+    {
+      "name": "time.Now",
+      "self_ns": 10309278,
+      "cumulative_ns": 61855668
+    },
+    {
+      "name": "srso_safe_ret",
+      "self_ns": 10309278,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "x64_sys_call",
+      "self_ns": 10309278,
+      "cumulative_ns": 144329892
+    },
+    {
+      "name": "runtime.sigfwdgo",
+      "self_ns": 10309278,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "__x64_sys_tgkill",
+      "self_ns": 10309278,
+      "cumulative_ns": 72164946
+    },
+    {
+      "name": "restore_altstack",
+      "self_ns": 10309278,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "runtime.pcdatavalue2",
+      "self_ns": 10309278,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "check_heap_object",
+      "self_ns": 10309278,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "finish_task_switch.isra.0",
+      "self_ns": 10309278,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "label_compound_match.isra.0",
+      "self_ns": 10309278,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "ep_unregister_pollwait.isra.0",
+      "self_ns": 10309278,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "aggr_pre_handler",
+      "self_ns": 10309278,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "tcp_clean_rtx_queue",
+      "self_ns": 10309278,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "memset_orig",
+      "self_ns": 10309278,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "ip_finish_output2",
+      "self_ns": 10309278,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "total",
+      "self_ns": 0,
+      "cumulative_ns": 77391749946
+    },
+    {
+      "name": "runtime.goexit",
+      "self_ns": 0,
+      "cumulative_ns": 77257729332
+    },
+    {
+      "name": "runtime.mcall",
+      "self_ns": 0,
+      "cumulative_ns": 51546390
+    },
+    {
+      "name": "runtime.morestack",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "runtime.mstart",
+      "self_ns": 0,
+      "cumulative_ns": 72164946
+    },
+    {
+      "name": "net/http.(*Server).Serve.gowrap3",
+      "self_ns": 0,
+      "cumulative_ns": 77257729332
+    },
+    {
+      "name": "runtime.asyncPreempt2.func1",
+      "self_ns": 0,
+      "cumulative_ns": 30927834
+    },
+    {
+      "name": "runtime.goexit0",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "runtime.park_m",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "runtime.newstack",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "runtime.mstart0",
+      "self_ns": 0,
+      "cumulative_ns": 72164946
+    },
+    {
+      "name": "net/http.(*conn).serve",
+      "self_ns": 0,
+      "cumulative_ns": 77257729332
+    },
+    {
+      "name": "runtime.goschedImpl",
+      "self_ns": 0,
+      "cumulative_ns": 20618556
+    },
+    {
+      "name": "runtime.schedule",
+      "self_ns": 0,
+      "cumulative_ns": 41237112
+    },
+    {
+      "name": "runtime.mstart1",
+      "self_ns": 0,
+      "cumulative_ns": 72164946
+    },
+    {
+      "name": "net/http.(*Server).protocols",
+      "self_ns": 0,
+      "cumulative_ns": 20618556
+    },
+    {
+      "name": "net/http.(*conn).readRequest",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "net/http.(*response).finishRequest",
+      "self_ns": 0,
+      "cumulative_ns": 30927834
+    },
+    {
+      "name": "net/http.serverHandler.ServeHTTP",
+      "self_ns": 0,
+      "cumulative_ns": 77175255108
+    },
+    {
+      "name": "runtime.deferreturn",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "runtime.typeAssert",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "runtime.findRunnable",
+      "self_ns": 0,
+      "cumulative_ns": 30927834
+    },
+    {
+      "name": "asm_exc_int3",
+      "self_ns": 0,
+      "cumulative_ns": 20618556
+    },
+    {
+      "name": "runtime.sysmon",
+      "self_ns": 0,
+      "cumulative_ns": 72164946
+    },
+    {
+      "name": "runtime.mapaccess2_faststr",
+      "self_ns": 0,
+      "cumulative_ns": 20618556
+    },
+    {
+      "name": "net/textproto.readMIMEHeader",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "bufio.(*Writer).Flush",
+      "self_ns": 0,
+      "cumulative_ns": 30927834
+    },
+    {
+      "name": "net/http.(*ServeMux).ServeHTTP",
+      "self_ns": 0,
+      "cumulative_ns": 77175255108
+    },
+    {
+      "name": "net/http.(*conn).serve.func1",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "runtime.execute",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "runtime.stopm",
+      "self_ns": 0,
+      "cumulative_ns": 20618556
+    },
+    {
+      "name": "exc_int3",
+      "self_ns": 0,
+      "cumulative_ns": 20618556
+    },
+    {
+      "name": "runtime.retake",
+      "self_ns": 0,
+      "cumulative_ns": 72164946
+    },
+    {
+      "name": "net/http.checkConnErrorWriter.Write",
+      "self_ns": 0,
+      "cumulative_ns": 30927834
+    },
+    {
+      "name": "net/http.HandlerFunc.ServeHTTP",
+      "self_ns": 0,
+      "cumulative_ns": 77175255108
+    },
+    {
+      "name": "net/http.(*conn).close",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "runtime.(*timers).check",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "runtime.notesleep",
+      "self_ns": 0,
+      "cumulative_ns": 20618556
+    },
+    {
+      "name": "exit_to_user_mode_loop",
+      "self_ns": 0,
+      "cumulative_ns": 20618556
+    },
+    {
+      "name": "runtime.preemptone",
+      "self_ns": 0,
+      "cumulative_ns": 72164946
+    },
+    {
+      "name": "net.(*conn).Write",
+      "self_ns": 0,
+      "cumulative_ns": 30927834
+    },
+    {
+      "name": "main.main.func1",
+      "self_ns": 0,
+      "cumulative_ns": 20443298274
+    },
+    {
+      "name": "main.main.func2",
+      "self_ns": 0,
+      "cumulative_ns": 56731956834
+    },
+    {
+      "name": "net.(*conn).Close",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "runtime.futexsleep",
+      "self_ns": 0,
+      "cumulative_ns": 20618556
+    },
+    {
+      "name": "uprobe_notify_resume",
+      "self_ns": 0,
+      "cumulative_ns": 20618556
+    },
+    {
+      "name": "runtime.signalM",
+      "self_ns": 0,
+      "cumulative_ns": 72164946
+    },
+    {
+      "name": "net.(*netFD).Write",
+      "self_ns": 0,
+      "cumulative_ns": 30927834
+    },
+    {
+      "name": "net.(*netFD).Close",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "handle_swbp",
+      "self_ns": 0,
+      "cumulative_ns": 20618556
+    },
+    {
+      "name": "runtime.tgkill",
+      "self_ns": 0,
+      "cumulative_ns": 72164946
+    },
+    {
+      "name": "internal/poll.(*FD).Write",
+      "self_ns": 0,
+      "cumulative_ns": 30927834
+    },
+    {
+      "name": "asm_common_interrupt",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "asm_sysvec_reschedule_ipi",
+      "self_ns": 0,
+      "cumulative_ns": 30927834
+    },
+    {
+      "name": "asm_sysvec_apic_timer_interrupt",
+      "self_ns": 0,
+      "cumulative_ns": 20618556
+    },
+    {
+      "name": "runtime.asyncPreempt",
+      "self_ns": 0,
+      "cumulative_ns": 20618556
+    },
+    {
+      "name": "runtime.sigreturn__sigaction",
+      "self_ns": 0,
+      "cumulative_ns": 41237112
+    },
+    {
+      "name": "internal/poll.(*FD).Close",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "entry_SYSCALL_64_after_hwframe",
+      "self_ns": 0,
+      "cumulative_ns": 144329892
+    },
+    {
+      "name": "syscall.write",
+      "self_ns": 0,
+      "cumulative_ns": 30927834
+    },
+    {
+      "name": "common_interrupt",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "sysvec_reschedule_ipi",
+      "self_ns": 0,
+      "cumulative_ns": 30927834
+    },
+    {
+      "name": "time.runtimeNow",
+      "self_ns": 0,
+      "cumulative_ns": 51546390
+    },
+    {
+      "name": "sysvec_apic_timer_interrupt",
+      "self_ns": 0,
+      "cumulative_ns": 20618556
+    },
+    {
+      "name": "runtime.sigtramp",
+      "self_ns": 0,
+      "cumulative_ns": 20618556
+    },
+    {
+      "name": "internal/poll.(*FD).decref",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "do_syscall_64",
+      "self_ns": 0,
+      "cumulative_ns": 144329892
+    },
+    {
+      "name": "handler_chain",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "syscall.Syscall",
+      "self_ns": 0,
+      "cumulative_ns": 30927834
+    },
+    {
+      "name": "irq_exit_rcu",
+      "self_ns": 0,
+      "cumulative_ns": 30927834
+    },
+    {
+      "name": "runtime.sigtrampgo",
+      "self_ns": 0,
+      "cumulative_ns": 20618556
+    },
+    {
+      "name": "internal/poll.(*FD).destroy",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "uprobe_multi_link_handler",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "syscall.RawSyscall6",
+      "self_ns": 0,
+      "cumulative_ns": 30927834
+    },
+    {
+      "name": "__irq_exit_rcu",
+      "self_ns": 0,
+      "cumulative_ns": 30927834
+    },
+    {
+      "name": "runtime.sighandler",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "internal/poll.runtime_pollClose",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "__x64_sys_futex",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "uprobe_prog_run",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "internal/runtime/syscall/linux.Syscall6",
+      "self_ns": 0,
+      "cumulative_ns": 41237112
+    },
+    {
+      "name": "handle_softirqs",
+      "self_ns": 0,
+      "cumulative_ns": 30927834
+    },
+    {
+      "name": "runtime.doSigPreempt",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "runtime.netpollclose",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "do_futex",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "do_send_specific",
+      "self_ns": 0,
+      "cumulative_ns": 61855668
+    },
+    {
+      "name": "bpf_prog_d49d23c50902edc4_obi_uprobe_readMimeHeader",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "net_rx_action",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "sched_balance_softirq",
+      "self_ns": 0,
+      "cumulative_ns": 20618556
+    },
+    {
+      "name": "runtime.isAsyncSafePoint",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "futex_wait",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "check_kill_permission",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "bpf_probe_read_user",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "__napi_poll",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "__futex_wait",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "security_task_kill",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "copy_from_user_nofault",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "process_backlog",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "futex_do_wait",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "apparmor_task_kill",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "__check_object_size",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "__x64_sys_write",
+      "self_ns": 0,
+      "cumulative_ns": 30927834
+    },
+    {
+      "name": "__netif_receive_skb",
+      "self_ns": 0,
+      "cumulative_ns": 20618556
+    },
+    {
+      "name": "schedule",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "aa_may_signal",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "ksys_write",
+      "self_ns": 0,
+      "cumulative_ns": 30927834
+    },
+    {
+      "name": "__netif_receive_skb_one_core",
+      "self_ns": 0,
+      "cumulative_ns": 20618556
+    },
+    {
+      "name": "__x64_sys_epoll_ctl",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "__schedule",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "profile_signal_perm",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "vfs_write",
+      "self_ns": 0,
+      "cumulative_ns": 30927834
+    },
+    {
+      "name": "__netif_receive_skb_core.constprop.0",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "do_epoll_ctl",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "aa_label_match",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "sock_write_iter",
+      "self_ns": 0,
+      "cumulative_ns": 30927834
+    },
+    {
+      "name": "br_handle_frame",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "ep_remove_safe",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "inet6_sendmsg",
+      "self_ns": 0,
+      "cumulative_ns": 20618556
+    },
+    {
+      "name": "tcp_sendmsg",
+      "self_ns": 0,
+      "cumulative_ns": 30927834
+    },
+    {
+      "name": "br_handle_frame_finish",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "cleanup_module",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "br_pass_frame_up",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "release_sock",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "tcp_sendmsg_locked",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "kprobe_ftrace_handler",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "netif_receive_skb",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "__release_sock",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "tcp_push",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "tcp_v4_do_rcv",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "__tcp_push_pending_frames",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "tcp_rcv_established",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "tcp_write_xmit",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "ip_rcv",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "tcp_ack",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "__tcp_transmit_skb",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "ip_forward",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "ip_queue_xmit",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "pskb_expand_head",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "__ip_queue_xmit",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "kmalloc_reserve",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "ip_local_out",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "ip_output",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "ip_finish_output",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    },
+    {
+      "name": "__ip_finish_output",
+      "self_ns": 0,
+      "cumulative_ns": 10309278
+    }
+  ]
+}

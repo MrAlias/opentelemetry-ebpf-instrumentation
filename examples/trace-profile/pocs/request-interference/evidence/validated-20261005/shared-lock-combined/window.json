@@ -1,0 +1,10 @@
+{
+  "start_ms": 1791234152688,
+  "end_ms": 1791234174708,
+  "mode": "combined",
+  "started_services": [
+    "obi",
+    "profiler"
+  ],
+  "obi_process_ctx": true
+}

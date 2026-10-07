@@ -1,0 +1,9 @@
+{
+  "path": "/api/datasources/proxy/uid/pyroscope/querier.v1.QuerierService/SelectMergeStacktraces",
+  "body": {
+    "profileTypeID": "process_cpu:cpu:nanoseconds:cpu:nanoseconds",
+    "labelSelector": "{service_name=\"obi-poc-interference\"}",
+    "start": 1791234152688,
+    "end": 1791234174708
+  }
+}

@@ -1,0 +1,378 @@
+{
+  "series": [
+    {
+      "slots": [
+        {
+          "timestamp": "1791234332499",
+          "yMin": [
+            51546390,
+            148453603,
+            245360816,
+            342268029,
+            439175242,
+            536082456,
+            632989669,
+            729896882,
+            826804095,
+            923711308,
+            1020618522,
+            1117525735,
+            1214432948,
+            1311340161,
+            1408247374,
+            1505154588,
+            1602061801,
+            1698969014,
+            1795876227,
+            1892783440
+          ],
+          "counts": [
+            2,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            1
+          ],
+          "exemplars": [
+            {
+              "timestamp": "1791234328425",
+              "spanId": "94899e6d55fe6c69",
+              "value": "92783502",
+              "labels": [
+                {
+                  "name": "__profile_type__",
+                  "value": "process_cpu:cpu:nanoseconds:cpu:nanoseconds"
+                },
+                {
+                  "name": "__service_name__",
+                  "value": "obi-poc-interference"
+                },
+                {
+                  "name": "__name__",
+                  "value": "process_cpu"
+                },
+                {
+                  "name": "__otel__",
+                  "value": "true"
+                },
+                {
+                  "name": "__period_type__",
+                  "value": "cpu"
+                },
+                {
+                  "name": "__period_unit__",
+                  "value": "nanoseconds"
+                },
+                {
+                  "name": "__type__",
+                  "value": "cpu"
+                },
+                {
+                  "name": "__unit__",
+                  "value": "nanoseconds"
+                },
+                {
+                  "name": "container.id",
+                  "value": "a22e17c26db14a65aa764f9a3a9acad2a5bea359d7f3b0a76ac620f5cc66a85b"
+                },
+                {
+                  "name": "process.executable.name",
+                  "value": "obi-poc-interference"
+                },
+                {
+                  "name": "process.executable.path",
+                  "value": "/obi-poc-interference"
+                },
+                {
+                  "name": "process.pid",
+                  "value": "3994306"
+                },
+                {
+                  "name": "service_name",
+                  "value": "obi-poc-interference"
+                },
+                {
+                  "name": "thread.name",
+                  "value": "obi-poc-interfe"
+                }
+              ],
+              "traceId": "510468cf6ae26caff0557612ea3a2eaf"
+            },
+            {
+              "timestamp": "1791234328425",
+              "spanId": "c99b31c2771c4f6d",
+              "value": "1422680364",
+              "labels": [
+                {
+                  "name": "__profile_type__",
+                  "value": "process_cpu:cpu:nanoseconds:cpu:nanoseconds"
+                },
+                {
+                  "name": "__service_name__",
+                  "value": "obi-poc-interference"
+                },
+                {
+                  "name": "__name__",
+                  "value": "process_cpu"
+                },
+                {
+                  "name": "__otel__",
+                  "value": "true"
+                },
+                {
+                  "name": "__period_type__",
+                  "value": "cpu"
+                },
+                {
+                  "name": "__period_unit__",
+                  "value": "nanoseconds"
+                },
+                {
+                  "name": "__type__",
+                  "value": "cpu"
+                },
+                {
+                  "name": "__unit__",
+                  "value": "nanoseconds"
+                },
+                {
+                  "name": "container.id",
+                  "value": "a22e17c26db14a65aa764f9a3a9acad2a5bea359d7f3b0a76ac620f5cc66a85b"
+                },
+                {
+                  "name": "cpu.logical_number",
+                  "value": "2"
+                },
+                {
+                  "name": "process.executable.name",
+                  "value": "obi-poc-interference"
+                },
+                {
+                  "name": "process.executable.path",
+                  "value": "/obi-poc-interference"
+                },
+                {
+                  "name": "process.pid",
+                  "value": "3994306"
+                },
+                {
+                  "name": "service_name",
+                  "value": "obi-poc-interference"
+                },
+                {
+                  "name": "thread.id",
+                  "value": "3994385"
+                },
+                {
+                  "name": "thread.name",
+                  "value": "obi-poc-interfe"
+                }
+              ],
+              "traceId": "99ae9b537aa3562a57d2a61f30b38479"
+            },
+            {
+              "timestamp": "1791234328425",
+              "spanId": "814221cf79436c71",
+              "value": "1989690654",
+              "labels": [
+                {
+                  "name": "__profile_type__",
+                  "value": "process_cpu:cpu:nanoseconds:cpu:nanoseconds"
+                },
+                {
+                  "name": "__service_name__",
+                  "value": "obi-poc-interference"
+                },
+                {
+                  "name": "__name__",
+                  "value": "process_cpu"
+                },
+                {
+                  "name": "__otel__",
+                  "value": "true"
+                },
+                {
+                  "name": "__period_type__",
+                  "value": "cpu"
+                },
+                {
+                  "name": "__period_unit__",
+                  "value": "nanoseconds"
+                },
+                {
+                  "name": "__type__",
+                  "value": "cpu"
+                },
+                {
+                  "name": "__unit__",
+                  "value": "nanoseconds"
+                },
+                {
+                  "name": "container.id",
+                  "value": "a22e17c26db14a65aa764f9a3a9acad2a5bea359d7f3b0a76ac620f5cc66a85b"
+                },
+                {
+                  "name": "process.executable.name",
+                  "value": "obi-poc-interference"
+                },
+                {
+                  "name": "process.executable.path",
+                  "value": "/obi-poc-interference"
+                },
+                {
+                  "name": "process.pid",
+                  "value": "3994306"
+                },
+                {
+                  "name": "service_name",
+                  "value": "obi-poc-interference"
+                },
+                {
+                  "name": "thread.name",
+                  "value": "obi-poc-interfe"
+                }
+              ],
+              "traceId": "0fc4c8ed2c72cbd645a8e52b6f607451"
+            }
+          ]
+        },
+        {
+          "timestamp": "1791234337499",
+          "yMin": [
+            51546390,
+            148453603,
+            245360816,
+            342268029,
+            439175242,
+            536082456,
+            632989669,
+            729896882,
+            826804095,
+            923711308,
+            1020618522,
+            1117525735,
+            1214432948,
+            1311340161,
+            1408247374,
+            1505154588,
+            1602061801,
+            1698969014,
+            1795876227,
+            1892783440
+          ],
+          "counts": [
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "exemplars": [
+            {
+              "timestamp": "1791234334373",
+              "spanId": "923f015b7e051005",
+              "value": "51546390",
+              "labels": [
+                {
+                  "name": "__profile_type__",
+                  "value": "process_cpu:cpu:nanoseconds:cpu:nanoseconds"
+                },
+                {
+                  "name": "__service_name__",
+                  "value": "obi-poc-interference"
+                },
+                {
+                  "name": "__name__",
+                  "value": "process_cpu"
+                },
+                {
+                  "name": "__otel__",
+                  "value": "true"
+                },
+                {
+                  "name": "__period_type__",
+                  "value": "cpu"
+                },
+                {
+                  "name": "__period_unit__",
+                  "value": "nanoseconds"
+                },
+                {
+                  "name": "__type__",
+                  "value": "cpu"
+                },
+                {
+                  "name": "__unit__",
+                  "value": "nanoseconds"
+                },
+                {
+                  "name": "container.id",
+                  "value": "a22e17c26db14a65aa764f9a3a9acad2a5bea359d7f3b0a76ac620f5cc66a85b"
+                },
+                {
+                  "name": "cpu.logical_number",
+                  "value": "11"
+                },
+                {
+                  "name": "process.executable.name",
+                  "value": "obi-poc-interference"
+                },
+                {
+                  "name": "process.executable.path",
+                  "value": "/obi-poc-interference"
+                },
+                {
+                  "name": "process.pid",
+                  "value": "3994306"
+                },
+                {
+                  "name": "service_name",
+                  "value": "obi-poc-interference"
+                },
+                {
+                  "name": "thread.id",
+                  "value": "3994306"
+                },
+                {
+                  "name": "thread.name",
+                  "value": "obi-poc-interfe"
+                }
+              ],
+              "traceId": "b4aaa293c768cb81f21a6e6df9362387"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

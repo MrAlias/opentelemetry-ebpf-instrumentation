@@ -1,0 +1,260 @@
+{
+  "before_attachment": [
+    {
+      "path": "/report",
+      "start_ms": 1791234134422,
+      "status": 200,
+      "end_ms": 1791234136423,
+      "duration_ms": 2001.3543129898608
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234134522,
+      "status": 200,
+      "end_ms": 1791234136523,
+      "duration_ms": 2001.1848490685225
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791234136624,
+      "status": 200,
+      "end_ms": 1791234138625,
+      "duration_ms": 2001.377903856337
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234136724,
+      "status": 200,
+      "end_ms": 1791234138725,
+      "duration_ms": 2001.2877320405096
+    }
+  ],
+  "during_attachment": [
+    {
+      "path": "/report",
+      "start_ms": 1791234139478,
+      "status": 200,
+      "end_ms": 1791234141479,
+      "duration_ms": 2001.3297230470926
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234139578,
+      "status": 200,
+      "end_ms": 1791234141579,
+      "duration_ms": 2000.8938030805439
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791234141679,
+      "status": 200,
+      "end_ms": 1791234143681,
+      "duration_ms": 2001.5291469171643
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234141780,
+      "status": 200,
+      "end_ms": 1791234143781,
+      "duration_ms": 2001.5500728040934
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791234143881,
+      "status": 200,
+      "end_ms": 1791234145883,
+      "duration_ms": 2001.3662949204445
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234143981,
+      "status": 200,
+      "end_ms": 1791234145983,
+      "duration_ms": 2001.3355039991438
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791234146083,
+      "status": 200,
+      "end_ms": 1791234148084,
+      "duration_ms": 2001.449987059459
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234146183,
+      "status": 200,
+      "end_ms": 1791234148184,
+      "duration_ms": 2001.4903480187058
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791234148285,
+      "status": 200,
+      "end_ms": 1791234150286,
+      "duration_ms": 2001.4477570075542
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234148385,
+      "status": 200,
+      "end_ms": 1791234150386,
+      "duration_ms": 2001.376885920763
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791234150486,
+      "status": 200,
+      "end_ms": 1791234152488,
+      "duration_ms": 2001.4720568433404
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234150586,
+      "status": 200,
+      "end_ms": 1791234152588,
+      "duration_ms": 2001.5311990864575
+    }
+  ],
+  "after_attachment": [
+    {
+      "path": "/report",
+      "start_ms": 1791234152689,
+      "status": 200,
+      "end_ms": 1791234154690,
+      "duration_ms": 2001.4445970300585
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234152789,
+      "status": 200,
+      "end_ms": 1791234154790,
+      "duration_ms": 2001.0967999696732
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791234154890,
+      "status": 200,
+      "end_ms": 1791234156892,
+      "duration_ms": 2001.5885499306023
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234154990,
+      "status": 200,
+      "end_ms": 1791234156992,
+      "duration_ms": 2001.6453210264444
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791234157092,
+      "status": 200,
+      "end_ms": 1791234159094,
+      "duration_ms": 2001.6251110937446
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234157193,
+      "status": 200,
+      "end_ms": 1791234159194,
+      "duration_ms": 2001.6787119675428
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791234159294,
+      "status": 200,
+      "end_ms": 1791234161296,
+      "duration_ms": 2001.3148679863662
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234159395,
+      "status": 200,
+      "end_ms": 1791234161396,
+      "duration_ms": 2001.4518601819873
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791234161496,
+      "status": 200,
+      "end_ms": 1791234163498,
+      "duration_ms": 2001.5652778092772
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234161596,
+      "status": 200,
+      "end_ms": 1791234163598,
+      "duration_ms": 2001.5536868013442
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791234163698,
+      "status": 200,
+      "end_ms": 1791234165699,
+      "duration_ms": 2001.412264071405
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234163798,
+      "status": 200,
+      "end_ms": 1791234165800,
+      "duration_ms": 2001.5670869033784
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791234165900,
+      "status": 200,
+      "end_ms": 1791234167901,
+      "duration_ms": 2001.4546851161867
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234166000,
+      "status": 200,
+      "end_ms": 1791234168002,
+      "duration_ms": 2001.6402988694608
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791234168102,
+      "status": 200,
+      "end_ms": 1791234170103,
+      "duration_ms": 2001.4640761073679
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234168202,
+      "status": 200,
+      "end_ms": 1791234170204,
+      "duration_ms": 2001.5263361856341
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791234170304,
+      "status": 200,
+      "end_ms": 1791234172305,
+      "duration_ms": 2001.3758440036327
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234170404,
+      "status": 200,
+      "end_ms": 1791234172405,
+      "duration_ms": 2001.4831859152764
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791234172506,
+      "status": 200,
+      "end_ms": 1791234174507,
+      "duration_ms": 2001.6455890145153
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791234172606,
+      "status": 200,
+      "end_ms": 1791234174607,
+      "duration_ms": 2001.6663291025907
+    }
+  ]
+}

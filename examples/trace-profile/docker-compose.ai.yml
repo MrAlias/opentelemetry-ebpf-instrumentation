@@ -1,0 +1,30 @@
+services:
+  app:
+    build:
+      context: ./app
+      dockerfile: Dockerfile.ai
+    pid: !reset null
+    ports: !override
+      - "127.0.0.1:8081:8080"
+    environment:
+      DEMO_SCENARIO: ${DEMO_SCENARIO:-cpu}
+
+  obi:
+    image: ${AI_OBI_IMAGE:-obi-ai-investigation:local}
+    pull_policy: never
+    profiles: [diagnostics]
+    environment:
+      OTEL_EBPF_BPF_FS_PATH: /sys/fs/bpf/obi-ai-investigation
+      OTEL_SERVICE_NAME: obi-ai-demo
+      OTEL_EBPF_EXECUTABLE_PATH: obi-ai-demo
+
+  profiler:
+    profiles: [diagnostics]
+    volumes:
+      - ./profiler.ai.yaml:/etc/profiler.yaml:ro
+
+  lgtm:
+    environment:
+      GF_SERVER_ROOT_URL: http://localhost:3001/
+    ports: !override
+      - "127.0.0.1:3001:3000"

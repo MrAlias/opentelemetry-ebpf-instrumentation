@@ -1,0 +1,260 @@
+{
+  "before_attachment": [
+    {
+      "path": "/report",
+      "start_ms": 1791233931206,
+      "status": 200,
+      "end_ms": 1791233933207,
+      "duration_ms": 2001.4466408174485
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791233931307,
+      "status": 200,
+      "end_ms": 1791233933308,
+      "duration_ms": 2001.0588730219752
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791233933408,
+      "status": 200,
+      "end_ms": 1791233935409,
+      "duration_ms": 2001.3722421135753
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791233933508,
+      "status": 200,
+      "end_ms": 1791233935509,
+      "duration_ms": 2001.358255976811
+    }
+  ],
+  "during_attachment": [
+    {
+      "path": "/report",
+      "start_ms": 1791233936125,
+      "status": 200,
+      "end_ms": 1791233938126,
+      "duration_ms": 2001.4441958628595
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791233936225,
+      "status": 200,
+      "end_ms": 1791233938227,
+      "duration_ms": 2001.1769710108638
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791233938327,
+      "status": 200,
+      "end_ms": 1791233940328,
+      "duration_ms": 2001.2313218321651
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791233938427,
+      "status": 200,
+      "end_ms": 1791233940428,
+      "duration_ms": 2001.312683802098
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791233940528,
+      "status": 200,
+      "end_ms": 1791233942530,
+      "duration_ms": 2001.3927859254181
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791233940629,
+      "status": 200,
+      "end_ms": 1791233942630,
+      "duration_ms": 2001.3418141752481
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791233942730,
+      "status": 200,
+      "end_ms": 1791233944731,
+      "duration_ms": 2001.260643126443
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791233942830,
+      "status": 200,
+      "end_ms": 1791233944831,
+      "duration_ms": 2001.2631530407816
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791233944932,
+      "status": 200,
+      "end_ms": 1791233946933,
+      "duration_ms": 2001.295493915677
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791233945032,
+      "status": 200,
+      "end_ms": 1791233947033,
+      "duration_ms": 2001.2557220179588
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791233947133,
+      "status": 200,
+      "end_ms": 1791233949135,
+      "duration_ms": 2001.24408188276
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791233947234,
+      "status": 200,
+      "end_ms": 1791233949235,
+      "duration_ms": 2001.1825209949166
+    }
+  ],
+  "after_attachment": [
+    {
+      "path": "/report",
+      "start_ms": 1791233949335,
+      "status": 200,
+      "end_ms": 1791233951337,
+      "duration_ms": 2001.3285020831972
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791233949436,
+      "status": 200,
+      "end_ms": 1791233951437,
+      "duration_ms": 2001.054901862517
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791233951537,
+      "status": 200,
+      "end_ms": 1791233953538,
+      "duration_ms": 2001.3905260711908
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791233951637,
+      "status": 200,
+      "end_ms": 1791233953638,
+      "duration_ms": 2001.4602080918849
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791233953739,
+      "status": 200,
+      "end_ms": 1791233955740,
+      "duration_ms": 2001.3288951013237
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791233953839,
+      "status": 200,
+      "end_ms": 1791233955840,
+      "duration_ms": 2001.3606459833682
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791233955940,
+      "status": 200,
+      "end_ms": 1791233957942,
+      "duration_ms": 2001.4491081237793
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791233956040,
+      "status": 200,
+      "end_ms": 1791233958042,
+      "duration_ms": 2001.4950090553612
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791233958142,
+      "status": 200,
+      "end_ms": 1791233960144,
+      "duration_ms": 2001.316815149039
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791233958242,
+      "status": 200,
+      "end_ms": 1791233960244,
+      "duration_ms": 2001.271874178201
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791233960344,
+      "status": 200,
+      "end_ms": 1791233962345,
+      "duration_ms": 2001.386416144669
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791233960444,
+      "status": 200,
+      "end_ms": 1791233962445,
+      "duration_ms": 2001.403396949172
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791233962545,
+      "status": 200,
+      "end_ms": 1791233964547,
+      "duration_ms": 2001.1812921147794
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791233962646,
+      "status": 200,
+      "end_ms": 1791233964647,
+      "duration_ms": 2001.299215015024
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791233964747,
+      "status": 200,
+      "end_ms": 1791233966749,
+      "duration_ms": 2001.4695059508085
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791233964847,
+      "status": 200,
+      "end_ms": 1791233966849,
+      "duration_ms": 2001.5725190751255
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791233966949,
+      "status": 200,
+      "end_ms": 1791233968950,
+      "duration_ms": 2001.271024113521
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791233967049,
+      "status": 200,
+      "end_ms": 1791233969050,
+      "duration_ms": 2001.1899520177394
+    },
+    {
+      "path": "/report",
+      "start_ms": 1791233969150,
+      "status": 200,
+      "end_ms": 1791233971152,
+      "duration_ms": 2001.3193348422647
+    },
+    {
+      "path": "/work",
+      "start_ms": 1791233969251,
+      "status": 200,
+      "end_ms": 1791233971252,
+      "duration_ms": 2001.282474026084
+    }
+  ]
+}

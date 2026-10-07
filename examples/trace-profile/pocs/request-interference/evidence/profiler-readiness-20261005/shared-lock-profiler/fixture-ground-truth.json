@@ -1,0 +1,285 @@
+{
+  "excluded_from_diagnostic_evidence": true,
+  "events": [
+    {
+      "event": "acquired",
+      "path": "/report",
+      "request": 17,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:09.336439433Z"
+    },
+    {
+      "event": "waiting",
+      "path": "/work",
+      "request": 18,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:09.436801831Z"
+    },
+    {
+      "event": "releasing",
+      "path": "/report",
+      "request": 17,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:11.336519059Z"
+    },
+    {
+      "event": "acquired",
+      "path": "/work",
+      "request": 18,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:11.336672732Z"
+    },
+    {
+      "event": "acquired",
+      "path": "/report",
+      "request": 19,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:11.538069073Z"
+    },
+    {
+      "event": "waiting",
+      "path": "/work",
+      "request": 20,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:11.638131299Z"
+    },
+    {
+      "event": "releasing",
+      "path": "/report",
+      "request": 19,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:13.538246093Z"
+    },
+    {
+      "event": "acquired",
+      "path": "/work",
+      "request": 20,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:13.538440587Z"
+    },
+    {
+      "event": "acquired",
+      "path": "/report",
+      "request": 21,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:13.73991661Z"
+    },
+    {
+      "event": "waiting",
+      "path": "/work",
+      "request": 22,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:13.839956376Z"
+    },
+    {
+      "event": "releasing",
+      "path": "/report",
+      "request": 21,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:15.740025919Z"
+    },
+    {
+      "event": "acquired",
+      "path": "/work",
+      "request": 22,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:15.740154482Z"
+    },
+    {
+      "event": "acquired",
+      "path": "/report",
+      "request": 23,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:15.941595933Z"
+    },
+    {
+      "event": "waiting",
+      "path": "/work",
+      "request": 24,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:16.041695761Z"
+    },
+    {
+      "event": "releasing",
+      "path": "/report",
+      "request": 23,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:17.941723543Z"
+    },
+    {
+      "event": "acquired",
+      "path": "/work",
+      "request": 24,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:17.941876036Z"
+    },
+    {
+      "event": "acquired",
+      "path": "/report",
+      "request": 25,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:18.14343006Z"
+    },
+    {
+      "event": "waiting",
+      "path": "/work",
+      "request": 26,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:18.243350094Z"
+    },
+    {
+      "event": "releasing",
+      "path": "/report",
+      "request": 25,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:20.143508589Z"
+    },
+    {
+      "event": "acquired",
+      "path": "/work",
+      "request": 26,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:20.143666162Z"
+    },
+    {
+      "event": "acquired",
+      "path": "/report",
+      "request": 27,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:20.344974651Z"
+    },
+    {
+      "event": "waiting",
+      "path": "/work",
+      "request": 28,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:20.444834933Z"
+    },
+    {
+      "event": "releasing",
+      "path": "/report",
+      "request": 27,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:22.345135221Z"
+    },
+    {
+      "event": "acquired",
+      "path": "/work",
+      "request": 28,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:22.345292074Z"
+    },
+    {
+      "event": "acquired",
+      "path": "/report",
+      "request": 29,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:22.546552062Z"
+    },
+    {
+      "event": "waiting",
+      "path": "/work",
+      "request": 30,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:22.646744611Z"
+    },
+    {
+      "event": "releasing",
+      "path": "/report",
+      "request": 29,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:24.54661734Z"
+    },
+    {
+      "event": "acquired",
+      "path": "/work",
+      "request": 30,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:24.546760923Z"
+    },
+    {
+      "event": "acquired",
+      "path": "/report",
+      "request": 31,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:24.748317127Z"
+    },
+    {
+      "event": "waiting",
+      "path": "/work",
+      "request": 32,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:24.848479706Z"
+    },
+    {
+      "event": "releasing",
+      "path": "/report",
+      "request": 31,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:26.748538886Z"
+    },
+    {
+      "event": "acquired",
+      "path": "/work",
+      "request": 32,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:26.748664778Z"
+    },
+    {
+      "event": "acquired",
+      "path": "/report",
+      "request": 33,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:26.950131714Z"
+    },
+    {
+      "event": "waiting",
+      "path": "/work",
+      "request": 34,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:27.050064919Z"
+    },
+    {
+      "event": "releasing",
+      "path": "/report",
+      "request": 33,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:28.950207932Z"
+    },
+    {
+      "event": "acquired",
+      "path": "/work",
+      "request": 34,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:28.950338715Z"
+    },
+    {
+      "event": "acquired",
+      "path": "/report",
+      "request": 35,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:29.151602046Z"
+    },
+    {
+      "event": "waiting",
+      "path": "/work",
+      "request": 36,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:29.251691715Z"
+    },
+    {
+      "event": "releasing",
+      "path": "/report",
+      "request": 35,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:31.151751266Z"
+    },
+    {
+      "event": "acquired",
+      "path": "/work",
+      "request": 36,
+      "resource": "0x19664eea2024",
+      "time": "2026-10-05T20:59:31.151879939Z"
+    }
+  ]
+}

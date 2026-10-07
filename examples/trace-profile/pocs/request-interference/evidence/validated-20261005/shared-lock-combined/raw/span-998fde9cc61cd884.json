@@ -1,0 +1,100 @@
+{
+  "flamegraph": {
+    "names": [
+      "total",
+      "runtime.goexit",
+      "net/http.(*Server).Serve.gowrap3",
+      "net/http.(*conn).serve",
+      "net/http.serverHandler.ServeHTTP",
+      "net/http.(*ServeMux).ServeHTTP",
+      "net/http.HandlerFunc.ServeHTTP",
+      "main.(*application).work-fm",
+      "main.(*application).work",
+      "main.finishWork"
+    ],
+    "levels": [
+      {
+        "values": [
+          "0",
+          "103092780",
+          "0",
+          "0"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "103092780",
+          "0",
+          "1"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "103092780",
+          "0",
+          "2"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "103092780",
+          "0",
+          "3"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "103092780",
+          "0",
+          "4"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "103092780",
+          "0",
+          "5"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "103092780",
+          "0",
+          "6"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "103092780",
+          "0",
+          "7"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "103092780",
+          "0",
+          "8"
+        ]
+      },
+      {
+        "values": [
+          "0",
+          "103092780",
+          "103092780",
+          "9"
+        ]
+      }
+    ],
+    "total": "103092780",
+    "maxSelf": "103092780"
+  }
+}

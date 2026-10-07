@@ -1,0 +1,67 @@
+{
+  "started_ms": 1791234027569,
+  "reference_obi_revision": "6d873d705d77e9764adab67502d65695df986e93",
+  "checkout_revision": "6d873d705d77e9764adab67502d65695df986e93",
+  "operator_declared_obi_build_revision": null,
+  "obi_revision_note": "Reference revision describes the default previously validated image. Image ID/tag does not prove a build revision; a custom image's build revision is unknown unless independently recorded by its operator.",
+  "images": {
+    "app": {
+      "image_id": "sha256:cc60a628f4fb2195359c2916db55cb7d905525f2731a79657d78e44452661618",
+      "repo_digests": [
+        "obi-poc-interference-app@sha256:cc60a628f4fb2195359c2916db55cb7d905525f2731a79657d78e44452661618"
+      ]
+    },
+    "obi": {
+      "image_id": "sha256:dc7edc1d3c3dd0d71983b0091af830baab2635b9e48a3341b04cd6c550996b72",
+      "repo_digests": [
+        "obi-ai-investigation@sha256:dc7edc1d3c3dd0d71983b0091af830baab2635b9e48a3341b04cd6c550996b72"
+      ]
+    },
+    "profiler": {
+      "image_id": "sha256:40bc11043fdef9f7744631d6ca60d44e63b4c2a356ec0a21a02a4a5f28ebff70",
+      "repo_digests": [
+        "otel/opentelemetry-collector-ebpf-profiler@sha256:40bc11043fdef9f7744631d6ca60d44e63b4c2a356ec0a21a02a4a5f28ebff70"
+      ]
+    },
+    "lgtm": {
+      "image_id": "sha256:d6c52678ab5b7144f27ae569fd778608121c0f4a10eb411983750a0d67c1fbe3",
+      "repo_digests": [
+        "grafana/otel-lgtm@sha256:d6c52678ab5b7144f27ae569fd778608121c0f4a10eb411983750a0d67c1fbe3"
+      ]
+    }
+  },
+  "configured_images": {
+    "app": "obi-poc-interference-app:local",
+    "obi": "obi-ai-investigation:6d873d7",
+    "profiler": "otel/opentelemetry-collector-ebpf-profiler:0.160.0@sha256:40bc11043fdef9f7744631d6ca60d44e63b4c2a356ec0a21a02a4a5f28ebff70",
+    "lgtm": "grafana/otel-lgtm:0.33.1@sha256:d6c52678ab5b7144f27ae569fd778608121c0f4a10eb411983750a0d67c1fbe3"
+  },
+  "kernel": "7.0.0-1012-aws",
+  "compose": "5.5.1",
+  "docker": "29.8.0 / 29.8.0",
+  "python": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+  "fixture_sha256": "4cfd5d65d46dce7213c64bf6d064877109283db976870b147dc8ca6144fbc462",
+  "background_containers": [
+    "obi-poc-interference-app-1",
+    "obi-poc-interference-lgtm-1",
+    "obi-ai-investigation-profiler-1",
+    "obi-ai-investigation-app-1",
+    "obi-ai-investigation-obi-1",
+    "obi-ai-investigation-lgtm-1",
+    "trace-profile-profiler-1",
+    "trace-profile-lgtm-1",
+    "trace-profile-obi-1",
+    "trace-profile-app-1",
+    "obi-dynamic-instrumentation-demo-inventory-java-1",
+    "obi-dynamic-instrumentation-demo-inventory-node-1",
+    "obi-dynamic-instrumentation-demo-loadgen-1",
+    "obi-dynamic-instrumentation-demo-checkout-1",
+    "obi-dynamic-instrumentation-demo-obi-1",
+    "obi-dynamic-instrumentation-demo-ui-1",
+    "obi-dynamic-instrumentation-demo-collector-1",
+    "obi-dynamic-instrumentation-demo-tempo-1"
+  ],
+  "profile_type": "process_cpu:cpu:nanoseconds:cpu:nanoseconds",
+  "sampling_rate_hz": 97,
+  "fixture_ground_truth": "scenario selection and source are operator ground truth, not diagnostic evidence"
+}

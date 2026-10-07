@@ -1,0 +1,228 @@
+{
+  "batches": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "cloud.account.id",
+            "value": {
+              "stringValue": "390403870171"
+            }
+          },
+          {
+            "key": "cloud.availability_zone",
+            "value": {
+              "stringValue": "us-west-2a"
+            }
+          },
+          {
+            "key": "cloud.platform",
+            "value": {
+              "stringValue": "aws_ec2"
+            }
+          },
+          {
+            "key": "cloud.provider",
+            "value": {
+              "stringValue": "aws"
+            }
+          },
+          {
+            "key": "cloud.region",
+            "value": {
+              "stringValue": "us-west-2"
+            }
+          },
+          {
+            "key": "host.id",
+            "value": {
+              "stringValue": "i-0e8fbe260a77aba22"
+            }
+          },
+          {
+            "key": "host.image.id",
+            "value": {
+              "stringValue": "ami-0794681e58321386f"
+            }
+          },
+          {
+            "key": "host.name",
+            "value": {
+              "stringValue": "a9b6c9d800bb"
+            }
+          },
+          {
+            "key": "host.type",
+            "value": {
+              "stringValue": "c5a.4xlarge"
+            }
+          },
+          {
+            "key": "os.type",
+            "value": {
+              "stringValue": "linux"
+            }
+          },
+          {
+            "key": "otel.scope.name",
+            "value": {
+              "stringValue": "go.opentelemetry.io/obi"
+            }
+          },
+          {
+            "key": "service.instance.id",
+            "value": {
+              "stringValue": "a9b6c9d800bb:3966172"
+            }
+          },
+          {
+            "key": "telemetry.distro.name",
+            "value": {
+              "stringValue": "opentelemetry-ebpf-instrumentation"
+            }
+          },
+          {
+            "key": "telemetry.distro.version",
+            "value": {
+              "stringValue": "ai-poc"
+            }
+          },
+          {
+            "key": "telemetry.sdk.language",
+            "value": {
+              "stringValue": "go"
+            }
+          },
+          {
+            "key": "telemetry.sdk.name",
+            "value": {
+              "stringValue": "opentelemetry"
+            }
+          },
+          {
+            "key": "telemetry.sdk.version",
+            "value": {
+              "stringValue": "v1.46.0"
+            }
+          },
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "obi-poc-cost"
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {},
+          "spans": [
+            {
+              "traceId": "D/K4tmepqAKcSlhh/Q4XUA==",
+              "spanId": "uhR78VgeL2o=",
+              "name": "GET /work",
+              "kind": "SPAN_KIND_SERVER",
+              "startTimeUnixNano": "1791232594687658443",
+              "endTimeUnixNano": "1791232594838069022",
+              "attributes": [
+                {
+                  "key": "client.address",
+                  "value": {
+                    "stringValue": "172.22.0.1"
+                  }
+                },
+                {
+                  "key": "server.port",
+                  "value": {
+                    "intValue": "8080"
+                  }
+                },
+                {
+                  "key": "http.request.body.size",
+                  "value": {
+                    "intValue": "0"
+                  }
+                },
+                {
+                  "key": "http.response.body.size",
+                  "value": {
+                    "intValue": "0"
+                  }
+                },
+                {
+                  "key": "http.response.status_code",
+                  "value": {
+                    "intValue": "200"
+                  }
+                },
+                {
+                  "key": "url.scheme",
+                  "value": {
+                    "stringValue": "http"
+                  }
+                },
+                {
+                  "key": "network.peer.address",
+                  "value": {
+                    "stringValue": "172.22.0.1"
+                  }
+                },
+                {
+                  "key": "network.peer.port",
+                  "value": {
+                    "intValue": "55920"
+                  }
+                },
+                {
+                  "key": "http.request.method",
+                  "value": {
+                    "stringValue": "GET"
+                  }
+                },
+                {
+                  "key": "url.path",
+                  "value": {
+                    "stringValue": "/work"
+                  }
+                },
+                {
+                  "key": "server.address",
+                  "value": {
+                    "stringValue": "obi-poc-cost"
+                  }
+                },
+                {
+                  "key": "http.route",
+                  "value": {
+                    "stringValue": "/work"
+                  }
+                }
+              ],
+              "status": {}
+            },
+            {
+              "traceId": "D/K4tmepqAKcSlhh/Q4XUA==",
+              "spanId": "yz8coGwlw18=",
+              "parentSpanId": "uhR78VgeL2o=",
+              "name": "in queue",
+              "kind": "SPAN_KIND_INTERNAL",
+              "startTimeUnixNano": "1791232594687658443",
+              "endTimeUnixNano": "1791232594687687734",
+              "status": {}
+            },
+            {
+              "traceId": "D/K4tmepqAKcSlhh/Q4XUA==",
+              "spanId": "bSp0u0Kj0HI=",
+              "parentSpanId": "uhR78VgeL2o=",
+              "name": "processing",
+              "kind": "SPAN_KIND_INTERNAL",
+              "startTimeUnixNano": "1791232594687687734",
+              "endTimeUnixNano": "1791232594838069022",
+              "status": {}
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

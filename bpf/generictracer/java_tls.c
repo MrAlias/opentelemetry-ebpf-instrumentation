@@ -18,6 +18,7 @@
 
 #include <generictracer/jvm.h>
 #include <generictracer/k_tracer_defs.h>
+#include <generictracer/maps/java_http1_requests.h>
 #include <generictracer/maps/pid_tid_to_conn.h>
 
 #include <logger/bpf_dbg.h>
@@ -25,6 +26,7 @@
 #include <maps/active_ssl_connections.h>
 #include <maps/java_tasks.h>
 #include <maps/java_vt_threads.h>
+#include <maps/tp_char_buf_mem.h>
 
 #include <pid/pid.h>
 
@@ -39,12 +41,125 @@ enum {
     k_ioctl_java_vt_unmount = 5, // virtual thread unmounted from this carrier
     k_ioctl_java_runtime_metrics = 6,
     k_ioctl_java_gc_duration = 7,
+    k_ioctl_java_http1_traceparent = 8,
+    k_ioctl_java_http1_traceparent_release = 9,
+    k_ioctl_java_http1_parent = 10,
 };
 
 enum { k_ioctl_invalid_op = 0xff };
 // Keep this ceiling aligned with the largest large-buffer capture limit in
 // bpf/common/large_buffers.h.
 enum { k_ioctl_max_payload_len = 1 << 16 };
+
+SCRATCH_MEM_TYPED(java_http1_request, java_http1_request_t);
+
+static __always_inline void java_http1_parent(unsigned char *uarg) {
+    if (!g_bpf_header_propagation || !g_bpf_probe_write_user_enabled) {
+        return;
+    }
+    trace_key_t key = {};
+    trace_key_from_pid_tid(&key);
+    const tp_info_pid_t *server = find_parent_java_trace(&key);
+    const tp_info_t now = {.ts = bpf_ktime_get_ns()};
+    java_http1_parent_t parent = {};
+    if (server && server->valid && valid_trace(server->tp.trace_id) &&
+        valid_span(server->tp.span_id) && should_be_in_same_transaction(&server->tp, &now)) {
+        __builtin_memcpy(parent.trace_id, server->tp.trace_id, sizeof(parent.trace_id));
+        __builtin_memcpy(parent.span_id, server->tp.span_id, sizeof(parent.span_id));
+        parent.flags = k_flag_sampled;
+        parent.parent_status = parent_kind(server);
+    }
+    const u8 complete = 0;
+    if (bpf_probe_write_user(uarg + 1, &parent, sizeof(parent)) == 0) {
+        bpf_probe_write_user(uarg, &complete, sizeof(complete));
+    }
+}
+
+static __always_inline void java_http1_traceparent(unsigned char *uarg) {
+    if (!g_bpf_header_propagation || !g_bpf_probe_write_user_enabled) {
+        return;
+    }
+
+    pid_connection_info_t conn = {.pid = pid_from_pid_tgid(bpf_get_current_pid_tgid())};
+    if (bpf_probe_read_user(&conn.conn, sizeof(conn.conn), uarg + 1) != 0 ||
+        is_empty_connection_info(&conn.conn)) {
+        return;
+    }
+    sort_connection_info(&conn.conn);
+    java_http1_request_t *request = java_http1_request_mem();
+    unsigned char *value = tp_char_buf_mem();
+    if (!request || !value) {
+        return;
+    }
+    __builtin_memset(request, 0, sizeof(*request));
+    if (bpf_probe_read_user(&request->value_offset,
+                            sizeof(request->value_offset),
+                            uarg + 1 + sizeof(conn.conn)) != 0) {
+        return;
+    }
+    if (request->value_offset > k_ioctl_max_payload_len - TP_MAX_VAL_LENGTH) {
+        return;
+    }
+    tp_info_pid_t *tp = &request->tp;
+    init_new_trace(&tp->tp);
+    unsigned char *output = uarg + 1 + sizeof(conn.conn) + sizeof(request->value_offset);
+    java_http1_parent_t parent = {};
+    if (bpf_probe_read_user(&parent, sizeof(parent), output + TP_MAX_VAL_LENGTH) != 0) {
+        return;
+    }
+    if (valid_trace(parent.trace_id) && parent.parent_status <= k_parent_status_conditional) {
+        __builtin_memcpy(tp->tp.trace_id, parent.trace_id, sizeof(tp->tp.trace_id));
+        __builtin_memcpy(tp->tp.parent_id, parent.span_id, sizeof(tp->tp.parent_id));
+        tp->tp.flags = parent.flags;
+        request->parent_status = parent.parent_status;
+    } else {
+        __builtin_memcpy(parent.trace_id, tp->tp.trace_id, sizeof(parent.trace_id));
+        __builtin_memcpy(parent.span_id, tp->tp.parent_id, sizeof(parent.span_id));
+        parent.flags = tp->tp.flags;
+        parent.parent_status = request->parent_status;
+    }
+    tp->pid = conn.pid;
+    tp->valid = 1;
+    tp->written = 1;
+    tp->req_type = k_event_type_http_client;
+    if (!valid_trace(tp->tp.trace_id) || !valid_span(tp->tp.span_id)) {
+        return;
+    }
+    make_tp_string(value, &tp->tp);
+
+    // Ciphertext passes through sock_msg before Java reports the plaintext SEND.
+    if (bpf_map_update_elem(&java_http1_requests, &conn, request, BPF_NOEXIST) != 0) {
+        return;
+    }
+    const u8 complete = 0;
+    if (bpf_probe_write_user(output + TP_MAX_VAL_LENGTH, &parent, sizeof(parent)) != 0 ||
+        bpf_probe_write_user(output, value, TP_MAX_VAL_LENGTH) != 0 ||
+        bpf_probe_write_user(uarg, &complete, sizeof(complete)) != 0) {
+        bpf_map_delete_elem(&java_http1_requests, &conn);
+    }
+}
+
+static __always_inline void java_http1_traceparent_release(const unsigned char *uarg) {
+    pid_connection_info_t conn = {.pid = pid_from_pid_tgid(bpf_get_current_pid_tgid())};
+    if (bpf_probe_read_user(&conn.conn, sizeof(conn.conn), uarg + 1) != 0) {
+        return;
+    }
+    sort_connection_info(&conn.conn);
+    const java_http1_request_t *request = bpf_map_lookup_elem(&java_http1_requests, &conn);
+    unsigned char *value = tp_char_buf_mem();
+    if (!request || !value) {
+        return;
+    }
+    const unsigned char *input = uarg + 1 + sizeof(conn.conn) + sizeof(request->value_offset);
+    if (bpf_probe_read_user(value + TP_MAX_VAL_LENGTH, TP_MAX_VAL_LENGTH, input) != 0) {
+        return;
+    }
+    make_tp_string(value, &request->tp.tp);
+    // A delayed cleanup must not delete a later request on a reused connection.
+    if (bpf_memcmp(value, value + TP_MAX_VAL_LENGTH, TP_MAX_VAL_LENGTH) == 0) {
+        bpf_map_delete_elem(&java_http1_requests, &conn);
+    }
+}
 
 static __always_inline u8 cmd_to_op(u8 cmd) {
     switch (cmd) {
@@ -105,6 +220,15 @@ int BPF_KPROBE_GUARDED(obi_kprobe_sys_ioctl) {
     // Control opcodes each handle themselves and return; the data opcodes
     // (send/recv) fall through to the connection/payload path below.
     switch (op_cmd) {
+    case k_ioctl_java_http1_parent:
+        java_http1_parent(uarg);
+        return 0;
+    case k_ioctl_java_http1_traceparent:
+        java_http1_traceparent(uarg);
+        return 0;
+    case k_ioctl_java_http1_traceparent_release:
+        java_http1_traceparent_release(uarg);
+        return 0;
     case k_ioctl_java_vt_mount: {
         // The agent reports, on every VirtualThread.mount(), the logical
         // thread id now mounted on this carrier; the current kernel thread

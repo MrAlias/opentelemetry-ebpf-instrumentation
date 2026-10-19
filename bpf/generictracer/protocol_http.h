@@ -26,6 +26,7 @@
 #include <common/tracked_connection.h>
 
 #include <generictracer/maps/http_info_mem.h>
+#include <generictracer/maps/java_http1_requests.h>
 
 #include <generictracer/k_tracer_tailcall.h>
 #include <generictracer/large_buf_tailcall.h>
@@ -671,6 +672,30 @@ __obi_continue_protocol_http(struct pt_regs *ctx,
                              unsigned char *(*tp_loop_fn)(unsigned char *, const u16)) {
     http_connection_metadata_t *meta =
         connection_meta_by_direction(args->direction, PACKET_TYPE_REQUEST);
+
+    const java_http1_request_t *java_request = NULL;
+    if (g_bpf_header_propagation && args->ssl && meta && meta->type == k_event_type_http_client) {
+        java_request = bpf_map_lookup_elem(&java_http1_requests, &args->pid_conn);
+    }
+    if (java_request) {
+        unsigned char *value = tp_char_buf_mem();
+        const u32 offset = java_request->value_offset;
+        if (value && args->bytes_len >= TP_MAX_VAL_LENGTH &&
+            offset <= args->bytes_len - TP_MAX_VAL_LENGTH &&
+            bpf_probe_read_user(value + TP_MAX_VAL_LENGTH,
+                                TP_MAX_VAL_LENGTH,
+                                (const unsigned char *)args->u_buf + offset) == 0) {
+            make_tp_string(value, &java_request->tp.tp);
+            if (bpf_memcmp(value, value + TP_MAX_VAL_LENGTH, TP_MAX_VAL_LENGTH) == 0) {
+                set_trace_info_for_connection(
+                    &args->pid_conn.conn, TRACE_TYPE_CLIENT, &java_request->tp);
+                info->parent_status = java_request->parent_status;
+                bpf_map_delete_elem(&java_http1_requests, &args->pid_conn);
+                goto skip_tp;
+            }
+        }
+        bpf_map_delete_elem(&java_http1_requests, &args->pid_conn);
+    }
 
     egress_key_t e_key = {
         .d_port = args->pid_conn.conn.d_port,

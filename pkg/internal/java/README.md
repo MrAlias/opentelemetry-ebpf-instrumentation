@@ -149,6 +149,41 @@ The version is stored in
 compatibility between OBI and the Java agent. Do not increment it for compatible changes, such
 as new instrumentation or bug fixes.
 
+### HTTP/1.1 propagation control packets
+
+With OBI header propagation enabled, synchronous Java 11+ HTTPS HTTP/1.1
+`HttpClient.send()` requests can inject `traceparent` before encryption.
+Application-owned values are preserved. See
+[Java HttpClient propagation](../../../devdocs/java-httpclient-propagation.md)
+for compatibility checks, limits, and integration tests.
+
+Three additive control operations use the same JNI/ioctl channel and preserve
+the existing agent contract version. The capability property
+`otel.obi.java.agent.httpclient.propagation` identifies an agent with this
+feature enabled. Multibyte integers use native byte order, as in the existing packet ABI.
+
+| Offset | Size | Operation 8: reserve HTTP/1.1 traceparent |
+| --- | --- | --- |
+| 0 | 1 byte | Opcode `8` |
+| 1 | 36 bytes | Outbound connection tuple |
+| 37 | 4 bytes | Traceparent value offset in the serialized HTTP headers |
+| 41 | 55 bytes | Zeroed output buffer; eBPF writes the serialized traceparent on success |
+| 96 | 26 bytes | Parent context: trace ID (16), parent span ID (8), flags (1), parent status (1) |
+
+Opcode `10` captures the current Java server parent at entry to `send()`. Its
+packet contains the opcode byte followed by the 26-byte parent context. eBPF
+sets the opcode byte to zero only after writing a complete response. A zeroed
+parent context means no server parent was found. Without an acknowledgment,
+the agent skips injection for this call.
+
+The captured parent is supplied in opcode `8`. A successful reservation returns
+the adopted context and sets its opcode byte to zero after both outputs have
+been written. The agent supplies that context on later attempts within the same `send()`.
+Each attempt still gets a fresh client span ID. The agent retains these buffers
+until `send()` exits and sends opcode `9` with the same connection and
+traceparent value to release any unconsumed reservation. Release compares the
+value before deleting state, protecting later requests on reused connections.
+
 ## 🔨 Building
 
 ### Prerequisites

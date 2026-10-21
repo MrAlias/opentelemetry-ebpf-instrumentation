@@ -23,6 +23,7 @@ import (
 	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
 	"go.opentelemetry.io/obi/pkg/appolly/discover/exec"
 	"go.opentelemetry.io/obi/pkg/appolly/services"
+	"go.opentelemetry.io/obi/pkg/config"
 	ebpfcommon "go.opentelemetry.io/obi/pkg/ebpf/common"
 	"go.opentelemetry.io/obi/pkg/ebpf/ringbuf"
 	"go.opentelemetry.io/obi/pkg/export"
@@ -226,6 +227,25 @@ func TestRingbufMetricsConstant(t *testing.T) {
 
 	tracer = New(nil, &obi.Config{}, struct{ imetrics.NoopReporter }{})
 	assert.Equal(t, true, tracer.constants()["ringbuf_metrics_enabled"])
+}
+
+func TestNodeGRPCPropagationConstants(t *testing.T) {
+	previous := ebpfcommon.IntegrityModeOverride
+	ebpfcommon.IntegrityModeOverride = true
+	t.Cleanup(func() { ebpfcommon.IntegrityModeOverride = previous })
+
+	for _, mode := range []config.ContextPropagationMode{
+		config.ContextPropagationDisabled,
+		config.ContextPropagationTCP,
+		config.ContextPropagationHeaders,
+		config.ContextPropagationAll,
+	} {
+		cfg := &obi.Config{EBPF: config.EBPFTracer{ContextPropagation: mode}}
+		tracer := New(nil, cfg, imetrics.NoopReporter{})
+		constants := tracer.constants()
+		assert.Equal(t, mode.HasHeaders(), constants["g_bpf_header_propagation"])
+		assert.Equal(t, false, constants["g_bpf_probe_write_user_enabled"])
+	}
 }
 
 func TestPythonAsyncMapsScopePointersByProcess(t *testing.T) {

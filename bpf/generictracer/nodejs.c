@@ -25,6 +25,7 @@
 #include <maps/fd_to_connection.h>
 #include <maps/node_manual_ctx_shadow.h>
 #include <maps/nodejs_fd_map.h>
+#include <maps/outgoing_trace_map.h>
 
 #include <pid/pid.h>
 
@@ -162,6 +163,127 @@ static __always_inline const tp_info_pid_t *nodejs_server_trace_for_fd(const u64
     }
 
     return tp;
+}
+
+struct nodejs_grpc_key {
+    u64 pid_tgid;
+    unsigned char span_id[SPAN_ID_SIZE_BYTES];
+};
+
+enum nodejs_grpc_operation {
+    k_nodejs_grpc_begin = 1,
+    k_nodejs_grpc_commit = 2,
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, struct nodejs_grpc_key);
+    __type(value, tp_info_pid_t);
+    __uint(max_entries, MAX_CONCURRENT_REQUESTS);
+    __uint(pinning, OBI_PIN_INTERNAL);
+} nodejs_grpc_pending SEC(".maps");
+
+// Linux uv_buf_t ABI. Unlike path arguments, uv_fs_write retains the JS
+// Buffer's backing store, allowing a synchronous exchange with the agent.
+struct nodejs_uv_buf {
+    unsigned char *base;
+    u64 len;
+};
+
+struct nodejs_grpc_record {
+    unsigned char magic[16];
+    u32 operation;
+    u32 incoming_fd;
+    u16 source_port;
+    u16 destination_port;
+    u32 stream_id;
+    unsigned char span_id[SPAN_ID_SIZE_BYTES];
+    unsigned char traceparent[TP_MAX_VAL_LENGTH];
+    u8 status;
+};
+
+_Static_assert(sizeof(struct nodejs_grpc_record) == 96, "grpcinjector.js exchange ABI");
+
+SEC("uprobe/node:uv_fs_write")
+int BPF_KPROBE_GUARDED(obi_node_grpc_write,
+                       void *loop,
+                       void *req,
+                       int fd,
+                       const struct nodejs_uv_buf *buffers,
+                       u32 count) {
+    (void)ctx;
+    (void)loop;
+    (void)req;
+    (void)fd;
+    const u64 pid_tgid = bpf_get_current_pid_tgid();
+    if (!g_bpf_header_propagation || !g_bpf_probe_write_user_enabled || count != 1 ||
+        !valid_pid(pid_tgid)) {
+        return 0;
+    }
+
+    struct nodejs_uv_buf buffer = {};
+    if (bpf_probe_read_user(&buffer, sizeof(buffer), buffers) != 0 ||
+        buffer.len != sizeof(struct nodejs_grpc_record)) {
+        return 0;
+    }
+    struct nodejs_grpc_record record = {};
+    if (bpf_probe_read_user(&record, sizeof(record), buffer.base) != 0) {
+        return 0;
+    }
+    static const unsigned char magic[16] = "obi-grpc-unary";
+    if (obi_bpf_memcmp((const char *)record.magic, (const char *)magic, sizeof(magic)) != 0) {
+        return 0;
+    }
+
+    struct nodejs_grpc_key key = {.pid_tgid = pid_tgid};
+    if (record.operation == k_nodejs_grpc_begin) {
+        tp_info_pid_t client = {};
+        if (record.incoming_fd == ~0U) {
+            init_new_trace(&client.tp);
+            client.pid = pid_from_pid_tgid(pid_tgid);
+            client.valid = 1;
+        } else {
+            const tp_info_pid_t *server = nodejs_server_trace_for_fd(pid_tgid, record.incoming_fd);
+            if (!server) {
+                return 0;
+            }
+            client = *server;
+            bpf_memcpy(client.tp.parent_id, server->tp.span_id, sizeof(client.tp.parent_id));
+            urand_bytes(client.tp.span_id, sizeof(client.tp.span_id));
+            client.tp.ts = bpf_ktime_get_ns();
+        }
+        client.written = 1;
+        client.req_type = k_event_type_http_client;
+        client.response_sent = 0;
+        bpf_memcpy(key.span_id, client.tp.span_id, sizeof(key.span_id));
+        if (bpf_map_update_elem(&nodejs_grpc_pending, &key, &client, BPF_ANY) != 0) {
+            return 0;
+        }
+        bpf_memcpy(record.span_id, client.tp.span_id, sizeof(record.span_id));
+        make_tp_string(record.traceparent, &client.tp);
+        record.status = 1;
+        if (bpf_probe_write_user(buffer.base, &record, sizeof(record)) != 0) {
+            bpf_map_delete_elem(&nodejs_grpc_pending, &key);
+        }
+        return 0;
+    }
+
+    if (record.operation != k_nodejs_grpc_commit || !record.stream_id || !(record.stream_id & 1) ||
+        !record.source_port || !record.destination_port) {
+        return 0;
+    }
+    bpf_memcpy(key.span_id, record.span_id, sizeof(key.span_id));
+    const tp_info_pid_t *client = bpf_map_lookup_elem(&nodejs_grpc_pending, &key);
+    if (!client) {
+        return 0;
+    }
+    egress_key_t egress = {.s_port = record.source_port,
+                           .d_port = record.destination_port,
+                           .stream_id = record.stream_id};
+    sort_egress_key(&egress);
+    bpf_map_update_elem(&outgoing_trace_map, &egress, client, BPF_ANY);
+    bpf_map_delete_elem(&nodejs_grpc_pending, &key);
+    return 0;
 }
 
 static __always_inline int nodejs_parse_fd(const unsigned char *digits, u32 *fd) {

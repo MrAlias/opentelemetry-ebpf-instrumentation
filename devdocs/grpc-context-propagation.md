@@ -85,6 +85,32 @@ Parent lookup priority in `create_tp`:
 1. `outgoing_trace_map[{ports, stream_id}]` — written by Go uprobe or kprobe CLIENT
 2. `find_parent_trace` — general fallback chain: Node.js → Python → nginx → Puma → Java → process traces → `cp_support_connect_info`
 
+### Node.js grpc-js unary metadata
+
+With header propagation enabled, the injected Node agent adds `traceparent` to
+unary `@grpc/grpc-js` metadata before HTTP/2 serialization, including TLS calls.
+It clones Metadata before adding a field and preserves any application-supplied
+`traceparent`. Streaming calls and the native `grpc` package are outside this path.
+
+The agent obtains the incoming request fd from the existing async-local context.
+A synchronous `uv_fs_write` exchange creates a client context under that request's
+server span; calls outside a request create a root client context. Once HTTP/2
+assigns a stream ID, a second exchange publishes the context in
+`outgoing_trace_map[{ports, stream_id}]` for the generic TLS client parser to adopt.
+Response listeners run in the initiating request's context so callback follow-up
+calls cannot inherit another request sharing the channel. Reinjection updates the
+enabled state without stacking hooks. The exchange requires
+`bpf_probe_write_user`; it is disabled in integrity mode.
+
+Node's memory BIO encrypts before the socket write. The shared TLS ciphertext
+matcher also runs in `sk_msg`, where the send buffer is still readable, to bind the
+SSL object to its actual socket before parsing client frames. This covers kernels
+whose subsequent TCP callback cannot recover the ciphertext from the message.
+
+The [unary TLS regression fixture](../internal/test/integration/components/nodegrpc/README.md)
+checks headers and full source-server → source-client → downstream-server
+parentage through an uninstrumented TLS-terminating HTTP/2 proxy.
+
 ### Go Uprobe Path
 
 1. **`transport_http2Client_NewStream`** — caches `{pid, conn_ptr} → {connection_info, socket_cookie}` in `grpc_conn_ptr_to_conn`. The socket cookie comes from the Go connection's `netFD.pfd.Sysfd` and the current task's file table.
@@ -151,6 +177,7 @@ For streams OBI owns, the chain then honors the `written` handshake: `written=1`
 Writers:
 
 - **Go uprobes** (`loopyWriter.clientHeaderHandler` or legacy `originateStream`, plus `grpcFramerWriteHeaders` entry) — `BPF_ANY` with `written=0`; application ownership or a committed direct write flips it to `written=1`. A failed or uncertain direct write leaves socket fallback enabled.
+- **Node grpc-js unary agent** (`uv_fs_write`) — publishes the generated client context with `written=1` after HTTP/2 assigns the stream ID.
 - **kprobe CLIENT** (`http2_grpc_start`) — `BPF_NOEXIST` with `written=0`, used only when no uprobe wrote first; span_id comes from `urand_bytes`
 - **sk_msg** (`find_existing_h2_tp` / `create_h2_tp`) — `BPF_ANY`, used by non-Go senders. Persists the traceparent that was just written onto the wire so kprobe CLIENT can adopt the same context
 

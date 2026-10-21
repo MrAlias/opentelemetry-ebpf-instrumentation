@@ -296,6 +296,9 @@ var _extractorCode string
 //go:embed spanbridge.js
 var _spanBridgeCode string
 
+//go:embed grpcinjector.js
+var _grpcInjectorCode string
+
 // Substituted at injection time so each injection installs only the
 // machinery its configuration asks for (see the OBI_RT_ENABLED and
 // OBI_TRACES_ENABLED comments in fdextractor.js).
@@ -329,5 +332,10 @@ func (i *NodeInjector) agentCode() string {
 	if i.cfg.NodeJS.ManualSpans {
 		code += ";\n" + _spanBridgeCode
 	}
+	grpcCode := _grpcInjectorCode
+	if (i.cfg.Traces.Enabled() || i.cfg.TracePrinter.Enabled()) && i.cfg.EBPF.ContextPropagation.HasHeaders() {
+		grpcCode = strings.Replace(grpcCode, "= false; /*OBI_GRPC_ENABLED*/", "= true; /*OBI_GRPC_ENABLED*/", 1)
+	}
+	code += ";\n" + grpcCode
 	return code
 }

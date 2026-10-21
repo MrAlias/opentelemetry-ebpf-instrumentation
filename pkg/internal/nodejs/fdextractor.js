@@ -21,6 +21,7 @@
     orig.ctxHook = undefined;
   }
   orig.requestFd = undefined;
+  orig.bindRequest = undefined;
 
   const { AsyncLocalStorage, createHook, executionAsyncResource } = require('async_hooks');
   const {
@@ -59,6 +60,12 @@
     orig.requestFd = () => {
       const store = als.getStore();
       return store && store.incomingFd != null ? store.incomingFd : -1;
+    };
+    orig.bindRequest = (callback) => {
+      const store = als.getStore();
+      return function (...args) {
+        return als.run(store, () => callback.apply(this, args));
+      };
     };
 
     let ctxActive = false;

@@ -33,6 +33,8 @@
 
 #include <logger/bpf_dbg.h>
 
+#include <generictracer/tls_prefix.h>
+
 #include <maps/incoming_trace_map.h>
 #include <maps/grpc_h2_owned_streams.h>
 #include <maps/go_h2_owned_streams.h>
@@ -1288,6 +1290,18 @@ int obi_packet_extender(struct sk_msg_md *msg) {
 
     bpf_msg_pull_data(msg, 0, msg->size, 0);
     const bool msg_buffers_ready = fill_msg_buffers(msg, &t_ctx->p_conn, &e_key);
+
+    if (msg_buffers_ready) {
+        const msg_buffer_t *buffer = bpf_map_lookup_elem(&msg_buffers, &e_key);
+        const unsigned char *data = bpf_map_lookup_elem(&msg_buffer_mem, &(u32){0});
+        // Some kernels expose only tcp_rate_check_app_limited after this send.
+        // Bind while the complete ciphertext buffer is still available here.
+        if (buffer && data &&
+            tls_prefix_try_bind(
+                id, data, buffer->real_size, msg->size, &t_ctx->p_conn, conn.d_port)) {
+            return SK_PASS;
+        }
+    }
 
     if (is_h2_socket(msg)) {
         bpf_tail_call_static(msg, &extender_jump_table, k_tail_detect_h2);

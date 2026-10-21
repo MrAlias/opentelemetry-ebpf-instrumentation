@@ -68,7 +68,7 @@ func TestAgentCodeGatesRuntimeMetrics(t *testing.T) {
 		"CTX_HOOK_ENABLED placeholder missing or duplicated in fdextractor.js")
 
 	off := &NodeInjector{cfg: &obi.Config{}}
-	require.Equal(t, _extractorCode, off.agentCode())
+	require.Equal(t, _extractorCode+";\n"+_grpcInjectorCode, off.agentCode())
 
 	metricsOnly := &NodeInjector{cfg: &obi.Config{
 		Metrics: perapp.GlobalMetricsConfig{Features: export.FeatureApplicationRuntime},
@@ -83,6 +83,30 @@ func TestAgentCodeGatesRuntimeMetrics(t *testing.T) {
 		"traces-only injection must not enable runtime sampling")
 	require.Contains(t, tracesOnly.agentCode(), ctxHookEnabledPlaceholder,
 		"tracing alone must not install the per-callback context hook")
+}
+
+func TestAgentCodeGatesGRPCUnary(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		tracing bool
+		mode    config.ContextPropagationMode
+		want    bool
+	}{
+		{name: "headers", tracing: true, mode: config.ContextPropagationHeaders, want: true},
+		{name: "all", tracing: true, mode: config.ContextPropagationAll, want: true},
+		{name: "disabled", tracing: true, mode: config.ContextPropagationDisabled},
+		{name: "tcp only", tracing: true, mode: config.ContextPropagationTCP},
+		{name: "metrics only", mode: config.ContextPropagationHeaders},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &obi.Config{EBPF: config.EBPFTracer{ContextPropagation: tc.mode}}
+			if tc.tracing {
+				cfg.TracePrinter = "text"
+			}
+			code := (&NodeInjector{cfg: cfg}).agentCode()
+			require.Equal(t, tc.want, strings.Contains(code, "= true; /*OBI_GRPC_ENABLED*/"))
+		})
+	}
 }
 
 // TestAgentCodeGatesCtxHook pins the before hook to the same predicate that

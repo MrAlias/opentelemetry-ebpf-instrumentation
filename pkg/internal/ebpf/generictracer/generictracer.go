@@ -225,6 +225,9 @@ func (p *Tracer) constants() map[string]any {
 
 	m["wakeup_data_bytes"] = uint32(p.cfg.EBPF.WakeupLen) * uint32(unsafe.Sizeof(ebpfcommon.HTTPRequestTrace{}))
 	m["ringbuf_metrics_enabled"] = p.metrics != nil && !imetrics.IsBuiltinNoopReporter(p.metrics)
+	m["g_bpf_header_propagation"] = p.cfg.EBPF.ContextPropagation.HasHeaders()
+	m["g_bpf_probe_write_user_enabled"] = !ebpfcommon.IntegrityModeOverride && p.cfg.EBPF.ContextPropagation.HasHeaders() &&
+		ebpfcommon.SupportsContextPropagationWithProbe(p.log)
 
 	// The eBPF side does some basic filtering of events that do not belong to
 	// processes which we monitor. We filter more accurately in the userspace, but
@@ -504,12 +507,20 @@ func (p *Tracer) UProbes() map[string]map[string][]*ebpfcommon.ProbeDesc {
 			}},
 		},
 		"node": {
+			"uv_fs_write": {{
+				Required: false,
+				Start:    p.bpfObjects.ObiNodeGrpcWrite,
+			}},
 			"uv_fs_access": {{
 				Required: false,
 				Start:    p.bpfObjects.ObiUvFsAccess,
 			}},
 		},
 		"libuv.so": {
+			"uv_fs_write": {{
+				Required: false,
+				Start:    p.bpfObjects.ObiNodeGrpcWrite,
+			}},
 			"uv_fs_access": {{
 				Required: false,
 				Start:    p.bpfObjects.ObiUvFsAccess,
@@ -596,6 +607,11 @@ func (p *Tracer) UProbes() map[string]map[string][]*ebpfcommon.ProbeDesc {
 				End:      p.bpfObjects.ObiUprobeTaskStepRet,
 			}},
 		},
+	}
+	if p.cfg == nil || !p.cfg.NodeJS.Enabled || !p.cfg.EBPF.ContextPropagation.HasHeaders() ||
+		(!p.cfg.Traces.Enabled() && !p.cfg.TracePrinter.Enabled()) {
+		delete(m["node"], "uv_fs_write")
+		delete(m["libuv.so"], "uv_fs_write")
 	}
 	return m
 }

@@ -26,6 +26,8 @@ type observation struct {
 	Protocol   int      `json:"protocol"`
 	Connection string   `json:"connection"`
 	Body       string   `json:"body"`
+	Unrelated  string   `json:"unrelated"`
+	Tracestate string   `json:"tracestate"`
 }
 
 func main() {
@@ -53,7 +55,10 @@ func main() {
 			return
 		}
 		mu.Lock()
-		records[r.URL.Path] = append(records[r.URL.Path], observation{headers, r.ProtoMajor, r.RemoteAddr, string(body)})
+		records[r.URL.Path] = append(records[r.URL.Path], observation{
+			Headers: headers, Protocol: r.ProtoMajor, Connection: r.RemoteAddr, Body: string(body),
+			Unrelated: r.Header.Get("X-Unrelated"), Tracestate: r.Header.Get("Tracestate"),
+		})
 		attempt := len(records[r.URL.Path])
 		mu.Unlock()
 		log.Printf("TRACEPARENT %s protocol=%s values=%q", r.URL.Path, r.Proto, headers)

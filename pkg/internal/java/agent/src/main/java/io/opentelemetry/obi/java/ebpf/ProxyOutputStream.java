@@ -6,6 +6,7 @@
 package io.opentelemetry.obi.java.ebpf;
 
 import io.opentelemetry.obi.java.Agent;
+import io.opentelemetry.obi.java.instrumentations.data.ApacheHttpClientPropagation;
 import io.opentelemetry.obi.java.instrumentations.data.SSLStorage;
 import java.io.IOException;
 import java.io.OutputStream;
@@ -46,6 +47,10 @@ public class ProxyOutputStream extends OutputStream {
     boolean capture = SSLStorage.enterSSLSocketWrite();
     try {
       if (capture) {
+        byte[] injected = ApacheHttpClientPropagation.inject(b, 0, b.length, socket);
+        if (injected != null) {
+          b = injected;
+        }
         forwardWrite(b, 0, b.length);
       }
       delegate.write(b);
@@ -61,6 +66,12 @@ public class ProxyOutputStream extends OutputStream {
     boolean capture = SSLStorage.enterSSLSocketWrite();
     try {
       if (capture) {
+        byte[] injected = ApacheHttpClientPropagation.inject(b, off, len, socket);
+        if (injected != null) {
+          b = injected;
+          off = 0;
+          len = b.length;
+        }
         forwardWrite(b, off, len);
       }
       delegate.write(b, off, len);

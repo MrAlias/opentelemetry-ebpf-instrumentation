@@ -251,9 +251,14 @@ public final class JdkHttpClientPropagation {
     InetSocketAddress remote = (InetSocketAddress) channel.getRemoteAddress();
     Connection connection =
         new Connection(local.getAddress(), local.getPort(), remote.getAddress(), remote.getPort());
+    return reserve(scope, connection, headers) ? Collections.singletonList(headers) : buffers;
+  }
+
+  static boolean reserve(
+      JdkHttpClientPropagation scope, Connection connection, ByteBuffer headers) {
     synchronized (scope) {
       if (!scope.active || scope.parent == null) {
-        return buffers;
+        return false;
       }
       NativeMemory packet = new NativeMemory(PARENT_OFFSET + PARENT_SIZE);
       packet.setByte(0, OperationType.HTTP1_TRACEPARENT.code);
@@ -264,7 +269,7 @@ public final class JdkHttpClientPropagation {
       }
       synchronized (requests) {
         if (retainedReservations >= MAX_TRACKED_REQUESTS) {
-          return buffers;
+          return false;
         }
         scope.reservations.add(packet);
         retainedReservations++;
@@ -275,7 +280,7 @@ public final class JdkHttpClientPropagation {
         synchronized (requests) {
           retainedReservations--;
         }
-        return buffers;
+        return false;
       }
       ByteBuffer value = packet.getBuffer().duplicate();
       ((java.nio.Buffer) value).position(PARENT_OFFSET);
@@ -284,7 +289,7 @@ public final class JdkHttpClientPropagation {
       ((java.nio.Buffer) value).position(VALUE_OFFSET);
       headers.put(value);
       ((java.nio.Buffer) headers).position(0);
-      return Collections.singletonList(headers);
+      return true;
     }
   }
 }

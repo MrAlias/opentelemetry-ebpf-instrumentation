@@ -9,6 +9,7 @@ import io.opentelemetry.obi.java.Agent;
 import io.opentelemetry.obi.java.ebpf.IOCTLPacket;
 import io.opentelemetry.obi.java.ebpf.NativeMemory;
 import io.opentelemetry.obi.java.ebpf.OperationType;
+import io.opentelemetry.obi.java.instrumentations.data.ApacheHttpClientPropagation;
 import io.opentelemetry.obi.java.instrumentations.data.SSLStorage;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -162,7 +163,8 @@ public class SSLSocketStreamInst {
   public static final class OutputStreamWriteAdvice {
     @Advice.OnMethodEnter(suppress = Throwable.class)
     public static void write(
-        @Advice.FieldValue("this$0") Object outer, @Advice.Argument(0) byte[] b) {
+        @Advice.FieldValue("this$0") Object outer,
+        @Advice.Argument(value = 0, readOnly = false) byte[] b) {
 
       if (!SSLStorage.isSSLSocketWriteActive() && b != null && b.length > 0) {
         Socket socket = null;
@@ -179,6 +181,10 @@ public class SSLSocketStreamInst {
         }
         if (socket != null) {
           try {
+            byte[] injected = ApacheHttpClientPropagation.inject(b, 0, b.length, socket);
+            if (injected != null) {
+              b = injected;
+            }
             NativeMemory p = new NativeMemory(IOCTLPacket.packetPrefixSize + b.length);
             int wOff = IOCTLPacket.writePacketPrefix(p, 0, OperationType.SEND, socket, b.length);
             IOCTLPacket.writePacketBuffer(p, wOff, b);
@@ -197,9 +203,9 @@ public class SSLSocketStreamInst {
     @Advice.OnMethodEnter(suppress = Throwable.class)
     public static void write(
         @Advice.FieldValue("this$0") Object outer,
-        @Advice.Argument(0) byte[] b,
-        @Advice.Argument(1) int off,
-        @Advice.Argument(2) int len) {
+        @Advice.Argument(value = 0, readOnly = false) byte[] b,
+        @Advice.Argument(value = 1, readOnly = false) int off,
+        @Advice.Argument(value = 2, readOnly = false) int len) {
 
       if (!SSLStorage.isSSLSocketWriteActive() && b != null && len > 0) {
         Socket socket = null;
@@ -216,6 +222,12 @@ public class SSLSocketStreamInst {
         }
         if (socket != null) {
           try {
+            byte[] injected = ApacheHttpClientPropagation.inject(b, off, len, socket);
+            if (injected != null) {
+              b = injected;
+              off = 0;
+              len = b.length;
+            }
             NativeMemory p = new NativeMemory(IOCTLPacket.packetPrefixSize + len);
             int wOff = IOCTLPacket.writePacketPrefix(p, 0, OperationType.SEND, socket, len);
             IOCTLPacket.writePacketBuffer(p, wOff, b, off, len);

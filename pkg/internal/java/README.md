@@ -334,6 +334,17 @@ jattach <PID of Java program> load instrument false "/path/to/obi-java-agent.jar
 - `wrap()` - Extracts connection info
 - `unwrap()` - Extracts connection info
 
+### 5. Apache HttpClient 4 HTTPS propagation
+
+Synchronous `org.apache.http.impl.client.CloseableHttpClient.execute()` calls
+can inject W3C `traceparent` over HTTPS HTTP/1.1 when header propagation is
+enabled. Apache HttpClient 4.5.14 on Java 21 is covered by integration tests.
+This reuses the Java HTTP/1.1 parent capture and eBPF reservation mechanism.
+The first JSSE plaintext write must contain the complete headers and fit within
+the 16 KiB capture limit after injection. Application-supplied headers and body
+bytes are preserved. See [Java HTTP client propagation](../../../devdocs/java-httpclient-propagation.md#apache-httpclient-4-synchronous-execution)
+for configuration, supported paths, and limitations.
+
 ## 💻 Development
 
 ### Key Technologies

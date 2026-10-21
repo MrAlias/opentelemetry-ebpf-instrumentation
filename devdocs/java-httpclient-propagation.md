@@ -1,4 +1,4 @@
-# Java HttpClient HTTPS propagation
+# Java HTTP client HTTPS propagation
 
 OBI can inject a W3C `traceparent` into synchronous Java 11+ `java.net.http.HttpClient.send()`
 requests sent over HTTPS with HTTP/1.1. Enable header propagation through the existing
@@ -101,3 +101,42 @@ also run in the Java agent CI JDK matrix. The JMH
 `JdkHttpClientPropagationBenchmark` compares bounded byte-buffer preparation
 against the prototype's string decoding and splitting; it does not measure
 total application or eBPF overhead.
+
+## Apache HttpClient 4 synchronous execution
+
+The OBI Java agent also injects `traceparent` for synchronous
+`org.apache.http.impl.client.CloseableHttpClient.execute()` calls over HTTPS
+HTTP/1.1 using JSSE `SSLSocket` streams. Apache HttpClient 4.5.14 on Java 21 is
+covered by the integration fixture. This uses the same header-propagation
+configuration, kernel capability checks, parent capture, and client span
+reservations described above; TCP-option propagation is not required.
+
+The scope starts at `execute()` and covers its overloads. Each
+`HttpRequestExecutor.doSendRequest()` attempt can inject into the first TLS
+plaintext write on its managed connection's socket. Writes through other sockets
+on the same thread are excluded. The agent copies that write before encryption, preserving the
+application's request object, body bytes, unrelated headers, and `tracestate`.
+An existing `traceparent`, including a mixed-case name, prevents injection.
+Reservations are released when `execute()` returns or throws, so pooled
+connections and concurrent calls retain their own incoming context.
+
+The first write must contain the complete HTTP/1.1 header block, and the entire
+write after injection must fit the existing 16 KiB plaintext capture limit.
+Split headers and larger writes are sent unchanged. Later body writes are never
+treated as headers, even when their contents resemble an HTTP request.
+This path does not enable injection for HttpClient 5, Apache's asynchronous
+client, HTTP/2, plaintext HTTP, or custom transports that bypass these synchronous
+execution and JSSE stream methods. Those paths retain their existing behavior.
+Restart JVMs with an already attached older OBI agent to load these new hooks.
+
+The Apache fixture uses an OBI-only source, an uninstrumented TLS-terminating
+proxy that records received headers, and an OpenTelemetry SDK downstream. It
+checks exactly one transmitted header and the exported source server → source
+client → downstream server chain (including OBI's existing internal `processing`
+span when emitted), pooled connection reuse with distinct parents,
+concurrent contexts, application-owned headers, disabled propagation, and body
+and unrelated-header preservation.
+
+```sh
+go test -v -count=1 -run '^TestJavaApacheHTTPClientTraceparent$' -timeout 10m ./internal/test/integration/
+```

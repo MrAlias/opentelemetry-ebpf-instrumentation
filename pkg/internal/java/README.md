@@ -10,6 +10,7 @@ communicates with eBPF programs for distributed tracing and monitoring.
 - **Socket-level tracing** - Instruments `javax.net.ssl.SSLSocket` and `java.nio.channels.SocketChannel` operations
 - **SSL/TLS support** - Intercepts `javax.net.ssl.SSLEngine` for encrypted traffic
 - **Netty support** - Instruments Netty channels for reactive applications
+- **OkHttp propagation** - Injects W3C traceparent headers for synchronous HTTPS HTTP/1.1 calls
 
 ## 📋 Basic concepts
 
@@ -298,6 +299,27 @@ jattach <PID of Java program> load instrument false "/path/to/obi-java-agent.jar
 
 - `wrap()` - Extracts connection info
 - `unwrap()` - Extracts connection info
+
+### 5. **okhttp3.Call.execute()** with **Http1ExchangeCodec**
+
+With OBI header propagation enabled, synchronous calls over a JDK `SSLSocket`
+receive a derived request containing a traceparent. The original request, body,
+and unrelated headers are preserved. A single valid application-supplied
+version-00 header is preserved and its span ID is used for the OBI client span.
+
+The agent requests the client context using opcode 8 on the existing ioctl
+channel: the normal 41-byte packet prefix followed by a 55-byte traceparent
+value. An empty value requests generation; a supplied value requests adoption.
+OBI gates this operation on header propagation and its existing user-memory
+write capability/lockdown checks. The outgoing context is consumed by the normal
+TLS SEND parser so the transmitted parent ID matches the exported client span.
+An older OBI that ignores opcode 8 leaves the request unchanged.
+
+`enqueue()`, HTTP/2, and older `Http1Codec` implementations are outside this
+hook. OkHttp is a test dependency only; application classes are accessed through
+reflection without adding runtime dependencies. See the
+[TLS propagation regression fixture](../../../internal/test/integration/components/java_tls/okhttp/README.md)
+for the reproduction, validation commands, tested versions, and limits.
 
 ## 💻 Development
 

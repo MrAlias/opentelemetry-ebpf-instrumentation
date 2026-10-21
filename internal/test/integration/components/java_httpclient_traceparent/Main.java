@@ -24,9 +24,12 @@ import java.util.concurrent.atomic.AtomicReference;
 
 public class Main {
   private static final CyclicBarrier concurrentCalls = new CyclicBarrier(4);
+  private static final java.util.concurrent.ExecutorService httpExecutor =
+      Executors.newFixedThreadPool(2);
   private static final HttpClient client =
       HttpClient.newBuilder()
           .version(HttpClient.Version.HTTP_1_1)
+          .executor(httpExecutor)
           .connectTimeout(Duration.ofSeconds(10))
           .build();
 
@@ -84,6 +87,7 @@ public class Main {
     try {
       String path = exchange.getRequestURI().getPath().substring("/call".length());
       String testMode = exchange.getRequestHeaders().getFirst("X-Test-Mode");
+      boolean async = "true".equals(exchange.getRequestHeaders().getFirst("X-Async"));
       boolean http2 = "http2".equals(testMode);
       boolean fallback = "http2-fallback".equals(testMode);
       HttpClient selected = client;
@@ -168,6 +172,7 @@ public class Main {
               .version(http2 || fallback ? HttpClient.Version.HTTP_2 : HttpClient.Version.HTTP_1_1)
               .timeout(Duration.ofSeconds(15))
               .GET();
+      request.header("X-Application", "preserved").header("tracestate", "fixture=preserved");
       String owned = exchange.getRequestHeaders().getFirst("X-Application-Traceparent");
       if (owned != null) {
         request.header("TrAcEpArEnT", owned);
@@ -199,11 +204,27 @@ public class Main {
           }
         }
         response =
-            "async".equals(testMode)
-                ? selected.sendAsync(original, HttpResponse.BodyHandlers.ofString()).join()
+            async || "async".equals(testMode)
+                ? selected
+                    .sendAsync(original, HttpResponse.BodyHandlers.ofString())
+                    .thenApply(
+                        value -> {
+                          if (async) {
+                            checkPropagationScope();
+                          }
+                          return value;
+                        })
+                    .join()
                 : selected.send(original, HttpResponse.BodyHandlers.ofString());
         if ("reuse".equals(testMode)) {
-          response = selected.send(original, HttpResponse.BodyHandlers.ofString());
+          response =
+              async
+                  ? selected.sendAsync(original, HttpResponse.BodyHandlers.ofString()).join()
+                  : selected.send(original, HttpResponse.BodyHandlers.ofString());
+        }
+        if (async) {
+          checkPropagationScope();
+          CompletableFuture.runAsync(Main::checkPropagationScope, httpExecutor).join();
         }
       } catch (java.io.IOException | InterruptedException expected) {
         if (!"timeout".equals(testMode)
@@ -239,6 +260,24 @@ public class Main {
         reply(exchange, 500, error.toString());
       } catch (Exception ignored) {
       }
+    }
+  }
+
+  private static void checkPropagationScope() {
+    try {
+      Class<?> helper =
+          Class.forName(
+              "io.opentelemetry.obi.java.instrumentations.data.JdkHttpClientPropagation",
+              true,
+              null);
+      java.lang.reflect.Field field = helper.getDeclaredField("current");
+      field.setAccessible(true);
+      if (((ThreadLocal<?>) field.get(null)).get() != null) {
+        throw new IllegalStateException(
+            "HttpClient propagation scope leaked into application code");
+      }
+    } catch (ReflectiveOperationException error) {
+      throw new IllegalStateException(error);
     }
   }
 

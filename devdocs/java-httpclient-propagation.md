@@ -1,6 +1,6 @@
 # Java HttpClient HTTPS propagation
 
-OBI can inject a W3C `traceparent` into synchronous Java 11+ `java.net.http.HttpClient.send()`
+OBI can inject a W3C `traceparent` into Java 11+ `java.net.http.HttpClient.send()` and `sendAsync()`
 requests sent over HTTPS with HTTP/1.1. Enable header propagation through the existing
 `capture.engine.propagation.context_propagation: headers` setting in Config v2.
 TCP-option propagation is independent and is not required.
@@ -12,16 +12,20 @@ OBI leaves the request unchanged. No additional configuration is introduced.
 
 ## Injection and span identity
 
-The agent tracks requests created during a synchronous `send()`, including
-internal copies used for redirects and retries. Public `sendAsync()` calls
-temporarily suspend that tracking, including calls made reentrantly during a
-synchronous send. Tracking is removed when `send()` returns or throws.
+The agent tracks internal request instances and copies used for redirects and retries.
+Each public `sendAsync()` call captures its own parent, including reentrant calls.
+Its temporary caller scope is restored before returning the original future;
+request ownership remains until that future completes, fails, or is cancelled.
+Completion cleanup removes ownership and reservations without setting or clearing
+thread-local context on the completion thread. Application completion callbacks
+and later executor tasks cannot inherit this propagation scope.
+Tracking for synchronous `send()` is removed when it returns or throws.
 
 The HTTP/1.1 header hook runs before TLS encryption. It obtains the connected
 socket's addresses and asks eBPF to reserve an outbound client span identity.
-At entry to `send()`, a separate control packet captures the current Java
+At entry to `send()` or `sendAsync()`, a separate control packet captures the current Java
 server context before work moves to pooled workers. The captured parent is
-retained only within that `send()`, so concurrent calls, retries on another
+retained only for that request, so concurrent calls, retries on another
 worker, and new connections keep their own parent. Each attempt receives a fresh
 client span ID using OBI's existing trace flags policy. An acknowledged empty
 context starts a new trace; an unacknowledged capture skips injection.
@@ -38,8 +42,8 @@ Java request tracking and retained native packets are each capped at 10,000
 entries per JVM; capacity exhaustion skips injection without evicting active
 requests. Reservations are keyed by PID and the full connection tuple. The bounded hash
 map does not evict active reservations; when full, new requests are sent without
-injection. Reservations are consumed on observation, released when `send()`
-exits, and removed when the socket closes. Release checks the reserved value so
+injection. Reservations are consumed on observation, released when the owning call
+completes, and removed when the socket closes. Release checks the reserved value so
 an older request cannot delete a later request's state on a reused connection.
 
 ## Ownership and compatibility
@@ -65,8 +69,8 @@ JVM restart. Disabling header propagation in OBI always prevents injection.
 
 ## Scope and validation
 
-Only actual HTTPS HTTP/1.1 requests from synchronous `send()` are eligible.
-`sendAsync()`, HTTP/2, plaintext HTTP, other clients, and messaging use their
+Only actual HTTPS HTTP/1.1 requests from `send()` and `sendAsync()` are eligible.
+HTTP/2, plaintext HTTP, other clients, and messaging use their
 existing instrumentation paths without this injection. An HTTP/2 preference
 that negotiates HTTP/1.1 is still an HTTP/1.1 request.
 
@@ -82,6 +86,14 @@ carrier-thread state.
 With header propagation disabled, the existing Java TLS path can export a
 virtual-thread HttpClient client span in a separate trace.
 
+The asynchronous suite instruments only the source with OBI and runs the
+OpenTelemetry Java agent on the downstream. The proxy is not instrumented, and
+TCP-option propagation is disabled. It checks exactly one header with the incoming
+trace ID and exported client span ID, the source server/client ancestry (including
+OBI processing spans), and direct downstream server parentage. It also exercises
+concurrent distinct contexts, connection and request reuse, application-owned
+headers, disabled propagation, and callback/executor scope isolation.
+
 The integration fixture records the headers received by a TLS-terminating proxy
 and checks the exported downstream trace. It covers application-owned headers,
 disabled propagation, concurrent and pooled distinct parents, request reuse,
@@ -92,7 +104,7 @@ after timeouts, interruption, TLS rejection, and connection failure.
 Run the focused integration suite with:
 
 ```sh
-go test -v -count=1 -run '^TestJavaHTTPClientTraceparent$' -timeout 15m ./internal/test/integration/
+go test -v -count=1 -run '^TestJavaHTTPClient(Async)?Traceparent$' -timeout 15m ./internal/test/integration/
 ```
 
 To select another JDK, set `JAVA_HTTPCLIENT_RUNTIME_IMAGE` to a digest-pinned

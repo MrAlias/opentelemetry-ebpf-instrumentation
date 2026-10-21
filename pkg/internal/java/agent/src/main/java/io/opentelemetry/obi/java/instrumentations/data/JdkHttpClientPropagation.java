@@ -20,8 +20,10 @@ import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.BiConsumer;
 
-public final class JdkHttpClientPropagation {
+public final class JdkHttpClientPropagation implements BiConsumer<Object, Throwable> {
   public static final String PROPERTY = "otel.obi.java.agent.httpclient.propagation";
   private static final int MAX_TRACKED_REQUESTS = 10_000;
   private static final int CONNECTION_SIZE = 36;
@@ -60,12 +62,6 @@ public final class JdkHttpClientPropagation {
     }
     JdkHttpClientPropagation scope = new JdkHttpClientPropagation(current.get());
     current.set(scope);
-    return scope;
-  }
-
-  public static JdkHttpClientPropagation suspend() {
-    JdkHttpClientPropagation scope = current.get();
-    current.remove();
     return scope;
   }
 
@@ -131,12 +127,30 @@ public final class JdkHttpClientPropagation {
     }
     current.remove();
     restore(scope.previous);
-    synchronized (scope) {
-      scope.active = false;
-      for (Object request : scope.instances) {
+    scope.accept(null, null);
+  }
+
+  public static void finishAsync(JdkHttpClientPropagation scope, CompletableFuture<?> future) {
+    if (scope == null) {
+      return;
+    }
+    current.remove();
+    restore(scope.previous);
+    if (future == null) {
+      scope.accept(null, null);
+    } else {
+      future.whenComplete(scope);
+    }
+  }
+
+  @Override
+  public void accept(Object response, Throwable failure) {
+    synchronized (this) {
+      active = false;
+      for (Object request : instances) {
         requests.remove(request);
       }
-      for (NativeMemory packet : scope.reservations) {
+      for (NativeMemory packet : reservations) {
         try {
           packet.setByte(0, OperationType.HTTP1_TRACEPARENT_RELEASE.code);
           Agent.NativeLib.ioctl(0, Agent.IOCTL_CMD, packet.getAddress());
@@ -145,8 +159,10 @@ public final class JdkHttpClientPropagation {
         }
       }
       synchronized (requests) {
-        retainedReservations -= scope.reservations.size();
+        retainedReservations -= reservations.size();
       }
+      instances.clear();
+      reservations.clear();
     }
   }
 

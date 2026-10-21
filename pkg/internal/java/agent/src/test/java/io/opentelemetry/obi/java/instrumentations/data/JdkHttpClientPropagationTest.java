@@ -111,24 +111,78 @@ class JdkHttpClientPropagationTest {
   }
 
   @Test
-  void excludesAsyncCallsAndRestoresTheSynchronousScope() {
-    Object sync = new Object();
-    Object async = new Object();
+  void asyncOwnershipOutlivesTheCallerAndDoesNotScopeCompletionCallbacks() throws Exception {
+    Object request = new Object();
+    Object callbackRequest = new Object();
+    java.util.concurrent.CompletableFuture<Object> future =
+        new java.util.concurrent.CompletableFuture<>();
     JdkHttpClientPropagation scope = JdkHttpClientPropagation.enter();
+    JdkHttpClientPropagation.register(request, new Object[0], true);
+    JdkHttpClientPropagation.finishAsync(scope, future);
+    Object callerRequest = new Object();
+    JdkHttpClientPropagation.register(callerRequest, new Object[0], true);
+    assertFalse(JdkHttpClientPropagation.contains(callerRequest));
+    assertTrue(JdkHttpClientPropagation.contains(request));
+    java.util.concurrent.CompletableFuture<Void> callback =
+        future.thenAccept(
+            value -> {
+              JdkHttpClientPropagation.register(callbackRequest, new Object[0], true);
+              assertFalse(JdkHttpClientPropagation.contains(callbackRequest));
+            });
+    java.util.concurrent.ExecutorService executor =
+        java.util.concurrent.Executors.newSingleThreadExecutor();
     try {
-      JdkHttpClientPropagation suspended = JdkHttpClientPropagation.suspend();
-      try {
-        JdkHttpClientPropagation.register(async, new Object[0], true);
-        assertFalse(JdkHttpClientPropagation.contains(async));
-      } finally {
-        JdkHttpClientPropagation.restore(suspended);
-      }
-      JdkHttpClientPropagation.register(sync, new Object[0], true);
-      assertTrue(JdkHttpClientPropagation.contains(sync));
+      executor.submit(() -> future.complete(new Object())).get();
+      callback.get();
+      assertFalse(JdkHttpClientPropagation.contains(request));
+      executor
+          .submit(
+              () -> {
+                JdkHttpClientPropagation.register(callbackRequest, new Object[0], true);
+                assertFalse(JdkHttpClientPropagation.contains(callbackRequest));
+              })
+          .get();
     } finally {
-      JdkHttpClientPropagation.exit(scope);
+      executor.shutdownNow();
     }
-    assertFalse(JdkHttpClientPropagation.contains(sync));
+  }
+
+  @Test
+  void asyncCleanupPreservesUnrelatedScopesAndHandlesEveryCompletion() {
+    for (String completion : Arrays.asList("completed", "cancelled", "failed", "thrown")) {
+      Object original = new Object();
+      Object unrelated = new Object();
+      Object late = new Object();
+      JdkHttpClientPropagation outer = JdkHttpClientPropagation.enter();
+      JdkHttpClientPropagation async = JdkHttpClientPropagation.enter();
+      JdkHttpClientPropagation.register(original, new Object[0], true);
+      java.util.concurrent.CompletableFuture<Object> future =
+          new java.util.concurrent.CompletableFuture<>();
+      if ("completed".equals(completion)) {
+        future.complete(new Object());
+      }
+      JdkHttpClientPropagation.finishAsync(async, "thrown".equals(completion) ? null : future);
+      JdkHttpClientPropagation unrelatedScope = JdkHttpClientPropagation.enter();
+      JdkHttpClientPropagation.register(unrelated, new Object[0], true);
+      assertTrue(JdkHttpClientPropagation.contains(unrelated));
+      if ("cancelled".equals(completion)) {
+        future.cancel(true);
+      }
+      if ("failed".equals(completion)) {
+        future.completeExceptionally(new IllegalStateException());
+      }
+      assertFalse(JdkHttpClientPropagation.contains(original));
+      assertTrue(JdkHttpClientPropagation.contains(unrelated));
+      JdkHttpClientPropagation.register(late, new Object[] {original}, false);
+      assertFalse(JdkHttpClientPropagation.contains(late));
+      Object afterCompletion = new Object();
+      JdkHttpClientPropagation.register(afterCompletion, new Object[0], true);
+      JdkHttpClientPropagation.exit(unrelatedScope);
+      assertFalse(JdkHttpClientPropagation.contains(afterCompletion));
+      assertFalse(JdkHttpClientPropagation.contains(unrelated));
+      JdkHttpClientPropagation.exit(outer);
+      assertFalse(JdkHttpClientPropagation.contains(unrelated));
+    }
   }
 
   @Test

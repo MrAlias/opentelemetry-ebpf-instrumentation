@@ -151,8 +151,8 @@ as new instrumentation or bug fixes.
 
 ### HTTP/1.1 propagation control packets
 
-With OBI header propagation enabled, synchronous Java 11+ HTTPS HTTP/1.1
-`HttpClient.send()` requests can inject `traceparent` before encryption.
+With OBI header propagation enabled, Java 11+ HTTPS HTTP/1.1
+`HttpClient.send()` and `sendAsync()` requests can inject `traceparent` before encryption.
 Application-owned values are preserved. See
 [Java HttpClient propagation](../../../devdocs/java-httpclient-propagation.md)
 for compatibility checks, limits, and integration tests.

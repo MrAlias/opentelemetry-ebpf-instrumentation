@@ -12,6 +12,7 @@ import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import net.bytebuddy.agent.builder.AgentBuilder;
 import net.bytebuddy.asm.Advice;
 import net.bytebuddy.description.type.TypeDescription;
@@ -169,7 +170,7 @@ public class JdkHttpClientInst {
                           ElementMatchers.returns(
                               ElementMatchers.named("java.net.http.HttpResponse"))))
               .isEmpty();
-      // send() delegates to a private overload; public sendAsync() must be excluded.
+      // send() delegates to a private overload; public sendAsync() owns its own scope.
       compatible &=
           !impl.getDeclaredMethods()
               .filter(
@@ -240,12 +241,15 @@ public class JdkHttpClientInst {
   public static final class AsynchronousSendAdvice {
     @Advice.OnMethodEnter(suppress = Throwable.class)
     public static JdkHttpClientPropagation enter() {
-      return JdkHttpClientPropagation.suspend();
+      JdkHttpClientPropagation scope = JdkHttpClientPropagation.enter();
+      JdkHttpClientPropagation.captureParent(scope);
+      return scope;
     }
 
     @Advice.OnMethodExit(onThrowable = Throwable.class, suppress = Throwable.class)
-    public static void exit(@Advice.Enter JdkHttpClientPropagation scope) {
-      JdkHttpClientPropagation.restore(scope);
+    public static void exit(
+        @Advice.Enter JdkHttpClientPropagation scope, @Advice.Return CompletableFuture<?> future) {
+      JdkHttpClientPropagation.finishAsync(scope, future);
     }
   }
 

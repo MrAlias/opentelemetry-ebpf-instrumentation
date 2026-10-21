@@ -52,17 +52,7 @@ func TestJavaHTTPClientTraceparent(t *testing.T) {
 			}
 
 			run := fmt.Sprintf("%s-%d", mode, time.Now().UnixNano())
-			require.EventuallyWithT(t, func(ct *assert.CollectT) {
-				resp, err := http.Get("http://localhost:18080/call/" + run + "-warmup-" + strconv.FormatInt(time.Now().UnixNano(), 10))
-				require.NoError(ct, err)
-				require.NoError(ct, resp.Body.Close())
-				require.Equal(ct, http.StatusOK, resp.StatusCode)
-				trace, err := latestTraceMatching("java-httpclient", func(trace jaeger.Trace) bool {
-					return len(clientSpans(trace)) > 0
-				})
-				require.NoError(ct, err)
-				require.NotEmpty(ct, trace.TraceID, "Java TLS instrumentation is not ready")
-			}, 2*time.Minute, time.Second)
+			waitForJavaHTTPClientTrace(t, run, mode)
 			t.Run("generated", func(t *testing.T) {
 				testJavaHTTPClientTraceparent(t, run+"-generated", "11111111111111111111111111111111", "", mode)
 			})
@@ -142,13 +132,52 @@ func TestJavaHTTPClientTraceparent(t *testing.T) {
 	}
 }
 
+func waitForJavaHTTPClientTrace(t *testing.T, run, mode string) {
+	t.Helper()
+	id := run + "-warmup"
+	traceID := fmt.Sprintf("%032x", []byte(id[len(id)-16:]))
+	require.EventuallyWithT(t, func(ct *assert.CollectT) {
+		req, err := http.NewRequest(http.MethodGet, "http://localhost:18080/call/"+id, nil)
+		require.NoError(ct, err)
+		req.Header.Set("traceparent", "00-"+traceID+"-"+traceID[16:]+"-01")
+		response, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+		require.NoError(ct, err)
+		_, err = io.ReadAll(response.Body)
+		require.NoError(ct, err)
+		require.NoError(ct, response.Body.Close())
+		require.Equal(ct, http.StatusOK, response.StatusCode)
+		query, err := fetchTrace(traceID)
+		require.NoError(ct, err)
+		require.Len(ct, query.Data, 1)
+		trace := query.Data[0]
+		servers := trace.FindByOperationNameServiceAndKind("GET /call/"+id, "java-httpclient", "server")
+		require.NotEmpty(ct, servers)
+		if mode == "headers" {
+			clients := trace.FindByOperationNameServiceAndKind("GET /"+id, "java-httpclient", "client")
+			linked := false
+			for _, client := range clients {
+				for _, server := range servers {
+					linked = linked || javaSpanDescendsFrom(trace, client, server.SpanID)
+				}
+			}
+			require.True(ct, linked)
+		} else {
+			clientTrace, err := latestTraceMatching("java-httpclient", func(trace jaeger.Trace) bool {
+				return len(trace.FindByOperationNameServiceAndKind("GET /"+id, "java-httpclient", "client")) > 0
+			})
+			require.NoError(ct, err)
+			require.NotEmpty(ct, clientTrace.TraceID)
+		}
+	}, 2*time.Minute, time.Second)
+}
+
 func testJavaHTTPClientTraceparent(t *testing.T, id, traceID, owned, mode string, testModes ...string) {
 	t.Helper()
 	testMode := ""
 	if len(testModes) > 0 {
 		testMode = testModes[0]
 	}
-	injected := mode == "headers" && testMode != "async" && testMode != "http2" && testMode != "oversized"
+	injected := mode == "headers" && testMode != "http2" && testMode != "oversized"
 	method := http.MethodGet
 	if testMode == "post" {
 		method = http.MethodPost
@@ -219,7 +248,12 @@ func testJavaHTTPClientTraceparent(t *testing.T, id, traceID, owned, mode string
 	if testMode == "reentrant-async" {
 		nested := javaProxyObservations(t, id+"-nested")
 		require.Len(t, nested, 1)
-		require.Empty(t, nested[0].Headers, "reentrant sendAsync must not inherit synchronous eligibility")
+		if mode == "headers" {
+			require.Len(t, nested[0].Headers, 1)
+			require.Regexp(t, `^00-`+traceID+`-[0-9a-f]{16}-01$`, nested[0].Headers[0])
+		} else {
+			require.Empty(t, nested[0].Headers)
+		}
 	}
 	var downstream jaeger.Trace
 	require.EventuallyWithT(t, func(ct *assert.CollectT) {
@@ -310,10 +344,12 @@ func testJavaHTTPClientTraceparent(t *testing.T, id, traceID, owned, mode string
 }
 
 type javaProxyObservation struct {
-	Headers    []string `json:"headers"`
-	Protocol   int      `json:"protocol"`
-	Connection string   `json:"connection"`
-	Body       string   `json:"body"`
+	Headers     []string `json:"headers"`
+	Protocol    int      `json:"protocol"`
+	Connection  string   `json:"connection"`
+	Body        string   `json:"body"`
+	Application string   `json:"application"`
+	Tracestate  string   `json:"tracestate"`
 }
 
 func javaSpanDescendsFrom(trace jaeger.Trace, span jaeger.Span, ancestor string) bool {

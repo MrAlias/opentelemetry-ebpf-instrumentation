@@ -276,3 +276,125 @@ logical contract OBI uses to reconstruct task lineage. The exception is
 `asyncio.start_server` on uvloop: its accept path runs in C with no
 CPython-visible context, so per-connection handler tasks cannot be correlated
 there.
+
+## aiohttp HTTPS header propagation regression
+
+The `TestSuiteAiohttpTLSHeaders` integration scenario uses one shared
+`aiohttp.ClientSession` on the standard asyncio selector loop. Only the source
+process is selected by OBI. An uninstrumented TLS-terminating proxy records
+`raw_headers`, HTTP version, body bytes, and connection identity before forwarding
+to a downstream service with an OpenTelemetry SDK server span. The source and
+proxy do not import the SDK. The proxy's two-request barrier ensures the source
+tasks overlap; sequential requests before that barrier establish connector reuse.
+
+The checks cover distinct known incoming contexts, source server → source client
+→ downstream server parentage, cancellation followed by another request,
+session defaults overridden by request headers, and application-supplied
+traceparents. Header counts are case-insensitive. Bodies contain all byte values
+and are checked at both the TLS terminator and downstream. The disabled case
+still reads incoming headers and preserves supplied outgoing traceparents.
+TCP-option propagation and black-box correlation are disabled.
+The source client may be parented through OBI's existing internal `processing`
+span belonging to that source server; the downstream server must be a direct
+child of the transmitted source client span.
+
+Run the complete scenario with:
+
+```sh
+docker compose -f internal/test/integration/docker-compose-aiohttp-tls.yml build source obi
+SKIP_DOCKER_BUILD=1 go test -count=1 -v -run '^TestSuiteAiohttpTLSHeaders$' -timeout 10m ./internal/test/integration/
+```
+
+For an explicit pre-fix baseline, start the fixture services and OBI, then run
+`check.py --baseline` in the check container. That mode expects no injected TLS
+header, but still requires OBI source spans and checks their parentage. It is
+separate from the default integration acceptance checks. `check.py --fixture-only`
+checks transport and supplied-header behavior without requiring OBI spans; passing
+it does not establish OBI injection or parentage.
+
+Local fixture checks passed on Linux amd64 with CPython 3.12.3, OpenSSL 3.0.13,
+OpenTelemetry SDK/HTTP exporter 1.36.0, and both aiohttp 3.12.15 and 3.13.3.
+All nine requests passed in each header-mode and disabled-mode fixture run.
+The complete native OBI scenario passed on CPython 3.14.3, aiohttp 3.13.3,
+multidict 6.9.1, OpenSSL 3.5.5, OpenTelemetry SDK/HTTP exporter 1.36.0, and Linux
+`7.0.0-1014-aws` on amd64. Both `headers` and `disabled` modes passed all nine
+requests, including source-parent checks for the canceled client span. The
+source and proxy reported no loaded OpenTelemetry SDK. The Docker fixture uses
+checksum-pinned, unstripped CPython 3.14.3 archives and the same Python dependencies.
+The Docker suite also passed both modes on amd64 with these versions: all nine
+requests passed per mode, including cancellation and source-parent checks.
+The standard `python:3.14.3-slim` image strips both `_asyncio` and libpython's
+private symbols. A diagnostic run with that runtime transmitted no injected
+header and failed overlapping-task correlation, so it cannot exercise this
+scenario's required asyncio association. The fixture leaves the acceptance
+checks unchanged and supplies the private symbols those existing probes need.
+It mounts the existing `security_none` mock; the repository's default security
+mock selects integrity lockdown, which disables probe-based header injection.
+
+Generation passed for amd64 and arm64 with CI LLVM 22.1.8. Go 1.27.2 production
+`make compile`, a focused binary build, generic-tracer package tests, collector
+race tests, Config v2 validation, CI LLVM formatting and lint checks,
+license-header checks, and Markdown lint passed.
+Final Docker regeneration refreshed both architectures after a C comment edit.
+The regenerated executable, map, data, and relocation sections match the tested
+objects; decoded BTF type graphs are equivalent despite type-ID ordering changes.
+The focused tracer tests and production build passed again after regeneration.
+The native end-to-end runs use the final capability-guarded binary. They launch
+the same fixture and acceptance checks outside Docker, with real OBI and SDK
+OTLP exports collected locally; the collector preserves exported IDs and parents.
+Local wire records and exported spans are retained under
+`testoutput/aiohttp-tls-native/` (ignored build output), along with the passing
+Docker suite and per-mode transcripts.
+A final-binary run with `CAP_SYS_ADMIN` removed from OBI also passed the
+no-injection baseline checks: tracing continued, no header was added, and supplied
+headers remained unchanged. This checks that the verifier can prune the write
+helper when the existing capability gate disables injection.
+
+Full `make verify` passed on 2026-10-21 with Go 1.27.2, `GOMAXPROCS=4`,
+`GOFLAGS=-p=1`, and short `TMPDIR` and `GOTMPDIR` paths (`/tmp`). This includes
+both module linters, main-module race/coverage tests, collector race tests, and
+license checks. The complete host run passed after the unchanged Kubernetes
+envtest package was also validated in a temporary private network namespace
+with a local interface and default route. Earlier shared-host retries hit that
+package's ten-second stress-test deadline and a collision on its fixed metrics
+port 8080. Its original 1,500-pod workload and deadlines were retained. The final
+full verification log is `testoutput/aiohttp-tls-native/verify-after-isolation.log`.
+
+A pre-change native OBI run on the same CPython 3.14.3 runtime and kernel
+`7.0.0-1014-aws` exported source spans and transmitted all nine requests. The TLS
+proxy saw no traceparent on the seven requests without an application-supplied
+value; the session and request values each arrived exactly once and unchanged.
+This establishes the missing injection baseline, not successful propagation.
+The baseline's parentage check failed for one overlapping request because its
+client span was not in the incoming trace. That Python build includes `_asyncio`
+in the interpreter executable; the original probe patterns did not attach its
+task-step probes. Thus the native baseline is a wire observation and a failed
+correlation check, not a passing integration run. An earlier Ubuntu CPython 3.12.3
+run also had stripped `_asyncio` symbols (`nm` reports no symbols), so that runtime
+could not establish the intended private asyncio probe coverage.
+
+### Native serializer injection
+
+The aiohttp probes append to unused capacity in its temporary native `Writer`,
+before the serializer creates the final Python byte buffer. They observe every
+header key before appending, preserving any supplied traceparent and the session
+and request precedence that aiohttp already applied. The header bytes are written
+first; updating the writer position publishes them. Bodies are outside this
+buffer. Recursive serialization and dictionary mutation disable injection for
+that serialization.
+
+The pending client context uses the existing task reference and generation. The
+generic tracer consumes it only for the same task or a validated ancestor and
+only if the transmitted traceparent bytes match. A later serialization replaces
+an unconsumed entry, so cancellation cannot reuse its span identity. The existing
+task-step probes also attach to versioned Python executables and libpython for
+builds that include `_asyncio` there.
+
+Injection requires `headers`, the existing `bpf_probe_write_user` capability and
+lockdown checks, resolvable native symbols, and a valid owning server context.
+It recognizes the GIL-enabled 64-bit native CIMultiDict layout validated above;
+unsupported types and layouts are left unchanged. The writer must have enough
+spare capacity for the header and final CRLFs. Serialization is bounded to 128
+headers and a 64 KiB insertion position. Pure-Python serialization, stripped
+private symbols, free-threaded builds, HTTP/2, other clients, and uvloop have not
+been validated by this scenario. Arm64 artifacts were generated but not executed.

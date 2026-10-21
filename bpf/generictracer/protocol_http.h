@@ -31,6 +31,7 @@
 #include <generictracer/large_buf_tailcall.h>
 #include <generictracer/http_server_trace.h>
 #include <generictracer/protocol_common.h>
+#include <generictracer/python_http.h>
 #include <generictracer/tcp_trace_cleanup.h>
 
 #include <logger/bpf_dbg.h>
@@ -678,6 +679,17 @@ __obi_continue_protocol_http(struct pt_regs *ctx,
     };
 
     sort_egress_key(&e_key);
+
+    tp_info_pid_t *python_tp = tp_info_mem();
+    if (meta && meta->type == k_event_type_http_client && python_tp) {
+        const u8 parent = take_python_http_client_trace(args, python_tp);
+        if (parent != k_parent_status_none) {
+            info->parent_status = parent;
+            set_trace_info_for_connection(&args->pid_conn.conn, TRACE_TYPE_CLIENT, python_tp);
+            bpf_map_delete_elem(&outgoing_trace_map, &e_key);
+            goto skip_tp;
+        }
+    }
 
     tp_info_pid_t *tp_p = bpf_map_lookup_elem(&outgoing_trace_map, &e_key);
 

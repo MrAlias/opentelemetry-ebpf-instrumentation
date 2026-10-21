@@ -220,6 +220,11 @@ func (p *Tracer) LoadSpecs() ([]*ebpfcommon.SpecBundle, error) {
 	return []*ebpfcommon.SpecBundle{{Spec: spec, Objects: &p.bpfObjects, Constants: p.constants()}}, nil
 }
 
+func (p *Tracer) headerPropagationEnabled() bool {
+	return p != nil && p.cfg != nil && p.cfg.EBPF.ContextPropagation.HasHeaders() &&
+		!ebpfcommon.IntegrityModeOverride && ebpfcommon.SupportsContextPropagationWithProbe(p.log)
+}
+
 func (p *Tracer) constants() map[string]any {
 	m := make(map[string]any, 2)
 
@@ -271,6 +276,8 @@ func (p *Tracer) constants() map[string]any {
 
 	m["g_bpf_debug"] = p.cfg.EBPF.BpfDebug
 	m["g_bpf_traceparent_enabled"] = p.cfg.EBPF.TrackRequestHeaders || p.cfg.EBPF.ContextPropagation.IsEnabled()
+	m["g_bpf_header_propagation"] = p.cfg.EBPF.ContextPropagation.HasHeaders()
+	m["g_bpf_probe_write_user_enabled"] = p.headerPropagationEnabled()
 	m["jvm_sampling_interval_ns"] = uint64(0)
 	if p.cfg.AppRuntimeMetricsEnabled() {
 		m["jvm_sampling_interval_ns"] = uint64(p.cfg.JVMRuntimeMetrics.SamplingInterval.Nanoseconds())
@@ -540,6 +547,10 @@ func (p *Tracer) UProbes() map[string]map[string][]*ebpfcommon.ProbeDesc {
 			}},
 		},
 		"libpython3.": {
+			"_asyncio_Task___init__": {{
+				Start: p.bpfObjects.ObiUprobeTaskInit,
+				End:   p.bpfObjects.ObiUprobeTaskInitRet,
+			}},
 			"context_new_empty": {{
 				Required: false,
 				End:      p.bpfObjects.ObiUprobeNewContext,
@@ -596,6 +607,47 @@ func (p *Tracer) UProbes() map[string]map[string][]*ebpfcommon.ProbeDesc {
 				End:      p.bpfObjects.ObiUprobeTaskStepRet,
 			}},
 		},
+		// _asyncio can be built into libpython or the interpreter executable.
+		"libpython3.[>= 3.12]": {
+			"task_step": {{
+				Start: p.bpfObjects.ObiUprobeTaskStep,
+				End:   p.bpfObjects.ObiUprobeTaskStepRet,
+			}},
+		},
+		"libpython3.[< 3.12]": {
+			"task_step": {{
+				Start: p.bpfObjects.ObiUprobeTaskStepLegacy,
+				End:   p.bpfObjects.ObiUprobeTaskStepRet,
+			}},
+		},
+		"python[>= 3.12]": {
+			"task_step": {{
+				Start: p.bpfObjects.ObiUprobeTaskStep,
+				End:   p.bpfObjects.ObiUprobeTaskStepRet,
+			}},
+		},
+		"python[< 3.12]": {
+			"task_step": {{
+				Start: p.bpfObjects.ObiUprobeTaskStepLegacy,
+				End:   p.bpfObjects.ObiUprobeTaskStepRet,
+			}},
+		},
+	}
+	if p.headerPropagationEnabled() {
+		m["_http_writer"] = map[string][]*ebpfcommon.ProbeDesc{
+			"__pyx_pf_7aiohttp_12_http_writer__serialize_headers": {{
+				Start: p.bpfObjects.ObiAiohttpSerialize,
+				End:   p.bpfObjects.ObiAiohttpSerializeRet,
+			}},
+			"__pyx_pf_7aiohttp_12_http_writer__serialize_headers.isra.0": {{
+				Start: p.bpfObjects.ObiAiohttpSerializeIsra,
+				End:   p.bpfObjects.ObiAiohttpSerializeRet,
+			}},
+			"__pyx_f_7aiohttp_12_http_writer__write_str_raise_on_nlcr": {{
+				Start: p.bpfObjects.ObiAiohttpWriteStr,
+				End:   p.bpfObjects.ObiAiohttpWriteStrRet,
+			}},
+		}
 	}
 	return m
 }

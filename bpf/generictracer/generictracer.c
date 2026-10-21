@@ -10,6 +10,7 @@
 #include "nginx.c"
 #include "nodejs.c"
 #include "python.c"
+#include "python_aiohttp.c"
 #include "protocol_handler.c"
 #include "ruby.c"
 #include "python_runtime.c"

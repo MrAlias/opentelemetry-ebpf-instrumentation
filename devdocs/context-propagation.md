@@ -53,8 +53,8 @@ Examples:
 - `headers` - HTTP headers only
 
 > **⚠️ TCP options and middleboxes.** TCP-option propagation writes an unknown
-> TCP option (kind 25) onto the connection's segments. On SSL/TLS connections
-> this is the *only* channel, since the payload is ciphertext (see Case 1). An
+> TCP option (kind 25) onto the connection's segments. For SSL/TLS clients without
+> library-level header injection, this is the only channel (see Case 1). An
 > unknown TCP option on an established connection is not preserved end-to-end
 > across many network paths: L7 proxies and load balancers discard and replay
 > the original packets, and some middleboxes and managed endpoints drop or reset
@@ -65,7 +65,7 @@ Examples:
 > If your instrumented services talk through such intermediaries, use
 > `headers` and do not enable `tcp`. HTTP-header propagation is unaffected;
 > only cross-service linking over paths that require the TCP-option channel
-> (chiefly non-Go SSL/TLS clients) is lost. TCP options are safe only when OBI
+> (SSL/TLS clients without library-level header injection) is lost. TCP options are safe only when OBI
 > is on both ends and the path preserves them (typically a direct L2/L3 network
 > with no option-stripping middlebox).
 
@@ -76,6 +76,13 @@ Examples:
 The order in which BPF programs execute varies depending on whether Go uprobes or SSL detection is involved:
 
 #### Scenario A: Go HTTP or SSL/TLS (uprobes involved)
+
+Supported native aiohttp HTTP/1.1 serializers can also inject before encryption.
+Their probes use the current Python task's server context and reserve the client
+span identity; the generic HTTP tracer adopts it when it observes the matching
+request bytes. See [Python asyncio context propagation](python-asyncio-context-propagation.md#aiohttp-https-header-propagation-regression)
+for tested versions and limits. The generic SSL probes themselves remain
+observational.
 
 1. **uprobes** (Go HTTP client or SSL detection)
    - Populate `outgoing_trace_map` with initial trace context
@@ -324,10 +331,10 @@ Sockets are added to `sock_dir` in two ways:
    - Later layers overwrite earlier layers
    - Result: Most reliable method takes precedence
 
-3. **HTTP/1 TLS uses TCP options, not HTTP headers**:
-   - Can't inject into encrypted payload
-   - TCP options work before TLS handshake
-   - tpinjector deletes entry early to skip HTTP detection
+3. **HTTP/1 TLS headers require library support before encryption**:
+   - Go and supported native aiohttp serializers can inject headers before encryption.
+   - Other generic TLS clients rely on TCP options; the SSL probes cannot grow their plaintext buffers.
+   - tpinjector skips HTTP detection on ciphertext.
    - HTTP/2 / gRPC TLS never uses TCP options (multiplexing). Generic TLS HTTP/2 cannot splice HPACK into ciphertext. Go TLS injects via uprobe before encrypt.
 
 4. **Execution order varies by scenario**:

@@ -24,6 +24,7 @@
 
 #include <maps/active_ssl_connections.h>
 #include <maps/java_tasks.h>
+#include <maps/outgoing_trace_map.h>
 #include <maps/java_vt_threads.h>
 
 #include <pid/pid.h>
@@ -39,6 +40,8 @@ enum {
     k_ioctl_java_vt_unmount = 5, // virtual thread unmounted from this carrier
     k_ioctl_java_runtime_metrics = 6,
     k_ioctl_java_gc_duration = 7,
+    k_ioctl_java_grpc_context = 8,
+    k_ioctl_java_grpc_stream = 9,
 };
 
 enum { k_ioctl_invalid_op = 0xff };
@@ -105,6 +108,58 @@ int BPF_KPROBE_GUARDED(obi_kprobe_sys_ioctl) {
     // Control opcodes each handle themselves and return; the data opcodes
     // (send/recv) fall through to the connection/payload path below.
     switch (op_cmd) {
+    case k_ioctl_java_grpc_context: {
+        if (!g_bpf_header_propagation) {
+            return 0;
+        }
+
+        trace_key_t key = {0};
+        trace_key_from_pid_tid(&key);
+        const tp_info_pid_t *parent = find_parent_java_trace(&key);
+        tp_info_t tp = {0};
+        tp.ts = bpf_ktime_get_ns();
+        tp.flags = k_flag_sampled;
+        urand_bytes(tp.span_id, sizeof(tp.span_id));
+        if (parent && parent->valid && valid_trace(parent->tp.trace_id) &&
+            should_be_in_same_transaction(&parent->tp, &tp)) {
+            bpf_memcpy(tp.trace_id, parent->tp.trace_id, sizeof(tp.trace_id));
+            bpf_memcpy(tp.parent_id, parent->tp.span_id, sizeof(tp.parent_id));
+            tp.flags = parent->tp.flags;
+        } else {
+            new_trace_id(&tp);
+        }
+        if (bpf_probe_write_user(uarg + 1, &tp, sizeof(tp)) == 0) {
+            const u8 complete = 0;
+            bpf_probe_write_user(uarg, &complete, sizeof(complete));
+        }
+        return 0;
+    }
+    case k_ioctl_java_grpc_stream: {
+        if (!g_bpf_header_propagation) {
+            return 0;
+        }
+
+        connection_info_t conn = {0};
+        u32 stream_id = 0;
+        tp_info_pid_t tp = {0};
+        if (bpf_probe_read_user(&conn, sizeof(conn), uarg + 1) ||
+            bpf_probe_read_user(&stream_id, sizeof(stream_id), uarg + 1 + sizeof(conn)) ||
+            bpf_probe_read_user(
+                &tp.tp, sizeof(tp.tp), uarg + 1 + sizeof(conn) + sizeof(stream_id))) {
+            return 0;
+        }
+        if (!stream_id || !(stream_id & 1) || !valid_trace(tp.tp.trace_id)) {
+            return 0;
+        }
+        egress_key_t key = {.s_port = conn.s_port, .d_port = conn.d_port, .stream_id = stream_id};
+        sort_egress_key(&key);
+        tp.pid = pid_from_pid_tgid(id);
+        tp.valid = 1;
+        tp.written = 1;
+        tp.req_type = k_event_type_http_client;
+        bpf_map_update_elem(&outgoing_trace_map, &key, &tp, BPF_ANY);
+        return 0;
+    }
     case k_ioctl_java_vt_mount: {
         // The agent reports, on every VirtualThread.mount(), the logical
         // thread id now mounted on this carrier; the current kernel thread

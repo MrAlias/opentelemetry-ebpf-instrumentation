@@ -10,6 +10,8 @@ communicates with eBPF programs for distributed tracing and monitoring.
 - **Socket-level tracing** - Instruments `javax.net.ssl.SSLSocket` and `java.nio.channels.SocketChannel` operations
 - **SSL/TLS support** - Intercepts `javax.net.ssl.SSLEngine` for encrypted traffic
 - **Netty support** - Instruments Netty channels for reactive applications
+- **gRPC propagation** - Injects W3C traceparent into blocking unary calls on
+  `grpc-netty-shaded`, including TLS; preserves application metadata
 
 ## 📋 Basic concepts
 
@@ -134,6 +136,18 @@ p.getByte(0)           → 1    (OperationType.SEND)
 p.getInt(1 + 36)       → 1    (Buffer length at offset 37)
 p.getByte(1 + 36 + 4)  → 42   (Data byte at offset 41)
 ```
+
+The control opcodes for blocking unary gRPC propagation are:
+
+- `8` (`GRPC_CONTEXT`): one opcode byte followed by a zeroed 48-byte
+  `tp_info_t` reply. OBI writes a new client context derived from the calling
+  thread's server span when header propagation and user-memory writes are
+  enabled. OBI clears the opcode after the complete reply is written; an
+  unacknowledged reply disables injection.
+- `9` (`GRPC_STREAM`): one opcode byte, 36-byte send connection info,
+  native-order 32-bit HTTP/2 stream ID and the 48-byte context. This publishes
+  the context before encryption so the observed client span uses the injected
+  span ID. No OpenTelemetry dependency is loaded into the application.
 
 ### 4. Java agent compatibility
 

@@ -85,6 +85,39 @@ Parent lookup priority in `create_tp`:
 1. `outgoing_trace_map[{ports, stream_id}]` — written by Go uprobe or kprobe CLIENT
 2. `find_parent_trace` — general fallback chain: Node.js → Python → nginx → Puma → Java → process traces → `cp_support_connect_info`
 
+### Java blocking unary calls over TLS
+
+For `grpc-netty-shaded`, the Java agent captures the calling thread's context
+inside `ClientCalls.blockingUnaryCall` and associates it with the call's
+`Metadata`. `DelayedClientCall.start` captures the initial RPC before gRPC's
+executor handoff. The `RetriableStream.updateHeaders` hook carries that association
+through gRPC's metadata copy, including the ordinary first attempt. Only
+the shaded transport's `Utils.convertClientHeaders` adds the W3C field, before HPACK encoding and
+TLS encryption. Any application-provided `traceparent`, including an empty or
+invalid value, owns that RPC's field and is preserved.
+
+At `DefaultHttp2ConnectionEncoder.writeHeaders`, the agent publishes the
+RPC context with the connection ports and assigned stream ID through the
+Java ioctl channel. The generic HTTP/2 parser adopts that entry for its client
+span, using the same `outgoing_trace_map` handshake as the Go path. Shaded
+`SslHandler` instrumentation supplies the connection for plaintext TLS capture.
+SSL engine advice also captures Netty’s native array-to-array unwrap path,
+including coalesced responses. The exact HTTP/2 header-carrier object carries ownership through serialization,
+including for application-owned fields, so client spans keep their RPC context.
+Ownership is bounded and specific to each RPC; an application field does not
+disable injection on other streams sharing a connection. Blocking-call exit
+cleans up call scope, including cancellation and exceptions.
+
+The ioctl context reply is enabled only for header propagation when
+`bpf_probe_write_user` is supported. With propagation disabled, the zeroed reply
+leaves metadata untouched. This path covers blocking unary calls only; other
+transports, asynchronous calls and streaming calls are outside its scope.
+
+`TestSuite_JavaGRPCTLS` exercises an OBI-only source, a non-instrumented nginx
+HTTP/2 TLS terminator and an OpenTelemetry downstream. It records received
+metadata and checks parentage, repeated calls, overlapping RPCs on one TLS
+connection, application metadata and propagation disabled.
+
 ### Go Uprobe Path
 
 1. **`transport_http2Client_NewStream`** — caches `{pid, conn_ptr} → {connection_info, socket_cookie}` in `grpc_conn_ptr_to_conn`. The socket cookie comes from the Go connection's `netFD.pfd.Sysfd` and the current task's file table.

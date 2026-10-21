@@ -48,6 +48,9 @@ public class SSLEngineInst {
                     .on(
                         ElementMatchers.named("unwrap")
                             .and(ElementMatchers.takesArguments(2))
+                            .and(
+                                ElementMatchers.takesArgument(0, ByteBuffer.class)
+                                    .or(ElementMatchers.takesArgument(0, ByteBuffer[].class)))
                             .and(ElementMatchers.takesArgument(1, ByteBuffer[].class))))
             .visit(
                 Advice.to(WrapAdvice.class)
@@ -164,7 +167,7 @@ public class SSLEngineInst {
     @Advice.OnMethodEnter(suppress = Throwable.class)
     public static Object[] unwrap(
         @Advice.This final javax.net.ssl.SSLEngine engine,
-        @Advice.Argument(0) final ByteBuffer src,
+        @Advice.Argument(0) final Object source,
         @Advice.Argument(1) final ByteBuffer[] dsts) {
       if (dsts == null) {
         return null;
@@ -185,6 +188,7 @@ public class SSLEngineInst {
       // Capture the buffer key from src BEFORE unwrap() modifies the buffer content
       // in-place. TLS 1.3 (AES-GCM) decrypts directly in the source buffer's backing
       // array, so after unwrap() the bytes no longer match what SocketChannelInst stored.
+      ByteBuffer src = source instanceof ByteBuffer ? (ByteBuffer) source : null;
       String srcBufKey =
           (src != null && b(src).hasRemaining())
               ? ByteBufferExtractor.keyFromFreshBuffer(src)
@@ -250,6 +254,7 @@ public class SSLEngineInst {
           }
           if (savedDstPositions[i] != -1) {
             dups[i] = dsts[i].duplicate();
+            b(dups[i]).limit(b(dsts[i]).position());
             b(dups[i]).position(savedDstPositions[i]);
           }
         }

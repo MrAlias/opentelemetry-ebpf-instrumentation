@@ -13,14 +13,16 @@ import net.bytebuddy.matcher.ElementMatcher;
 import net.bytebuddy.matcher.ElementMatchers;
 
 public class NettySSLHandlerInst {
+  private static final String shadedClassName =
+      "io.grpc.netty.shaded.io.netty.handler.ssl.SslHandler";
   private static final String instClassName = "io.netty.handler.ssl.SslHandler";
 
   public static ElementMatcher<? super TypeDescription> type() {
-    return ElementMatchers.named(instClassName);
+    return ElementMatchers.namedOneOf(instClassName, shadedClassName);
   }
 
   public static boolean matches(Class<?> clazz) {
-    return clazz.getName().equals(instClassName);
+    return clazz.getName().equals(instClassName) || clazz.getName().equals(shadedClassName);
   }
 
   public static AgentBuilder.Transformer transformer() {

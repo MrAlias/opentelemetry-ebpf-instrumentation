@@ -12,6 +12,7 @@ import io.opentelemetry.obi.java.ebpf.*;
 import io.opentelemetry.obi.java.instrumentations.*;
 import io.opentelemetry.obi.java.instrumentations.data.BytesWithLen;
 import io.opentelemetry.obi.java.instrumentations.data.Connection;
+import io.opentelemetry.obi.java.instrumentations.data.GrpcClientContext;
 import io.opentelemetry.obi.java.instrumentations.data.JdkHttpClientTask;
 import io.opentelemetry.obi.java.instrumentations.data.SSLStorage;
 import io.opentelemetry.obi.java.instrumentations.util.ByteBufferExtractor;
@@ -166,6 +167,8 @@ public class Agent {
         .transform(NettySSLHandlerInst.transformer())
         .type(JavaExecutorInst.type())
         .transform(JavaExecutorInst.transformer())
+        .type(GrpcClientInst.type())
+        .transform(GrpcClientInst.transformer())
         .type(JdkHttpClientInst.type())
         .transform(JdkHttpClientInst.transformer())
         .type(CallableInst.type())
@@ -215,6 +218,7 @@ public class Agent {
           || SSLEngineInst.matches(clazz)
           || SocketChannelInst.matches(clazz)
           || JavaExecutorInst.matches(clazz)
+          || GrpcClientInst.matches(clazz)
           || JdkHttpClientInst.matches(clazz)
           || CallableInst.matches(clazz)
           || RunnableInst.matches(clazz)
@@ -252,6 +256,7 @@ public class Agent {
     Class.forName(BytesWithLen.class.getName());
     Class.forName(Connection.class.getName());
     Class.forName(JdkHttpClientTask.class.getName());
+    Class.forName(GrpcClientContext.class.getName());
     Class.forName(NettyChannelExtractor.class.getName());
     Class.forName(SSLStorage.class.getName());
     Class.forName(ByteBufferExtractor.class.getName());

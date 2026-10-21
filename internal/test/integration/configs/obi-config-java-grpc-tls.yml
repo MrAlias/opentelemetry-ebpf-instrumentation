@@ -1,0 +1,43 @@
+file_format: "1.0"
+log_level: debug
+resource:
+  attributes:
+    - name: service.name
+      value: java-grpc-source
+tracer_provider:
+  processors:
+    - batch:
+        schedule_delay: 100
+        exporter:
+          otlp_grpc:
+            endpoint: http://jaeger:4317
+            tls:
+              insecure: true
+extensions:
+  obi:
+    version: "2.0"
+    capture:
+      policy:
+        default_action: exclude
+        poll_interval: 500ms
+        min_process_age: 0s
+      rules:
+        - action: include
+          match:
+            process:
+              open_ports: "8080"
+              cmd_args_glob: ["*fixture.Source*"]
+      engine:
+        batching:
+          batch_timeout: 100ms
+        propagation:
+          context_propagation: "${JAVA_GRPC_PROPAGATION:-headers}"
+      instrumentation:
+        http:
+          track_request_headers: true
+          routes:
+            incoming:
+              unmatched: path
+    daemon:
+      logging:
+        debug_trace_output: text

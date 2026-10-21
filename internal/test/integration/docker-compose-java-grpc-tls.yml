@@ -1,0 +1,57 @@
+services:
+  certs:
+    image: alpine:3.23@sha256:85fe1e81d6758c208f3e1eed4338a1997e19d4be002d4dd32d3100c9a8c010a0
+    command: sh -c 'apk add --no-cache openssl && openssl req -x509 -newkey rsa:2048 -nodes -keyout /certs/key.pem -out /certs/cert.pem -days 2 -subj /CN=proxy -addext subjectAltName=DNS:proxy && chmod 644 /certs/key.pem'
+    volumes:
+      - java-grpc-certs:/certs
+  source:
+    build:
+      context: ../../..
+      dockerfile: internal/test/integration/components/java_grpc_tls/Dockerfile
+    image: hatest-java-grpc-tls-source
+    volumes:
+      - java-grpc-certs:/certs:ro
+    ports:
+      - "18086:8080"
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+      proxy:
+        condition: service_started
+  proxy:
+    image: nginx:1.31.3@sha256:5a88c9c45479443d7be2eadc894b4ed0a9801bae03d97a5760ae13b5c2005942
+    volumes:
+      - java-grpc-certs:/certs:ro
+      - ./components/java_grpc_tls/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+      receiver:
+        condition: service_started
+  receiver:
+    build:
+      context: ../../..
+      dockerfile: internal/test/integration/components/java_grpc_tls/receiver/Dockerfile
+    image: hatest-java-grpc-tls-receiver
+  obi:
+    build:
+      context: ../../..
+      dockerfile: internal/test/integration/components/obi/Dockerfile-with-javaagent
+    image: hatest-java-grpc-obi
+    privileged: true
+    pid: host
+    environment:
+      OTEL_EBPF_CONFIG_PATH: /configs/obi-config-java-grpc-tls.yml
+      JAVA_GRPC_PROPAGATION: "${JAVA_GRPC_PROPAGATION:-headers}"
+    volumes:
+      - ./configs:/configs:ro
+      - ./system/sys/kernel/security_none:/sys/kernel/security
+      - /sys/kernel/tracing:/sys/kernel/tracing:ro
+      - /sys/fs/cgroup:/sys/fs/cgroup
+      - ../../../testoutput/run-java-grpc-tls:/var/run/obi
+  jaeger:
+    image: jaegertracing/jaeger:2.22.0@sha256:836b967b5abcf1f7758066aa6b348619267a2f1459f72d472840570f9bd88a17
+    ports:
+      - "16686:16686"
+volumes:
+  java-grpc-certs:

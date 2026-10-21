@@ -200,6 +200,11 @@ func TestBPFVerifierWithConstants(t *testing.T) {
 		{"ringbuf_metrics_enabled", []any{true, false}},
 	})
 
+	forEachCombination(t, "generictracer/BpfJavaGRPC", generictracerbpf.LoadBpf, []constOption{
+		{"g_bpf_debug", []any{true, false}},
+		{"g_bpf_header_propagation", []any{ebpfcommon.SupportsContextPropagationWithProbe(slog.Default())}},
+	})
+
 	// nodejs_runtime_metrics_enabled only gates the decode path in nodejs.c,
 	// which shares no code with the constants above except the debug and
 	// traceparent machinery — a dedicated small matrix keeps the nodejs path

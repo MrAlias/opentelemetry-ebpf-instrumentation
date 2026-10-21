@@ -22,6 +22,8 @@ public final class AgentVersion {
   /** JVM system property the agent publishes when it loads. */
   public static final String PROPERTY = "otel.obi.java.agent.version";
 
+  public static final String READY_PROPERTY = "otel.obi.java.agent.ready";
+
   private static final String RESOURCE = "/obi-java-agent-version.properties";
 
   private AgentVersion() {}

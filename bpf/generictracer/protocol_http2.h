@@ -84,7 +84,7 @@ static __always_inline u64 uniqueHTTP2ConnId(pid_connection_info_t *p_conn) {
     return random_id;
 }
 
-// Use the trace the Go uprobe wrote to outgoing_trace_map (replaces what find_trace_for_client_request returned).
+// Use the context supplied by the request's Go uprobe or Java agent.
 // Returns 1 when the injected context replaced the inferred one.
 static __always_inline u8 adopt_injected_trace(http2_conn_stream_t *s_key, tp_info_t *tp) {
     egress_key_t sorted_e = {
@@ -99,6 +99,7 @@ static __always_inline u8 adopt_injected_trace(http2_conn_stream_t *s_key, tp_in
         bpf_memcpy(tp->trace_id, injected->tp.trace_id, TRACE_ID_SIZE_BYTES);
         bpf_memcpy(tp->span_id, injected->tp.span_id, SPAN_ID_SIZE_BYTES);
         bpf_memcpy(tp->parent_id, injected->tp.parent_id, SPAN_ID_SIZE_BYTES);
+        tp->flags = injected->tp.flags;
 
         return 1;
     }

@@ -22,6 +22,8 @@ class JdkHttpClientInstTest {
         JdkHttpClientInst.matches(
             Class.forName("jdk.internal.net.http.HttpClientImpl$SelectorManager")));
     assertTrue(JdkHttpClientInst.matches(Class.forName("jdk.internal.net.http.AsyncEvent")));
+    assertTrue(JdkHttpClientInst.matches(Class.forName("jdk.internal.net.http.HttpRequestImpl")));
+    assertTrue(JdkHttpClientInst.matches(Class.forName("jdk.internal.net.http.Http2Connection")));
     assertFalse(JdkHttpClientInst.matches(Object.class));
   }
 

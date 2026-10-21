@@ -12,6 +12,7 @@ import io.opentelemetry.obi.java.ebpf.*;
 import io.opentelemetry.obi.java.instrumentations.*;
 import io.opentelemetry.obi.java.instrumentations.data.BytesWithLen;
 import io.opentelemetry.obi.java.instrumentations.data.Connection;
+import io.opentelemetry.obi.java.instrumentations.data.JdkHttpClientPropagation;
 import io.opentelemetry.obi.java.instrumentations.data.JdkHttpClientTask;
 import io.opentelemetry.obi.java.instrumentations.data.SSLStorage;
 import io.opentelemetry.obi.java.instrumentations.util.ByteBufferExtractor;
@@ -82,6 +83,13 @@ public class Agent {
     }
   }
 
+  private static void publishReady(boolean ready) {
+    try {
+      System.setProperty(AgentVersion.READY_PROPERTY, Boolean.toString(ready));
+    } catch (SecurityException ignored) {
+    }
+  }
+
   private static Map<String, String> parseArgs(String agentArgs) {
     Map<String, String> opts = new HashMap<>();
     if (agentArgs != null && !agentArgs.isEmpty()) {
@@ -129,6 +137,7 @@ public class Agent {
       agentLoaded = true;
     }
 
+    publishReady(false);
     publishVersion();
 
     Map<String, String> opts = parseArgs(agentArgs);
@@ -177,6 +186,8 @@ public class Agent {
         .type(VirtualThreadInst.type())
         .transform(VirtualThreadInst.transformer())
         .installOn(inst);
+
+    publishReady(true);
 
     if (optEnabled(opts, "runtimeMetrics")) {
       try {
@@ -252,6 +263,9 @@ public class Agent {
     Class.forName(BytesWithLen.class.getName());
     Class.forName(Connection.class.getName());
     Class.forName(JdkHttpClientTask.class.getName());
+    Class.forName(JdkHttpClientPropagation.class.getName());
+    Class.forName(JdkHttpClientPropagation.Scope.class.getName());
+    Class.forName(JdkHttpClientPropagation.IdentityKey.class.getName());
     Class.forName(NettyChannelExtractor.class.getName());
     Class.forName(SSLStorage.class.getName());
     Class.forName(ByteBufferExtractor.class.getName());

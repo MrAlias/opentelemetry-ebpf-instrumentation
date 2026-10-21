@@ -1,0 +1,34 @@
+file_format: "1.0"
+log_level: info
+tracer_provider:
+  processors:
+    - batch:
+        schedule_delay: 10
+        exporter:
+          otlp_http:
+            endpoint: http://127.0.0.1:28418
+extensions:
+  obi:
+    version: "2.0"
+    capture:
+      policy:
+        default_action: exclude
+        poll_interval: 500ms
+        min_process_age: 0s
+      rules:
+        - action: include
+          match:
+            process:
+              open_ports: "28180"
+      engine:
+        batching:
+          batch_timeout: 10ms
+        propagation:
+          context_propagation: "${JAVA_HTTP2_PROPAGATION:-headers}"
+      instrumentation:
+        http:
+          routes:
+            incoming:
+              unmatched: path
+            outgoing:
+              unmatched: path

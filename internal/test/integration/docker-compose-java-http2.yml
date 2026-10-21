@@ -1,0 +1,57 @@
+name: obi-java-http2
+
+services:
+  source:
+    image: hatest-java-http2-source
+    build:
+      context: ../../..
+      dockerfile: internal/test/integration/components/java_http2/Dockerfile
+      target: source
+    ports:
+      - "28181:28180"
+    environment:
+      OTEL_SERVICE_NAME: java-http2-source
+
+  proxy:
+    image: hatest-java-http2-backend
+    build:
+      context: ../../..
+      dockerfile: internal/test/integration/components/java_http2/Dockerfile
+      target: backend
+    environment:
+      ROLE: proxy
+
+  downstream:
+    image: hatest-java-http2-backend
+    build:
+      context: ../../..
+      dockerfile: internal/test/integration/components/java_http2/Dockerfile
+      target: backend
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+
+  obi:
+    build:
+      context: ../../..
+      dockerfile: internal/test/integration/components/obi/Dockerfile-with-javaagent
+    image: hatest-obi-javaagent
+    privileged: true
+    network_mode: host
+    pid: host
+    volumes:
+      - ./configs:/configs:ro
+      - /sys/kernel/tracing:/sys/kernel/tracing:ro
+      - /sys/fs/cgroup:/sys/fs/cgroup
+      - ../../../testoutput/run-java-http2:/var/run/obi
+    environment:
+      OTEL_EBPF_CONFIG_PATH: /configs/obi-config-java-http2.yml
+      JAVA_HTTP2_PROPAGATION: "${JAVA_HTTP2_PROPAGATION:-headers}"
+    depends_on:
+      - source
+      - jaeger
+
+  jaeger:
+    image: jaegertracing/jaeger:2.22.0@sha256:836b967b5abcf1f7758066aa6b348619267a2f1459f72d472840570f9bd88a17
+    ports:
+      - "28686:16686"
+      - "28418:4318"

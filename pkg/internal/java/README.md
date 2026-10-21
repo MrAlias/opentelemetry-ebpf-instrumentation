@@ -10,6 +10,8 @@ communicates with eBPF programs for distributed tracing and monitoring.
 - **Socket-level tracing** - Instruments `javax.net.ssl.SSLSocket` and `java.nio.channels.SocketChannel` operations
 - **SSL/TLS support** - Intercepts `javax.net.ssl.SSLEngine` for encrypted traffic
 - **Netty support** - Instruments Netty channels for reactive applications
+- **JDK HttpClient propagation** - Injects W3C `traceparent` for synchronous
+  `HttpClient.send()` requests over HTTPS/HTTP/2 before HPACK encoding and TLS encryption
 
 ## 📋 Basic concepts
 
@@ -148,6 +150,50 @@ The version is stored in
 `agent/src/main/resources/obi-java-agent-version.properties`. Increment it when a change breaks
 compatibility between OBI and the Java agent. Do not increment it for compatible changes, such
 as new instrumentation or bug fixes.
+
+The `otel.obi.java.agent.ready` property is `false` during initialization and
+becomes `true` after bytecode transformations are installed. The HTTP/2 test
+fixture uses it to avoid sending its first TLS request before dynamic attachment
+has finished.
+
+### 5. Synchronous JDK HTTP/2 propagation
+
+The JDK HttpClient hook captures the caller's OBI context while `send()` creates
+its internal request. A bounded map retains that context by request identity,
+so equal requests and concurrent callers sharing a TLS connection remain separate.
+The HTTP/2 encoder binds the chosen client span to the connection's stream ID
+before adding the header. The generic tracer adopts that span, and its existing
+`written` marker prevents another OBI injector from adding a second header.
+Request state is removed when it is bound or when synchronous `send()` exits.
+
+Application-supplied `traceparent` headers are preserved. Injection requires
+header propagation and support for `bpf_probe_write_user` (including the required
+capabilities and kernel lockdown settings). Disabled propagation and failed
+context operations leave the request headers unchanged. The hook does not inject
+into `sendAsync()`, HTTP/1.1, cleartext HTTP/2, or other Java HTTP clients.
+
+Two additional IOCTL operations use a two-byte prefix: operation and a zero-initialized
+status byte. OBI sets status to one only after completing the operation:
+
+| Operation | Payload after the prefix |
+| --- | --- |
+| 8: capture synchronous context | Output: 48-byte native `tp_info_t` |
+| 9: bind HTTP/2 stream | Input: `tp_info_t`, 36-byte `connection_info_t`, native `u32` stream ID |
+
+An older OBI ignores these operations, leaving status zero and injection disabled.
+The existing TLS capture and JNI interfaces are unchanged.
+
+This path has been validated on Linux amd64 with Temurin 11.0.28+6,
+17.0.16+8, 21.0.8+9, and 21.0.12.1+1. The agent still targets Java 8 bytecode; the
+`java.net.http` hooks apply only where the JDK HttpClient is available.
+
+The `TestJavaHTTP2Propagation` integration regression selects only the source
+service for OBI instrumentation and checks negotiated HTTP/2, header ownership,
+concurrent callers sharing a TLS connection, and exact downstream parent links:
+
+```sh
+go test -v -run '^TestJavaHTTP2Propagation$' -timeout 10m ./internal/test/integration/
+```
 
 ## 🔨 Building
 

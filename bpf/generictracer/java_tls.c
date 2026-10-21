@@ -9,12 +9,14 @@
 #include <bpfcore/bpf_tracing.h>
 
 #include <common/connection_info.h>
+#include <common/globals.h>
 #include <common/event_defs.h>
 #include <common/preempt_guard.h>
 #include <common/protocol_defs.h>
 #include <common/ringbuf.h>
 #include <common/trace_key.h>
 #include <common/trace_parent.h>
+#include <common/tracing.h>
 
 #include <generictracer/jvm.h>
 #include <generictracer/k_tracer_defs.h>
@@ -25,6 +27,7 @@
 #include <maps/active_ssl_connections.h>
 #include <maps/java_tasks.h>
 #include <maps/java_vt_threads.h>
+#include <maps/outgoing_trace_map.h>
 
 #include <pid/pid.h>
 
@@ -39,9 +42,12 @@ enum {
     k_ioctl_java_vt_unmount = 5, // virtual thread unmounted from this carrier
     k_ioctl_java_runtime_metrics = 6,
     k_ioctl_java_gc_duration = 7,
+    k_ioctl_java_http2_context = 8,
+    k_ioctl_java_http2_bind = 9,
 };
 
 enum { k_ioctl_invalid_op = 0xff };
+enum { k_ioctl_control_header_len = 2, k_java_http2_max_stream_id = 0x7fffffff };
 // Keep this ceiling aligned with the largest large-buffer capture limit in
 // bpf/common/large_buffers.h.
 enum { k_ioctl_max_payload_len = 1 << 16 };
@@ -105,6 +111,65 @@ int BPF_KPROBE_GUARDED(obi_kprobe_sys_ioctl) {
     // Control opcodes each handle themselves and return; the data opcodes
     // (send/recv) fall through to the connection/payload path below.
     switch (op_cmd) {
+    case k_ioctl_java_http2_context: {
+        if (!g_bpf_header_propagation || !g_bpf_probe_write_user_enabled) {
+            return 0;
+        }
+
+        trace_key_t key = {};
+        trace_key_from_pid_tid(&key);
+        const tp_info_pid_t *parent = find_parent_java_trace(&key);
+        tp_info_t tp = {.ts = bpf_ktime_get_ns(), .flags = k_flag_sampled};
+        urand_bytes(tp.span_id, sizeof(tp.span_id));
+        if (parent && parent->valid && valid_trace(parent->tp.trace_id)) {
+            bpf_memcpy(tp.trace_id, parent->tp.trace_id, sizeof(tp.trace_id));
+            bpf_memcpy(tp.parent_id, parent->tp.span_id, sizeof(tp.parent_id));
+            tp.flags = parent->tp.flags;
+        } else {
+            new_trace_id(&tp);
+        }
+
+        // The status byte is committed last; an old agent/OBI or a failed write is a no-op.
+        if (bpf_probe_write_user(uarg + k_ioctl_control_header_len, &tp, sizeof(tp)) == 0) {
+            const u8 ready = 1;
+            bpf_probe_write_user(uarg + 1, &ready, sizeof(ready));
+        }
+        return 0;
+    }
+    case k_ioctl_java_http2_bind: {
+        if (!g_bpf_header_propagation || !g_bpf_probe_write_user_enabled) {
+            return 0;
+        }
+
+        tp_info_pid_t tp = {.pid = pid_from_pid_tgid(id),
+                            .valid = 1,
+                            .written = 1,
+                            .req_type = k_event_type_http_client};
+        connection_info_t conn = {};
+        u32 stream_id = 0;
+        if (bpf_probe_read_user(&tp.tp, sizeof(tp.tp), uarg + k_ioctl_control_header_len) != 0 ||
+            bpf_probe_read_user(
+                &conn, sizeof(conn), uarg + k_ioctl_control_header_len + sizeof(tp.tp)) != 0 ||
+            bpf_probe_read_user(&stream_id,
+                                sizeof(stream_id),
+                                uarg + k_ioctl_control_header_len + sizeof(tp.tp) + sizeof(conn)) !=
+                0 ||
+            !valid_trace(tp.tp.trace_id) || !conn.s_port || !conn.d_port || !(stream_id & 1) ||
+            stream_id > k_java_http2_max_stream_id) {
+            return 0;
+        }
+
+        egress_key_t key = {.s_port = conn.s_port, .d_port = conn.d_port, .stream_id = stream_id};
+        sort_egress_key(&key);
+        // The generic HTTP/2 tracer adopts this span; the wire injector skips written entries.
+        if (bpf_map_update_elem(&outgoing_trace_map, &key, &tp, BPF_NOEXIST) == 0) {
+            const u8 ready = 1;
+            if (bpf_probe_write_user(uarg + 1, &ready, sizeof(ready)) != 0) {
+                bpf_map_delete_elem(&outgoing_trace_map, &key);
+            }
+        }
+        return 0;
+    }
     case k_ioctl_java_vt_mount: {
         // The agent reports, on every VirtualThread.mount(), the logical
         // thread id now mounted on this carrier; the current kernel thread

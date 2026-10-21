@@ -1,0 +1,31 @@
+services:
+  source:
+    build:
+      context: ../../..
+      dockerfile: internal/test/integration/components/pythonhttpx/Dockerfile
+    image: obi-test-python-httpx
+    command: ["python", "source.py"]
+  proxy:
+    image: obi-test-python-httpx
+    command: ["python", "proxy.py"]
+    depends_on: [source]
+  downstream:
+    image: obi-test-python-httpx
+    command: ["python", "downstream.py"]
+    depends_on: [source, jaeger]
+  jaeger:
+    image: jaegertracing/all-in-one:1.60@sha256:4fd2d70fa347d6a47e79fcb06b1c177e6079f92cba88b083153d56263082135e
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+  obi:
+    image: ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac
+    entrypoint: ["/obi", "--config=/config.yml"]
+    volumes:
+      - ../../../bin/obi:/obi:ro
+      - ./configs/obi-config-python-httpx.yml:/config.yml:ro
+    privileged: true
+    pid: service:source
+    network_mode: service:source
+    environment:
+      HTTPX_PROPAGATION: ${HTTPX_PROPAGATION:-headers}
+    depends_on: [source, proxy, downstream]

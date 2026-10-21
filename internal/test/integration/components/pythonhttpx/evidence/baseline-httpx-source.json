@@ -1,0 +1,272 @@
+{
+  "data": [
+    {
+      "traceID": "e5b2a3ccaf295d4276b9183fa4df706e",
+      "spans": [
+        {
+          "traceID": "e5b2a3ccaf295d4276b9183fa4df706e",
+          "spanID": "91605445c3d166ed",
+          "operationName": "POST /echo",
+          "references": [
+            {
+              "refType": "CHILD_OF",
+              "traceID": "e5b2a3ccaf295d4276b9183fa4df706e",
+              "spanID": "1db07d4f1b151394"
+            }
+          ],
+          "startTime": 1792457649443714,
+          "duration": 58390,
+          "tags": [
+            {
+              "key": "server.port",
+              "type": "int64",
+              "value": 43056
+            },
+            {
+              "key": "server.address",
+              "type": "string",
+              "value": "127.0.0.1"
+            },
+            {
+              "key": "url.full",
+              "type": "string",
+              "value": "https://127.0.0.1/echo?id=97d1b6ea2f4f5361"
+            },
+            {
+              "key": "http.request.method",
+              "type": "string",
+              "value": "POST"
+            },
+            {
+              "key": "http.response.status_code",
+              "type": "int64",
+              "value": 200
+            },
+            {
+              "key": "url.scheme",
+              "type": "string",
+              "value": "https"
+            },
+            {
+              "key": "url.query",
+              "type": "string",
+              "value": "id=97d1b6ea2f4f5361"
+            },
+            {
+              "key": "network.peer.address",
+              "type": "string",
+              "value": "127.0.0.1"
+            },
+            {
+              "key": "network.peer.port",
+              "type": "int64",
+              "value": 43056
+            },
+            {
+              "key": "network.protocol.version",
+              "type": "string",
+              "value": "1.1"
+            },
+            {
+              "key": "span.kind",
+              "type": "string",
+              "value": "client"
+            },
+            {
+              "key": "internal.span.format",
+              "type": "string",
+              "value": "otlp"
+            }
+          ],
+          "logs": [],
+          "processID": "p1",
+          "warnings": null
+        },
+        {
+          "traceID": "e5b2a3ccaf295d4276b9183fa4df706e",
+          "spanID": "1db07d4f1b151394",
+          "operationName": "GET /call",
+          "references": [
+            {
+              "refType": "CHILD_OF",
+              "traceID": "e5b2a3ccaf295d4276b9183fa4df706e",
+              "spanID": "52940769451d1953"
+            }
+          ],
+          "startTime": 1792457649442682,
+          "duration": 60909,
+          "tags": [
+            {
+              "key": "server.port",
+              "type": "int64",
+              "value": 42293
+            },
+            {
+              "key": "client.address",
+              "type": "string",
+              "value": "127.0.0.1"
+            },
+            {
+              "key": "server.address",
+              "type": "string",
+              "value": "httpx-source"
+            },
+            {
+              "key": "http.response.status_code",
+              "type": "int64",
+              "value": 200
+            },
+            {
+              "key": "http.request.method",
+              "type": "string",
+              "value": "GET"
+            },
+            {
+              "key": "url.path",
+              "type": "string",
+              "value": "/call"
+            },
+            {
+              "key": "url.scheme",
+              "type": "string",
+              "value": "http"
+            },
+            {
+              "key": "http.route",
+              "type": "string",
+              "value": "/call"
+            },
+            {
+              "key": "url.query",
+              "type": "string",
+              "value": "id=97d1b6ea2f4f5361&mode=normal"
+            },
+            {
+              "key": "network.peer.address",
+              "type": "string",
+              "value": "127.0.0.1"
+            },
+            {
+              "key": "network.peer.port",
+              "type": "int64",
+              "value": 32976
+            },
+            {
+              "key": "network.protocol.version",
+              "type": "string",
+              "value": "1.1"
+            },
+            {
+              "key": "span.kind",
+              "type": "string",
+              "value": "server"
+            },
+            {
+              "key": "internal.span.format",
+              "type": "string",
+              "value": "otlp"
+            }
+          ],
+          "logs": [],
+          "processID": "p1",
+          "warnings": [
+            "invalid parent span IDs=52940769451d1953; skipping clock skew adjustment"
+          ]
+        }
+      ],
+      "processes": {
+        "p1": {
+          "serviceName": "httpx-source",
+          "tags": [
+            {
+              "key": "cloud.account.id",
+              "type": "string",
+              "value": "390403870171"
+            },
+            {
+              "key": "cloud.availability_zone",
+              "type": "string",
+              "value": "us-west-2a"
+            },
+            {
+              "key": "cloud.platform",
+              "type": "string",
+              "value": "aws_ec2"
+            },
+            {
+              "key": "cloud.provider",
+              "type": "string",
+              "value": "aws"
+            },
+            {
+              "key": "cloud.region",
+              "type": "string",
+              "value": "us-west-2"
+            },
+            {
+              "key": "host.id",
+              "type": "string",
+              "value": "i-0e8fbe260a77aba22"
+            },
+            {
+              "key": "host.image.id",
+              "type": "string",
+              "value": "ami-0794681e58321386f"
+            },
+            {
+              "key": "host.name",
+              "type": "string",
+              "value": "ip-10-236-40-89"
+            },
+            {
+              "key": "host.type",
+              "type": "string",
+              "value": "c5a.4xlarge"
+            },
+            {
+              "key": "os.type",
+              "type": "string",
+              "value": "linux"
+            },
+            {
+              "key": "otel.scope.name",
+              "type": "string",
+              "value": "go.opentelemetry.io/obi"
+            },
+            {
+              "key": "service.instance.id",
+              "type": "string",
+              "value": "ip-10-236-40-89:3892528"
+            },
+            {
+              "key": "telemetry.distro.name",
+              "type": "string",
+              "value": "opentelemetry-ebpf-instrumentation"
+            },
+            {
+              "key": "telemetry.distro.version",
+              "type": "string",
+              "value": "origin/HEAD"
+            },
+            {
+              "key": "telemetry.sdk.language",
+              "type": "string",
+              "value": "python"
+            },
+            {
+              "key": "telemetry.sdk.name",
+              "type": "string",
+              "value": "opentelemetry"
+            },
+            {
+              "key": "telemetry.sdk.version",
+              "type": "string",
+              "value": "v1.47.0"
+            }
+          ]
+        }
+      },
+      "warnings": null
+    }
+  ]
+}

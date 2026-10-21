@@ -21,6 +21,11 @@
     orig.ctxHook = undefined;
   }
   orig.requestFd = undefined;
+  if (orig.undiciCleanup) {
+    orig.undiciCleanup();
+    orig.undiciCleanup = undefined;
+  }
+  orig.undiciWrite = undefined;
 
   const { AsyncLocalStorage, createHook, executionAsyncResource } = require('async_hooks');
   const {
@@ -46,6 +51,7 @@
   // reader. Client spans are parented from the fd-pair map and manual spans
   // from the fd carried in their own sentinel, so neither depends on it.
   const CTX_HOOK_ENABLED = false; /*OBI_CTX_HOOK_ENABLED*/
+  const HEADER_PROPAGATION_ENABLED = false; /*OBI_HEADER_PROPAGATION_ENABLED*/
 
   if (debug_enabled) {
     console.log('OpenTelemetry eBPF Instrumentation has injected instrumentation via the NodeJS debugger');
@@ -168,8 +174,87 @@
         correlate(store.incomingFd, outFd, this);
       }
 
+      if (orig.undiciWrite) {
+        data = orig.undiciWrite(this, data);
+      }
       return doWrite();
     };
+
+    if (HEADER_PROPAGATION_ENABLED) {
+      const dc = require('diagnostics_channel');
+      const modules = require('module');
+      // Pool callbacks can run in a different request's async scope.
+      const requestFds = new WeakMap();
+      const pendingWrites = new WeakMap();
+      const npmRequests = new WeakMap();
+      const prefix = '/dev/null/obi-undici/';
+      const traceparentLength = 55;
+      const maxFd = 9999;
+      let nullFd;
+
+      const onCreate = ({ request }) => {
+        try {
+          const store = als.getStore();
+          if (!store || !String(request.origin).startsWith('https://')) return;
+          const ctor = request.constructor;
+          if (!npmRequests.has(ctor)) {
+            npmRequests.set(ctor, Object.values(modules._cache).some((m) =>
+              m.filename.endsWith('/undici/lib/core/request.js') && m.exports === ctor));
+          }
+          if (!npmRequests.get(ctor)) return;
+          const handler = Object.getOwnPropertySymbols(request).find((s) => s.description === 'handler');
+          if (!handler || request[handler].constructor.name !== 'RequestHandler') return;
+          requestFds.set(request, store.incomingFd);
+        } catch (_) {}
+      };
+      const onSendHeaders = ({ request, headers, socket }) => {
+        try {
+          const incomingFd = requestFds.get(request);
+          if (incomingFd == null || !socket.encrypted ||
+              (socket.alpnProtocol && socket.alpnProtocol !== 'http/1.1')) return;
+          pendingWrites.set(socket, { incomingFd, headers });
+        } catch (_) {}
+      };
+
+      orig.undiciWrite = (socket, data) => {
+        const pending = pendingWrites.get(socket);
+        if (!pending) return data;
+        pendingWrites.delete(socket);
+        try {
+          const { incomingFd, headers } = pending;
+          const outFd = socket._handle && socket._handle.fd;
+          correlate(incomingFd, outFd, socket);
+          if (!Number.isInteger(incomingFd) || !Number.isInteger(outFd) ||
+              incomingFd < 0 || incomingFd > maxFd || outFd < 0 || outFd > maxFd ||
+              typeof headers !== 'string' || /\r\ntraceparent:/i.test(headers)) return data;
+          const bytes = typeof data === 'string' ? data : Buffer.from(data);
+          const matches = typeof bytes === 'string' ? bytes.startsWith(headers) :
+            bytes.subarray(0, Buffer.byteLength(headers, 'latin1')).equals(Buffer.from(headers, 'latin1'));
+          if (!matches) return data;
+          if (nullFd === undefined) nullFd = fs.openSync('/dev/null', 'r');
+          const payload = Buffer.from(prefix + pad4(incomingFd) + pad4(outFd) + '0'.repeat(traceparentLength));
+          // uv_fs_read exposes the Buffer to BPF, which fills the traceparent tail.
+          fs.readSync(nullFd, payload, 0, payload.length, null);
+          const tp = payload.subarray(-traceparentLength).toString('ascii');
+          if (!/^00-[0-9a-f]{32}-[0-9a-f]{16}-0[01]$/.test(tp)) return data;
+          const at = headers.indexOf('\r\n') + 2;
+          const field = `traceparent: ${tp}\r\n`;
+          if (typeof data === 'string') return data.slice(0, at) + field + data.slice(at);
+          return Buffer.concat([bytes.subarray(0, at), Buffer.from(field), bytes.subarray(at)]);
+        } catch (_) {
+          return data;
+        }
+      };
+      dc.subscribe('undici:request:create', onCreate);
+      dc.subscribe('undici:client:sendHeaders', onSendHeaders);
+      orig.undiciCleanup = () => {
+        dc.unsubscribe('undici:request:create', onCreate);
+        dc.unsubscribe('undici:client:sendHeaders', onSendHeaders);
+        if (nullFd !== undefined) {
+          try { fs.closeSync(nullFd); } catch (_) {}
+        }
+      };
+    }
 
     // Signal the BPF layer before each async callback so it can restore the correct
     // trace context for this request into traces_ctx_v1.

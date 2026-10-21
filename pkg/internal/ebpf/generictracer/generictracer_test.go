@@ -23,6 +23,7 @@ import (
 	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
 	"go.opentelemetry.io/obi/pkg/appolly/discover/exec"
 	"go.opentelemetry.io/obi/pkg/appolly/services"
+	"go.opentelemetry.io/obi/pkg/config"
 	ebpfcommon "go.opentelemetry.io/obi/pkg/ebpf/common"
 	"go.opentelemetry.io/obi/pkg/ebpf/ringbuf"
 	"go.opentelemetry.io/obi/pkg/export"
@@ -480,3 +481,24 @@ func (f fakeServiceFilter) CurrentPIDs(ebpfcommon.PIDType) map[uint32]map[app.PI
 }
 
 func (f fakeServiceFilter) ProcPIDs(ebpfcommon.PIDType) []app.PID { return f.procPIDs }
+
+func TestNodeUndiciReadProbeRequiresHeaderPropagation(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		mode    config.ContextPropagationMode
+		enabled bool
+	}{
+		{"disabled", config.ContextPropagationDisabled, false},
+		{"TCP only", config.ContextPropagationTCP, false},
+		{"headers", config.ContextPropagationHeaders, true},
+		{"all", config.ContextPropagationAll, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tracer := &Tracer{cfg: &obi.Config{EBPF: config.EBPFTracer{ContextPropagation: tc.mode}}}
+			for _, library := range []string{"node", "libuv.so"} {
+				_, present := tracer.UProbes()[library]["uv_fs_read"]
+				require.Equal(t, tc.enabled, present)
+			}
+		})
+	}
+}

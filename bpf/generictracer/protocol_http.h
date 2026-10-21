@@ -26,6 +26,7 @@
 #include <common/tracked_connection.h>
 
 #include <generictracer/maps/http_info_mem.h>
+#include <generictracer/types/nodejs.h>
 
 #include <generictracer/k_tracer_tailcall.h>
 #include <generictracer/large_buf_tailcall.h>
@@ -671,6 +672,16 @@ __obi_continue_protocol_http(struct pt_regs *ctx,
                              unsigned char *(*tp_loop_fn)(unsigned char *, const u16)) {
     http_connection_metadata_t *meta =
         connection_meta_by_direction(args->direction, PACKET_TYPE_REQUEST);
+
+    if (g_bpf_header_propagation && args->ssl && meta && meta->type == k_event_type_http_client) {
+        tp_info_pid_t *prepared =
+            trace_info_for_connection(&args->pid_conn.conn, TRACE_TYPE_CLIENT);
+        if (prepared && prepared->valid && prepared->written == k_nodejs_traceparent_prepared &&
+            prepared->pid == args->pid_conn.pid) {
+            prepared->written = 0;
+            goto skip_tp;
+        }
+    }
 
     egress_key_t e_key = {
         .d_port = args->pid_conn.conn.d_port,

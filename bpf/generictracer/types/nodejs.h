@@ -5,6 +5,9 @@
 
 #include <bpfcore/vmlinux.h>
 
+// Distinguish a prepared Node.js TLS context from sk_msg's written=1.
+enum { k_nodejs_traceparent_prepared = 2 };
+
 // Event loop metrics reported by the injected nodejs agent (fdextractor.js)
 // through the uv_fs_access side channel. Field semantics:
 //   - elu_* are cumulative nanoseconds since loop start

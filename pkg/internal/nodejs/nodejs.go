@@ -307,6 +307,9 @@ const (
 
 	ctxHookEnabledPlaceholder = "= false; /*OBI_CTX_HOOK_ENABLED*/"
 	ctxHookEnabledOn          = "= true; /*OBI_CTX_HOOK_ENABLED*/"
+
+	headerPropagationPlaceholder = "= false; /*OBI_HEADER_PROPAGATION_ENABLED*/"
+	headerPropagationOn          = "= true; /*OBI_HEADER_PROPAGATION_ENABLED*/"
 )
 
 // agentCode returns the extractor script with the RT gate substituted from
@@ -325,6 +328,9 @@ func (i *NodeInjector) agentCode() string {
 	}
 	if i.cfg.PopulateTraceContext() {
 		code = strings.Replace(code, ctxHookEnabledPlaceholder, ctxHookEnabledOn, 1)
+	}
+	if i.cfg.EBPF.ContextPropagation.HasHeaders() {
+		code = strings.Replace(code, headerPropagationPlaceholder, headerPropagationOn, 1)
 	}
 	if i.cfg.NodeJS.ManualSpans {
 		code += ";\n" + _spanBridgeCode

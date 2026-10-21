@@ -17,8 +17,10 @@
 #include <common/trace_helpers.h>
 #include <common/trace_util.h>
 #include <common/tracing.h>
+#include <common/trace_parent.h>
 
 #include <generictracer/types/nodejs.h>
+#include <generictracer/maps/pid_tid_to_conn.h>
 
 #include <logger/bpf_dbg.h>
 
@@ -653,6 +655,92 @@ static __always_inline int handle_fd_correlation(char *buf, const u64 pid_tgid) 
 
     bpf_map_update_elem(&nodejs_fd_map, &key, &fd1, BPF_ANY);
 
+    return 0;
+}
+
+// A synchronous /dev/null read lets the agent receive the BPF context in its
+// own Buffer. uv_buf_t has the Linux iovec layout on both supported ABIs.
+SEC("uprobe/uv_fs_read")
+int BPF_UPROBE_GUARDED(
+    obi_uv_fs_read, void *loop, void *req, int file, const struct iovec *bufs, unsigned int nbufs) {
+    (void)ctx;
+    (void)loop;
+    (void)req;
+    (void)file;
+
+    if (!g_bpf_header_propagation || !g_bpf_probe_write_user_enabled || nbufs != 1) {
+        return 0;
+    }
+    const u64 pid_tgid = bpf_get_current_pid_tgid();
+    if (!valid_pid(pid_tgid)) {
+        return 0;
+    }
+
+    static const unsigned char prefix[] = "/dev/null/obi-undici/";
+    struct {
+        unsigned char prefix[sizeof(prefix) - 1];
+        unsigned char incoming_fd[k_max_fd_digits];
+        unsigned char outgoing_fd[k_max_fd_digits];
+        unsigned char traceparent[TP_MAX_VAL_LENGTH];
+    } payload;
+    struct iovec buf;
+    if (bpf_probe_read_user(&buf, sizeof(buf), bufs) != 0 || buf.iov_len != sizeof(payload) ||
+        bpf_probe_read_user(&payload, sizeof(payload), buf.iov_base) != 0 ||
+        bpf_memcmp(prefix, payload.prefix, sizeof(payload.prefix)) != 0) {
+        return 0;
+    }
+
+    u32 incoming_fd = 0;
+    u32 outgoing_fd = 0;
+    if (nodejs_parse_fd(payload.incoming_fd, &incoming_fd) != 0 ||
+        nodejs_parse_fd(payload.outgoing_fd, &outgoing_fd) != 0 || incoming_fd == outgoing_fd) {
+        return 0;
+    }
+    const tp_info_pid_t *server = nodejs_server_trace_for_fd(pid_tgid, incoming_fd);
+    const fd_key key = {.pid_tgid = pid_tgid, .fd = (s32)outgoing_fd};
+    const connection_info_t *conn = bpf_map_lookup_elem(&fd_to_connection, &key);
+    if (!server || server->response_sent || !conn || !valid_trace(server->tp.trace_id)) {
+        return 0;
+    }
+
+    tp_info_pid_t client = {};
+    init_new_trace(&client.tp);
+    if (!should_be_in_same_transaction(&server->tp, &client.tp)) {
+        return 0;
+    }
+    __builtin_memcpy(client.tp.trace_id, server->tp.trace_id, sizeof(client.tp.trace_id));
+    __builtin_memcpy(client.tp.parent_id, server->tp.span_id, sizeof(client.tp.parent_id));
+    client.tp.flags = server->tp.flags;
+    nodejs_manual_parent_span_id(pid_tgid, client.tp.trace_id, client.tp.parent_id);
+    client.pid = pid_from_pid_tgid(pid_tgid);
+    client.valid = 1;
+    client.written = k_nodejs_traceparent_prepared;
+    client.req_type = k_event_type_http_client;
+
+    connection_info_t connection = *conn;
+    sort_connection_info(&connection);
+    trace_map_key_t trace_key = {};
+    trace_key_from_conn(&trace_key, &connection, TRACE_TYPE_CLIENT);
+    // Keep prepared TLS context in trace_map: outgoing_trace_map is consumed
+    // by sk_msg before SSL_write returns, while it is looking at ciphertext.
+    if (bpf_map_update_elem(&trace_map, &trace_key, &client, BPF_ANY) != 0) {
+        return 0;
+    }
+    ssl_pid_connection_info_t tls = {
+        .p_conn = {.conn = connection, .pid = client.pid},
+        .orig_dport = conn->d_port,
+    };
+    if (bpf_map_update_elem(&pid_tid_to_conn, &pid_tgid, &tls, BPF_ANY) != 0) {
+        bpf_map_delete_elem(&trace_map, &trace_key);
+        return 0;
+    }
+    make_tp_string(payload.traceparent, &client.tp);
+    unsigned char *dst =
+        (unsigned char *)buf.iov_base + (sizeof(payload) - sizeof(payload.traceparent));
+    if (bpf_probe_write_user(dst, payload.traceparent, sizeof(payload.traceparent)) != 0) {
+        bpf_map_delete_elem(&trace_map, &trace_key);
+        bpf_map_delete_elem(&pid_tid_to_conn, &pid_tgid);
+    }
     return 0;
 }
 

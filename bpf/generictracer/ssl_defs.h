@@ -7,6 +7,7 @@
 #include <bpfcore/bpf_helpers.h>
 
 #include <common/ssl_args.h>
+#include <common/ssl_helpers.h>
 #include <common/trace_key.h>
 #include <common/trace_lifecycle.h>
 
@@ -20,6 +21,26 @@
 #include <maps/ssl_to_conn.h>
 
 #include <logger/bpf_dbg.h>
+
+// Node.js memory-BIO writes need the fd captured at dispatch: another accept
+// or connect can replace the thread's fallback before SSL_write runs.
+static __always_inline void bind_nodejs_prepared_ssl(const u64 id, void *ssl) {
+    if (!g_bpf_header_propagation) {
+        return;
+    }
+    const ssl_pid_connection_info_t *hint = bpf_map_lookup_elem(&pid_tid_to_conn, &id);
+    if (!hint || hint->p_conn.pid != pid_from_pid_tgid(id)) {
+        return;
+    }
+    const tp_info_pid_t *tp = trace_info_for_connection(&hint->p_conn.conn, TRACE_TYPE_CLIENT);
+    if (!tp || !tp->valid || tp->pid != pid_from_pid_tgid(id) ||
+        tp->written != k_nodejs_traceparent_prepared) {
+        return;
+    }
+    ssl_pid_connection_info_t connection = *hint;
+    bpf_map_delete_elem(&pid_tid_to_conn, &id);
+    set_active_ssl_connection(&connection, ssl);
+}
 
 static __always_inline void
 finish_possible_delayed_tls_http_request(pid_connection_info_t *pid_conn) {

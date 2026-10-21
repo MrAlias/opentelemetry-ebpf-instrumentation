@@ -161,6 +161,8 @@ int BPF_UPROBE_GUARDED(obi_uprobe_ssl_write, void *ssl, const void *buf, int num
         return 0;
     }
 
+    bind_nodejs_prepared_ssl(id, ssl);
+
     bpf_dbg_printk("=== uprobe SSL_write id=%d ssl=%llx ===", id, ssl);
 
     ssl_args_t args = {};
@@ -211,6 +213,8 @@ int BPF_UPROBE_GUARDED(obi_uprobe_ssl_write_ex,
         return 0;
     }
 
+    bind_nodejs_prepared_ssl(id, ssl);
+
     bpf_dbg_printk("=== SSL_write_ex id=%d ssl=%llx ===", id, ssl);
 
     ssl_args_t args = {};
@@ -240,6 +244,8 @@ int BPF_UPROBE_GUARDED(obi_uprobe_ssl_write_ex2,
     if (!valid_pid(id)) {
         return 0;
     }
+
+    bind_nodejs_prepared_ssl(id, ssl);
 
     bpf_dbg_printk("=== SSL_write_ex2 id=%d ssl=%llx ===", id, ssl);
 

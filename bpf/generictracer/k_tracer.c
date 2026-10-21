@@ -402,6 +402,10 @@ int BPF_KRETPROBE_GUARDED(obi_kretprobe_sys_connect, int res) {
         info.p_conn.pid = host_pid;
         bpf_dbg_printk("id=%d, pid=%d, fd=%d", id, host_pid, args->fd);
         store_connect_fd_info(host_pid, args->fd, &info.p_conn.conn);
+        if (g_bpf_header_propagation) {
+            const fd_key key = {.pid_tgid = id, .fd = args->fd};
+            bpf_map_update_elem(&fd_to_connection, &key, &info.p_conn.conn, BPF_ANY);
+        }
 
         const u16 orig_dport = info.p_conn.conn.d_port;
         dbg_print_http_connection_info(&info.p_conn.conn);

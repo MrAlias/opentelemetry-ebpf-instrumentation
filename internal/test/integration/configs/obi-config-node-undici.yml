@@ -1,0 +1,36 @@
+file_format: "1.0"
+log_level: debug
+tracer_provider:
+  processors:
+    - batch:
+        schedule_delay: 1
+        exporter:
+          otlp_http:
+            endpoint: http://jaeger:4318
+extensions:
+  obi:
+    version: "2.0"
+    capture:
+      policy:
+        default_action: exclude
+        poll_interval: 500ms
+      rules:
+        - action: include
+          match:
+            process:
+              open_ports: "8080"
+      instrumentation:
+        http:
+          enabled:
+            traces: true
+          track_request_headers: true
+          routes:
+            incoming:
+              unmatched: path
+            outgoing:
+              unmatched: path
+      engine:
+        batching:
+          batch_timeout: 10ms
+        propagation:
+          context_propagation: ${UNDICI_PROPAGATION:-headers}

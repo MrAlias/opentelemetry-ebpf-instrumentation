@@ -308,3 +308,24 @@ func TestV8MachineryFollowsRuntimeGate(t *testing.T) {
 	require.Contains(t, src[:gateStart], "orig.gcObserver.disconnect()",
 		"gc observer teardown must run outside the RT gate")
 }
+
+func TestAgentCodeGatesHeaderPropagation(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		mode    config.ContextPropagationMode
+		enabled bool
+	}{
+		{"disabled", config.ContextPropagationDisabled, false},
+		{"TCP only", config.ContextPropagationTCP, false},
+		{"headers", config.ContextPropagationHeaders, true},
+		{"all", config.ContextPropagationAll, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			code := (&NodeInjector{cfg: &obi.Config{
+				EBPF:         config.EBPFTracer{ContextPropagation: tc.mode},
+				TracePrinter: "text",
+			}}).agentCode()
+			require.Equal(t, tc.enabled, strings.Contains(code, headerPropagationOn))
+		})
+	}
+}

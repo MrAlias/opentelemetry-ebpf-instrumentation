@@ -1,0 +1,4 @@
+plugins { id 'java'; id 'application' }
+repositories { mavenCentral() }
+dependencies { implementation 'org.apache.httpcomponents.client5:httpclient5:5.4.4' }
+application { mainClass = 'HttpClient5Service' }

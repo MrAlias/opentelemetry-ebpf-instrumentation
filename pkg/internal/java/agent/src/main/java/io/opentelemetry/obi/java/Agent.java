@@ -10,6 +10,7 @@ import static net.bytebuddy.matcher.ElementMatchers.nameStartsWith;
 
 import io.opentelemetry.obi.java.ebpf.*;
 import io.opentelemetry.obi.java.instrumentations.*;
+import io.opentelemetry.obi.java.instrumentations.data.ApacheHttpClient5Context;
 import io.opentelemetry.obi.java.instrumentations.data.BytesWithLen;
 import io.opentelemetry.obi.java.instrumentations.data.Connection;
 import io.opentelemetry.obi.java.instrumentations.data.JdkHttpClientTask;
@@ -168,6 +169,8 @@ public class Agent {
         .transform(JavaExecutorInst.transformer())
         .type(JdkHttpClientInst.type())
         .transform(JdkHttpClientInst.transformer())
+        .type(ApacheHttpClient5Inst.type())
+        .transform(ApacheHttpClient5Inst.transformer())
         .type(CallableInst.type())
         .transform(CallableInst.transformer())
         .type(RunnableInst.type())
@@ -216,6 +219,7 @@ public class Agent {
           || SocketChannelInst.matches(clazz)
           || JavaExecutorInst.matches(clazz)
           || JdkHttpClientInst.matches(clazz)
+          || ApacheHttpClient5Inst.matches(clazz)
           || CallableInst.matches(clazz)
           || RunnableInst.matches(clazz)
           || JavaForkJoinTaskInst.matches(clazz)
@@ -252,6 +256,8 @@ public class Agent {
     Class.forName(BytesWithLen.class.getName());
     Class.forName(Connection.class.getName());
     Class.forName(JdkHttpClientTask.class.getName());
+    Class.forName(ApacheHttpClient5Context.class.getName());
+    Class.forName(ApacheHttpClient5Context.Injection.class.getName());
     Class.forName(NettyChannelExtractor.class.getName());
     Class.forName(SSLStorage.class.getName());
     Class.forName(ByteBufferExtractor.class.getName());

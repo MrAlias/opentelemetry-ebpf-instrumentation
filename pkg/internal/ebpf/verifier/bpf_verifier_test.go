@@ -199,6 +199,14 @@ func TestBPFVerifierWithConstants(t *testing.T) {
 	forEachCombination(t, "generictracer/BpfRingbufMetrics", generictracerbpf.LoadBpf, []constOption{
 		{"ringbuf_metrics_enabled", []any{true, false}},
 	})
+	forEachCombination(t, "generictracer/BpfJavaHTTPClient", generictracerbpf.LoadBpf, []constOption{
+		{"g_bpf_debug", []any{true, false}},
+		{"g_bpf_traceparent_enabled", []any{true}},
+		{"g_bpf_header_propagation", []any{true, false}},
+		{"g_bpf_probe_write_user_enabled", []any{true, false}},
+		{"capture_header_buffer", []any{int32(1)}},
+		{"max_transaction_time", []any{uint64(60_000_000_000)}},
+	})
 
 	// nodejs_runtime_metrics_enabled only gates the decode path in nodejs.c,
 	// which shares no code with the constants above except the debug and

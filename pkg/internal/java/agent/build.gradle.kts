@@ -49,6 +49,7 @@ dependencies {
     testImplementation("org.junit.jupiter:junit-jupiter-api:5.14.4")
     testImplementation("org.junit.platform:junit-platform-launcher:1.14.4")
     testImplementation("org.awaitility:awaitility:4.3.0")
+    testImplementation("org.apache.httpcomponents.client5:httpclient5:5.4.4")
 
     testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine:5.14.4")
 }

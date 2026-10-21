@@ -135,6 +135,15 @@ p.getInt(1 + 36)       → 1    (Buffer length at offset 37)
 p.getByte(1 + 36 + 4)  → 42   (Data byte at offset 41)
 ```
 
+HttpClient 5 classic HTTP/1.1 requests over `SSLSocket` use operation 8 with the
+same packet prefix to request a 55-byte W3C `traceparent` value. eBPF reserves
+the client context in `outgoing_trace_map`; the existing TLS SEND capture adopts
+it so the transmitted header and exported client span share an ID. A zero
+payload length releases an unconsumed reservation when execution ends, matching
+its span ID before removal. This exchange requires header propagation and the
+existing `bpf_probe_write_user` capability check. The asynchronous client is not
+instrumented by this hook.
+
 ### 4. Java agent compatibility
 
 A JVM cannot unload or replace a Java agent. The agent therefore publishes its version in the

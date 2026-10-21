@@ -25,6 +25,8 @@
 #include <maps/active_ssl_connections.h>
 #include <maps/java_tasks.h>
 #include <maps/java_vt_threads.h>
+#include <maps/outgoing_trace_map.h>
+#include <maps/tp_char_buf_mem.h>
 
 #include <pid/pid.h>
 
@@ -39,12 +41,75 @@ enum {
     k_ioctl_java_vt_unmount = 5, // virtual thread unmounted from this carrier
     k_ioctl_java_runtime_metrics = 6,
     k_ioctl_java_gc_duration = 7,
+    k_ioctl_java_http_client_context = 8,
 };
 
 enum { k_ioctl_invalid_op = 0xff };
 // Keep this ceiling aligned with the largest large-buffer capture limit in
 // bpf/common/large_buffers.h.
 enum { k_ioctl_max_payload_len = 1 << 16 };
+
+static __always_inline void java_http_client_context(unsigned char *uarg, const u64 id) {
+    if (!g_bpf_header_propagation || !g_bpf_probe_write_user_enabled) {
+        return;
+    }
+
+    pid_connection_info_t p_conn = {.pid = pid_from_pid_tgid(id)};
+    if (bpf_probe_read_user(&p_conn.conn, sizeof(p_conn.conn), uarg + 1) != 0 ||
+        is_empty_connection_info(&p_conn.conn)) {
+        return;
+    }
+    const u16 orig_dport = p_conn.conn.d_port;
+    sort_connection_info(&p_conn.conn);
+
+    u32 len = 0;
+    if (bpf_probe_read_user(&len, sizeof(len), uarg + 1 + sizeof(connection_info_t)) != 0) {
+        return;
+    }
+
+    egress_key_t key = {.s_port = p_conn.conn.s_port, .d_port = p_conn.conn.d_port};
+    sort_egress_key(&key);
+    unsigned char *result = uarg + 1 + sizeof(connection_info_t) + sizeof(len);
+    unsigned char *buf = (unsigned char *)tp_char_buf_mem();
+    if (!buf) {
+        return;
+    }
+    if (len == 0) {
+        const tp_info_pid_t *pending = bpf_map_lookup_elem(&outgoing_trace_map, &key);
+        unsigned char *span_id = buf + SPAN_ID_CHAR_LEN;
+        // Only retire this invocation's reservation if execution failed before SEND.
+        if (pending && pending->pid == p_conn.pid && pending->written &&
+            bpf_probe_read_user(buf, SPAN_ID_CHAR_LEN, result + 2 + 1 + TRACE_ID_CHAR_LEN + 1) ==
+                0) {
+            decode_hex(span_id, buf, SPAN_ID_CHAR_LEN);
+            if (bpf_memcmp(span_id, pending->tp.span_id, SPAN_ID_SIZE_BYTES) == 0) {
+                bpf_map_delete_elem(&outgoing_trace_map, &key);
+            }
+        }
+        return;
+    }
+    if (len != TP_MAX_VAL_LENGTH) {
+        return;
+    }
+
+    tp_info_pid_t tp = {
+        .pid = p_conn.pid, .valid = 1, .written = 1, .req_type = k_event_type_http_client};
+    tp.tp.ts = bpf_ktime_get_ns();
+    tp.tp.flags = 1;
+    urand_bytes(tp.tp.span_id, sizeof(tp.tp.span_id));
+    if (!find_trace_for_client_request(&p_conn, orig_dport, k_lw_thread_none, &tp.tp)) {
+        new_trace_id(&tp.tp);
+    }
+
+    // The TLS SEND capture adopts this reservation through the existing HTTP path.
+    if (bpf_map_update_elem(&outgoing_trace_map, &key, &tp, BPF_ANY) != 0) {
+        return;
+    }
+    make_tp_string(buf, &tp.tp);
+    if (bpf_probe_write_user(result, buf, TP_MAX_VAL_LENGTH) != 0) {
+        bpf_map_delete_elem(&outgoing_trace_map, &key);
+    }
+}
 
 static __always_inline u8 cmd_to_op(u8 cmd) {
     switch (cmd) {
@@ -105,6 +170,9 @@ int BPF_KPROBE_GUARDED(obi_kprobe_sys_ioctl) {
     // Control opcodes each handle themselves and return; the data opcodes
     // (send/recv) fall through to the connection/payload path below.
     switch (op_cmd) {
+    case k_ioctl_java_http_client_context:
+        java_http_client_context(uarg, id);
+        return 0;
     case k_ioctl_java_vt_mount: {
         // The agent reports, on every VirtualThread.mount(), the logical
         // thread id now mounted on this carrier; the current kernel thread

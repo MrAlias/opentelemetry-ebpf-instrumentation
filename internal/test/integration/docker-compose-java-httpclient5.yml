@@ -1,0 +1,45 @@
+name: obi-java-httpclient5
+
+services:
+  source:
+    build:
+      context: ../../..
+      dockerfile: internal/test/integration/components/java_httpclient5/Dockerfile
+    image: hatest-httpclient5
+    ports: ["18095:8080"]
+    environment:
+      OTEL_SERVICE_NAME: httpclient5-source
+  proxy:
+    build:
+      context: ../../..
+      dockerfile: internal/test/integration/components/java_httpclient5/peer/Dockerfile
+    image: hatest-httpclient5-peer
+    depends_on: [downstream]
+  downstream:
+    image: hatest-httpclient5-peer
+    environment:
+      ROLE: downstream
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://jaeger:4318/v1/traces
+      OTEL_EXPORTER_OTLP_TRACES_PROTOCOL: http/protobuf
+      OTEL_EXPORTER_OTLP_TRACES_INSECURE: "true"
+      OTEL_BSP_SCHEDULE_DELAY: "50"
+    depends_on: [jaeger]
+  jaeger:
+    image: jaegertracing/jaeger:2.22.0@sha256:836b967b5abcf1f7758066aa6b348619267a2f1459f72d472840570f9bd88a17
+    ports: ["17695:16686", "14395:4318"]
+  obi:
+    build:
+      context: ../../..
+      dockerfile: internal/test/integration/components/obi/Dockerfile-with-javaagent
+    image: "${HTTPCLIENT5_OBI_IMAGE:-hatest-obi-httpclient5}"
+    privileged: true
+    pid: host
+    network_mode: host
+    volumes:
+      - ./configs/obi-config-java-httpclient5.yml:/config.yml:ro
+      - /sys/kernel/tracing:/sys/kernel/tracing:ro
+      - /sys/fs/cgroup:/sys/fs/cgroup
+    environment:
+      OTEL_EBPF_CONFIG_PATH: /config.yml
+      HTTPCLIENT5_PROPAGATION: "${HTTPCLIENT5_PROPAGATION:-headers}"
+    depends_on: [source, proxy, jaeger]

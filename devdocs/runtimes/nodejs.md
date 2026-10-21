@@ -1,5 +1,27 @@
 # Node.js runtime metrics
 
+## HTTPS trace-context propagation
+
+With header context propagation enabled, the injected agent adds a W3C
+`traceparent` to HTTP/1.1 `https.request()` calls. The value identifies OBI's
+outgoing client span, including across TLS termination at an uninstrumented
+proxy. Existing application `traceparent` headers retain ownership regardless
+of casing or validity. Disabling header
+propagation leaves requests unchanged. Calls outside an incoming request start
+a new trace.
+
+This uses the existing Node.js injection version gate: Node.js 12.17 or newer,
+excluding 13.0–13.9. It also requires TLS probes and permission to use
+`bpf_probe_write_user` (including `CAP_SYS_ADMIN` on kernels 5.10 or newer and
+no kernel lockdown). If those prerequisites are unavailable, or an associated
+incoming request cannot be resolved, the agent sends no additional header.
+Request descriptors must fit the existing four-digit Node.js context side channel.
+
+This path covers Node's HTTP/1.1 `ClientRequest`; it does not cover Undici,
+`fetch`, HTTP/2, or gRPC.
+
+## Runtime metrics
+
 With `application_runtime` enabled, OBI collects event-loop, garbage-collection,
 heap and active-resource metrics from instrumented Node.js services and exports
 the following metric set.

@@ -85,6 +85,24 @@ func TestAgentCodeGatesRuntimeMetrics(t *testing.T) {
 		"tracing alone must not install the per-callback context hook")
 }
 
+func TestAgentCodeGatesHTTPSHeaders(t *testing.T) {
+	require.Equal(t, 1, strings.Count(_extractorCode, headersEnabledPlaceholder))
+	for _, mode := range []config.ContextPropagationMode{
+		config.ContextPropagationDisabled, config.ContextPropagationTCP,
+		config.ContextPropagationHeaders, config.ContextPropagationAll,
+	} {
+		code := (&NodeInjector{cfg: &obi.Config{
+			TracePrinter: "text",
+			EBPF:         config.EBPFTracer{ContextPropagation: mode},
+		}}).agentCode()
+		if mode.HasHeaders() {
+			require.Contains(t, code, headersEnabledOn)
+		} else {
+			require.Contains(t, code, headersEnabledPlaceholder)
+		}
+	}
+}
+
 // TestAgentCodeGatesCtxHook pins the before hook to the same predicate that
 // drives the g_traces_ctx_v1_enabled BPF constant: it is installed only when
 // something reads traces_ctx_v1.

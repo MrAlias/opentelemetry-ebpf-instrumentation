@@ -1,0 +1,42 @@
+file_format: "1.0"
+log_level: debug
+resource:
+  attributes:
+    - name: service.name
+      value: node-https-source
+    - name: service.namespace
+      value: integration-test
+tracer_provider:
+  processors:
+    - batch:
+        schedule_delay: 10
+        exporter:
+          otlp_http:
+            endpoint: http://jaeger:4318
+            encoding: protobuf
+extensions:
+  obi:
+    version: "2.0"
+    capture:
+      policy:
+        default_action: exclude
+        poll_interval: 100ms
+      rules:
+        - action: include
+          match:
+            process:
+              open_ports: 3030
+      instrumentation:
+        http:
+          track_request_headers: true
+          routes:
+            incoming:
+              unmatched: path
+            outgoing:
+              unmatched: path
+      engine:
+        batching:
+          batch_timeout: 10ms
+        propagation:
+          context_propagation: ${NODE_HTTPS_PROPAGATION:-headers}
+          disable_black_box_cp: true

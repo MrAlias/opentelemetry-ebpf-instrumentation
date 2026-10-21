@@ -15,6 +15,7 @@
 #include <common/scratch_mem.h>
 #include <common/strings.h>
 #include <common/trace_helpers.h>
+#include <common/trace_parent.h>
 #include <common/trace_util.h>
 #include <common/tracing.h>
 
@@ -24,6 +25,7 @@
 
 #include <maps/fd_to_connection.h>
 #include <maps/node_manual_ctx_shadow.h>
+#include <maps/nodejs_client_traces.h>
 #include <maps/nodejs_fd_map.h>
 
 #include <pid/pid.h>
@@ -174,6 +176,92 @@ static __always_inline int nodejs_parse_fd(const unsigned char *digits, u32 *fd)
         v = v * 10 + (u32)(c - '0');
     }
     *fd = v;
+    return 0;
+}
+
+// Synchronous reads from /dev/null leave the caller-owned buffer intact.
+// Unlike uv_fs_access's path (which Node copies), uv_buf_t points directly
+// at the JS Buffer, allowing this side channel to return a traceparent.
+SEC("uprobe/node:uv_fs_read")
+int BPF_KPROBE_GUARDED(obi_nodejs_https_context,
+                       void *loop,
+                       void *req,
+                       int file,
+                       const struct iovec *bufs,
+                       unsigned int nbufs) {
+    (void)ctx;
+    (void)loop;
+    (void)req;
+    (void)file;
+    if (!g_bpf_header_propagation || !g_bpf_probe_write_user_enabled) {
+        return 0;
+    }
+
+    const u64 pid_tgid = bpf_get_current_pid_tgid();
+    if (nbufs != 1 || !valid_pid(pid_tgid)) {
+        return 0;
+    }
+
+    static const unsigned char prefix[] = "/dev/null/obi-https/";
+    enum {
+        k_fd_offset = sizeof(prefix) - 1,
+        k_value_offset = k_fd_offset + k_max_fd_digits + 1,
+        k_path_size = k_value_offset + TP_MAX_VAL_LENGTH + 1,
+    };
+    // On supported Linux architectures uv_buf_t has the iovec ABI.
+    struct iovec iov;
+    if (bpf_probe_read_user(&iov, sizeof(iov), bufs) != 0 || iov.iov_len != k_path_size) {
+        return 0;
+    }
+    unsigned char *path = iov.iov_base;
+    unsigned char buf[k_path_size];
+    if (bpf_probe_read_user_str(buf, sizeof(buf), path) != sizeof(buf) ||
+        bpf_memcmp(buf, prefix, sizeof(prefix) - 1) != 0 || buf[k_value_offset - 1] != '/') {
+        return 0;
+    }
+    for (u32 i = k_value_offset; i < k_path_size - 1; ++i) {
+        if (buf[i] != '0') {
+            return 0;
+        }
+    }
+
+    const tp_info_pid_t *server = NULL;
+    static const unsigned char no_request[] = "none";
+    if (bpf_memcmp(buf + k_fd_offset, no_request, sizeof(no_request) - 1) != 0) {
+        u32 fd = 0;
+        if (nodejs_parse_fd(buf + k_fd_offset, &fd) != 0) {
+            return 0;
+        }
+        server = nodejs_server_trace_for_fd(pid_tgid, fd);
+        if (!server || !valid_trace(server->tp.trace_id)) {
+            return 0;
+        }
+    }
+
+    nodejs_client_trace_t client = {.pid = pid_from_pid_tgid(pid_tgid)};
+    init_new_trace(&client.tp);
+    if (server) {
+        if (!should_be_in_same_transaction(&server->tp, &client.tp)) {
+            return 0;
+        }
+        __builtin_memcpy(client.tp.trace_id, server->tp.trace_id, sizeof(client.tp.trace_id));
+        __builtin_memcpy(client.tp.parent_id, server->tp.span_id, sizeof(client.tp.parent_id));
+        client.tp.flags = server->tp.flags;
+        client.parent_status = parent_kind(server);
+        if (nodejs_manual_parent_span_id(pid_tgid, client.tp.trace_id, client.tp.parent_id)) {
+            client.parent_status = k_parent_status_live;
+        }
+    }
+
+    u64 key = 0;
+    __builtin_memcpy(&key, client.tp.span_id, sizeof(key));
+    if (bpf_map_update_elem(&nodejs_client_traces, &key, &client, BPF_ANY) != 0) {
+        return 0;
+    }
+    make_tp_string(buf + k_value_offset, &client.tp);
+    if (bpf_probe_write_user(path + k_value_offset, buf + k_value_offset, TP_MAX_VAL_LENGTH) != 0) {
+        bpf_map_delete_elem(&nodejs_client_traces, &key);
+    }
     return 0;
 }
 

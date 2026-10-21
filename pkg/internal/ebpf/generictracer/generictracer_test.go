@@ -23,6 +23,7 @@ import (
 	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
 	"go.opentelemetry.io/obi/pkg/appolly/discover/exec"
 	"go.opentelemetry.io/obi/pkg/appolly/services"
+	"go.opentelemetry.io/obi/pkg/config"
 	ebpfcommon "go.opentelemetry.io/obi/pkg/ebpf/common"
 	"go.opentelemetry.io/obi/pkg/ebpf/ringbuf"
 	"go.opentelemetry.io/obi/pkg/export"
@@ -33,6 +34,25 @@ import (
 	"go.opentelemetry.io/obi/pkg/pipe/msg"
 	"go.opentelemetry.io/obi/pkg/runtimemetrics"
 )
+
+func TestNodeHTTPSProbeRequiresHeaderPropagation(t *testing.T) {
+	for _, mode := range []config.ContextPropagationMode{
+		config.ContextPropagationDisabled, config.ContextPropagationTCP,
+		config.ContextPropagationHeaders, config.ContextPropagationAll,
+	} {
+		cfg := &obi.Config{}
+		cfg.EBPF.ContextPropagation = mode
+		probes := New(nil, cfg, imetrics.NoopReporter{}).UProbes()
+		for _, library := range []string{"node", "libuv.so"} {
+			require.Contains(t, probes[library], "uv_fs_access")
+			if mode.HasHeaders() {
+				require.Contains(t, probes[library], "uv_fs_read")
+			} else {
+				require.NotContains(t, probes[library], "uv_fs_read")
+			}
+		}
+	}
+}
 
 func TestParseJVMMemoryPoolRecordDecoratesServiceByPIDNamespace(t *testing.T) {
 	service := svc.Attrs{UID: svc.UID{Name: "orders", Namespace: "prod"}}

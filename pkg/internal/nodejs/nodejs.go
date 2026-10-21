@@ -300,10 +300,12 @@ var _spanBridgeCode string
 // machinery its configuration asks for (see the OBI_RT_ENABLED and
 // OBI_TRACES_ENABLED comments in fdextractor.js).
 const (
-	rtEnabledPlaceholder     = "= false; /*OBI_RT_ENABLED*/"
-	rtEnabledOn              = "= true; /*OBI_RT_ENABLED*/"
-	tracesEnabledPlaceholder = "= false; /*OBI_TRACES_ENABLED*/"
-	tracesEnabledOn          = "= true; /*OBI_TRACES_ENABLED*/"
+	rtEnabledPlaceholder      = "= false; /*OBI_RT_ENABLED*/"
+	rtEnabledOn               = "= true; /*OBI_RT_ENABLED*/"
+	tracesEnabledPlaceholder  = "= false; /*OBI_TRACES_ENABLED*/"
+	tracesEnabledOn           = "= true; /*OBI_TRACES_ENABLED*/"
+	headersEnabledPlaceholder = "= false; /*OBI_HEADERS_ENABLED*/"
+	headersEnabledOn          = "= true; /*OBI_HEADERS_ENABLED*/"
 
 	ctxHookEnabledPlaceholder = "= false; /*OBI_CTX_HOOK_ENABLED*/"
 	ctxHookEnabledOn          = "= true; /*OBI_CTX_HOOK_ENABLED*/"
@@ -322,6 +324,9 @@ func (i *NodeInjector) agentCode() string {
 	}
 	if i.cfg.Traces.Enabled() || i.cfg.TracePrinter.Enabled() {
 		code = strings.Replace(code, tracesEnabledPlaceholder, tracesEnabledOn, 1)
+	}
+	if i.cfg.EBPF.ContextPropagation.HasHeaders() {
+		code = strings.Replace(code, headersEnabledPlaceholder, headersEnabledOn, 1)
 	}
 	if i.cfg.PopulateTraceContext() {
 		code = strings.Replace(code, ctxHookEnabledPlaceholder, ctxHookEnabledOn, 1)

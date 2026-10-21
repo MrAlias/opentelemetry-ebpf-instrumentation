@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/btf"
@@ -334,5 +335,18 @@ func TestBPFVerifierWithConstants(t *testing.T) {
 	forEachCombination(t, "statsolly/Stats", statsolly.LoadStats, []constOption{
 		{"g_bpf_debug", []any{true, false}},
 		{"stats_wakeup_data_bytes", []any{uint32(0), uint32(1 << 20)}},
+	})
+}
+
+func TestNodeHTTPSPropagationVerifier(t *testing.T) {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Skipf("cannot remove memlock limit: %v", err)
+	}
+	loadAndVerify(t, "nodejs-https", generictracerbpf.LoadBpf, map[string]any{
+		"g_bpf_header_propagation":       true,
+		"g_bpf_probe_write_user_enabled": true,
+		"g_bpf_traceparent_enabled":      true,
+		"capture_header_buffer":          int32(1),
+		"max_transaction_time":           uint64(time.Minute),
 	})
 }

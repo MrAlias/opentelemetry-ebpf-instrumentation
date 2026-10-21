@@ -38,6 +38,7 @@
 #include <maps/active_ssl_connections.h>
 #include <maps/connection_tracker.h>
 #include <maps/ongoing_http.h>
+#include <maps/nodejs_client_traces.h>
 #include <maps/tp_info_mem.h>
 #include <maps/tp_char_buf_mem.h>
 
@@ -595,6 +596,29 @@ __obi_continue_protocol_http_tp(struct pt_regs *ctx,
                     }
                 }
 
+                // Only contexts issued by the Node side channel own the client
+                // span id. Application-supplied traceparents retain their value.
+                if (is_client && args->ssl) {
+                    unsigned char span_id[SPAN_ID_SIZE_BYTES];
+                    decode_hex(span_id, s_id, SPAN_ID_CHAR_LEN);
+                    u64 key = 0;
+                    __builtin_memcpy(&key, span_id, sizeof(key));
+                    const nodejs_client_trace_t *client =
+                        bpf_map_lookup_elem(&nodejs_client_traces, &key);
+                    if (client && client->pid == args->pid_conn.pid) {
+                        unsigned char trace_id[TRACE_ID_SIZE_BYTES];
+                        decode_hex(trace_id, t_id, TRACE_ID_CHAR_LEN);
+                        if (bpf_memcmp(trace_id, client->tp.trace_id, sizeof(trace_id)) == 0) {
+                            tp_p->tp = client->tp;
+                            info->parent_status = client->parent_status;
+                            if (previous_trace_id) {
+                                __builtin_memcpy(
+                                    previous_trace_id, client->tp.trace_id, TRACE_ID_SIZE_BYTES);
+                            }
+                            bpf_map_delete_elem(&nodejs_client_traces, &key);
+                        }
+                    }
+                }
                 decode_hex(tp_p->tp.trace_id, t_id, TRACE_ID_CHAR_LEN);
                 decode_hex((unsigned char *)&tp_p->tp.flags, f_id, FLAGS_CHAR_LEN);
                 if (meta && meta->type != k_event_type_http_client) {

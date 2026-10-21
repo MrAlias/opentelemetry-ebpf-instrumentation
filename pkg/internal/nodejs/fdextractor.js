@@ -2,6 +2,7 @@
   const STORE = Symbol.for('otel-ebpf-instrumentation.fdextractor');
 
   const net = require('net');
+  const http = require('http');
   const fs = require('fs');
 
   if (!global[STORE]) {
@@ -13,9 +14,13 @@
   }
 
   const orig = global[STORE];
+  if (!orig.storeHeader) {
+    orig.storeHeader = http.ClientRequest.prototype._storeHeader;
+  }
   net.Server.prototype.emit = orig.serverEmit;
   net.Socket.prototype.connect = orig.socketConnect;
   net.Socket.prototype.write = orig.socketWrite;
+  http.ClientRequest.prototype._storeHeader = orig.storeHeader;
   if (orig.ctxHook) {
     orig.ctxHook.disable();
     orig.ctxHook = undefined;
@@ -38,6 +43,7 @@
   // hook firing on every callback) and is skipped entirely for
   // metrics-only injections.
   const TRACES_ENABLED = false; /*OBI_TRACES_ENABLED*/
+  const HEADERS_ENABLED = false; /*OBI_HEADERS_ENABLED*/
 
   // Substituted by the injector from the same predicate that sets the
   // g_traces_ctx_v1_enabled BPF constant (Config.PopulateTraceContext).
@@ -60,6 +66,49 @@
       const store = als.getStore();
       return store && store.incomingFd != null ? store.incomingFd : -1;
     };
+
+    if (HEADERS_ENABLED) {
+      const TRACEPARENT_LENGTH = 55;
+      const MAX_REQUEST_FD = 9999;
+      http.ClientRequest.prototype._storeHeader = function (firstLine, headers) {
+        if (this.protocol !== 'https:') {
+          return orig.storeHeader.call(this, firstLine, headers);
+        }
+        const ownsHeader = this.hasHeader('traceparent') ||
+          (Array.isArray(headers) && headers.some((entry, index) => {
+            if (Array.isArray(headers[0])) return String(entry[0]).toLowerCase() === 'traceparent';
+            return index % 2 === 0 && String(entry).toLowerCase() === 'traceparent';
+          }));
+        if (ownsHeader) {
+          return orig.storeHeader.call(this, firstLine, headers);
+        }
+
+        const fd = orig.requestFd();
+        if (fd > MAX_REQUEST_FD) {
+          return orig.storeHeader.call(this, firstLine, headers);
+        }
+
+        // uv_fs_read fills only this reserved value; an unsupported kernel or
+        // missing request context leaves the buffer unchanged and sends no header.
+        const prefix = `/dev/null/obi-https/${fd < 0 ? 'none' : pad4(fd)}/`;
+        const path = Buffer.from(prefix + '0'.repeat(TRACEPARENT_LENGTH) + '\0');
+        let nullFd;
+        try {
+          nullFd = fs.openSync('/dev/null', 'r');
+          fs.readSync(nullFd, path, 0, path.length, null);
+          const tp = path.toString('ascii', prefix.length, path.length - 1);
+          if (/^00-[0-9a-f]{32}-[0-9a-f]{16}-0[01]$/.test(tp)) {
+            firstLine += `traceparent: ${tp}\r\n`;
+          }
+        } catch (_) {
+        } finally {
+          if (nullFd !== undefined) {
+            try { fs.closeSync(nullFd); } catch (_) {}
+          }
+        }
+        return orig.storeHeader.call(this, firstLine, headers);
+      };
+    }
 
     let ctxActive = false;
     let ctxFd = -1;

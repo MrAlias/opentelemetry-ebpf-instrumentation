@@ -271,6 +271,9 @@ func (p *Tracer) constants() map[string]any {
 
 	m["g_bpf_debug"] = p.cfg.EBPF.BpfDebug
 	m["g_bpf_traceparent_enabled"] = p.cfg.EBPF.TrackRequestHeaders || p.cfg.EBPF.ContextPropagation.IsEnabled()
+	m["g_bpf_header_propagation"] = p.cfg.EBPF.ContextPropagation.HasHeaders()
+	m["g_bpf_probe_write_user_enabled"] = !ebpfcommon.IntegrityModeOverride &&
+		p.cfg.EBPF.ContextPropagation.HasHeaders() && ebpfcommon.SupportsContextPropagationWithProbe(p.log)
 	m["jvm_sampling_interval_ns"] = uint64(0)
 	if p.cfg.AppRuntimeMetricsEnabled() {
 		m["jvm_sampling_interval_ns"] = uint64(p.cfg.JVMRuntimeMetrics.SamplingInterval.Nanoseconds())
@@ -504,12 +507,20 @@ func (p *Tracer) UProbes() map[string]map[string][]*ebpfcommon.ProbeDesc {
 			}},
 		},
 		"node": {
+			"uv_fs_read": {{
+				Required: false,
+				Start:    p.bpfObjects.ObiNodejsHttpsContext,
+			}},
 			"uv_fs_access": {{
 				Required: false,
 				Start:    p.bpfObjects.ObiUvFsAccess,
 			}},
 		},
 		"libuv.so": {
+			"uv_fs_read": {{
+				Required: false,
+				Start:    p.bpfObjects.ObiNodejsHttpsContext,
+			}},
 			"uv_fs_access": {{
 				Required: false,
 				Start:    p.bpfObjects.ObiUvFsAccess,
@@ -596,6 +607,10 @@ func (p *Tracer) UProbes() map[string]map[string][]*ebpfcommon.ProbeDesc {
 				End:      p.bpfObjects.ObiUprobeTaskStepRet,
 			}},
 		},
+	}
+	if p.cfg == nil || !p.cfg.EBPF.ContextPropagation.HasHeaders() {
+		delete(m["node"], "uv_fs_read")
+		delete(m["libuv.so"], "uv_fs_read")
 	}
 	return m
 }

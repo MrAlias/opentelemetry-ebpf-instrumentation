@@ -25,6 +25,7 @@
 #include <maps/active_ssl_connections.h>
 #include <maps/java_tasks.h>
 #include <maps/java_vt_threads.h>
+#include <maps/outgoing_trace_map.h>
 
 #include <pid/pid.h>
 
@@ -39,12 +40,68 @@ enum {
     k_ioctl_java_vt_unmount = 5, // virtual thread unmounted from this carrier
     k_ioctl_java_runtime_metrics = 6,
     k_ioctl_java_gc_duration = 7,
+    k_ioctl_java_capture_context = 8,
+    k_ioctl_java_prepare_http = 9,
 };
 
 enum { k_ioctl_invalid_op = 0xff };
 // Keep this ceiling aligned with the largest large-buffer capture limit in
 // bpf/common/large_buffers.h.
 enum { k_ioctl_max_payload_len = 1 << 16 };
+
+static __always_inline void java_capture_context(unsigned char *uarg) {
+    if (!g_bpf_probe_write_user_enabled) {
+        return;
+    }
+
+    trace_key_t key = {0};
+    trace_key_from_pid_tid(&key);
+    const tp_info_pid_t *parent = find_parent_java_trace(&key);
+    if (parent && parent->valid) {
+        bpf_probe_write_user(uarg + 1, &parent->tp, sizeof(parent->tp));
+    }
+}
+
+static __always_inline void java_prepare_http(unsigned char *uarg, const u64 id) {
+    if (!g_bpf_probe_write_user_enabled) {
+        return;
+    }
+
+    connection_info_t conn = {0};
+    tp_info_t parent = {0};
+    if (bpf_probe_read_user(&conn, sizeof(conn), uarg + 1) != 0 ||
+        bpf_probe_read_user(&parent, sizeof(parent), uarg + 1 + sizeof(conn)) != 0 ||
+        is_empty_connection_info(&conn)) {
+        return;
+    }
+
+    tp_info_pid_t client = {0};
+    init_new_trace(&client.tp);
+    if (valid_trace(parent.trace_id) && valid_span(parent.span_id) &&
+        should_be_in_same_transaction(&parent, &client.tp)) {
+        __builtin_memcpy(client.tp.trace_id, parent.trace_id, sizeof(client.tp.trace_id));
+        __builtin_memcpy(client.tp.parent_id, parent.span_id, sizeof(client.tp.parent_id));
+        client.tp.flags = parent.flags;
+    }
+    client.pid = pid_from_pid_tgid(id);
+    client.valid = 1;
+    client.written = 1;
+    client.req_type = k_event_type_http_client;
+
+    if (g_bpf_header_propagation) {
+        unsigned char header[TP_MAX_VAL_LENGTH] = {0};
+        make_tp_string(header, &client.tp);
+        if (bpf_probe_write_user(
+                uarg + 1 + sizeof(conn) + sizeof(parent), header, sizeof(header)) != 0) {
+            return;
+        }
+    }
+
+    // The TLS plaintext parser adopts this exact span instead of generating another one.
+    egress_key_t key = {.s_port = conn.s_port, .d_port = conn.d_port};
+    sort_egress_key(&key);
+    bpf_map_update_elem(&outgoing_trace_map, &key, &client, BPF_ANY);
+}
 
 static __always_inline u8 cmd_to_op(u8 cmd) {
     switch (cmd) {
@@ -105,6 +162,12 @@ int BPF_KPROBE_GUARDED(obi_kprobe_sys_ioctl) {
     // Control opcodes each handle themselves and return; the data opcodes
     // (send/recv) fall through to the connection/payload path below.
     switch (op_cmd) {
+    case k_ioctl_java_capture_context:
+        java_capture_context(uarg);
+        return 0;
+    case k_ioctl_java_prepare_http:
+        java_prepare_http(uarg, id);
+        return 0;
     case k_ioctl_java_vt_mount: {
         // The agent reports, on every VirtualThread.mount(), the logical
         // thread id now mounted on this carrier; the current kernel thread

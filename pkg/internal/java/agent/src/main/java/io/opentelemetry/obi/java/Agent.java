@@ -13,6 +13,7 @@ import io.opentelemetry.obi.java.instrumentations.*;
 import io.opentelemetry.obi.java.instrumentations.data.BytesWithLen;
 import io.opentelemetry.obi.java.instrumentations.data.Connection;
 import io.opentelemetry.obi.java.instrumentations.data.JdkHttpClientTask;
+import io.opentelemetry.obi.java.instrumentations.data.ReactorNettyContext;
 import io.opentelemetry.obi.java.instrumentations.data.SSLStorage;
 import io.opentelemetry.obi.java.instrumentations.util.ByteBufferExtractor;
 import io.opentelemetry.obi.java.instrumentations.util.CappedConcurrentHashMap;
@@ -164,6 +165,8 @@ public class Agent {
         .transform(SocketChannelInst.transformer())
         .type(NettySSLHandlerInst.type())
         .transform(NettySSLHandlerInst.transformer())
+        .type(ReactorNettyHttpClientInst.type())
+        .transform(ReactorNettyHttpClientInst.transformer())
         .type(JavaExecutorInst.type())
         .transform(JavaExecutorInst.transformer())
         .type(JdkHttpClientInst.type())
@@ -220,6 +223,7 @@ public class Agent {
           || RunnableInst.matches(clazz)
           || JavaForkJoinTaskInst.matches(clazz)
           || NettySSLHandlerInst.matches(clazz)
+          || ReactorNettyHttpClientInst.matches(clazz)
           || VirtualThreadInst.matches(clazz)) {
         if (Agent.debugOn) {
           System.err.println("Retransforming " + clazz);
@@ -252,6 +256,7 @@ public class Agent {
     Class.forName(BytesWithLen.class.getName());
     Class.forName(Connection.class.getName());
     Class.forName(JdkHttpClientTask.class.getName());
+    Class.forName(ReactorNettyContext.class.getName());
     Class.forName(NettyChannelExtractor.class.getName());
     Class.forName(SSLStorage.class.getName());
     Class.forName(ByteBufferExtractor.class.getName());

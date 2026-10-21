@@ -298,7 +298,7 @@ func TestJVMRuntimeMetricsConstantOverridesUseApplicationRuntimeAsFeatureGate(t 
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			tracer := Tracer{cfg: &obi.Config{}}
+			tracer := Tracer{cfg: &obi.Config{}, log: tlog()}
 			if tt.configure != nil {
 				tt.configure(tracer.cfg)
 			}

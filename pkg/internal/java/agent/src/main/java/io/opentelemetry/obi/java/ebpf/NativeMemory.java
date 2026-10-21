@@ -79,6 +79,15 @@ public class NativeMemory {
     ((java.nio.Buffer) buffer).position(oldPosition);
   }
 
+  public byte[] read(int offset, int length) {
+    byte[] data = new byte[length];
+    int oldPosition = ((java.nio.Buffer) buffer).position();
+    ((java.nio.Buffer) buffer).position(offset);
+    buffer.get(data);
+    ((java.nio.Buffer) buffer).position(oldPosition);
+    return data;
+  }
+
   public ByteBuffer getBuffer() {
     return buffer;
   }

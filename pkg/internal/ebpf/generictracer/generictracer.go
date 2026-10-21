@@ -271,6 +271,8 @@ func (p *Tracer) constants() map[string]any {
 
 	m["g_bpf_debug"] = p.cfg.EBPF.BpfDebug
 	m["g_bpf_traceparent_enabled"] = p.cfg.EBPF.TrackRequestHeaders || p.cfg.EBPF.ContextPropagation.IsEnabled()
+	m["g_bpf_header_propagation"] = p.cfg.EBPF.ContextPropagation.HasHeaders()
+	m["g_bpf_probe_write_user_enabled"] = !ebpfcommon.IntegrityModeOverride && ebpfcommon.SupportsContextPropagationWithProbe(p.log)
 	m["jvm_sampling_interval_ns"] = uint64(0)
 	if p.cfg.AppRuntimeMetricsEnabled() {
 		m["jvm_sampling_interval_ns"] = uint64(p.cfg.JVMRuntimeMetrics.SamplingInterval.Nanoseconds())

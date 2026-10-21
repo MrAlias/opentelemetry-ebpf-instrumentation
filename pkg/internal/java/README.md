@@ -299,6 +299,38 @@ jattach <PID of Java program> load instrument false "/path/to/obi-java-agent.jar
 - `wrap()` - Extracts connection info
 - `unwrap()` - Extracts connection info
 
+### 5. **reactor.netty.http.client.HttpClient** for HTTPS HTTP/1.1 propagation
+
+At subscription entry, the agent carries a snapshot of the current OBI parent in
+Reactor's subscriber `Context`. `HttpClientOperations` retrieves that subscription's
+snapshot after scheduler handoffs and pooled connection reuse. Before headers are
+serialized, the agent asks OBI to prepare the client span and inserts its W3C `traceparent` if the application
+has not supplied one. The existing TLS plaintext parser adopts the prepared span.
+Context is not retained on the event-loop thread or pooled channel.
+
+This uses two additional ioctl operations: 8 returns a 48-byte `tp_info_t` parent
+snapshot; 9 accepts a 36-byte connection and that snapshot, and returns a 55-byte
+traceparent value. Both payloads follow the one-byte operation code. The return
+value is populated only when header propagation is enabled. Like Go's library
+injection, this requires `bpf_probe_write_user` support and the corresponding
+capabilities and kernel lockdown settings. Advice fails open if context cannot
+be captured or a header cannot be inserted.
+
+The integration regression uses Reactor Netty 1.2.15, direct `HttpClient` calls,
+a separate uninstrumented TLS proxy, and an OpenTelemetry SDK downstream. It
+checks overlapping subscriptions to a shared publisher, a scheduler handoff, pooled
+connection reuse, application-supplied headers, and disabled propagation. Run it with:
+
+```sh
+go test -v -run TestJavaReactorTraceparent -timeout 10m ./internal/test/integration/
+```
+
+This instrumentation excludes HTTP/2, WebSocket requests, and Spring
+WebClient-specific hooks. The source fixture uses fresh incoming connections and
+keeps its HTTP server handler open until the reactive client call completes.
+Connection reuse is checked on the outbound TLS pool; asynchronous server ingress
+association is outside this test's scope.
+
 ## 💻 Development
 
 ### Key Technologies

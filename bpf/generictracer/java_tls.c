@@ -19,6 +19,7 @@
 #include <generictracer/jvm.h>
 #include <generictracer/k_tracer_defs.h>
 #include <generictracer/maps/pid_tid_to_conn.h>
+#include <generictracer/python_httpx.h>
 
 #include <logger/bpf_dbg.h>
 
@@ -78,6 +79,11 @@ int BPF_KPROBE_GUARDED(obi_kprobe_sys_ioctl) {
     bpf_probe_read(&fd, sizeof(unsigned int), (void *)&PT_REGS_PARM1(__ctx));
     bpf_probe_read(&cmd, sizeof(unsigned int), (void *)&PT_REGS_PARM2(__ctx));
     bpf_probe_read(&arg, sizeof(void *), (void *)&PT_REGS_PARM3(__ctx));
+
+    if (fd == (unsigned int)-1 && cmd == k_python_httpx_ioctl) {
+        python_httpx_ioctl(arg, id);
+        return 0;
+    }
 
     // it must be fd == 0 if we are considering this request
     if (fd) {

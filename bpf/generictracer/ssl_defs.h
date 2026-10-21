@@ -65,7 +65,11 @@ handle_ssl_buf(void *ctx, u64 id, ssl_args_t *args, int bytes_len, u8 direction)
         bpf_dbg_printk("SSL_buf id=%d ssl=%llx", id, ssl);
         ssl_pid_connection_info_t *conn = bpf_map_lookup_elem(&ssl_to_conn, &ssl);
 
-        if (!conn) {
+        const pid_ptr_key_t ssl_key = pid_ptr_key(pid_from_pid_tgid(id), ssl);
+        const ssl_bios_t *bios = bpf_map_lookup_elem(&ssl_to_bios, &ssl_key);
+        // Split BIOs drain outside SSL calls; a shared event-loop thread cannot identify their socket.
+        const bool split_bios = bios && bios->rbio && bios->wbio && bios->rbio != bios->wbio;
+        if (!conn && !split_bios) {
             conn = bpf_map_lookup_elem(&pid_tid_to_conn, &id);
 
             if (!conn) {

@@ -1,4 +1,51 @@
-# Python runtime metrics
+# Python runtime
+
+## HTTPX HTTPS header propagation
+
+With header context propagation enabled, OBI loads a small Python agent into
+selected CPython processes. It adds a W3C `traceparent` to HTTPS requests from
+`httpx.AsyncClient` using HTTP/1.1 on the standard asyncio event loop. The
+agent preserves an application-supplied header, including its spelling and
+value. Synchronous HTTPX clients, Trio, uvloop, and HTTP/2 are outside this path.
+
+The loader currently supports Linux `amd64`. It needs process access through
+`ptrace`, executable anonymous memory, and the exported CPython pending-call
+API. It queues installation while the main thread is idle in an event-loop
+syscall; CPython executes the agent in its main interpreter with the GIL held.
+Free-threaded and debug builds are excluded. HTTPX must be installed in the
+target environment. The request bridge also needs `bpf_probe_write_user`, with
+the same capability and lockdown restrictions as Go header propagation.
+Existing Python task probes must be available for parent association; stripped
+`_asyncio` builds can lack these symbols.
+
+The agent hooks HTTP/1.1 header serialization after connection acquisition. It
+uses a private header list and preserves the request's URL, method, stream, and
+extensions. An ioctl bridge obtains the owning asyncio task's server context
+and creates the client span ID before serialization. The TLS observer adopts
+that same client context. Pending state belongs to the process, connection,
+and task generation and is cleared on both completion and cancellation.
+The bridge also supplies the socket addresses so the existing SSL-write probes
+can bind MemoryBIO TLS to the request's connection instead of another socket
+used by the asyncio thread. Binding requires the generated token in the TLS
+header write, so other TLS activity in an application trace callback cannot
+claim the request's socket.
+It remains available through response headers so a delayed MemoryBIO
+observation can adopt the same client span ID.
+
+For TLS with separate read and write BIOs, passive tracing also waits for
+ciphertext-to-socket correlation instead of inheriting a thread's last socket.
+This association rule applies with propagation disabled as well.
+
+Disabling header propagation prevents agent loading. An agent remaining after
+OBI detaches receives no context from the bridge and forwards requests normally.
+Loading failures are logged and leave passive application tracing available.
+
+The regression fixture in
+`internal/test/integration/components/pythonhttpx/` records raw headers at an
+uninstrumented TLS proxy and checks them against OBI source spans and an
+OpenTelemetry downstream span. It pins HTTPX 0.28.1 and httpcore 1.0.9.
+
+## Garbage collector metrics
 
 With `application_runtime` enabled, OBI reads cumulative garbage-collector
 counters from supported CPython processes and exports all nine combinations of

@@ -56,6 +56,7 @@ static int test_ssl_conn_available;
 static u64 test_ssl_ptr;
 static u64 test_mapped_pid_tid;
 static int test_mapped_pid_tid_available;
+static ssl_bios_t test_bios;
 
 static void assert_int_eq(int expected, int actual, const char *message) {
     if (expected != actual) {
@@ -79,6 +80,9 @@ static void assert_u16_eq(u16 expected, u16 actual, const char *message) {
 }
 
 static void *test_map_lookup(void *map, const void *key) {
+    if (map == &ssl_to_bios) {
+        return test_bios.rbio ? &test_bios : NULL;
+    }
     if (map == &ssl_to_conn) {
         const u64 ssl = (u64) * (void *const *)key;
         if (test_ssl_conn_available && ssl == test_ssl_ptr) {
@@ -155,6 +159,7 @@ static void reset(void) {
     test_ssl_ptr = 0x1234;
     test_mapped_pid_tid = 0;
     test_mapped_pid_tid_available = 0;
+    test_bios = (ssl_bios_t){};
 }
 
 static ssl_args_t ssl_args(void) {
@@ -279,6 +284,21 @@ static void test_missing_args_noops(void) {
     assert_int_eq(0, test_parser_call_count, "missing args do not enter protocol parsing");
 }
 
+static void test_split_bios_do_not_inherit_thread_socket(void) {
+    reset();
+    test_bios = (ssl_bios_t){.rbio = 1, .wbio = 2};
+    test_mapped_pid_tid = 0x2a00000001ULL;
+    test_mapped_pid_tid_available = 1;
+    test_ssl_conn.orig_dport = 8080;
+    ssl_args_t args = ssl_args();
+
+    handle_ssl_buf(NULL, test_mapped_pid_tid, &args, 64, TCP_SEND);
+
+    assert_u16_eq(0, test_last_orig_dport, "split BIO waits for ciphertext socket correlation");
+    assert_int_eq(0, pid_tid_delete_count, "unrelated thread socket remains untouched");
+    assert_int_eq(1, test_parser_call_count, "unbound TLS still emits a partial observation");
+}
+
 int main(void) {
     test_failed_read_skips_parser_after_cleanup();
     test_eof_read_skips_parser_after_cleanup();
@@ -288,6 +308,7 @@ int main(void) {
     test_successful_read_can_create_fake_connection();
     test_successful_read_can_reuse_mapped_pid_tid_connection();
     test_missing_args_noops();
+    test_split_bios_do_not_inherit_thread_socket();
 
     return 0;
 }

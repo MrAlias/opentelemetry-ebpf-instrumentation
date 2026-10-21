@@ -32,6 +32,7 @@
 #include <generictracer/http_server_trace.h>
 #include <generictracer/protocol_common.h>
 #include <generictracer/tcp_trace_cleanup.h>
+#include <generictracer/python_httpx.h>
 
 #include <logger/bpf_dbg.h>
 
@@ -671,6 +672,11 @@ __obi_continue_protocol_http(struct pt_regs *ctx,
                              unsigned char *(*tp_loop_fn)(unsigned char *, const u16)) {
     http_connection_metadata_t *meta =
         connection_meta_by_direction(args->direction, PACKET_TYPE_REQUEST);
+
+    if (args->ssl && meta && meta->type == k_event_type_http_client &&
+        python_httpx_adopt(&args->pid_conn, &info->parent_status)) {
+        goto skip_tp;
+    }
 
     egress_key_t e_key = {
         .d_port = args->pid_conn.conn.d_port,

@@ -66,6 +66,7 @@ type Tracer struct {
 	eventCtx       *ebpfcommon.EBPFEventContext
 	jvmUSDTManager ebpfcommon.USDTSpecManager
 	pythonRuntime  *pythonRuntimeController
+	pythonAgent    pythonAgentLoader
 }
 
 func tlog() *slog.Logger {
@@ -175,6 +176,7 @@ func (p *Tracer) AllowPID(pid app.PID, ns uint32, fi *exec.FileInfo) {
 	}
 
 	p.runItersForPID(pid)
+	p.pythonAgent.allow(p, pid, fi, serviceSource)
 }
 
 func ensureJVMRuntimeMetricGeneration(fi *exec.FileInfo) uint64 {
@@ -198,6 +200,7 @@ func (p *Tracer) BlockPID(pid app.PID, ns uint32) {
 
 // BlockPIDLifecycle removes Python state only for the matching process lifecycle.
 func (p *Tracer) BlockPIDLifecycle(pid app.PID, ns uint32, lifecycle *exec.FileInfo) {
+	p.pythonAgent.block(pid, lifecycle)
 	if p.pythonRuntime != nil {
 		p.pythonRuntime.block(pid, ns, lifecycle)
 	}
@@ -270,6 +273,17 @@ func (p *Tracer) constants() map[string]any {
 	m["max_transaction_time"] = uint64(p.cfg.EBPF.MaxTransactionTime.Nanoseconds())
 
 	m["g_bpf_debug"] = p.cfg.EBPF.BpfDebug
+	m["g_bpf_header_propagation"] = p.cfg.EBPF.ContextPropagation.HasHeaders()
+	probeWriteUserEnabled := false
+	if p.cfg.EBPF.ContextPropagation.HasHeaders() && !ebpfcommon.IntegrityModeOverride {
+		log := p.log
+		if log == nil {
+			log = tlog()
+		}
+		probeWriteUserEnabled = ebpfcommon.SupportsContextPropagationWithProbe(log)
+	}
+	m["g_bpf_probe_write_user_enabled"] = probeWriteUserEnabled
+	p.pythonAgent.enabled = p.cfg.EBPF.ContextPropagation.HasHeaders() && probeWriteUserEnabled
 	m["g_bpf_traceparent_enabled"] = p.cfg.EBPF.TrackRequestHeaders || p.cfg.EBPF.ContextPropagation.IsEnabled()
 	m["jvm_sampling_interval_ns"] = uint64(0)
 	if p.cfg.AppRuntimeMetricsEnabled() {
@@ -747,6 +761,7 @@ func (p *Tracer) Run(
 	eventsChan *msg.Queue[[]request.Span],
 ) {
 	p.eventCtx = ebpfEventContext
+	defer p.pythonAgent.close()
 	if p.pythonRuntime != nil {
 		defer p.pythonRuntime.close()
 	}

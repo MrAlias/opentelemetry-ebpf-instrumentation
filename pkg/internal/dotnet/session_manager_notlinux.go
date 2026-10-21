@@ -10,12 +10,15 @@ import (
 	"errors"
 	"time"
 
+	"go.opentelemetry.io/obi/pkg/appolly/app/request"
 	"go.opentelemetry.io/obi/pkg/appolly/discover/exec"
 	"go.opentelemetry.io/obi/pkg/pipe/msg"
 	"go.opentelemetry.io/obi/pkg/runtimemetrics"
 )
 
-type SessionManager struct{}
+type SessionManager struct {
+	HTTPTraces *msg.Queue[[]request.Span]
+}
 
 func NewSessionManager(context.Context, time.Duration, time.Duration, *msg.Queue[[]runtimemetrics.RuntimeMetricSnapshot]) *SessionManager {
 	return &SessionManager{}

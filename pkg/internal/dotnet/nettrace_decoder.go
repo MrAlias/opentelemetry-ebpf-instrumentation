@@ -33,9 +33,28 @@ type netTraceDecoder struct {
 	sequences map[uint64]uint32
 }
 
+type netTraceEvent struct {
+	Header   netTraceEventHeader
+	Metadata netTraceMetadataHeader
+	Values   map[string]any
+}
+
 // readRuntimeCounters reads a .NET stream and delivers counters synchronously.
 // The caller owns the stream and closes it to interrupt a blocked read.
 func readRuntimeCounters(stream io.Reader, expectedPID uint64, consume func(runtimeCounter) error) error {
+	return readNetTraceEvents(stream, expectedPID, func(_ netTraceInfo, event netTraceEvent) error {
+		counter, err := runtimeCounterFromEvent(event)
+		if err != nil || counter.Name == "" {
+			return err
+		}
+		if err := consume(counter); err != nil {
+			return fmt.Errorf("consuming runtime counter %q: %w", counter.Name, err)
+		}
+		return nil
+	})
+}
+
+func readNetTraceEvents(stream io.Reader, expectedPID uint64, consume func(netTraceInfo, netTraceEvent) error) error {
 	reader := newNetTraceReader(stream)
 	info, err := readNetTracePreamble(reader)
 	if err != nil {
@@ -62,21 +81,53 @@ func readRuntimeCounters(stream io.Reader, expectedPID uint64, consume func(runt
 		if header.Name != "EventBlock" && header.Name != "MetadataBlock" {
 			continue
 		}
-		counters, err := decoder.decodeEventBlock(header.Name, payload)
+		events, err := decoder.decodeBlock(header.Name, payload)
 		if err != nil {
 			return err
 		}
-		for _, counter := range counters {
-			if err := consume(counter); err != nil {
-				return fmt.Errorf("consuming runtime counter %q: %w", counter.Name, err)
+		for _, event := range events {
+			if err := consume(info, event); err != nil {
+				return err
 			}
 		}
 	}
 }
 
-// decodeEventBlock retains metadata definitions and decodes System.Runtime
-// counters from .NET event blocks. Calls must follow stream order.
+func runtimeCounterFromEvent(event netTraceEvent) (runtimeCounter, error) {
+	if event.Metadata.ProviderName != "System.Runtime" {
+		return runtimeCounter{}, nil
+	}
+	switch event.Metadata.EventName {
+	case "ProcessorCount":
+		return decodeProcessorCount(event.Values)
+	case "EventCounters":
+		return decodeRuntimeCounter(event.Values)
+	default:
+		return runtimeCounter{}, nil
+	}
+}
+
 func (d *netTraceDecoder) decodeEventBlock(name string, payload []byte) ([]runtimeCounter, error) {
+	events, err := d.decodeBlock(name, payload)
+	if err != nil {
+		return nil, err
+	}
+	var counters []runtimeCounter
+	for _, event := range events {
+		counter, err := runtimeCounterFromEvent(event)
+		if err != nil {
+			return nil, err
+		}
+		if counter.Name != "" {
+			counters = append(counters, counter)
+		}
+	}
+	return counters, nil
+}
+
+// decodeBlock retains metadata definitions and checks per-thread event loss.
+// Calls must follow stream order.
+func (d *netTraceDecoder) decodeBlock(name string, payload []byte) ([]netTraceEvent, error) {
 	if name != "MetadataBlock" && name != "EventBlock" {
 		return nil, fmt.Errorf("expected NetTrace event or metadata block, got %q", name)
 	}
@@ -89,7 +140,7 @@ func (d *netTraceDecoder) decodeEventBlock(name string, payload []byte) ([]runti
 		return nil, errors.New("uncompressed NetTrace event blocks are unsupported")
 	}
 	var previous netTraceEventHeader
-	var counters []runtimeCounter
+	var events []netTraceEvent
 	for reader.Len() > 0 {
 		event, err := readNetTraceCompressedEventHeader(reader, previous)
 		if err != nil {
@@ -105,30 +156,21 @@ func (d *netTraceDecoder) decodeEventBlock(name string, payload []byte) ([]runti
 			if event.MetadataID != 0 {
 				return nil, errors.New("nonzero metadata ID in NetTrace metadata block")
 			}
-			definition, err := readNetTraceMetadataHeader(valuesReader)
+			definition, err := readNetTraceMetadata(valuesReader)
 			if err != nil {
 				return nil, err
 			}
-			if _, exists := d.metadata[definition.MetadataID]; exists {
-				return nil, fmt.Errorf("duplicate NetTrace metadata ID: %d", definition.MetadataID)
+			id := definition.Header.MetadataID
+			if _, exists := d.metadata[id]; exists {
+				return nil, fmt.Errorf("duplicate NetTrace metadata ID: %d", id)
 			}
 			if len(d.metadata) >= maximumMetadataDefinitions {
 				return nil, errors.New("NetTrace metadata exceeds decoder limit")
 			}
-			var fields []netTraceField
-			if valuesReader.Len() > 0 {
-				fields, err = readNetTraceFields(valuesReader, 0)
-				if err != nil {
-					return nil, err
-				}
-			}
-			if valuesReader.Len() != 0 {
-				return nil, errors.New("unsupported NetTrace metadata extension")
-			}
 			if d.metadata == nil {
 				d.metadata = make(map[uint32]netTraceMetadata)
 			}
-			d.metadata[definition.MetadataID] = netTraceMetadata{Header: definition, Fields: fields}
+			d.metadata[id] = definition
 			continue
 		}
 		definition, exists := d.metadata[event.MetadataID]
@@ -138,11 +180,13 @@ func (d *netTraceDecoder) decodeEventBlock(name string, payload []byte) ([]runti
 		if err := d.checkSequence(event.CaptureThreadID, event.SequenceNumber, true); err != nil {
 			return nil, err
 		}
-		if definition.Header.ProviderName != "System.Runtime" {
-			continue
-		}
-		eventName := definition.Header.EventName
-		if eventName != "EventCounters" && eventName != "ProcessorCount" {
+		switch definition.Header.ProviderName {
+		case "System.Runtime":
+			if definition.Header.EventName != "EventCounters" && definition.Header.EventName != "ProcessorCount" {
+				continue
+			}
+		case "Microsoft-Diagnostics-DiagnosticSource":
+		default:
 			continue
 		}
 		values, err := readNetTraceValues(valuesReader, definition.Fields)
@@ -152,21 +196,9 @@ func (d *netTraceDecoder) decodeEventBlock(name string, payload []byte) ([]runti
 		if valuesReader.Len() != 0 {
 			return nil, errors.New("trailing bytes in NetTrace counter payload")
 		}
-		var counter runtimeCounter
-		if eventName == "ProcessorCount" {
-			counter, err = decodeProcessorCount(values)
-		} else {
-			counter, err = decodeRuntimeCounter(values)
-		}
-		if err != nil {
-			return nil, err
-		}
-		if counter.Name == "" {
-			continue
-		}
-		counters = append(counters, counter)
+		events = append(events, netTraceEvent{Header: event, Metadata: definition.Header, Values: values})
 	}
-	return counters, nil
+	return events, nil
 }
 
 // checkSequence rejects dropped events before their counter deltas are used.

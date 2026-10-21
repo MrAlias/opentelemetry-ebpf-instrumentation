@@ -1,4 +1,60 @@
-# .NET runtime metrics
+# .NET runtime support
+
+## HTTP tracing and context propagation
+
+With header propagation enabled, OBI associates Linux .NET HTTP/1.1 HTTPS
+`HttpClient.SendAsync()` requests with their native HTTP activities. No
+application SDK or code changes are required. The supported runtime is .NET 8
+CoreCLR on Linux x86-64. HTTP association on .NET 9, .NET 10, other architectures,
+and NativeAOT has not been validated; runtime-metrics compatibility below does
+not establish HTTP association support.
+
+`System.Net.Http` performs W3C header injection through its diagnostic handler.
+OBI reuses that header and preserves application-supplied traceparents. It does
+not write an additional header or replace an existing one. Disabling OBI
+propagation leaves the runtime's independent propagation enabled. Applications
+that explicitly disable runtime propagation with
+`DOTNET_SYSTEM_NET_HTTP_ENABLEACTIVITYPROPAGATION=false` are outside this support;
+OBI respects that opt-out and has no independent TLS header-insertion fallback.
+
+OBI uses its existing diagnostic-socket collector to subscribe to ASP.NET Core
+server starts and native HTTP client activities. The collector requires access
+to the target's diagnostic socket and enabled .NET diagnostics. A native server
+activity is associated with an observed server request using its process,
+incoming W3C context, connection, method, path, and monotonic request interval.
+Client traces use the native activity and its existing request header rather
+than depending on a TLS probe observing every async request. Matching BPF client
+records supply metrics instead of duplicate traces. This avoids using thread
+identity to associate async work. Incomplete server observations do not establish
+a parent link.
+
+Plaintext is observed with the existing `CryptoNative_SslRead` and
+`CryptoNative_SslWrite` probes in
+`libSystem.Security.Cryptography.Native.OpenSsl.so`. OBI also looks for this
+library beside the loaded `libcoreclr.so`, allowing attachment before the first
+TLS request lazily loads the wrapper. Existing queue and processing spans retain
+their IDs; the native HttpClient activity is parented to the outer server span.
+The validated parent chain uses an ASP.NET Core HTTP/1.1 source request with a
+valid incoming W3C traceparent and an HTTP/1.1 HTTPS outbound request. HTTP/2,
+requests without incoming context, and other HTTP client implementations are
+outside this scope.
+
+The Linux .NET 8 regression fixture in
+`internal/test/integration/docker-compose-dotnet-httpclient.yml` forces
+`RequestVersionExact` HTTP/1.1 and uses an OBI-only ASP.NET source, an
+uninstrumented TLS proxy recording header values and connections, and an OTel
+SDK downstream. `TestSuite_DotNetHTTPClientTraceparent` checks sequential pool
+reuse, overlapping async requests, cancellation recovery, supplied headers,
+and propagation disabled. Controls with runtime diagnostic propagation disabled
+verify the explicit application opt-out. The fixture asserts exactly one wire
+traceparent and the complete span-ID chain, rather than only matching trace IDs.
+Live integration coverage runs on .NET 8.0.27 (Linux x86-64). Native EventPipe
+decoding also has a replay fixture captured on .NET 8.0.0.
+
+The runtime behavior is defined in
+[.NET 8 DiagnosticsHandler](https://github.com/dotnet/runtime/blob/v8.0.0/src/libraries/System.Net.Http/src/System/Net/Http/DiagnosticsHandler.cs).
+
+## Runtime metrics
 
 With `application_runtime` enabled, OBI collects runtime metrics from
 .NET 8 and newer processes on Linux through their diagnostic Unix sockets.
@@ -49,7 +105,9 @@ metrics:
 `dotnet_runtime_metrics.sampling_interval` controls `System.Runtime` EventCounter
 polling and the delay before reconnecting after a collection session ends.
 `dotnet_runtime_metrics.timeout` bounds diagnostic IPC setup and the final
-EventPipe shutdown and drain.
+EventPipe shutdown and drain. With HTTP header propagation enabled, it also
+bounds the wait for a matching native client record before falling back to the
+BPF client trace.
 
 ```yaml
 dotnet_runtime_metrics:

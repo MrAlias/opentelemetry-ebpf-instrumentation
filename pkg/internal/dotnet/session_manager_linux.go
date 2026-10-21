@@ -9,14 +9,17 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"strconv"
 	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
 
 	"go.opentelemetry.io/obi/pkg/appolly/app"
+	"go.opentelemetry.io/obi/pkg/appolly/app/request"
 	"go.opentelemetry.io/obi/pkg/appolly/discover/exec"
 	ebpfcommon "go.opentelemetry.io/obi/pkg/ebpf/common"
+	"go.opentelemetry.io/obi/pkg/ebpf/timing"
 	"go.opentelemetry.io/obi/pkg/internal/procs"
 	"go.opentelemetry.io/obi/pkg/pipe/msg"
 	"go.opentelemetry.io/obi/pkg/runtimemetrics"
@@ -24,6 +27,8 @@ import (
 
 // SessionManager owns one asynchronous EventPipe reader per discovered process.
 type SessionManager struct {
+	HTTPTraces *msg.Queue[[]request.Span]
+
 	ctx      context.Context
 	interval time.Duration
 	timeout  time.Duration
@@ -52,8 +57,8 @@ func (c *SessionManager) Start(file *exec.FileInfo) error {
 	if c.closed || c.ctx.Err() != nil {
 		return nil
 	}
-	if c.interval <= 0 || c.timeout <= 0 || c.queue == nil {
-		return errors.New(".NET session manager requires a positive sampling interval, timeout, and a metrics queue")
+	if c.interval <= 0 || c.timeout <= 0 || (c.queue == nil && c.HTTPTraces == nil) {
+		return errors.New(".NET session manager requires a positive sampling interval, timeout, and an output queue")
 	}
 	pid, startTime := file.Pid(), file.StartTime()
 	previous := c.targets[pid]
@@ -120,11 +125,21 @@ func (c *SessionManager) Close() {
 // Reconnected sessions keep the last published totals as their new baseline.
 func (c *SessionManager) run(ctx context.Context, process *procs.ProcessHandle, file *exec.FileInfo) {
 	log := slog.With("component", "dotnet.SessionManager", "pid", process.PID())
+	service := file.ServiceAttrs()
+	collectMetrics := c.queue != nil && (c.HTTPTraces == nil || service.Features.AppRuntime())
+	collectHTTP := c.HTTPTraces != nil && service.ExportModes.CanExportTraces()
+	if !collectMetrics && !collectHTTP {
+		return
+	}
 	var totals [runtimemetrics.DotnetGCGenerationCount]uint64
 	var cumulativeTotals cumulativeSessionTotals
 	warned := false
+	var httpReadyFrom int64
 	generation := file.RuntimeMetricGeneration(process.PID())
 	defer func() {
+		if !collectMetrics {
+			return
+		}
 		c.queue.SendCtx(c.ctx, []runtimemetrics.RuntimeMetricSnapshot{{
 			Service: file.ServiceAttrs(), PID: process.PID(), Generation: generation,
 			Time: time.Now(), Removed: true, Dotnet: &runtimemetrics.DotnetRuntimeMetricSnapshot{},
@@ -141,14 +156,32 @@ func (c *SessionManager) run(ctx context.Context, process *procs.ProcessHandle, 
 		target, err := resolveDiagnosticTarget(setupCtx, process, file.ServiceAttrs().EnvVars["TMPDIR"])
 		var session *eventPipeSession
 		if err == nil {
-			session, err = startEventPipe(setupCtx, target.socketPath, c.interval)
+			var providers []eventPipeProvider
+			if collectMetrics {
+				interval := strconv.FormatFloat(c.interval.Seconds(), 'f', -1, 64)
+				providers = append(providers, eventPipeProvider{
+					name: "System.Runtime", arguments: "EventCounterIntervalSec=" + interval,
+					keywords: systemRuntimeKeywords, level: eventLevelInformational,
+				})
+			}
+			if collectHTTP {
+				providers = append(providers, httpActivityProvider())
+			}
+			var startRequest []byte
+			startRequest, err = encodeEventPipeProviders(providers)
+			if err == nil {
+				session, err = startEventPipeRequest(setupCtx, target.socketPath, startRequest)
+			}
 		}
 		cancel()
 		if err == nil {
 			log.Debug("started EventPipe GC collection", "session", session.id)
 			base := totals
 			cumulativeBase := cumulativeTotals
-			err = c.readSession(ctx, session, target.info.PID, func(publishCtx context.Context, snapshot *runtimemetrics.DotnetRuntimeMetricSnapshot) error {
+			err = c.readSessionEvents(ctx, session, target.info.PID, func(publishCtx context.Context, snapshot *runtimemetrics.DotnetRuntimeMetricSnapshot) error {
+				if !collectMetrics {
+					return nil
+				}
 				for gcGeneration, count := range snapshot.GCCollections {
 					if *count > math.MaxInt64-base[gcGeneration] {
 						return errors.New(".NET GC collections exceed exporter integer range")
@@ -173,6 +206,41 @@ func (c *SessionManager) run(ctx context.Context, process *procs.ProcessHandle, 
 					Service: file.ServiceAttrs(), PID: process.PID(), Generation: generation,
 					Time: time.Now(), Dotnet: snapshot,
 				}})
+				return nil
+			}, func(publishCtx context.Context, info netTraceInfo, event netTraceEvent) error {
+				if !collectHTTP {
+					return nil
+				}
+				if event.Metadata.ProviderName == diagnosticSourceProviderName && event.Metadata.EventName == "NewDiagnosticListener" {
+					if name := event.Values["SourceName"]; name == "Microsoft.AspNetCore" || name == "HttpHandlerDiagnosticListener" {
+						now := int64(timing.MonoTimeNow())
+						if httpReadyFrom == 0 {
+							httpReadyFrom = now
+							log.Info("started .NET HTTP Activity collection")
+						}
+					}
+				}
+				span, err := decodeHTTPActivity(info, event)
+				if err != nil {
+					log.Warn("unable to decode .NET HTTP Activity", "error", err)
+					return nil
+				}
+				if span == nil || httpReadyFrom == 0 || span.Start < httpReadyFrom {
+					return nil
+				}
+				if span.Type == request.EventTypeHTTP {
+					if event.Values["EventName"] != "Microsoft.AspNetCore.Hosting.HttpRequestIn.Start" {
+						return nil
+					}
+					span.Start = event.Header.Timestamp
+					span.RequestStart = span.Start
+					span.End = span.Start
+				}
+				span.Service = file.ServiceAttrs()
+				span.Pid = request.PidInfo{HostPID: file.Pid(), UserPID: app.PID(target.info.PID), Namespace: file.Ns()}
+				request.SetIgnoreMetrics(span)
+				span.DotnetHTTPContext = true
+				c.HTTPTraces.SendCtx(publishCtx, []request.Span{*span})
 				return nil
 			})
 		}
@@ -204,13 +272,26 @@ func (c *SessionManager) run(ctx context.Context, process *procs.ProcessHandle, 
 // readSession drains concurrently with StopTracing. A deadline bounds both
 // control IPC and the final stream drain when the process stops responding.
 func (c *SessionManager) readSession(ctx context.Context, session *eventPipeSession, pid uint64, publish func(context.Context, *runtimemetrics.DotnetRuntimeMetricSnapshot) error) error {
+	return c.readSessionEvents(ctx, session, pid, publish, nil)
+}
+
+func (c *SessionManager) readSessionEvents(ctx context.Context, session *eventPipeSession, pid uint64, publish func(context.Context, *runtimemetrics.DotnetRuntimeMetricSnapshot) error, consume func(context.Context, netTraceInfo, netTraceEvent) error) error {
 	defer session.stream.Close()
 	publishCtx, cancelPublish := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelPublish()
 	done := make(chan error, 1)
 	go func() {
 		var collection runtimeCollection
-		err := readRuntimeCounters(session.stream, pid, func(counter runtimeCounter) error {
+		err := readNetTraceEvents(session.stream, pid, func(info netTraceInfo, event netTraceEvent) error {
+			if consume != nil {
+				if err := consume(publishCtx, info, event); err != nil {
+					return err
+				}
+			}
+			counter, err := runtimeCounterFromEvent(event)
+			if err != nil || counter.Name == "" {
+				return err
+			}
 			snapshot, err := collection.observe(counter)
 			if err != nil || snapshot == nil {
 				return err

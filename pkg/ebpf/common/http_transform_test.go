@@ -88,6 +88,32 @@ func TestHTTPRequestResponseToSpanSetsSchemeFromSSLFlag(t *testing.T) {
 	}
 }
 
+func TestHTTPSClientRetainsWireContextWithoutChangingSpan(t *testing.T) {
+	const parent = "00-12345678901234567890123456789012-1234567890123456-01"
+	parseCtx := &EBPFParseContext{httpWireContext: true}
+	for _, value := range []string{parent, "invalid"} {
+		req := &http.Request{
+			Method: http.MethodGet, URL: &url.URL{Path: "/test"},
+			Host: "example.com", Header: http.Header{"Traceparent": {value}}, Body: http.NoBody,
+		}
+		event := &BPFHTTPInfo{Type: uint8(request.EventTypeHTTPClient), Ssl: 1}
+		span := httpRequestResponseToSpan(parseCtx, event, req, &http.Response{StatusCode: http.StatusOK, Body: http.NoBody})
+		require.Equal(t, value == parent, span.WireTraceContext.IsValid())
+		if value == parent {
+			require.Equal(t, "12345678901234567890123456789012", span.WireTraceContext.TraceID().String())
+			require.Equal(t, "1234567890123456", span.WireTraceContext.SpanID().String())
+		}
+		require.False(t, span.SpanID.IsValid(), "wire context requires native Activity association")
+		require.Equal(t, []string{value}, req.Header.Values("Traceparent"))
+		var raw bytes.Buffer
+		require.NoError(t, req.Write(&raw))
+		fast := httpRequestToSpan(parseCtx, event, largebuf.NewLargeBufferFrom(raw.Bytes()))
+		require.Equal(t, span.WireTraceContext, fast.WireTraceContext)
+		disabled := httpRequestToSpan(nil, event, largebuf.NewLargeBufferFrom(raw.Bytes()))
+		require.False(t, disabled.WireTraceContext.IsValid())
+	}
+}
+
 func TestHTTPRequestResponseToSpanSetsFullPath(t *testing.T) {
 	t.Run("URL.String includes path and query", func(t *testing.T) {
 		req := &http.Request{
@@ -410,20 +436,20 @@ func TestHTTPRequestToSpanMethodFromSSLBuffer(t *testing.T) {
 
 	t.Run("short request line is enough to recover the method", func(t *testing.T) {
 		event := newSSLEvent([]uint8("GET /greeting HTTP/1.1\r\n"))
-		span := httpRequestToSpan(event, largebuf.NewLargeBufferFrom(event.Buf[:]))
+		span := httpRequestToSpan(nil, event, largebuf.NewLargeBufferFrom(event.Buf[:]))
 		assert.Equal(t, "GET", span.Method)
 		assert.Equal(t, "/greeting", span.Path)
 	})
 
 	t.Run("minimal method token still recovers the method", func(t *testing.T) {
 		event := newSSLEvent([]uint8("GET /"))
-		span := httpRequestToSpan(event, largebuf.NewLargeBufferFrom(event.Buf[:]))
+		span := httpRequestToSpan(nil, event, largebuf.NewLargeBufferFrom(event.Buf[:]))
 		assert.Equal(t, "GET", span.Method)
 	})
 
 	t.Run("zeroed buffer yields empty method", func(t *testing.T) {
 		event := newSSLEvent(nil)
-		span := httpRequestToSpan(event, largebuf.NewLargeBufferFrom(event.Buf[:]))
+		span := httpRequestToSpan(nil, event, largebuf.NewLargeBufferFrom(event.Buf[:]))
 		assert.Empty(t, span.Method)
 	})
 }

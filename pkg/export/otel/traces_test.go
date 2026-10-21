@@ -98,6 +98,22 @@ func TestGenerateTracesSpanLinks(t *testing.T) {
 		TraceFlags: 3,
 	}
 
+	t.Run("server ID independent of processing ID", func(t *testing.T) {
+		serverID := trace.SpanID{7}
+		span := &request.Span{
+			Type: request.EventTypeHTTP, TraceID: traceID, SpanID: spanID, ServerSpanID: serverID,
+			RequestStart: start.UnixNano(), Start: start.Add(time.Second).UnixNano(), End: start.Add(2 * time.Second).UnixNano(),
+		}
+		traces := tracesgen.GenerateTracesWithAttributes(cache, &span.Service, nil, hostID, groupFromSpanAndAttributes(span, nil), reporterName)
+		spans := traces.ResourceSpans().At(0).ScopeSpans().At(0).Spans()
+		require.Equal(t, 3, spans.Len())
+		require.Equal(t, serverID.String(), spans.At(2).SpanID().String())
+		require.Equal(t, spanID.String(), spans.At(1).SpanID().String())
+		for i := range 2 {
+			require.Equal(t, serverID.String(), spans.At(i).ParentSpanID().String())
+		}
+	})
+
 	t.Run("without subspans", func(t *testing.T) {
 		span := &request.Span{
 			Type:         request.EventTypeHTTP,

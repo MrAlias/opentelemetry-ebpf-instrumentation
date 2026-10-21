@@ -312,6 +312,7 @@ type pendingGoHTTPClientKey struct {
 
 type EBPFParseContext struct {
 	protocolDebug               bool
+	httpWireContext             bool
 	h2c                         *lru.Cache[uint64, *h2Connection]
 	redisDBCache                *simplelru.LRU[BpfConnectionInfoT, int]
 	couchbaseBucketCache        *simplelru.LRU[BpfConnectionInfoT, CouchbaseBucketInfo]
@@ -498,6 +499,7 @@ func NewEBPFParseContext(cfg *config.EBPFTracer, spansChan *msg.Queue[[]request.
 
 	parseCtx := &EBPFParseContext{
 		protocolDebug:              protocolDebug,
+		httpWireContext:            cfg != nil && cfg.ContextPropagation.HasHeaders(),
 		h2c:                        h2c,
 		redisDBCache:               redisDBCache,
 		couchbaseBucketCache:       couchbaseBucketCache,

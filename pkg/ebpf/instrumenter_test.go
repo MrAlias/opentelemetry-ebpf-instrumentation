@@ -996,6 +996,26 @@ func TestResolveInstrPathUsesMappedPathWhenLibraryIsMapped(t *testing.T) {
 	assert.Equal(t, "/usr/lib/libjvm.so", mappedPath)
 }
 
+func TestResolveInstrPathFindsLazyDotnetTLSLibrary(t *testing.T) {
+	const library = "libSystem.Security.Cryptography.Native.OpenSsl.so"
+	dir := t.TempDir()
+	path := filepath.Join(dir, library)
+	require.NoError(t, os.WriteFile(path, []byte("fixture"), 0o600))
+	pid := app.PID(os.Getpid())
+	maps := makeProcMaps(filepath.Join(dir, "libcoreclr.so"))
+	instrPath, ino, resolved, found := resolveInstrPath(pid, library, maps, "/unused", 42)
+	require.True(t, found)
+	require.Equal(t, path, resolved)
+	require.NotEqual(t, uint64(42), ino)
+	contents, err := os.ReadFile(instrPath)
+	require.NoError(t, err)
+	require.Equal(t, "fixture", string(contents))
+
+	require.NoError(t, os.Remove(path))
+	_, _, _, found = resolveInstrPath(pid, library, maps, "/unused", 42)
+	require.False(t, found, "a runtime without the wrapper must retain the existing fallback")
+}
+
 func TestUSDTIPMapPIDsIncludesNamespacedAliases(t *testing.T) {
 	original := findNamespacedPids
 	defer func() { findNamespacedPids = original }()

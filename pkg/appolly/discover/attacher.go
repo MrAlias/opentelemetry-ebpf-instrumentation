@@ -135,8 +135,17 @@ func (ta *traceAttacher) attacherLoop(_ context.Context) (swarm.RunFunc, error) 
 		defer ta.OutputTracerEvents.Close()
 
 		var dotnetSessions *dotnet.SessionManager
-		if ta.RuntimeMetrics != nil && ta.Cfg.AppRuntimeMetricsEnabled() {
-			dotnetSessions = dotnet.NewSessionManager(ctx, ta.Cfg.DotnetRuntimeMetrics.SamplingInterval, ta.Cfg.DotnetRuntimeMetrics.Timeout, ta.RuntimeMetrics)
+		dotnetHTTP := ta.Cfg.EBPF.ContextPropagation.HasHeaders() && ta.SpanSignalsShortcut != nil
+		dotnetMetrics := ta.RuntimeMetrics != nil && ta.Cfg.AppRuntimeMetricsEnabled()
+		if dotnetMetrics || dotnetHTTP {
+			var metricsQueue *msg.Queue[[]runtimemetrics.RuntimeMetricSnapshot]
+			if dotnetMetrics {
+				metricsQueue = ta.RuntimeMetrics
+			}
+			dotnetSessions = dotnet.NewSessionManager(ctx, ta.Cfg.DotnetRuntimeMetrics.SamplingInterval, ta.Cfg.DotnetRuntimeMetrics.Timeout, metricsQueue)
+			if dotnetHTTP {
+				dotnetSessions.HTTPTraces = ta.SpanSignalsShortcut
+			}
 			defer dotnetSessions.Close()
 		}
 
@@ -193,10 +202,10 @@ func (ta *traceAttacher) attacherLoop(_ context.Context) (swarm.RunFunc, error) 
 					if ok := ta.getTracer(ctx, &instr.Obj); ok {
 						ta.addProcessInstances(&instr.Obj)
 						if dotnetSessions != nil && instr.Obj.Type == svc.InstrumentableDotnet &&
-							instr.Obj.FileInfo.ServiceAttrs().Features.AppRuntime() &&
-							instr.Obj.FileInfo.ServiceAttrs().ExportModes.CanExportMetrics() {
+							(dotnetHTTP || (instr.Obj.FileInfo.ServiceAttrs().Features.AppRuntime() &&
+								instr.Obj.FileInfo.ServiceAttrs().ExportModes.CanExportMetrics())) {
 							if err := dotnetSessions.Start(instr.Obj.FileInfo); err != nil {
-								ta.log.Warn("unable to start .NET runtime metrics", "pid", instr.Obj.FileInfo.Pid(), "error", err)
+								ta.log.Warn("unable to start .NET diagnostic collection", "pid", instr.Obj.FileInfo.Pid(), "error", err)
 							}
 						}
 						ta.OutputTracerEvents.SendCtx(ctx, Event[*ebpf.Instrumentable]{Type: EventCreated, Obj: &instr.Obj})

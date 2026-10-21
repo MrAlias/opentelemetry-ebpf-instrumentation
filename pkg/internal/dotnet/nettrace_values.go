@@ -6,6 +6,7 @@ package dotnet // import "go.opentelemetry.io/obi/pkg/internal/dotnet"
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 )
 
@@ -22,6 +23,8 @@ func readNetTraceValues(reader *bytes.Reader, fields []netTraceField) (map[strin
 		switch field.Type {
 		case netTraceTypeObject:
 			value, err = readNetTraceValues(reader, field.Fields)
+		case netTraceTypeArray:
+			value, err = readNetTraceArray(reader, field.Element)
 		case netTraceTypeString:
 			value, err = readNetTraceString(reader)
 		case netTraceTypeInt32:
@@ -45,4 +48,30 @@ func readNetTraceValues(reader *bytes.Reader, fields []netTraceField) (map[strin
 		values[field.Name] = value
 	}
 	return values, nil
+}
+
+// DiagnosticSource arguments are a counted array of string key/value pairs.
+func readNetTraceArray(reader *bytes.Reader, element *netTraceField) ([]any, error) {
+	if element == nil || element.Type != netTraceTypeObject || len(element.Fields) != 2 ||
+		element.Fields[0].Name != "Key" || element.Fields[0].Type != netTraceTypeString ||
+		element.Fields[1].Name != "Value" || element.Fields[1].Type != netTraceTypeString {
+		return nil, errors.New("unsupported NetTrace array element type")
+	}
+	var count uint16
+	if err := binary.Read(reader, binary.LittleEndian, &count); err != nil {
+		return nil, err
+	}
+	minimum := binary.Size(uint16(0)) * len(element.Fields)
+	if count > maximumNetTraceFields || int(count) > reader.Len()/minimum {
+		return nil, fmt.Errorf("invalid NetTrace array element count: %d", count)
+	}
+	items := make([]any, count)
+	for i := range items {
+		values, err := readNetTraceValues(reader, element.Fields)
+		if err != nil {
+			return nil, err
+		}
+		items[i] = values
+	}
+	return items, nil
 }

@@ -1544,6 +1544,12 @@ type Span struct {
 	TraceID        trace.TraceID  `json:"traceID"`
 	SpanID         trace.SpanID   `json:"spanID"`
 	ParentSpanID   trace.SpanID   `json:"parentSpanID"`
+
+	WireTraceContext  trace.SpanContext `json:"-"`
+	DotnetHTTPContext bool              `json:"-"`
+	// ServerSpanID identifies the server span when SpanID identifies its processing subspan.
+	ServerSpanID trace.SpanID `json:"-"`
+
 	// ParentConditional marks a parent that may already have finished when this
 	// span started: BPF cannot tell at that moment, so the pipeline settles the
 	// link against the parent span's real end timestamp before export.

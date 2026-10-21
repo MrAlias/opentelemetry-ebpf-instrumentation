@@ -690,6 +690,19 @@ func resolveInstrPath(
 
 	libMap := procs.LibPath(lib, maps)
 	if libMap == nil {
+		// CoreCLR loads its OpenSSL wrapper on the first TLS request. Uprobes
+		// can attach to its inode before it is mapped into the process.
+		if lib == "libSystem.Security.Cryptography.Native.OpenSsl.so" {
+			if runtime := procs.LibPath("libcoreclr.so", maps); runtime != nil {
+				library := filepath.Join(filepath.Dir(runtime.Pathname), lib)
+				path := fmt.Sprintf("/proc/%d/root%s", pid, library)
+				if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() {
+					if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+						return path, stat.Ino, library, true
+					}
+				}
+			}
+		}
 		return exePath, exeIno, "", false
 	}
 

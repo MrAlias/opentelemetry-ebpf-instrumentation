@@ -6,6 +6,7 @@ package ebpfcommon // import "go.opentelemetry.io/obi/pkg/ebpf/common"
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -13,6 +14,9 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 
 	"go.opentelemetry.io/obi/pkg/appolly/app"
 	"go.opentelemetry.io/obi/pkg/appolly/app/request"
@@ -206,6 +210,9 @@ func httpRequestResponseToSpan(parseCtx *EBPFParseContext, event *BPFHTTPInfo, r
 	}
 
 	markResponseObservation(&httpSpan, event)
+	if parseCtx != nil && parseCtx.httpWireContext && reqType == request.EventTypeHTTPClient && event.Ssl == 1 {
+		httpSpan.WireTraceContext = httpWireTraceContext(req.Header)
+	}
 
 	return postProcessHTTPSpan(parseCtx, &httpSpan, req, resp)
 }
@@ -398,12 +405,12 @@ func HTTPInfoEventToSpan(parseCtx *EBPFParseContext, event *BPFHTTPInfo) (reques
 	if parseCtx != nil && !parseCtx.payloadExtraction.Enabled() {
 		// There's no need to parse HTTP headers/body,
 		// create the span directly.
-		return httpRequestToSpan(event, requestBuffer), false, nil
+		return httpRequestToSpan(parseCtx, event, requestBuffer), false, nil
 	}
 
 	if !hasResponse {
 		// Large buffers disabled
-		return httpRequestToSpan(event, requestBuffer), false, nil
+		return httpRequestToSpan(parseCtx, event, requestBuffer), false, nil
 	}
 
 	// http.ReadRequest requires a *bufio.Reader; that one allocation is unavoidable.
@@ -412,7 +419,7 @@ func HTTPInfoEventToSpan(parseCtx *EBPFParseContext, event *BPFHTTPInfo) (reques
 	resp, err2 := httpSafeParseResponse(responseBuffer, req)
 	if err != nil || err2 != nil {
 		slog.Debug("error while parsing http request or response, falling back to manual HTTP info parsing", "reqErr", err, "respErr", err2)
-		return httpRequestToSpan(event, requestBuffer), false, nil
+		return httpRequestToSpan(parseCtx, event, requestBuffer), false, nil
 	}
 
 	// When the body is empty but Content-Length indicates data should be
@@ -589,7 +596,7 @@ func dechunkBody(data []byte) []byte {
 	return result
 }
 
-func httpRequestToSpan(event *BPFHTTPInfo, requestBuffer *largebuf.LargeBuffer) request.Span {
+func httpRequestToSpan(parseCtx *EBPFParseContext, event *BPFHTTPInfo, requestBuffer *largebuf.LargeBuffer) request.Span {
 	var (
 		result     = HTTPInfo{BPFHTTPInfo: *event}
 		bufHost    string
@@ -624,7 +631,23 @@ func httpRequestToSpan(event *BPFHTTPInfo, requestBuffer *largebuf.LargeBuffer) 
 
 	result.HeaderHost = bufHost
 
-	return httpInfoToSpanLegacy(&result)
+	span := httpInfoToSpanLegacy(&result)
+	if parseCtx != nil && parseCtx.httpWireContext && span.Type == request.EventTypeHTTPClient && event.Ssl == 1 {
+		reader := requestBuffer.NewReader()
+		if req, err := http.ReadRequest(bufio.NewReader(&reader)); err == nil {
+			span.WireTraceContext = httpWireTraceContext(req.Header)
+			_ = req.Body.Close()
+		}
+	}
+	return span
+}
+
+func httpWireTraceContext(headers http.Header) trace.SpanContext {
+	if len(headers.Values("Traceparent")) != 1 {
+		return trace.SpanContext{}
+	}
+	carrier := propagation.HeaderCarrier(headers)
+	return trace.SpanContextFromContext(propagation.TraceContext{}.Extract(context.Background(), carrier))
 }
 
 func httpURLFromBuf(req []byte) string {

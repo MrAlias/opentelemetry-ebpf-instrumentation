@@ -265,6 +265,9 @@ func generateTracesWithAttributes(
 		}
 
 		if hasSubSpans {
+			if span.Type == request.EventTypeHTTP && span.ServerSpanID.IsValid() {
+				spanID = pcommon.SpanID(span.ServerSpanID)
+			}
 			createSubSpans(span, spanID, traceID, &ss, t)
 		} else if span.SpanID.IsValid() {
 			spanID = pcommon.SpanID(span.SpanID)

@@ -22,11 +22,17 @@ const (
 	ipcCommandCollectTracing2 uint8  = 0x03
 	eventPipeBufferSizeMB     uint32 = 16
 	eventPipeFormatNetTrace   uint32 = 1
-	eventPipeProviderCount    uint32 = 1
 	// .NET ProcessorCount keyword; EventCounterIntervalSec enables counter polling.
 	systemRuntimeKeywords   uint64 = 0x2
 	eventLevelInformational uint32 = 4
 )
+
+type eventPipeProvider struct {
+	name      string
+	arguments string
+	keywords  uint64
+	level     uint32
+}
 
 // encodeEventPipeStart encodes a CollectTracing2 request for System.Runtime EventCounters.
 // This is the .NET metrics source.
@@ -36,21 +42,32 @@ func encodeEventPipeStart(samplingInterval time.Duration) ([]byte, error) {
 		return nil, errors.New("EventPipe sampling interval must be greater than 0")
 	}
 
+	interval := strconv.FormatFloat(samplingInterval.Seconds(), 'f', -1, 64)
+	return encodeEventPipeProviders([]eventPipeProvider{{
+		name: "System.Runtime", arguments: "EventCounterIntervalSec=" + interval,
+		keywords: systemRuntimeKeywords, level: eventLevelInformational,
+	}})
+}
+
+func encodeEventPipeProviders(providers []eventPipeProvider) ([]byte, error) {
+	if len(providers) == 0 {
+		return nil, errors.New("EventPipe requires at least one provider")
+	}
 	payload := binary.LittleEndian.AppendUint32(nil, eventPipeBufferSizeMB)
 	payload = binary.LittleEndian.AppendUint32(payload, eventPipeFormatNetTrace)
-	payload = append(payload, 0) // requestRundown is false for this metrics session.
-	payload = binary.LittleEndian.AppendUint32(payload, eventPipeProviderCount)
-	payload = binary.LittleEndian.AppendUint64(payload, systemRuntimeKeywords)
-	payload = binary.LittleEndian.AppendUint32(payload, eventLevelInformational)
-
-	interval := strconv.FormatFloat(samplingInterval.Seconds(), 'f', -1, 64)
-	for _, value := range []string{"System.Runtime", "EventCounterIntervalSec=" + interval} {
-		units := utf16.Encode([]rune(value))
-		payload = binary.LittleEndian.AppendUint32(payload, uint32(len(units)+1))
-		for _, unit := range units {
-			payload = binary.LittleEndian.AppendUint16(payload, unit)
+	payload = append(payload, 0) // No rundown is needed for counters or HTTP activities.
+	payload = binary.LittleEndian.AppendUint32(payload, uint32(len(providers)))
+	for _, provider := range providers {
+		payload = binary.LittleEndian.AppendUint64(payload, provider.keywords)
+		payload = binary.LittleEndian.AppendUint32(payload, provider.level)
+		for _, value := range []string{provider.name, provider.arguments} {
+			units := utf16.Encode([]rune(value))
+			payload = binary.LittleEndian.AppendUint32(payload, uint32(len(units)+1))
+			for _, unit := range units {
+				payload = binary.LittleEndian.AppendUint16(payload, unit)
+			}
+			payload = binary.LittleEndian.AppendUint16(payload, 0)
 		}
-		payload = binary.LittleEndian.AppendUint16(payload, 0)
 	}
 	return encodeIPCMessage(ipcCommandSetEventPipe, ipcCommandCollectTracing2, payload)
 }
@@ -68,6 +85,10 @@ func startEventPipe(ctx context.Context, socketPath string, samplingInterval tim
 	if err != nil {
 		return nil, err
 	}
+	return startEventPipeRequest(ctx, socketPath, request)
+}
+
+func startEventPipeRequest(ctx context.Context, socketPath string, request []byte) (*eventPipeSession, error) {
 	// Diagnostic IPC allows one command per connection. CollectTracing2 needs
 	// a new connection after ProcessInfo2 and retains it for the event stream.
 	var dialer net.Dialer

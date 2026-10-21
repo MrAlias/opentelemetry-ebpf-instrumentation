@@ -1,0 +1,61 @@
+services:
+  source:
+    build:
+      context: ../../..
+      dockerfile: internal/test/integration/components/dotnet-httpclient/source/Dockerfile
+    image: hatest-dotnet-httpclient-source
+    environment:
+      PROXY_URL: https://proxy:8443
+      DOTNET_SYSTEM_NET_HTTP_ENABLEACTIVITYPROPAGATION: "${DOTNET_DIAGNOSTIC_PROPAGATION:-true}"
+    ports:
+      - "127.0.0.1:${DOTNET_HTTPCLIENT_SOURCE_PORT:-18086}:8080"
+    depends_on:
+      - proxy
+
+  proxy:
+    build:
+      context: ../../..
+      dockerfile: internal/test/integration/components/dotnet-httpclient/peer/Dockerfile
+    image: hatest-dotnet-httpclient-peer
+    ports:
+      - "127.0.0.1:${DOTNET_HTTPCLIENT_PROXY_PORT:-18443}:8443"
+    depends_on:
+      - downstream
+
+  downstream:
+    build:
+      context: ../../..
+      dockerfile: internal/test/integration/components/dotnet-httpclient/peer/Dockerfile
+    image: hatest-dotnet-httpclient-peer
+    environment:
+      ROLE: downstream
+      OTEL_SERVICE_NAME: dotnet-httpclient-downstream
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+    depends_on:
+      - jaeger
+
+  obi:
+    build:
+      context: ../../..
+      dockerfile: internal/test/integration/components/obi/Dockerfile
+    image: hatest-obi
+    command: ["--config=/configs/obi-config-dotnet-httpclient.yml"]
+    privileged: true
+    pid: "service:source"
+    network_mode: "service:source"
+    environment:
+      GOCOVERDIR: /coverage
+      OTEL_SERVICE_NAME: dotnet-httpclient-source
+      DOTNET_OBI_PROPAGATION: "${DOTNET_OBI_PROPAGATION:-headers}"
+    volumes:
+      - ./configs:/configs:ro
+      - ./system/sys/kernel/security${SECURITY_CONFIG_SUFFIX}:/sys/kernel/security
+      - ../../../testoutput:/coverage
+      - ../../../testoutput/run-dotnet-httpclient:/var/run/obi
+    depends_on:
+      - source
+
+  jaeger:
+    image: jaegertracing/jaeger:2.22.0@sha256:836b967b5abcf1f7758066aa6b348619267a2f1459f72d472840570f9bd88a17
+    ports:
+      - "127.0.0.1:${DOTNET_HTTPCLIENT_JAEGER_PORT:-16686}:16686"

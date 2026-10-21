@@ -104,10 +104,15 @@ func newGraphBuilderWithProtocolMetricSelection(
 	// TODO: consider moving the queues to a public structure so when OBI is used as library, other components can
 	// listen to the messages and expanding the Pipeline
 	tracesReaderToRouter := msg2.QueueFromConfig[[]request.Span](config, ctxInfo.Metrics, "tracesReaderToRouter")
+	tracesReaderOutput := tracesReaderToRouter
+	if config.EBPF.ContextPropagation.HasHeaders() {
+		tracesReaderOutput = msg2.QueueFromConfig[[]request.Span](config, ctxInfo.Metrics, "tracesReaderToDotnetContext")
+		swi.Add(resolveDotnetHTTPContext(config.EBPF.MaxTransactionTime, config.DotnetRuntimeMetrics.Timeout, tracesReaderOutput, tracesReaderToRouter), swarm.WithID("DotnetHTTPContext"))
+	}
 	swi.Add(traces.ReadFromChannel(&traces.ReadDecorator{
 		InstanceID:      config.Attributes.InstanceID,
 		TracesInput:     tracesCh,
-		DecoratedTraces: tracesReaderToRouter,
+		DecoratedTraces: tracesReaderOutput,
 	}), swarm.WithID("ReadFromChannel"))
 
 	routerToKubeDecorator := msg2.QueueFromConfig[[]request.Span](config, ctxInfo.Metrics, "routerToKubeDecorator",

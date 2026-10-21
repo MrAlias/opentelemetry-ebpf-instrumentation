@@ -1,0 +1,41 @@
+file_format: "1.0"
+log_level: debug
+resource:
+  attributes:
+    - name: service.name
+      value: dotnet-httpclient-source
+tracer_provider:
+  processors:
+    - batch:
+        schedule_delay: 100
+        exporter:
+          otlp_grpc:
+            endpoint: http://jaeger:4317
+            tls:
+              insecure: true
+extensions:
+  obi:
+    version: "2.0"
+    capture:
+      policy:
+        default_action: exclude
+        poll_interval: 500ms
+      rules:
+        - action: include
+          match:
+            process:
+              open_ports: "8080"
+      engine:
+        batching:
+          batch_timeout: 100ms
+        propagation:
+          context_propagation: "${DOTNET_OBI_PROPAGATION:-headers}"
+          disable_black_box_cp: true
+      instrumentation:
+        http:
+          track_request_headers: true
+          routes:
+            incoming:
+              unmatched: path
+            outgoing:
+              unmatched: path

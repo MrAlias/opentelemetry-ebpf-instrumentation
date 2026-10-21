@@ -1,0 +1,13 @@
+PASS make docker-clang-format
+PASS make docker-generate
+PASS make compile
+PASS make lint
+PASS make lint-markdown
+PASS make license-header-check
+PASS git diff --check
+PASS focused Go tests: CPython gRPC injector, discovery, generic tracer
+PASS real grpcio 1.78.0 TLS Python agent unit tests
+PASS privileged BPF verifier with header and user-write branches enabled
+PASS Docker integration: headers and disabled (32 RPCs each)
+PASS make docker-clang-tidy (LLVM 22)
+PASS config v2 validation: headers and disabled

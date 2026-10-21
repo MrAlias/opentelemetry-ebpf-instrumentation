@@ -1,0 +1,11 @@
+Skipping OBI image build (pre-built image found)
+=== RUN   TestSuite_PythonGRPCTLS
+=== RUN   TestSuite_PythonGRPCTLS/disabled
+    python_grpc_tls_test.go:162: verified 24 automatic RPCs, 7 application-owned RPCs and one later RPC on one TLS connection; propagation=disabled
+=== RUN   TestSuite_PythonGRPCTLS/headers
+    python_grpc_tls_test.go:162: verified 24 automatic RPCs, 7 application-owned RPCs and one later RPC on one TLS connection; propagation=headers
+--- PASS: TestSuite_PythonGRPCTLS (58.67s)
+    --- PASS: TestSuite_PythonGRPCTLS/disabled (25.47s)
+    --- PASS: TestSuite_PythonGRPCTLS/headers (33.20s)
+PASS
+ok  	go.opentelemetry.io/obi/internal/test/integration	58.690s

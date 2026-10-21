@@ -196,6 +196,10 @@ func TestBPFVerifierWithConstants(t *testing.T) {
 		// every combination below, and pairing it here would double the matrix
 		{"g_traces_ctx_v1_enabled", []any{true}},
 	})
+	loadAndVerify(t, "generictracer/PythonGrpc", generictracerbpf.LoadBpf, map[string]any{
+		"g_bpf_header_propagation":       true,
+		"g_bpf_probe_write_user_enabled": true,
+	})
 	forEachCombination(t, "generictracer/BpfRingbufMetrics", generictracerbpf.LoadBpf, []constOption{
 		{"ringbuf_metrics_enabled", []any{true, false}},
 	})

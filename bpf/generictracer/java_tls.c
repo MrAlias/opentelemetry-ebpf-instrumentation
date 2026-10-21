@@ -3,6 +3,9 @@
 
 //go:build obi_bpf_ignore
 
+#define OBI_JUMP_TABLE_EXTRA_ENTRIES(entry)                                                        \
+    entry(k_tail_python_grpc_ioctl, obi_python_grpc_ioctl, struct pt_regs *)
+
 #include "pid/types/pid_key.h"
 #include <bpfcore/vmlinux.h>
 #include <bpfcore/bpf_helpers.h>
@@ -19,6 +22,7 @@
 #include <generictracer/jvm.h>
 #include <generictracer/k_tracer_defs.h>
 #include <generictracer/maps/pid_tid_to_conn.h>
+#include <generictracer/python_grpc.h>
 
 #include <logger/bpf_dbg.h>
 
@@ -81,6 +85,11 @@ int BPF_KPROBE_GUARDED(obi_kprobe_sys_ioctl) {
 
     // it must be fd == 0 if we are considering this request
     if (fd) {
+        return 0;
+    }
+
+    if (cmd == k_python_grpc_ioctl) {
+        preempt_guarded_tail_call_static(ctx, &jump_table, k_tail_python_grpc_ioctl);
         return 0;
     }
 

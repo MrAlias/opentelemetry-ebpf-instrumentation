@@ -1,0 +1,37 @@
+file_format: "1.0"
+log_level: debug
+resource:
+  attributes:
+    - name: service.name
+      value: python-grpc-source
+tracer_provider:
+  processors:
+    - batch:
+        schedule_delay: 100
+        exporter:
+          otlp_grpc:
+            endpoint: http://jaeger:4317
+            tls:
+              insecure: true
+extensions:
+  obi:
+    version: "2.0"
+    capture:
+      policy:
+        default_action: exclude
+        poll_interval: 500ms
+      rules:
+        - action: include
+          match:
+            process:
+              open_ports: 8080
+      instrumentation:
+        http:
+          routes:
+            incoming:
+              unmatched: path
+      engine:
+        batching:
+          batch_timeout: 100ms
+        propagation:
+          context_propagation: ${PYTHON_GRPC_PROPAGATION}

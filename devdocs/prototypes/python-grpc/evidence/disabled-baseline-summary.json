@@ -1,0 +1,23 @@
+{
+  "propagation": "disabled",
+  "tcp_option_propagation": false,
+  "automatic_rpc_count": 24,
+  "received_traceparent_counts": [
+    0
+  ],
+  "incoming_source_server_traces_verified": 0,
+  "source_grpc_client_spans": 0,
+  "maximum_concurrent_streams": 8,
+  "proxy_upstream_peers": [
+    "ipv4:127.0.0.1:54000"
+  ],
+  "application_traceparents_and_sdk_parents_verified": 4,
+  "after_application_traceparents": [],
+  "duplicate_and_binary_metadata_preserved": true,
+  "python": "3.12.3",
+  "grpcio": "1.78.0",
+  "opentelemetry_sdk": "1.39.1",
+  "opentelemetry_grpc_instrumentation": "0.60b1",
+  "proxy_openssl": "3.0.13",
+  "obi_revision": "e64f42f70"
+}

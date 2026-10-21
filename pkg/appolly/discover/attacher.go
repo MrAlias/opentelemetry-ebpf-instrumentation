@@ -22,6 +22,7 @@ import (
 	ebpfcommon "go.opentelemetry.io/obi/pkg/ebpf/common"
 	attr "go.opentelemetry.io/obi/pkg/export/attributes/names"
 	"go.opentelemetry.io/obi/pkg/export/imetrics"
+	pythongrpc "go.opentelemetry.io/obi/pkg/internal/cpython/grpc"
 	"go.opentelemetry.io/obi/pkg/internal/dotnet"
 	"go.opentelemetry.io/obi/pkg/internal/helpers/maps"
 	javaagent "go.opentelemetry.io/obi/pkg/internal/java"
@@ -159,6 +160,14 @@ func (ta *traceAttacher) attacherLoop(_ context.Context) (swarm.RunFunc, error) 
 			defer nodeInjections.wait()
 		}
 
+		var pythonInjections *injectionQueue[pythongrpc.InjectionTarget]
+		if ta.Cfg.EBPF.ContextPropagation.HasHeaders() && (ta.Cfg.Traces.Enabled() || ta.Cfg.TracePrinter.Enabled()) {
+			injector := pythongrpc.NewInjector()
+			pythonInjections = newInjectionQueue(ta.log, "python", injectionSlot, 100, injector.Inject, nil)
+			pythonInjections.start(ctx)
+			defer pythonInjections.wait()
+		}
+
 		swarms.ForEachInput(ctx, in, ta.log.Debug, func(instrumentables []Event[ebpf.Instrumentable]) {
 			for _, instr := range instrumentables {
 				ta.log.Debug("Instrumentable", "created", instr.Type, "type", instr.Obj.Type,
@@ -190,6 +199,17 @@ func (ta *traceAttacher) attacherLoop(_ context.Context) (swarm.RunFunc, error) 
 						}
 					}
 
+					var pythonTarget *pythongrpc.InjectionTarget
+					if pythonInjections != nil && instr.Obj.Type == svc.InstrumentablePython &&
+						instr.Obj.FileInfo.ServiceAttrs().ExportModes.CanExportTraces() {
+						target, err := pythongrpc.InjectionTargetFrom(&instr.Obj)
+						if err != nil {
+							ta.log.Debug("unable to capture Python injection target", "error", err)
+						} else {
+							pythonTarget = &target
+						}
+					}
+
 					if ok := ta.getTracer(ctx, &instr.Obj); ok {
 						ta.addProcessInstances(&instr.Obj)
 						if dotnetSessions != nil && instr.Obj.Type == svc.InstrumentableDotnet &&
@@ -200,6 +220,11 @@ func (ta *traceAttacher) attacherLoop(_ context.Context) (swarm.RunFunc, error) 
 							}
 						}
 						ta.OutputTracerEvents.SendCtx(ctx, Event[*ebpf.Instrumentable]{Type: EventCreated, Obj: &instr.Obj})
+						if pythonTarget != nil {
+							pythonInjections.enqueue(*pythonTarget)
+						}
+					} else if pythonTarget != nil {
+						_ = pythonTarget.Close()
 					}
 
 					// Injection blocks for up to the Java attach timeout, so it is

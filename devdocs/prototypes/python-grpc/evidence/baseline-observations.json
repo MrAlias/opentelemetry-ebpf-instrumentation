@@ -1,0 +1,555 @@
+{
+  "automatic": [
+    {
+      "incoming_trace_id": "18e01711a3ccbbeb0000000000000001",
+      "observations": [
+        {
+          "traceparents": [],
+          "users": [
+            "first",
+            "second"
+          ],
+          "binary": [
+            "00ff"
+          ],
+          "case": [
+            "caller-0"
+          ],
+          "trace_id": "9751d55d6455d1a6f756ea718c7de1b8",
+          "span_id": "987838d4586dacd4",
+          "peer": "ipv4:127.0.0.1:42624",
+          "max_active": 7
+        },
+        {
+          "traceparents": [],
+          "users": [
+            "first",
+            "second"
+          ],
+          "binary": [
+            "00ff"
+          ],
+          "case": [
+            "caller-0"
+          ],
+          "trace_id": "dcfcdc4b43e8680b5ab733b0958c3be6",
+          "span_id": "a299a8f19232e0b2",
+          "peer": "ipv4:127.0.0.1:42624",
+          "max_active": 8
+        },
+        {
+          "traceparents": [],
+          "users": [
+            "first",
+            "second"
+          ],
+          "binary": [
+            "00ff"
+          ],
+          "case": [
+            "caller-0"
+          ],
+          "trace_id": "77d3a040f9c0c7a709c77b68caea4bd0",
+          "span_id": "474f8e45a790d4e4",
+          "peer": "ipv4:127.0.0.1:42624",
+          "max_active": 8
+        }
+      ]
+    },
+    {
+      "incoming_trace_id": "18e01711a434c7b40000000000000002",
+      "observations": [
+        {
+          "traceparents": [],
+          "users": [
+            "first",
+            "second"
+          ],
+          "binary": [
+            "00ff"
+          ],
+          "case": [
+            "caller-1"
+          ],
+          "trace_id": "e9a2ae5763a6f4342ec38bc265fd5e41",
+          "span_id": "2b3c3e92505594a6",
+          "peer": "ipv4:127.0.0.1:42624",
+          "max_active": 2
+        },
+        {
+          "traceparents": [],
+          "users": [
+            "first",
+            "second"
+          ],
+          "binary": [
+            "00ff"
+          ],
+          "case": [
+            "caller-1"
+          ],
+          "trace_id": "4878647c1ce19404f255a1f90b46ffa5",
+          "span_id": "e7201f2e721c697a",
+          "peer": "ipv4:127.0.0.1:42624",
+          "max_active": 8
+        },
+        {
+          "traceparents": [],
+          "users": [
+            "first",
+            "second"
+          ],
+          "binary": [
+            "00ff"
+          ],
+          "case": [
+            "caller-1"
+          ],
+          "trace_id": "d9e54ea534087223d9462c6a5fa3feb5",
+          "span_id": "a133acd14b1f7a59",
+          "peer": "ipv4:127.0.0.1:42624",
+          "max_active": 8
+        }
+      ]
+    },
+    {
+      "incoming_trace_id": "18e01711a494d2a80000000000000003",
+      "observations": [
+        {
+          "traceparents": [],
+          "users": [
+            "first",
+            "second"
+          ],
+          "binary": [
+            "00ff"
+          ],
+          "case": [
+            "caller-2"
+          ],
+          "trace_id": "5cf54b77c949f9a894814f18e5b79b84",
+          "span_id": "cf57988f0cec647e",
+          "peer": "ipv4:127.0.0.1:42624",
+          "max_active": 5
+        },
+        {
+          "traceparents": [],
+          "users": [
+            "first",
+            "second"
+          ],
+          "binary": [
+            "00ff"
+          ],
+          "case": [
+            "caller-2"
+          ],
+          "trace_id": "2a77e93ec77eb400898d2a5ab2e9c318",
+          "span_id": "5aceaf048be4b273",
+          "peer": "ipv4:127.0.0.1:42624",
+          "max_active": 8
+        },
+        {
+          "traceparents": [],
+          "users": [
+            "first",
+            "second"
+          ],
+          "binary": [
+            "00ff"
+          ],
+          "case": [
+            "caller-2"
+          ],
+          "trace_id": "c38785b82cdb707283d2275ba3f3097f",
+          "span_id": "b3d20a6f56ba75c9",
+          "peer": "ipv4:127.0.0.1:42624",
+          "max_active": 8
+        }
+      ]
+    },
+    {
+      "incoming_trace_id": "18e01711a4c268aa0000000000000004",
+      "observations": [
+        {
+          "traceparents": [],
+          "users": [
+            "first",
+            "second"
+          ],
+          "binary": [
+            "00ff"
+          ],
+          "case": [
+            "caller-3"
+          ],
+          "trace_id": "a482a674b488f0c2a946932c111eea94",
+          "span_id": "2496184743332dfc",
+          "peer": "ipv4:127.0.0.1:42624",
+          "max_active": 6
+        },
+        {
+          "traceparents": [],
+          "users": [
+            "first",
+            "second"
+          ],
+          "binary": [
+            "00ff"
+          ],
+          "case": [
+            "caller-3"
+          ],
+          "trace_id": "3a86eb6f6f6ebdfdf243f84621009a97",
+          "span_id": "bd035d278a9178e5",
+          "peer": "ipv4:127.0.0.1:42624",
+          "max_active": 8
+        },
+        {
+          "traceparents": [],
+          "users": [
+            "first",
+            "second"
+          ],
+          "binary": [
+            "00ff"
+          ],
+          "case": [
+            "caller-3"
+          ],
+          "trace_id": "5333897bfe25b02604156b040ea4f535",
+          "span_id": "5334fb445292d7aa",
+          "peer": "ipv4:127.0.0.1:42624",
+          "max_active": 8
+        }
+      ]
+    },
+    {
+      "incoming_trace_id": "18e01711a54fe1460000000000000005",
+      "observations": [
+        {
+          "traceparents": [],
+          "users": [
+            "first",
+            "second"
+          ],
+          "binary": [
+            "00ff"
+          ],
+          "case": [
+            "caller-4"
+          ],
+          "trace_id": "c2d291c3a14a27bb57814e80c8fc69b7",
+          "span_id": "860edef00ea4efd2",
+          "peer": "ipv4:127.0.0.1:42624",
+          "max_active": 8
+        },
+        {
+          "traceparents": [],
+          "users": [
+            "first",
+            "second"
+          ],
+          "binary": [
+            "00ff"
+          ],
+          "case": [
+            "caller-4"
+          ],
+          "trace_id": "b12c807be18bc34e7edb2e2018fae29c",
+          "span_id": "27d4a1b40625ad71",
+          "peer": "ipv4:127.0.0.1:42624",
+          "max_active": 8
+        },
+        {
+          "traceparents": [],
+          "users": [
+            "first",
+            "second"
+          ],
+          "binary": [
+            "00ff"
+          ],
+          "case": [
+            "caller-4"
+          ],
+          "trace_id": "bbf1d2bae00de299209ab1bfacdcdabc",
+          "span_id": "254633f6f77d840f",
+          "peer": "ipv4:127.0.0.1:42624",
+          "max_active": 8
+        }
+      ]
+    },
+    {
+      "incoming_trace_id": "18e01711a56a413f0000000000000006",
+      "observations": [
+        {
+          "traceparents": [],
+          "users": [
+            "first",
+            "second"
+          ],
+          "binary": [
+            "00ff"
+          ],
+          "case": [
+            "caller-5"
+          ],
+          "trace_id": "dab7022a536f10666fd17c23e86043af",
+          "span_id": "b25a886374d33c8d",
+          "peer": "ipv4:127.0.0.1:42624",
+          "max_active": 4
+        },
+        {
+          "traceparents": [],
+          "users": [
+            "first",
+            "second"
+          ],
+          "binary": [
+            "00ff"
+          ],
+          "case": [
+            "caller-5"
+          ],
+          "trace_id": "53c0c57143c10e668e8e05c5ad603463",
+          "span_id": "29b4fc2de7c11e3d",
+          "peer": "ipv4:127.0.0.1:42624",
+          "max_active": 8
+        },
+        {
+          "traceparents": [],
+          "users": [
+            "first",
+            "second"
+          ],
+          "binary": [
+            "00ff"
+          ],
+          "case": [
+            "caller-5"
+          ],
+          "trace_id": "5b672010e60a5c6c04a83a2ccddd7ddc",
+          "span_id": "bcda21eb38f921c9",
+          "peer": "ipv4:127.0.0.1:42624",
+          "max_active": 8
+        }
+      ]
+    },
+    {
+      "incoming_trace_id": "18e01711a5787e8f0000000000000007",
+      "observations": [
+        {
+          "traceparents": [],
+          "users": [
+            "first",
+            "second"
+          ],
+          "binary": [
+            "00ff"
+          ],
+          "case": [
+            "caller-6"
+          ],
+          "trace_id": "9a7f4e519696f177a49d6d4952a0bbe0",
+          "span_id": "d9c8969f311510af",
+          "peer": "ipv4:127.0.0.1:42624",
+          "max_active": 3
+        },
+        {
+          "traceparents": [],
+          "users": [
+            "first",
+            "second"
+          ],
+          "binary": [
+            "00ff"
+          ],
+          "case": [
+            "caller-6"
+          ],
+          "trace_id": "b6f26c62c671fdee2e7ee4a0a9a6bb59",
+          "span_id": "82e8bdeb09753d29",
+          "peer": "ipv4:127.0.0.1:42624",
+          "max_active": 8
+        },
+        {
+          "traceparents": [],
+          "users": [
+            "first",
+            "second"
+          ],
+          "binary": [
+            "00ff"
+          ],
+          "case": [
+            "caller-6"
+          ],
+          "trace_id": "12746674487b279534b840209f0b436f",
+          "span_id": "e10fc12834e23127",
+          "peer": "ipv4:127.0.0.1:42624",
+          "max_active": 8
+        }
+      ]
+    },
+    {
+      "incoming_trace_id": "18e01711a58a84850000000000000008",
+      "observations": [
+        {
+          "traceparents": [],
+          "users": [
+            "first",
+            "second"
+          ],
+          "binary": [
+            "00ff"
+          ],
+          "case": [
+            "caller-7"
+          ],
+          "trace_id": "e4f2004115cda077bd5d5beb12f56fef",
+          "span_id": "4d999555b68ebc9b",
+          "peer": "ipv4:127.0.0.1:42624",
+          "max_active": 1
+        },
+        {
+          "traceparents": [],
+          "users": [
+            "first",
+            "second"
+          ],
+          "binary": [
+            "00ff"
+          ],
+          "case": [
+            "caller-7"
+          ],
+          "trace_id": "c3e28bbbce0a8fc89c2c015a89131367",
+          "span_id": "4771443653b3afe1",
+          "peer": "ipv4:127.0.0.1:42624",
+          "max_active": 8
+        },
+        {
+          "traceparents": [],
+          "users": [
+            "first",
+            "second"
+          ],
+          "binary": [
+            "00ff"
+          ],
+          "case": [
+            "caller-7"
+          ],
+          "trace_id": "2e5ffc0f47ae933ce4ef4a0d53b95fcb",
+          "span_id": "1e2e79b868b1ca18",
+          "peer": "ipv4:127.0.0.1:42624",
+          "max_active": 8
+        }
+      ]
+    }
+  ],
+  "application": {
+    "incoming_trace_id": "18e01711daecaefd000000000000000a",
+    "observations": [
+      {
+        "traceparents": [
+          "00-1234567890abcdef1234567890abcdef-1234567890abcdef-01"
+        ],
+        "users": [
+          "first",
+          "second"
+        ],
+        "binary": [
+          "00ff"
+        ],
+        "case": [
+          "caller-9"
+        ],
+        "trace_id": "1234567890abcdef1234567890abcdef",
+        "span_id": "0d53c62989838f05",
+        "peer": "ipv4:127.0.0.1:42624",
+        "max_active": 8
+      },
+      {
+        "traceparents": [
+          "00-1234567890abcdef1234567890abcdef-1234567890abcdef-01"
+        ],
+        "users": [
+          "first",
+          "second"
+        ],
+        "binary": [
+          "00ff"
+        ],
+        "case": [
+          "caller-9"
+        ],
+        "trace_id": "1234567890abcdef1234567890abcdef",
+        "span_id": "df31edb7137644fa",
+        "peer": "ipv4:127.0.0.1:42624",
+        "max_active": 8
+      },
+      {
+        "traceparents": [
+          "00-1234567890abcdef1234567890abcdef-1234567890abcdef-01"
+        ],
+        "users": [
+          "first",
+          "second"
+        ],
+        "binary": [
+          "00ff"
+        ],
+        "case": [
+          "caller-9"
+        ],
+        "trace_id": "1234567890abcdef1234567890abcdef",
+        "span_id": "fe45cd7f829fdeaf",
+        "peer": "ipv4:127.0.0.1:42624",
+        "max_active": 8
+      },
+      {
+        "traceparents": [
+          "00-1234567890abcdef1234567890abcdef-1234567890abcdef-01"
+        ],
+        "users": [
+          "first",
+          "second"
+        ],
+        "binary": [
+          "00ff"
+        ],
+        "case": [
+          "caller-9"
+        ],
+        "trace_id": "1234567890abcdef1234567890abcdef",
+        "span_id": "5a0ca68a73aa01f4",
+        "peer": "ipv4:127.0.0.1:42624",
+        "max_active": 8
+      }
+    ]
+  },
+  "after_application": {
+    "incoming_trace_id": "18e0171235c0b121000000000000000b",
+    "observations": [
+      {
+        "traceparents": [],
+        "users": [
+          "first",
+          "second"
+        ],
+        "binary": [
+          "00ff"
+        ],
+        "case": [
+          "caller-10"
+        ],
+        "trace_id": "03738e722bad378a504943002a325029",
+        "span_id": "c082a6ecbc7d441b",
+        "peer": "ipv4:127.0.0.1:42624",
+        "max_active": 8
+      }
+    ]
+  }
+}

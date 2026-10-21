@@ -1,0 +1,52 @@
+services:
+  source:
+    build:
+      context: ../../..
+      dockerfile: internal/test/integration/components/python_grpc_tls/Dockerfile
+    image: hatest-python-grpc-tls
+    init: true
+    ports:
+      - "127.0.0.1:18090:8080"
+    depends_on:
+      - proxy
+
+  proxy:
+    image: hatest-python-grpc-tls
+    command: ["python", "proxy.py"]
+    init: true
+    depends_on:
+      - downstream
+
+  downstream:
+    image: hatest-python-grpc-tls
+    command: ["python", "server.py"]
+    init: true
+    depends_on:
+      - jaeger
+
+  obi:
+    build:
+      context: ../../..
+      dockerfile: internal/test/integration/components/obi/Dockerfile
+    image: hatest-python-grpc-tls-obi
+    command: ["--config=/configs/obi-config-python-grpc-tls.yml"]
+    privileged: true
+    pid: "service:source"
+    network_mode: "service:source"
+    volumes:
+      - ./configs:/configs:ro
+      - ./system/sys/kernel/security${SECURITY_CONFIG_SUFFIX}:/sys/kernel/security:ro
+      - ../../../testoutput:/coverage
+      - ../../../testoutput/run-python-grpc-tls:/var/run/obi
+    environment:
+      GOCOVERDIR: /coverage
+      PYTHON_GRPC_PROPAGATION: "${PYTHON_GRPC_PROPAGATION:-headers}"
+    depends_on:
+      - source
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.60@sha256:4fd2d70fa347d6a47e79fcb06b1c177e6079f92cba88b083153d56263082135e
+    ports:
+      - "127.0.0.1:18091:16686"
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"

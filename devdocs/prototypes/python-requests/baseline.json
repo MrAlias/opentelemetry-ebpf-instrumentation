@@ -1,0 +1,621 @@
+{
+  "capture": {
+    "status": "BASELINE",
+    "mode": "baseline",
+    "propagation": "headers",
+    "observations": 6,
+    "versions": {
+      "python": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+      "requests": "2.31.0",
+      "urllib3": "2.0.7",
+      "openssl": "OpenSSL 3.0.13 30 Jan 2024"
+    },
+    "limitation": "baseline without runtime agent"
+  },
+  "observations": [
+    {
+      "case_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/0",
+      "traceparents": [],
+      "peer": "127.0.0.1:49658",
+      "active": 1,
+      "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+      "method": "POST",
+      "path": "/observe?case=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa%2F0",
+      "http_version": "HTTP/1.1",
+      "headers": {
+        "Host": "127.0.0.1:8443",
+        "User-Agent": "python-requests/2.31.0",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+        "X-Session": "preserved",
+        "X-Case-ID": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/0",
+        "X-Unrelated": "preserved",
+        "Cookie": "session-cookie=preserved",
+        "Content-Length": "21",
+        "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+      },
+      "downstream": {
+        "parent_id": "0000000000000000",
+        "span_id": "22f00e8c6b80cff3",
+        "trace_id": "c73aee9d6fb518d493b328faae723948"
+      },
+      "prepared_before": {
+        "User-Agent": "python-requests/2.31.0",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+        "X-Session": "preserved",
+        "X-Case-ID": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/0",
+        "X-Unrelated": "preserved",
+        "Cookie": "session-cookie=preserved",
+        "Content-Length": "21",
+        "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+      },
+      "prepared_after": {
+        "User-Agent": "python-requests/2.31.0",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+        "X-Session": "preserved",
+        "X-Case-ID": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/0",
+        "X-Unrelated": "preserved",
+        "Cookie": "session-cookie=preserved",
+        "Content-Length": "21",
+        "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+      },
+      "prepared_body_hex": "70726570617265642d626f64793a00ff0d0a656e64"
+    },
+    {
+      "case_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/1",
+      "traceparents": [],
+      "peer": "127.0.0.1:49658",
+      "active": 1,
+      "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+      "method": "POST",
+      "path": "/observe?case=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa%2F1",
+      "http_version": "HTTP/1.1",
+      "headers": {
+        "Host": "127.0.0.1:8443",
+        "User-Agent": "python-requests/2.31.0",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+        "X-Session": "preserved",
+        "X-Case-ID": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/1",
+        "X-Unrelated": "preserved",
+        "Cookie": "session-cookie=preserved",
+        "Content-Length": "21",
+        "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+      },
+      "downstream": {
+        "parent_id": "0000000000000000",
+        "span_id": "9092c48908203c15",
+        "trace_id": "47e6b42ef11588d53b7241bf90e8515b"
+      },
+      "prepared_before": {
+        "User-Agent": "python-requests/2.31.0",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+        "X-Session": "preserved",
+        "X-Case-ID": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/1",
+        "X-Unrelated": "preserved",
+        "Cookie": "session-cookie=preserved",
+        "Content-Length": "21",
+        "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+      },
+      "prepared_after": {
+        "User-Agent": "python-requests/2.31.0",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+        "X-Session": "preserved",
+        "X-Case-ID": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/1",
+        "X-Unrelated": "preserved",
+        "Cookie": "session-cookie=preserved",
+        "Content-Length": "21",
+        "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+      },
+      "prepared_body_hex": "70726570617265642d626f64793a00ff0d0a656e64"
+    },
+    {
+      "case_id": "cccccccccccccccccccccccccccccccc/0",
+      "traceparents": [
+        "00-33333333333333333333333333333333-4444444444444444-01"
+      ],
+      "peer": "127.0.0.1:49660",
+      "active": 1,
+      "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+      "method": "POST",
+      "path": "/observe?case=cccccccccccccccccccccccccccccccc%2F0",
+      "http_version": "HTTP/1.1",
+      "headers": {
+        "Host": "127.0.0.1:8443",
+        "User-Agent": "python-requests/2.31.0",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+        "X-Session": "preserved",
+        "X-Case-ID": "cccccccccccccccccccccccccccccccc/0",
+        "X-Unrelated": "preserved",
+        "TrAcEpArEnT": "00-33333333333333333333333333333333-4444444444444444-01",
+        "Cookie": "session-cookie=preserved",
+        "Content-Length": "21",
+        "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+      },
+      "downstream": {
+        "parent_id": "4444444444444444",
+        "span_id": "18ba7e18d78fe937",
+        "trace_id": "33333333333333333333333333333333"
+      },
+      "prepared_before": {
+        "User-Agent": "python-requests/2.31.0",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+        "X-Session": "preserved",
+        "X-Case-ID": "cccccccccccccccccccccccccccccccc/0",
+        "X-Unrelated": "preserved",
+        "TrAcEpArEnT": "00-33333333333333333333333333333333-4444444444444444-01",
+        "Cookie": "session-cookie=preserved",
+        "Content-Length": "21",
+        "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+      },
+      "prepared_after": {
+        "User-Agent": "python-requests/2.31.0",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+        "X-Session": "preserved",
+        "X-Case-ID": "cccccccccccccccccccccccccccccccc/0",
+        "X-Unrelated": "preserved",
+        "TrAcEpArEnT": "00-33333333333333333333333333333333-4444444444444444-01",
+        "Cookie": "session-cookie=preserved",
+        "Content-Length": "21",
+        "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+      },
+      "prepared_body_hex": "70726570617265642d626f64793a00ff0d0a656e64"
+    },
+    {
+      "case_id": "cccccccccccccccccccccccccccccccc/1",
+      "traceparents": [
+        "00-33333333333333333333333333333333-4444444444444444-01"
+      ],
+      "peer": "127.0.0.1:49660",
+      "active": 1,
+      "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+      "method": "POST",
+      "path": "/observe?case=cccccccccccccccccccccccccccccccc%2F1",
+      "http_version": "HTTP/1.1",
+      "headers": {
+        "Host": "127.0.0.1:8443",
+        "User-Agent": "python-requests/2.31.0",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+        "X-Session": "preserved",
+        "X-Case-ID": "cccccccccccccccccccccccccccccccc/1",
+        "X-Unrelated": "preserved",
+        "TrAcEpArEnT": "00-33333333333333333333333333333333-4444444444444444-01",
+        "Cookie": "session-cookie=preserved",
+        "Content-Length": "21",
+        "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+      },
+      "downstream": {
+        "parent_id": "4444444444444444",
+        "span_id": "baf91e48ea05b217",
+        "trace_id": "33333333333333333333333333333333"
+      },
+      "prepared_before": {
+        "User-Agent": "python-requests/2.31.0",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+        "X-Session": "preserved",
+        "X-Case-ID": "cccccccccccccccccccccccccccccccc/1",
+        "X-Unrelated": "preserved",
+        "TrAcEpArEnT": "00-33333333333333333333333333333333-4444444444444444-01",
+        "Cookie": "session-cookie=preserved",
+        "Content-Length": "21",
+        "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+      },
+      "prepared_after": {
+        "User-Agent": "python-requests/2.31.0",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+        "X-Session": "preserved",
+        "X-Case-ID": "cccccccccccccccccccccccccccccccc/1",
+        "X-Unrelated": "preserved",
+        "TrAcEpArEnT": "00-33333333333333333333333333333333-4444444444444444-01",
+        "Cookie": "session-cookie=preserved",
+        "Content-Length": "21",
+        "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+      },
+      "prepared_body_hex": "70726570617265642d626f64793a00ff0d0a656e64"
+    },
+    {
+      "case_id": "dddddddddddddddddddddddddddddddd/0",
+      "traceparents": [
+        "application-owned-invalid-value"
+      ],
+      "peer": "127.0.0.1:49674",
+      "active": 1,
+      "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+      "method": "POST",
+      "path": "/observe?case=dddddddddddddddddddddddddddddddd%2F0",
+      "http_version": "HTTP/1.1",
+      "headers": {
+        "Host": "127.0.0.1:8443",
+        "User-Agent": "python-requests/2.31.0",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+        "X-Session": "preserved",
+        "X-Case-ID": "dddddddddddddddddddddddddddddddd/0",
+        "X-Unrelated": "preserved",
+        "TrAcEpArEnT": "application-owned-invalid-value",
+        "Cookie": "session-cookie=preserved",
+        "Content-Length": "21",
+        "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+      },
+      "downstream": {
+        "parent_id": "0000000000000000",
+        "span_id": "7e09e37b69fa6da9",
+        "trace_id": "a358d1aca141cf7c26a8a03be941ae93"
+      },
+      "prepared_before": {
+        "User-Agent": "python-requests/2.31.0",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+        "X-Session": "preserved",
+        "X-Case-ID": "dddddddddddddddddddddddddddddddd/0",
+        "X-Unrelated": "preserved",
+        "TrAcEpArEnT": "application-owned-invalid-value",
+        "Cookie": "session-cookie=preserved",
+        "Content-Length": "21",
+        "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+      },
+      "prepared_after": {
+        "User-Agent": "python-requests/2.31.0",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+        "X-Session": "preserved",
+        "X-Case-ID": "dddddddddddddddddddddddddddddddd/0",
+        "X-Unrelated": "preserved",
+        "TrAcEpArEnT": "application-owned-invalid-value",
+        "Cookie": "session-cookie=preserved",
+        "Content-Length": "21",
+        "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+      },
+      "prepared_body_hex": "70726570617265642d626f64793a00ff0d0a656e64"
+    },
+    {
+      "case_id": "dddddddddddddddddddddddddddddddd/1",
+      "traceparents": [
+        "application-owned-invalid-value"
+      ],
+      "peer": "127.0.0.1:49674",
+      "active": 1,
+      "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+      "method": "POST",
+      "path": "/observe?case=dddddddddddddddddddddddddddddddd%2F1",
+      "http_version": "HTTP/1.1",
+      "headers": {
+        "Host": "127.0.0.1:8443",
+        "User-Agent": "python-requests/2.31.0",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+        "X-Session": "preserved",
+        "X-Case-ID": "dddddddddddddddddddddddddddddddd/1",
+        "X-Unrelated": "preserved",
+        "TrAcEpArEnT": "application-owned-invalid-value",
+        "Cookie": "session-cookie=preserved",
+        "Content-Length": "21",
+        "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+      },
+      "downstream": {
+        "parent_id": "0000000000000000",
+        "span_id": "23582b81bc4b3300",
+        "trace_id": "39217dc265467b889b7ac8c7b30d66b6"
+      },
+      "prepared_before": {
+        "User-Agent": "python-requests/2.31.0",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+        "X-Session": "preserved",
+        "X-Case-ID": "dddddddddddddddddddddddddddddddd/1",
+        "X-Unrelated": "preserved",
+        "TrAcEpArEnT": "application-owned-invalid-value",
+        "Cookie": "session-cookie=preserved",
+        "Content-Length": "21",
+        "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+      },
+      "prepared_after": {
+        "User-Agent": "python-requests/2.31.0",
+        "Accept-Encoding": "gzip, deflate",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+        "X-Session": "preserved",
+        "X-Case-ID": "dddddddddddddddddddddddddddddddd/1",
+        "X-Unrelated": "preserved",
+        "TrAcEpArEnT": "application-owned-invalid-value",
+        "Cookie": "session-cookie=preserved",
+        "Content-Length": "21",
+        "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+      },
+      "prepared_body_hex": "70726570617265642d626f64793a00ff0d0a656e64"
+    }
+  ],
+  "exported_span_excerpts": [
+    {
+      "service": "requests-source",
+      "name": "in queue",
+      "kind": "Internal",
+      "trace_id": "ed57aa5927a65bd18673629f24458ab4",
+      "span_id": "1eb6e34d88f72da0",
+      "parent_id": "b7f768a63ace62eb"
+    },
+    {
+      "service": "requests-source",
+      "name": "processing",
+      "kind": "Internal",
+      "trace_id": "ed57aa5927a65bd18673629f24458ab4",
+      "span_id": "a3576addc4cdfbce",
+      "parent_id": "b7f768a63ace62eb"
+    },
+    {
+      "service": "requests-source",
+      "name": "GET /health",
+      "kind": "Server",
+      "trace_id": "ed57aa5927a65bd18673629f24458ab4",
+      "span_id": "b7f768a63ace62eb",
+      "parent_id": ""
+    },
+    {
+      "service": "requests-source",
+      "name": "in queue",
+      "kind": "Internal",
+      "trace_id": "5b51e0d090eaa17a67e1289098b32e69",
+      "span_id": "41e5dffd13e641e9",
+      "parent_id": "a4d6d73382638fb7"
+    },
+    {
+      "service": "requests-source",
+      "name": "processing",
+      "kind": "Internal",
+      "trace_id": "5b51e0d090eaa17a67e1289098b32e69",
+      "span_id": "6533bf69086508e0",
+      "parent_id": "a4d6d73382638fb7"
+    },
+    {
+      "service": "requests-source",
+      "name": "GET /health",
+      "kind": "Server",
+      "trace_id": "5b51e0d090eaa17a67e1289098b32e69",
+      "span_id": "a4d6d73382638fb7",
+      "parent_id": ""
+    },
+    {
+      "service": "requests-source",
+      "name": "in queue",
+      "kind": "Internal",
+      "trace_id": "a5b3489daf29cac5f1ea193317a097a4",
+      "span_id": "d61a7633ceb3461f",
+      "parent_id": "78e30d31bacb5d0e"
+    },
+    {
+      "service": "requests-source",
+      "name": "processing",
+      "kind": "Internal",
+      "trace_id": "a5b3489daf29cac5f1ea193317a097a4",
+      "span_id": "c3bebc681dcca86d",
+      "parent_id": "78e30d31bacb5d0e"
+    },
+    {
+      "service": "requests-source",
+      "name": "GET /health",
+      "kind": "Server",
+      "trace_id": "a5b3489daf29cac5f1ea193317a097a4",
+      "span_id": "78e30d31bacb5d0e",
+      "parent_id": ""
+    },
+    {
+      "service": "requests-downstream",
+      "name": "POST",
+      "kind": "Server",
+      "trace_id": "c73aee9d6fb518d493b328faae723948",
+      "span_id": "22f00e8c6b80cff3",
+      "parent_id": ""
+    },
+    {
+      "service": "requests-downstream",
+      "name": "POST",
+      "kind": "Server",
+      "trace_id": "47e6b42ef11588d53b7241bf90e8515b",
+      "span_id": "9092c48908203c15",
+      "parent_id": ""
+    },
+    {
+      "service": "requests-downstream",
+      "name": "POST",
+      "kind": "Server",
+      "trace_id": "33333333333333333333333333333333",
+      "span_id": "18ba7e18d78fe937",
+      "parent_id": "4444444444444444"
+    },
+    {
+      "service": "requests-downstream",
+      "name": "POST",
+      "kind": "Server",
+      "trace_id": "33333333333333333333333333333333",
+      "span_id": "baf91e48ea05b217",
+      "parent_id": "4444444444444444"
+    },
+    {
+      "service": "requests-downstream",
+      "name": "POST",
+      "kind": "Server",
+      "trace_id": "a358d1aca141cf7c26a8a03be941ae93",
+      "span_id": "7e09e37b69fa6da9",
+      "parent_id": ""
+    },
+    {
+      "service": "requests-downstream",
+      "name": "POST",
+      "kind": "Server",
+      "trace_id": "39217dc265467b889b7ac8c7b30d66b6",
+      "span_id": "23582b81bc4b3300",
+      "parent_id": ""
+    },
+    {
+      "service": "requests-source",
+      "name": "in queue",
+      "kind": "Internal",
+      "trace_id": "2949aeaf0deecc264b005d9be39ce7ae",
+      "span_id": "2981e0ff6ee79c24",
+      "parent_id": "6ab9c9ba868e03bf"
+    },
+    {
+      "service": "requests-source",
+      "name": "processing",
+      "kind": "Internal",
+      "trace_id": "2949aeaf0deecc264b005d9be39ce7ae",
+      "span_id": "985230a57df3f98e",
+      "parent_id": "6ab9c9ba868e03bf"
+    },
+    {
+      "service": "requests-source",
+      "name": "GET /health",
+      "kind": "Server",
+      "trace_id": "2949aeaf0deecc264b005d9be39ce7ae",
+      "span_id": "6ab9c9ba868e03bf",
+      "parent_id": ""
+    },
+    {
+      "service": "requests-source",
+      "name": "POST /observe",
+      "kind": "Client",
+      "trace_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "span_id": "376742d822ac7b6e",
+      "parent_id": "350c5e5b647d9ca6"
+    },
+    {
+      "service": "requests-source",
+      "name": "in queue",
+      "kind": "Internal",
+      "trace_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "span_id": "d47166fceb41e7a1",
+      "parent_id": "5b54b9caeb31e2f9"
+    },
+    {
+      "service": "requests-source",
+      "name": "processing",
+      "kind": "Internal",
+      "trace_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "span_id": "350c5e5b647d9ca6",
+      "parent_id": "5b54b9caeb31e2f9"
+    },
+    {
+      "service": "requests-source",
+      "name": "GET /call",
+      "kind": "Server",
+      "trace_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "span_id": "5b54b9caeb31e2f9",
+      "parent_id": "eeeeeeeeeeeeeeee"
+    },
+    {
+      "service": "requests-source",
+      "name": "POST /observe",
+      "kind": "Client",
+      "trace_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "span_id": "5e7ab228a3072b4a",
+      "parent_id": "350c5e5b647d9ca6"
+    },
+    {
+      "service": "requests-source",
+      "name": "POST /observe",
+      "kind": "Client",
+      "trace_id": "cccccccccccccccccccccccccccccccc",
+      "span_id": "e88dc1dab01d6540",
+      "parent_id": "db97e2660e45d69d"
+    },
+    {
+      "service": "requests-source",
+      "name": "in queue",
+      "kind": "Internal",
+      "trace_id": "cccccccccccccccccccccccccccccccc",
+      "span_id": "2bfa647141d50d71",
+      "parent_id": "c2d3f05dba9fb1d5"
+    },
+    {
+      "service": "requests-source",
+      "name": "processing",
+      "kind": "Internal",
+      "trace_id": "cccccccccccccccccccccccccccccccc",
+      "span_id": "db97e2660e45d69d",
+      "parent_id": "c2d3f05dba9fb1d5"
+    },
+    {
+      "service": "requests-source",
+      "name": "GET /call",
+      "kind": "Server",
+      "trace_id": "cccccccccccccccccccccccccccccccc",
+      "span_id": "c2d3f05dba9fb1d5",
+      "parent_id": "eeeeeeeeeeeeeeee"
+    },
+    {
+      "service": "requests-source",
+      "name": "POST /observe",
+      "kind": "Client",
+      "trace_id": "cccccccccccccccccccccccccccccccc",
+      "span_id": "dcf3e9e67f29e51f",
+      "parent_id": "db97e2660e45d69d"
+    },
+    {
+      "service": "requests-source",
+      "name": "POST /observe",
+      "kind": "Client",
+      "trace_id": "dddddddddddddddddddddddddddddddd",
+      "span_id": "53cb72c9247b72ce",
+      "parent_id": "606f36ef3a57793b"
+    },
+    {
+      "service": "requests-source",
+      "name": "in queue",
+      "kind": "Internal",
+      "trace_id": "dddddddddddddddddddddddddddddddd",
+      "span_id": "7403bae9069cfaee",
+      "parent_id": "0fdca560b7162782"
+    },
+    {
+      "service": "requests-source",
+      "name": "processing",
+      "kind": "Internal",
+      "trace_id": "dddddddddddddddddddddddddddddddd",
+      "span_id": "606f36ef3a57793b",
+      "parent_id": "0fdca560b7162782"
+    },
+    {
+      "service": "requests-source",
+      "name": "GET /call",
+      "kind": "Server",
+      "trace_id": "dddddddddddddddddddddddddddddddd",
+      "span_id": "0fdca560b7162782",
+      "parent_id": "eeeeeeeeeeeeeeee"
+    },
+    {
+      "service": "requests-source",
+      "name": "POST /observe",
+      "kind": "Client",
+      "trace_id": "dddddddddddddddddddddddddddddddd",
+      "span_id": "71c27eca7f77dd28",
+      "parent_id": "606f36ef3a57793b"
+    }
+  ]
+}

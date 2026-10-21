@@ -1,0 +1,1050 @@
+[
+  {
+    "case_id": "000000000000000018e09a0a518c9eb8/0",
+    "traceparents": [],
+    "peer": "172.22.0.5:59740",
+    "active": 1,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0a518c9eb8%2F0",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8443",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0a518c9eb8/0",
+      "X-Unrelated": "preserved",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "0000000000000000",
+      "span_id": "3637c465c527f502",
+      "trace_id": "bfdf17ad6930137815d6d7a4263c4708"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0a644c49bc/0",
+    "traceparents": [],
+    "peer": "172.22.0.5:59740",
+    "active": 1,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0a644c49bc%2F0",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8443",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0a644c49bc/0",
+      "X-Unrelated": "preserved",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "0000000000000000",
+      "span_id": "596d811cf0b5c94d",
+      "trace_id": "172eafb98d643dac26c5559d3ad41fcb"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0a672e7a30/0",
+    "traceparents": [],
+    "peer": "172.22.0.5:59740",
+    "active": 1,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0a672e7a30%2F0",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8443",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0a672e7a30/0",
+      "X-Unrelated": "preserved",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "0000000000000000",
+      "span_id": "74535ca54fcf0ea4",
+      "trace_id": "83d675fe25b069180d7b3a62893325f8"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0a6b061c1e/0",
+    "traceparents": [],
+    "peer": "172.22.0.5:59750",
+    "active": 1,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0a6b061c1e%2F0",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8443",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0a6b061c1e/0",
+      "X-Unrelated": "preserved",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "0000000000000000",
+      "span_id": "6af457cda0c85541",
+      "trace_id": "c0cdea1c80f136a5c9c0716633cd1300"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0a6b061c1e/1",
+    "traceparents": [],
+    "peer": "172.22.0.5:59750",
+    "active": 1,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0a6b061c1e%2F1",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8443",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0a6b061c1e/1",
+      "X-Unrelated": "preserved",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "0000000000000000",
+      "span_id": "248ec73b39700fa0",
+      "trace_id": "f42e41acc4d9c3046280cb3661453a24"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0a6b061c1e/2",
+    "traceparents": [],
+    "peer": "172.22.0.5:59750",
+    "active": 1,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0a6b061c1e%2F2",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8443",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0a6b061c1e/2",
+      "X-Unrelated": "preserved",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "0000000000000000",
+      "span_id": "c5ba66ee0d132027",
+      "trace_id": "e36ed6437dc6386623710dca26a4a4c1"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0a753faf73/0",
+    "traceparents": [
+      "00-33333333333333333333333333333333-4444444444444444-01"
+    ],
+    "peer": "172.22.0.5:59750",
+    "active": 1,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0a753faf73%2F0",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8443",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0a753faf73/0",
+      "X-Unrelated": "preserved",
+      "TrAcEpArEnT": "00-33333333333333333333333333333333-4444444444444444-01",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "4444444444444444",
+      "span_id": "f22050254ef2a44e",
+      "trace_id": "33333333333333333333333333333333"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0a753faf73/1",
+    "traceparents": [
+      "00-33333333333333333333333333333333-4444444444444444-01"
+    ],
+    "peer": "172.22.0.5:59750",
+    "active": 1,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0a753faf73%2F1",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8443",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0a753faf73/1",
+      "X-Unrelated": "preserved",
+      "TrAcEpArEnT": "00-33333333333333333333333333333333-4444444444444444-01",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "4444444444444444",
+      "span_id": "6ed1e4ef22e9e913",
+      "trace_id": "33333333333333333333333333333333"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0a7fa21a47/0",
+    "traceparents": [
+      "application-owned-invalid-value"
+    ],
+    "peer": "172.22.0.5:59750",
+    "active": 1,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0a7fa21a47%2F0",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8443",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0a7fa21a47/0",
+      "X-Unrelated": "preserved",
+      "TrAcEpArEnT": "application-owned-invalid-value",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "0000000000000000",
+      "span_id": "6a3f34c83b4bdc5c",
+      "trace_id": "3a8eeafec778c8e229bae57edbd9bad9"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0a7fa21a47/1",
+    "traceparents": [
+      "application-owned-invalid-value"
+    ],
+    "peer": "172.22.0.5:59750",
+    "active": 1,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0a7fa21a47%2F1",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8443",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0a7fa21a47/1",
+      "X-Unrelated": "preserved",
+      "TrAcEpArEnT": "application-owned-invalid-value",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "0000000000000000",
+      "span_id": "dc55582084ee499d",
+      "trace_id": "0aa713b4b87f85971fc9d2546b452cd0"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0a8597fc9c/0",
+    "traceparents": [],
+    "peer": "172.22.0.5:59750",
+    "active": 4,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0a8597fc9c%2F0",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8443",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0a8597fc9c/0",
+      "X-Unrelated": "preserved",
+      "X-Concurrent": "true",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "0000000000000000",
+      "span_id": "f6b811ff0014922f",
+      "trace_id": "4270b3766d770fab196ec78c70c0192f"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0a855e0030/0",
+    "traceparents": [],
+    "peer": "172.22.0.5:59762",
+    "active": 4,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0a855e0030%2F0",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8443",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0a855e0030/0",
+      "X-Unrelated": "preserved",
+      "X-Concurrent": "true",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "0000000000000000",
+      "span_id": "82e2d8b0c12c3073",
+      "trace_id": "9613a619f42048f2e9381786238f61f1"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0a85980b61/0",
+    "traceparents": [],
+    "peer": "172.22.0.5:59772",
+    "active": 4,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0a85980b61%2F0",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8443",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0a85980b61/0",
+      "X-Unrelated": "preserved",
+      "X-Concurrent": "true",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "0000000000000000",
+      "span_id": "785a3a0a6bc02a73",
+      "trace_id": "4a75a7e832286950ebe43cab3d678997"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0a85981094/0",
+    "traceparents": [],
+    "peer": "172.22.0.5:59784",
+    "active": 4,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0a85981094%2F0",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8443",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0a85981094/0",
+      "X-Unrelated": "preserved",
+      "X-Concurrent": "true",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "0000000000000000",
+      "span_id": "c7a1dcf29994857d",
+      "trace_id": "35a75ab6e25436f86f21c62140552922"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0a8597fc9c/1",
+    "traceparents": [],
+    "peer": "172.22.0.5:59750",
+    "active": 4,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0a8597fc9c%2F1",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8443",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0a8597fc9c/1",
+      "X-Unrelated": "preserved",
+      "X-Concurrent": "true",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "0000000000000000",
+      "span_id": "235d5444fc9b981d",
+      "trace_id": "000b1948f9bd8dd07821044bb26c8f5b"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0a855e0030/1",
+    "traceparents": [],
+    "peer": "172.22.0.5:59762",
+    "active": 3,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0a855e0030%2F1",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8443",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0a855e0030/1",
+      "X-Unrelated": "preserved",
+      "X-Concurrent": "true",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "0000000000000000",
+      "span_id": "596d1cf97e152e56",
+      "trace_id": "da0eecfdaf41bcd815cf70b146975709"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0a85980b61/1",
+    "traceparents": [],
+    "peer": "172.22.0.5:59772",
+    "active": 2,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0a85980b61%2F1",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8443",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0a85980b61/1",
+      "X-Unrelated": "preserved",
+      "X-Concurrent": "true",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "0000000000000000",
+      "span_id": "5b714192b0bf7e0f",
+      "trace_id": "2e2c147ccba2ddaab44f4e9b7cb7d06f"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0a85981094/1",
+    "traceparents": [],
+    "peer": "172.22.0.5:59784",
+    "active": 1,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0a85981094%2F1",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8443",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0a85981094/1",
+      "X-Unrelated": "preserved",
+      "X-Concurrent": "true",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "0000000000000000",
+      "span_id": "c65eedb5ed740f1c",
+      "trace_id": "4293bc1f6389934f90b37baa593706c6"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0ab405be8f/0",
+    "traceparents": [],
+    "peer": "172.22.0.5:36108",
+    "active": 1,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0ab405be8f%2F0",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8081",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0ab405be8f/0",
+      "X-Unrelated": "preserved",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "0000000000000000",
+      "span_id": "ce252ac61495ee2b",
+      "trace_id": "a593562413cd89f5dbd16d50208d25d7"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0ab6fede65/0",
+    "traceparents": [],
+    "peer": "172.22.0.5:36108",
+    "active": 1,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0ab6fede65%2F0",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8081",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0ab6fede65/0",
+      "X-Unrelated": "preserved",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "0000000000000000",
+      "span_id": "d53bc37ae0ae9b86",
+      "trace_id": "16ceae32d291091a485b876c0e352bd3"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0ab9daffa2/0",
+    "traceparents": [],
+    "peer": "172.22.0.5:36108",
+    "active": 1,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0ab9daffa2%2F0",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8081",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0ab9daffa2/0",
+      "X-Unrelated": "preserved",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "0000000000000000",
+      "span_id": "5894070eacf1733d",
+      "trace_id": "a026d2010eb6d7b754ddfdd50c2595b6"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0ac1c42257/0",
+    "traceparents": [],
+    "peer": "172.22.0.5:36118",
+    "active": 1,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0ac1c42257%2F0",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8081",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0ac1c42257/0",
+      "X-Unrelated": "preserved",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "0000000000000000",
+      "span_id": "5dbce99b65110c3c",
+      "trace_id": "49812bf18e98b5bb33467b5ae13943f8"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0ac1c42257/1",
+    "traceparents": [],
+    "peer": "172.22.0.5:36118",
+    "active": 1,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0ac1c42257%2F1",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8081",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0ac1c42257/1",
+      "X-Unrelated": "preserved",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "0000000000000000",
+      "span_id": "0a85f22254338d1b",
+      "trace_id": "b691000d070e86b22708777ee82db4f3"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0ac1c42257/2",
+    "traceparents": [],
+    "peer": "172.22.0.5:36118",
+    "active": 1,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0ac1c42257%2F2",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8081",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0ac1c42257/2",
+      "X-Unrelated": "preserved",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "0000000000000000",
+      "span_id": "596ddcffd3e2e011",
+      "trace_id": "24fd7ec4ed55c56ed5143c255a795f61"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0ac7bd251e/0",
+    "traceparents": [
+      "00-33333333333333333333333333333333-4444444444444444-01"
+    ],
+    "peer": "172.22.0.5:36118",
+    "active": 1,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0ac7bd251e%2F0",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8081",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0ac7bd251e/0",
+      "X-Unrelated": "preserved",
+      "TrAcEpArEnT": "00-33333333333333333333333333333333-4444444444444444-01",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "4444444444444444",
+      "span_id": "f2a857a35004bdd3",
+      "trace_id": "33333333333333333333333333333333"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0ac7bd251e/1",
+    "traceparents": [
+      "00-33333333333333333333333333333333-4444444444444444-01"
+    ],
+    "peer": "172.22.0.5:36118",
+    "active": 1,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0ac7bd251e%2F1",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8081",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0ac7bd251e/1",
+      "X-Unrelated": "preserved",
+      "TrAcEpArEnT": "00-33333333333333333333333333333333-4444444444444444-01",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "4444444444444444",
+      "span_id": "cbb94e513b980ff1",
+      "trace_id": "33333333333333333333333333333333"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0acfc980e2/0",
+    "traceparents": [
+      "application-owned-invalid-value"
+    ],
+    "peer": "172.22.0.5:36118",
+    "active": 1,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0acfc980e2%2F0",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8081",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0acfc980e2/0",
+      "X-Unrelated": "preserved",
+      "TrAcEpArEnT": "application-owned-invalid-value",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "0000000000000000",
+      "span_id": "e5bf62520bc1e98d",
+      "trace_id": "1697b02ed25969303bd70b6c2c8fe72f"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0acfc980e2/1",
+    "traceparents": [
+      "application-owned-invalid-value"
+    ],
+    "peer": "172.22.0.5:36118",
+    "active": 1,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0acfc980e2%2F1",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8081",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0acfc980e2/1",
+      "X-Unrelated": "preserved",
+      "TrAcEpArEnT": "application-owned-invalid-value",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "0000000000000000",
+      "span_id": "036de575e1b02837",
+      "trace_id": "1917ecc2fc6d95c4d0a41870743a6e71"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0ad31bd31c/0",
+    "traceparents": [],
+    "peer": "172.22.0.5:36118",
+    "active": 4,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0ad31bd31c%2F0",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8081",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0ad31bd31c/0",
+      "X-Unrelated": "preserved",
+      "X-Concurrent": "true",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "0000000000000000",
+      "span_id": "bca53324ff4ed49b",
+      "trace_id": "d2898589729c0cf69f1fc8b3cb83fe40"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0ad31b9de5/0",
+    "traceparents": [],
+    "peer": "172.22.0.5:36134",
+    "active": 3,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0ad31b9de5%2F0",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8081",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0ad31b9de5/0",
+      "X-Unrelated": "preserved",
+      "X-Concurrent": "true",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "0000000000000000",
+      "span_id": "0b505dd4b71486ee",
+      "trace_id": "c66761a6c3e96e7e6fafd92e96877ec8"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0ad31bce89/0",
+    "traceparents": [],
+    "peer": "172.22.0.5:36138",
+    "active": 3,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0ad31bce89%2F0",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8081",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0ad31bce89/0",
+      "X-Unrelated": "preserved",
+      "X-Concurrent": "true",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "0000000000000000",
+      "span_id": "58610d7b53980e2b",
+      "trace_id": "4d3519c2f6198ee773326c20eca792ad"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0ad31bca6e/0",
+    "traceparents": [],
+    "peer": "172.22.0.5:36150",
+    "active": 2,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0ad31bca6e%2F0",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8081",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0ad31bca6e/0",
+      "X-Unrelated": "preserved",
+      "X-Concurrent": "true",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "0000000000000000",
+      "span_id": "ddb18ab7e50bc5c0",
+      "trace_id": "e9d68b07528e8b90cb9a40527a8178ec"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0ad31b9de5/1",
+    "traceparents": [],
+    "peer": "172.22.0.5:36134",
+    "active": 4,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0ad31b9de5%2F1",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8081",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0ad31b9de5/1",
+      "X-Unrelated": "preserved",
+      "X-Concurrent": "true",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "0000000000000000",
+      "span_id": "d25178ca87b2f3a4",
+      "trace_id": "5b38ddbef68c18166f0b401919895211"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0ad31bce89/1",
+    "traceparents": [],
+    "peer": "172.22.0.5:36138",
+    "active": 4,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0ad31bce89%2F1",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8081",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0ad31bce89/1",
+      "X-Unrelated": "preserved",
+      "X-Concurrent": "true",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "0000000000000000",
+      "span_id": "a1560d6a93c1f706",
+      "trace_id": "ed8f951d0020c20200de0003a02b9619"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0ad31bca6e/1",
+    "traceparents": [],
+    "peer": "172.22.0.5:36150",
+    "active": 4,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0ad31bca6e%2F1",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8081",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0ad31bca6e/1",
+      "X-Unrelated": "preserved",
+      "X-Concurrent": "true",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "0000000000000000",
+      "span_id": "10b1e01e6d258f62",
+      "trace_id": "dceaf30ce164350e3e065a24f5a45ed3"
+    }
+  },
+  {
+    "case_id": "000000000000000018e09a0ad31bd31c/1",
+    "traceparents": [],
+    "peer": "172.22.0.5:36118",
+    "active": 1,
+    "body_hex": "70726570617265642d626f64793a00ff0d0a656e64",
+    "method": "POST",
+    "path": "/observe?case=000000000000000018e09a0ad31bd31c%2F1",
+    "http_version": "HTTP/1.1",
+    "headers": {
+      "Host": "proxy:8081",
+      "User-Agent": "python-requests/2.32.5",
+      "Accept-Encoding": "gzip, deflate, zstd",
+      "Accept": "*/*",
+      "Connection": "keep-alive",
+      "X-Session": "preserved",
+      "X-Case-ID": "000000000000000018e09a0ad31bd31c/1",
+      "X-Unrelated": "preserved",
+      "X-Concurrent": "true",
+      "Cookie": "session-cookie=preserved",
+      "Content-Length": "21",
+      "Authorization": "Basic cHJlcGFyZWQ6cGFzc3dvcmQ="
+    },
+    "downstream": {
+      "parent_id": "0000000000000000",
+      "span_id": "17ee1d8ac3b4ca5e",
+      "trace_id": "f88324119d4b20e1436976a58fcc317d"
+    }
+  }
+]

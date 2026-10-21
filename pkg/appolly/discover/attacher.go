@@ -26,6 +26,7 @@ import (
 	"go.opentelemetry.io/obi/pkg/internal/helpers/maps"
 	javaagent "go.opentelemetry.io/obi/pkg/internal/java"
 	"go.opentelemetry.io/obi/pkg/internal/nodejs"
+	"go.opentelemetry.io/obi/pkg/internal/pythonagent"
 	"go.opentelemetry.io/obi/pkg/internal/transform/route/harvest"
 	"go.opentelemetry.io/obi/pkg/metadata"
 	"go.opentelemetry.io/obi/pkg/obi"
@@ -55,6 +56,7 @@ type traceAttacher struct {
 	existingTracers     map[ebpf.ExecutableKey]executableTracer
 	nodeInjector        *nodejs.NodeInjector
 	javaInjector        *javaagent.JavaInjector
+	pythonInjector      *pythonagent.Injector
 	reusableTracer      *ebpf.ProcessTracer
 	reusableGoTracer    *ebpf.ProcessTracer
 	commonTracers       []ebpf.Tracer
@@ -110,6 +112,7 @@ func (ta *traceAttacher) attacherLoop(_ context.Context) (swarm.RunFunc, error) 
 	ta.log = slog.With("component", "discover.traceAttacher")
 	ta.existingTracers = map[ebpf.ExecutableKey]executableTracer{}
 	ta.nodeInjector = nodejs.NewNodeInjector(ta.Cfg)
+	ta.pythonInjector = pythonagent.NewInjector(ta.Cfg)
 	javaInjector, err := javaagent.NewJavaInjector(ta.Cfg)
 	if err != nil {
 		ta.log.Warn("unable to inject OBI java agent, Java TLS telemetry generation will not work", "error", err)
@@ -159,6 +162,13 @@ func (ta *traceAttacher) attacherLoop(_ context.Context) (swarm.RunFunc, error) 
 			defer nodeInjections.wait()
 		}
 
+		var pythonInjections *injectionQueue[pythonagent.InjectionTarget]
+		if ta.pythonInjector.Enabled() {
+			pythonInjections = newPythonInjectionQueue(ta.log, injectionSlot, ta.pythonInjector.Inject)
+			pythonInjections.start(ctx)
+			defer pythonInjections.wait()
+		}
+
 		swarms.ForEachInput(ctx, in, ta.log.Debug, func(instrumentables []Event[ebpf.Instrumentable]) {
 			for _, instr := range instrumentables {
 				ta.log.Debug("Instrumentable", "created", instr.Type, "type", instr.Obj.Type,
@@ -200,6 +210,14 @@ func (ta *traceAttacher) attacherLoop(_ context.Context) (swarm.RunFunc, error) 
 							}
 						}
 						ta.OutputTracerEvents.SendCtx(ctx, Event[*ebpf.Instrumentable]{Type: EventCreated, Obj: &instr.Obj})
+						if pythonInjections != nil && ta.pythonInjector.Accepts(&instr.Obj) {
+							target, err := pythonagent.InjectionTargetFrom(&instr.Obj)
+							if err != nil {
+								ta.log.Warn("unable to capture stable Python injection target", "pid", instr.Obj.FileInfo.Pid(), "error", err)
+							} else {
+								pythonInjections.enqueue(target)
+							}
+						}
 					}
 
 					// Injection blocks for up to the Java attach timeout, so it is

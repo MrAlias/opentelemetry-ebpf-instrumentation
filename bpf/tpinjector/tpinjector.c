@@ -38,6 +38,7 @@
 #include <maps/go_h2_owned_streams.h>
 #include <maps/msg_buffers.h>
 #include <maps/outgoing_trace_map.h>
+#include <maps/python_requests.h>
 #include <maps/sock_dir.h>
 #include <maps/socket_cookie.h>
 #include <maps/tp_info_mem.h>
@@ -1265,6 +1266,14 @@ int obi_packet_extender(struct sk_msg_md *msg) {
     t_ctx->h2_tp_retries = 0;
     bpf_memset(&t_ctx->h2_framing, 0, sizeof(t_ctx->h2_framing));
     t_ctx->go_grpc_conn = false;
+
+    python_request_context_t *python = bpf_map_lookup_elem(&python_requests, &t_ctx->p_conn);
+    if ((inject_flags & k_inject_http_headers) && python_requests_owned_by(python, id)) {
+        if (inject_flags & k_inject_tcp_options) {
+            schedule_write_tcp_option(msg, &python->trace);
+        }
+        return SK_PASS;
+    }
 
     // skip H2 here — it uses HPACK for per-stream traceparents
     tp_info_pid_t *tp_pid = get_tp_info_pid(&e_key);

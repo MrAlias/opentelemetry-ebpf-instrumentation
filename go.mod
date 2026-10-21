@@ -64,6 +64,7 @@ require (
 	go.opentelemetry.io/contrib/detectors/aws/eks v1.47.0
 	go.opentelemetry.io/contrib/detectors/azure/azurevm v0.19.0
 	go.opentelemetry.io/contrib/detectors/gcp v1.47.0
+	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.71.0
 	go.opentelemetry.io/contrib/otelconf v0.27.0
 	go.opentelemetry.io/ebpf-profiler v0.0.202640
 	go.opentelemetry.io/otel v1.47.0
@@ -182,7 +183,6 @@ require (
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	github.com/zeebo/xxh3 v1.1.0 // indirect
 	go.opentelemetry.io/collector/featuregate v1.69.0 // indirect
-	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.71.0 // indirect
 	go.opentelemetry.io/contrib/propagators/autoprop v0.72.0 // indirect
 	go.opentelemetry.io/contrib/propagators/aws v1.47.0 // indirect
 	go.opentelemetry.io/contrib/propagators/b3 v1.47.0 // indirect

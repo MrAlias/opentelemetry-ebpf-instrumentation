@@ -38,6 +38,7 @@
 #include <maps/active_ssl_connections.h>
 #include <maps/connection_tracker.h>
 #include <maps/ongoing_http.h>
+#include <maps/python_requests.h>
 #include <maps/tp_info_mem.h>
 #include <maps/tp_char_buf_mem.h>
 
@@ -678,6 +679,15 @@ __obi_continue_protocol_http(struct pt_regs *ctx,
     };
 
     sort_egress_key(&e_key);
+
+    const python_request_context_t *python = bpf_map_lookup_elem(&python_requests, &args->pid_conn);
+    if (g_bpf_header_propagation && meta && meta->type == k_event_type_http_client &&
+        python_requests_owned_by(python, bpf_get_current_pid_tgid())) {
+        set_trace_info_for_connection(&args->pid_conn.conn, TRACE_TYPE_CLIENT, &python->trace);
+        info->parent_status = python->parent_status;
+        bpf_map_delete_elem(&outgoing_trace_map, &e_key);
+        goto skip_tp;
+    }
 
     tp_info_pid_t *tp_p = bpf_map_lookup_elem(&outgoing_trace_map, &e_key);
 

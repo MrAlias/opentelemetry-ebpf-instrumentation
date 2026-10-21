@@ -18,6 +18,7 @@
 
 #include <generictracer/jvm.h>
 #include <generictracer/k_tracer_defs.h>
+#include <generictracer/python_requests.h>
 #include <generictracer/maps/pid_tid_to_conn.h>
 
 #include <logger/bpf_dbg.h>
@@ -82,6 +83,10 @@ int BPF_KPROBE_GUARDED(obi_kprobe_sys_ioctl) {
     // it must be fd == 0 if we are considering this request
     if (fd) {
         return 0;
+    }
+
+    if (cmd == k_python_requests_ioctl) {
+        return python_requests_ioctl(id, arg);
     }
 
     // some other IOCTL by the app

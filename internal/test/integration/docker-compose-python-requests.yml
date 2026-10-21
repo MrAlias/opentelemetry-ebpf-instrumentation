@@ -1,0 +1,61 @@
+services:
+  source:
+    build:
+      context: ../../..
+      dockerfile: internal/test/integration/components/pythonrequests/Dockerfile
+      args:
+        PYTHON_IMAGE: "${REQUESTS_PYTHON_IMAGE:-python:3.14@sha256:7aea6827c8787754f99339ffed8cfc41fb09421f9c7d0e77a198b08422a3455e}"
+    image: hatest-python-requests
+    init: true
+    environment:
+      OTEL_SERVICE_NAME: requests-source
+    ports:
+      - "127.0.0.1:28086:8080"
+    depends_on:
+      - proxy
+
+  proxy:
+    build:
+      context: ../../..
+      dockerfile: internal/test/integration/components/pythonrequests/Dockerfile
+    image: hatest-python-requests-proxy
+    init: true
+    command: ["python", "proxy.py"]
+    depends_on:
+      - downstream
+
+  downstream:
+    build:
+      context: ../../..
+      dockerfile: internal/test/integration/components/pythonrequests/downstream/Dockerfile
+    image: hatest-python-requests-downstream
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+      OTEL_EXPORTER_OTLP_INSECURE: "true"
+      OTEL_BSP_SCHEDULE_DELAY: "100"
+    depends_on:
+      - jaeger
+
+  obi:
+    build:
+      context: ../../..
+      dockerfile: internal/test/integration/components/obi/Dockerfile
+    image: "${REQUESTS_OBI_IMAGE:-hatest-obi}"
+    privileged: true
+    init: true
+    pid: "service:source"
+    network_mode: "service:source"
+    environment:
+      OTEL_EBPF_CONFIG_PATH: /configs/obi-config-python-requests.yml
+      REQUESTS_PROPAGATION: "${REQUESTS_PROPAGATION:-headers}"
+    volumes:
+      - ./configs:/configs:ro
+      - ./system/sys/kernel/security${SECURITY_CONFIG_SUFFIX}:/sys/kernel/security:ro
+      - /sys/kernel/tracing:/sys/kernel/tracing:ro
+    depends_on:
+      - source
+
+  jaeger:
+    image: jaegertracing/jaeger:2.22.0@sha256:836b967b5abcf1f7758066aa6b348619267a2f1459f72d472840570f9bd88a17
+    ports:
+      - "127.0.0.1:28186:16686"

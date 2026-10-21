@@ -28,6 +28,29 @@ import (
 
 const maxRuntimeObjectCandidates = 4
 
+// RuntimeObjectCandidates identifies the executable and mapped libpython objects.
+func RuntimeObjectCandidates(pid app.PID, mappings []*procfs.ProcMap) ([]*procfs.ProcMap, error) {
+	return runtimeObjectCandidates(pid, mappings)
+}
+
+// ReadVersion reads a mapped CPython ELF's version and free-threaded build flag.
+func ReadVersion(file *elf.File) (uint32, bool, error) {
+	objects, err := procs.FindExeSymbols(file, []string{"_PyRuntime", "Py_Version"}, elf.STT_OBJECT)
+	if err != nil {
+		return 0, false, err
+	}
+	anchor, ok := runtimeAnchor(file, objects)
+	if !ok {
+		return 0, false, errRuntimeNotFound
+	}
+	analysis := &elfAnalysis{anchor: anchor}
+	if symbol, found := objects["Py_Version"]; found {
+		analysis.versionAddress = symbol.Value
+	}
+	version, freeThreaded, _, err := runtimeVersionFromELF(file, analysis)
+	return version, freeThreaded, err
+}
+
 var (
 	errRuntimeNotFound          = errors.New("CPython runtime not found")
 	errRuntimeObjectUnavailable = errors.New("CPython runtime object unavailable")
